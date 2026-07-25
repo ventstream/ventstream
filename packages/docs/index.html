@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VentStream — Overview</title>
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="assets/docs.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="logo" href="index.html">VentStream</a>
+    <div class="tagline">CDC + denormalized indexing + durable WebSocket subscriptions, in a single Rust binary.</div>
+
+    <div class="nav-section">Start here</div>
+    <nav><ul>
+      <li><a data-page="index.html" href="index.html">Overview</a></li>
+      <li><a data-page="architecture.html" href="architecture.html">Architecture</a></li>
+      <li><a data-page="getting-started.html" href="getting-started.html">Getting started</a></li>
+    </ul></nav>
+
+    <div class="nav-section">Pipelines</div>
+    <nav><ul>
+      <li><a data-page="pipeline-a.html" href="pipeline-a.html">A · CDC + joins</a></li>
+      <li><a data-page="pipeline-b.html" href="pipeline-b.html">B · WS fan-out</a></li>
+      <li><a data-page="graphql.html" href="graphql.html">GraphQL gateway</a></li>
+    </ul></nav>
+
+    <div class="nav-section">Operations</div>
+    <nav><ul>
+      <li><a data-page="operations.html" href="operations.html">Deploy &amp; configure</a></li>
+      <li><a data-page="roadmap.html" href="roadmap.html">Roadmap</a></li>
+    </ul></nav>
+
+    <div class="footer-note">v0.1 · <a href="https://github.com/bashiru98/ventstream">bashiru98/ventstream</a></div>
+  </aside>
+
+  <main>
+    <h1>VentStream</h1>
+    <p class="subtitle">Real-time event infrastructure as a single-binary engine. CDC with stateful joins on one side, durable WebSocket fan-out with proper consumer cleanup on the other. Built in Rust.</p>
+
+    <h2>What it does</h2>
+    <p>Two independent event pipelines, both running in the same binary, role-selectable per pod:</p>
+
+    <div class="diagram">┌─────────────────────────────────────────────────────────────────────────┐
+│  Pipeline A — CDC + denormalized indexing                              │
+│                                                                          │
+│  Postgres WAL ──► Join engine ──► OpenSearch (or Algolia / Typesense)   │
+│       (slot)         ▲                                                   │
+│                      │                                                   │
+│                  joins.yaml: 1-1, 1-N, composite PKs, partial-FK,        │
+│                  foreign-side re-emit, sync-on-miss backfill             │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Pipeline B — Durable WebSocket fan-out                                 │
+│                                                                          │
+│  SDK ──► NATS JetStream ──► WS gateway ──► clients                       │
+│  (publish)                  (one durable                                 │
+│                              consumer per                                │
+│                              connection +                                │
+│                              3-layer cleanup)                            │
+│                                                                          │
+│  Or: Apollo Client speaks graphql-transport-ws to the same engine —     │
+│      generic events(subject) field or typed subscriptions from a        │
+│      manifest. Works as a federated subgraph behind any router.         │
+└─────────────────────────────────────────────────────────────────────────┘</div>
+
+    <h2>Why it exists</h2>
+    <p>Two real-world problems that show up at scale in federated GraphQL / data-platform environments:</p>
+    <ol>
+      <li><strong>Postgres → search index with joins is a pipeline, not a primitive.</strong> Most CDC tools push raw table rows. Reconstructing the denormalized doc (an Order with its line items, its buyer, its shipping address) becomes Logstash / Kafka Streams / a custom service. VentStream lets you declare the joins in YAML and emits the composed document.</li>
+      <li><strong>WebSocket subscription gateways leak resources.</strong> Federation routers (notably Cosmo) have a documented bug where JetStream durable consumers pile up — 733 zombies in production for one team. VentStream's WS path uses a three-layer cleanup hierarchy that makes leaks structurally hard.</li>
+    </ol>
+
+    <p>Both problems have the same shape underneath — event routing with state — which is why the same engine handles both.</p>
+
+    <h2>What's shipped <span class="pill shipped">v0.1</span></h2>
+
+    <h3>Pipeline A (CDC)</h3>
+    <ul>
+      <li>Postgres logical replication via <code>pgwire-replication</code> (pgoutput plugin)</li>
+      <li>Stateful join engine: 1-to-1, 1-to-many, composite primary keys, partial-FK joins, foreign-side re-emit, sync-on-miss backfill</li>
+      <li>OpenSearch bulk sink with idempotent <code>index</code> actions, NDJSON framing, per-item DLQ, partial-failure retry</li>
+      <li>Deterministic per-logical-row document IDs (re-emits overwrite the same doc instead of leaving lifecycle copies)</li>
+      <li>Validated against a realistic orders schema (orders + shipments + addresses + buyers + line items) with composite-PK + foreign-side mutations</li>
+    </ul>
+
+    <h3>Pipeline B (WS)</h3>
+    <ul>
+      <li>Native WebSocket gateway speaking VentStream's own protocol (axum + NATS)</li>
+      <li>Per-connection durable JetStream consumers — clients resume their own cursor on reconnect</li>
+      <li>Three-layer cleanup hierarchy: RAII drop guard, <code>inactive_threshold</code> on the consumer, periodic reaper</li>
+      <li>Slow consumer disconnect (no slow client takes down a fast publisher)</li>
+      <li>TypeScript SDKs: <code>@ventstream/sdk</code> (publisher) and <code>@ventstream/client</code> (subscriber, browser + Node)</li>
+    </ul>
+
+    <h3>GraphQL gateway <span class="pill shipped">includes Federation</span></h3>
+    <ul>
+      <li>graphql-transport-ws endpoint — Apollo Client connects natively, no custom Link</li>
+      <li>Model 1: generic <code>events(subject)</code> subscription with opaque JSON payload</li>
+      <li>Model 2: typed subscription fields declared in a YAML manifest with args + response shape</li>
+      <li>Federation Flavor B verified end-to-end through Cosmo Router with entity-ref stitching</li>
+    </ul>
+
+    <h2>Single binary, role-based deployment</h2>
+    <p>The same binary runs as any subset of the three roles. Each role is independent — they share the engine kernel (config, logging, shutdown) but their data paths don't intersect.</p>
+
+    <div class="code-block">
+<pre><code data-lang="bash"># CDC role only (production: 1 active + N warm standbys)
+VS_ROLES=cdc ./ventstream
+
+# WS gateway only (horizontally scaled via HPA)
+VS_ROLES=ws ./ventstream
+
+# GraphQL gateway only (drop-in Apollo Client backend)
+VS_ROLES=graphql ./ventstream
+
+# Everything together (single-node demos, small-tenant deployments)
+VS_ROLES=cdc,ws,graphql ./ventstream</code></pre>
+    </div>
+
+    <h2>What to read next</h2>
+    <ul>
+      <li><a href="architecture.html">Architecture</a> — the two pipelines in detail, key design decisions, and how the crates are laid out.</li>
+      <li><a href="getting-started.html">Getting started</a> — clone, build, run NATS, and have the first event flowing in ~5 minutes.</li>
+      <li><a href="pipeline-b.html">Pipeline B</a> — the most interesting piece: per-connection durable consumers and the cleanup story.</li>
+      <li><a href="graphql.html">GraphQL gateway</a> — Apollo Client and federation specifics.</li>
+    </ul>
+
+    <div class="page-footer">
+      <span>VentStream v0.1 — internal docs</span>
+      <span><a href="architecture.html">Architecture →</a></span>
+    </div>
+  </main>
+</div>
+</body>
+</html>

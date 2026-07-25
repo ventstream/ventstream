@@ -1,0 +1,190 @@
+# VentStream self-contained demo stack.
+#
+#   postgres   source  — shop schema (orders/customers/order_items), wal_level=logical
+#   neo4j      source  — product catalog graph, CDC enabled
+#   opensearch target   — receives the denormalized documents
+#   engine-orders       — Postgres → OpenSearch (index: orders)
+#   engine-products     — Neo4j     → OpenSearch (index: products)
+#
+# Optional inspection UIs live behind compose profiles so the core
+# stack stays lean:
+#   --profile dashboards   → OpenSearch Dashboards on :5601
+#   (Neo4j Browser is built in at http://localhost:7474 — always on)
+#
+# The engines run WITHOUT a control plane (telemetry is opt-in by env
+# presence). This keeps the demo standalone. Verbose engine logs are
+# enabled via RUST_LOG + pretty formatting; the engine never logs
+# credentials (only host/db/slot identifiers).
+
+name: ventstream-demo
+
+services:
+  # ── Postgres source ────────────────────────────────────────────────
+  postgres:
+    image: postgres:16
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+    environment:
+      POSTGRES_USER: ventstream
+      POSTGRES_PASSWORD: ventstream
+      POSTGRES_DB: shop
+    ports:
+      - "${VENTSTREAM_DEMO_PG_PORT:-5544}:5432"
+    volumes:
+      # Auto-runs on first boot (empty data dir only).
+      - ./seed/postgres.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ventstream -d shop"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # ── Neo4j source (Enterprise, CDC-capable) ─────────────────────────
+  neo4j:
+    image: neo4j:5.26-enterprise
+    environment:
+      NEO4J_ACCEPT_LICENSE_AGREEMENT: "yes"
+      NEO4J_AUTH: neo4j/ventstream
+      # CDC enrichment is enabled per-database at runtime via
+      # `ALTER DATABASE neo4j SET OPTION txLogEnrichment 'FULL'`
+      # (see README step 2) — it is NOT a server-config setting.
+    ports:
+      - "7474:7474"   # Neo4j Browser (always on)
+      - "7687:7687"   # Bolt
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p ventstream 'RETURN 1' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # ── OpenSearch target ──────────────────────────────────────────────
+  opensearch:
+    image: opensearchproject/opensearch:2.17.0
+    environment:
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      # Demo only: disable the security plugin so the engine + curl can
+      # talk plain HTTP on :9200. NEVER do this in production.
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    ports:
+      - "${VENTSTREAM_DEMO_OS_PORT:-9200}:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # ── OpenSearch Dashboards (optional: --profile dashboards) ─────────
+  dashboards:
+    image: opensearchproject/opensearch-dashboards:2.17.0
+    profiles: ["dashboards"]
+    environment:
+      OPENSEARCH_HOSTS: '["http://opensearch:9200"]'
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
+    ports:
+      - "5601:5601"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+
+  # ── Engine: Postgres → OpenSearch ──────────────────────────────────
+  engine-orders:
+    build:
+      context: ../..
+      dockerfile: infra/docker/engine.Dockerfile
+    image: ventstream-engine:demo
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    environment:
+      VS_ROLES: cdc
+      VS_CDC_SOURCE: postgres
+      # source
+      VS_PG_HOST: postgres
+      VS_PG_PORT: "5432"
+      VS_PG_USER: ventstream
+      VS_PG_PASSWORD: ventstream
+      VS_PG_DATABASE: shop
+      VS_PG_PUBLICATION: ventstream_shop
+      VS_PG_SLOT: ventstream_orders_slot
+      VS_PG_BOOTSTRAP_MODE: snapshot
+      # projection
+      VS_JOINS_YAML: /specs/orders.yaml
+      VS_JOINS_STATE_DIR: /var/lib/ventstream/state
+      VS_DLQ_PATH: /var/lib/ventstream/dlq.jsonl
+      VS_PG_AUTO_RESYNC_ON_YAML_CHANGE: "true"
+      # sink — literal template → static index name "orders"
+      VS_OS_ENDPOINT: http://opensearch:9200
+      VS_INDEX_TEMPLATE: orders
+      # verbose, non-sensitive logs
+      RUST_LOG: "info,ventstream=debug,ventstream_sources=debug,ventstream_sinks=debug"
+      VS_LOG_FORMAT: pretty
+    volumes:
+      - ./specs:/specs:ro
+      - engine_orders_state:/var/lib/ventstream
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/ventstream", "--healthcheck", "127.0.0.1:4043", "/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # ── Engine: Neo4j → OpenSearch ─────────────────────────────────────
+  engine-products:
+    build:
+      context: ../..
+      dockerfile: infra/docker/engine.Dockerfile
+    image: ventstream-engine:demo
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    environment:
+      VS_ROLES: cdc
+      VS_CDC_SOURCE: neo4j
+      # source
+      VS_NEO4J_URI: bolt://neo4j:7687
+      VS_NEO4J_USER: neo4j
+      VS_NEO4J_PASSWORD: ventstream
+      VS_NEO4J_DATABASE: neo4j
+      VS_NEO4J_BOOTSTRAP_MODE: snapshot
+      VS_NEO4J_BOOTSTRAP_BATCH_SIZE: "2000"
+      VS_NEO4J_POLL_INTERVAL_MS: "500"
+      VS_NEO4J_HOT_NODE_THRESHOLD: "100"
+      # projection
+      VS_NEO4J_DENORMALIZE_YAML: /specs/products.yaml
+      VS_NEO4J_STATE_DIR: /var/lib/ventstream/state
+      VS_DLQ_PATH: /var/lib/ventstream/dlq.jsonl
+      # sink — literal template → static index name "products"
+      VS_OS_ENDPOINT: http://opensearch:9200
+      VS_INDEX_TEMPLATE: products
+      # verbose, non-sensitive logs
+      RUST_LOG: "info,ventstream=debug,ventstream_sources=debug,ventstream_sinks=debug"
+      VS_LOG_FORMAT: pretty
+    volumes:
+      - ./specs:/specs:ro
+      - engine_products_state:/var/lib/ventstream
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/ventstream", "--healthcheck", "127.0.0.1:4043", "/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  engine_orders_state:
+  engine_products_state:

@@ -1,0 +1,118 @@
+---
+title: "Testing a pipeline"
+description: "Verify create / update / delete propagation and source↔index consistency."
+---
+
+Once an agent is tailing, you want confidence that every kind of change
+reaches the index correctly. This page is the test recipe used to
+validate the engine — adapt it to your own projection.
+
+## Automated integration suite
+
+The recipe below is also codified as an automated, environment-agnostic
+suite under `crates/ventstream/tests/`. Each test spins its own
+Postgres / OpenSearch / Neo4j via **testcontainers** and drives the real
+engine binary end-to-end — no pre-staged stack, just a Docker daemon.
+It covers bootstrap, child-row deletes (incl. composite-key reconcile),
+crash recovery, the Neo4j edge/node-delete path, and connection
+resilience — killing the source's replication connection mid-stream and
+asserting the engine reconnects in-process and keeps delivering.
+
+These tests are marked `#[ignore]` so the fast unit run skips them; run
+them explicitly:
+
+```bash
+# needs a running Docker daemon
+cargo test -p ventstream --test it_postgres -- --ignored --test-threads=1
+cargo test -p ventstream --test it_neo4j    -- --ignored --test-threads=1
+```
+
+CI runs them in a dedicated `integration` job (ubuntu, Docker-backed);
+the cross-platform `test` job skips them automatically.
+
+## The matrix
+
+For each path your spec embeds, exercise all three operations and
+confirm the document converges:
+
+| Operation | What to check |
+|---|---|
+| **CREATE** | a new related row/edge → the embedded field appears |
+| **UPDATE** | change an embedded value → the document reflects it |
+| **DELETE** | remove the row/edge → the field clears / array shrinks |
+
+## The sibling check (the important one)
+
+For any **shared** endpoint (a customer many orders reference, a category
+many products reference), do the change on one primary and assert a
+**sibling** primary that shares the endpoint is **undisturbed**.
+
+This is the test that proves the [fan-out](/concepts/fan-out) is exactly
+right — it catches both failure modes:
+
+- **over-propagation** — the sibling wrongly changed (hot-endpoint bug)
+- **under-propagation** — the target didn't change (missed fan-out)
+
+Every hot-endpoint edge in the scale validation passed this: changing
+one primary's edge updated that primary and left its siblings alone.
+
+## Latency expectations
+
+Steady-state propagation is **~1 second** end-to-end (source commit →
+CDC read → projection → bulk write). A change to a shared *node
+property* fans out to every embedding document, so its wall-clock
+scales with the fan-out size — e.g. renaming a shared node referenced by
+5,715 documents took ~13s for all of them.
+
+## Consistency check
+
+After a batch of changes, confirm counts match:
+
+```bash
+# Neo4j
+NEO4J_AUTH="neo4j:${VS_NEO4J_PASSWORD:?set VS_NEO4J_PASSWORD}"
+curl -s --user "$NEO4J_AUTH" \
+  -X POST http://localhost:7474/db/neo4j/tx/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"statements":[{"statement":"MATCH (p:Product) RETURN count(p)"}]}'
+
+# OpenSearch
+curl -s 'http://localhost:9200/products_denormalized/_count'
+```
+
+They should be equal once the engine has drained its queue. Check source lag and
+engine metrics/logs to confirm the pipeline is idle before comparing.
+
+## Burst testing
+
+To check the engine holds up under load, fire a mixed batch (e.g. 500
+updates + 250 deletes + 250 creates) in one transaction and watch:
+
+- **CDC lag** drains to zero (no growing backlog)
+- **RSS** stays bounded (no per-event accumulation)
+- **count parity** holds afterward
+
+In validation a 1,000-op burst drained in seconds with each event
+recomputing exactly one document and RSS staying in the tens of MB.
+
+## Drain-resume + reconciliation
+
+To verify delete reconciliation:
+
+<Steps>
+  <Step title="Note the index count and pick rows">Record the baseline.</Step>
+  <Step title="Drain the pipeline">Use `ventstreamctl pipelines drain ... --wait` and verify the durable operation succeeds.</Step>
+  <Step title="Delete rows in the source while drained">The agent isn't watching.</Step>
+  <Step title="Rebootstrap and resume">Run the explicit rebootstrap operation, then resume and wait for both operations.</Step>
+  <Step title="Assert">The deleted rows' docs are gone AND counts match.</Step>
+</Steps>
+
+Validated: 500 source deletes during a drain → exactly 500 index
+orphans removed, final counts equal.
+
+## What won't propagate (and shouldn't)
+
+Updating a node/table the spec never traverses produces zero
+recomputations — verify this too. It confirms the spec is the true
+boundary: in testing, renaming an off-spec `Review` node produced 0
+recomposes and 0 index writes.

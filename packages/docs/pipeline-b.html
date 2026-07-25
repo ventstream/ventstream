@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VentStream — Pipeline B · WS fan-out</title>
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="assets/docs.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="logo" href="index.html">VentStream</a>
+    <div class="tagline">CDC + denormalized indexing + durable WebSocket subscriptions, in a single Rust binary.</div>
+
+    <div class="nav-section">Start here</div>
+    <nav><ul>
+      <li><a data-page="index.html" href="index.html">Overview</a></li>
+      <li><a data-page="architecture.html" href="architecture.html">Architecture</a></li>
+      <li><a data-page="getting-started.html" href="getting-started.html">Getting started</a></li>
+    </ul></nav>
+
+    <div class="nav-section">Pipelines</div>
+    <nav><ul>
+      <li><a data-page="pipeline-a.html" href="pipeline-a.html">A · CDC + joins</a></li>
+      <li><a data-page="pipeline-b.html" href="pipeline-b.html">B · WS fan-out</a></li>
+      <li><a data-page="graphql.html" href="graphql.html">GraphQL gateway</a></li>
+    </ul></nav>
+
+    <div class="nav-section">Operations</div>
+    <nav><ul>
+      <li><a data-page="operations.html" href="operations.html">Deploy &amp; configure</a></li>
+      <li><a data-page="roadmap.html" href="roadmap.html">Roadmap</a></li>
+    </ul></nav>
+
+    <div class="footer-note">v0.1 · <a href="https://github.com/bashiru98/ventstream">bashiru98/ventstream</a></div>
+  </aside>
+
+  <main>
+    <h1>Pipeline B · WebSocket fan-out</h1>
+    <p class="subtitle">Application events published via NATS, fanned out to subscribed WebSocket clients with per-connection durable cursors. Three-layer cleanup means no Cosmo-style leaks.</p>
+
+    <h2>The wire envelope</h2>
+    <p>Every event flowing through the bus carries this envelope. The SDK fills in <code>id</code>, <code>event</code>, <code>received_at</code>, and <code>schema_version</code>; developers supply the business identity and payload.</p>
+
+    <div class="code-block">
+<pre><code data-lang="json">{
+  "id": "01KSA...",                            // ULID, set by SDK, idempotency key
+  "event": "orders.order.status_changed",      // {domain}.{entity.kind}.{action}
+  "tenant": "acme",                            // verified against publisher's auth
+  "entity_id": "order_123",                    // final routing-subject segment
+  "actor":  { "kind": "user",  "id": "user_456" },  // optional audit principal
+  "occurred_at": "2026-05-23T03:55:00Z",       // when the business event happened
+  "received_at": "2026-05-23T03:55:01Z",       // when SDK shipped to bus
+  "schema_version": 2,
+  "data": { "from": "pending", "to": "confirmed" },  // dev-defined, opaque
+  "metadata": {
+    "trace_id":       "01KSA...",              // optional W3C trace context
+    "correlation_id": "01KSA...",              // optional app-level correlation
+    "causation_id":   "01KSA..."               // optional parent event id
+  }
+}</code></pre>
+    </div>
+
+    <h3>Field rules</h3>
+    <ul>
+      <li><strong><code>actor</code> is optional</strong> — include it when an auditable user or service caused the event.</li>
+      <li><strong><code>data</code> is opaque</strong> — the engine doesn't introspect it. v1 by design.</li>
+      <li><strong><code>occurred_at</code> ≠ <code>received_at</code></strong> is normal — backfills, delayed publishes, async workflows. Both are needed.</li>
+      <li><strong><code>schema_version</code></strong> bumps only on envelope shape changes (not <code>data</code> shape).</li>
+      <li>Unknown envelope fields → <strong>rejected</strong> (<code>deny_unknown_fields</code> in serde).</li>
+    </ul>
+
+    <h2>The subject grammar</h2>
+    <p>Every event's NATS routing key follows a strict ID-last pattern. The event name may contain one or more dot-separated segments. The SDK builds it; the gateway validates it.</p>
+
+    <div class="code-block">
+<pre><code data-lang="text">vs.t.{tenant}.{event}.{entity_id}</code></pre>
+    </div>
+
+    <table>
+      <thead><tr><th>Segment</th><th>Rule</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td><code>vs</code></td><td>Literal namespace</td><td><code>vs</code></td></tr>
+        <tr><td><code>t.{tenant}</code></td><td>Tenant scope. Enforced by NATS JWT</td><td><code>t.acme</code></td></tr>
+        <tr><td><code>{event}</code></td><td>One or more <code>[A-Za-z0-9_-]+</code> segments</td><td><code>orders.order.status_changed</code></td></tr>
+        <tr><td><code>{entity_id}</code></td><td>Final segment; <code>[A-Za-z0-9_-]+</code>, max 128</td><td><code>order_123</code></td></tr>
+      </tbody>
+    </table>
+
+    <h3>Subscribe patterns</h3>
+    <p>NATS wildcards (<code>*</code> for one segment, <code>&gt;</code> for trailing) are supported. Clients pass the unanchored form; the gateway prepends <code>vs.t.{tenant}.</code> from auth.</p>
+
+    <div class="code-block">
+<pre><code data-lang="text">orders.&gt;                                # everything orders-related
+orders.order.status_changed.*            # status changes for any order
+orders.order.status_changed.order_123    # one event class for one order
+*.order.deleted.*                        # any order deletion in this tenant</code></pre>
+    </div>
+
+    <h2>Publishing — <code>@ventstream/sdk</code></h2>
+
+    <div class="code-block">
+<pre><code data-lang="javascript">import { VentStream } from "@ventstream/sdk";
+
+const vs = new VentStream({
+  servers: "nats://localhost:4222",
+  name: "orders-api",          // shown in NATS server logs
+});
+await vs.connect();
+
+await vs.publish({
+  tenant: "acme",
+  domain: "orders",
+  action: "status_changed",
+  entity: { kind: "order", id: "order_123" },
+  actor:  { kind: "user",  id: "user_alice" },
+  data: { from: "pending", to: "confirmed" },
+  // optional:
+  occurredAt: new Date(),
+  metadata: { trace_id: "abc...", correlation_id: "req_xyz" },
+});
+
+await vs.close();</code></pre>
+    </div>
+
+    <h3>Backpressure policies</h3>
+    <p>Per-publish or per-connection default:</p>
+    <table>
+      <thead><tr><th>Policy</th><th>Behavior</th><th>Use</th></tr></thead>
+      <tbody>
+        <tr><td><code>"buffer"</code> (default)</td><td>Let nats.js buffer in memory</td><td>Common case; fastest</td></tr>
+        <tr><td><code>"block"</code></td><td><code>await publish()</code> only resolves after flush</td><td>Safest; lowest throughput</td></tr>
+        <tr><td><code>"drop"</code></td><td>If connection is closed, drop silently</td><td>Fire-and-forget telemetry</td></tr>
+      </tbody>
+    </table>
+
+    <h3>What gets rejected at publish time</h3>
+    <p>The SDK validates before any bytes hit the network:</p>
+    <div class="code-block">
+<pre><code data-lang="text">✗ tenant: only [a-z0-9_-] allowed              ← caller passed "ACME"
+✗ action: only [a-z0-9_-] allowed              ← caller passed "Status Changed"
+✗ entity.id: only [A-Za-z0-9_-] allowed        ← caller passed "ord.with.dots"</code></pre>
+    </div>
+
+    <h2>Subscribing — <code>@ventstream/client</code></h2>
+
+    <div class="code-block">
+<pre><code data-lang="javascript">import { VentStreamClient } from "@ventstream/client";
+
+const client = new VentStreamClient({
+  url: "ws://localhost:4040/ws",
+  tenant: "acme",
+  token: "demo",              // JWT in v1.5; trusted-string in v1
+  reconnect: true,            // auto-reconnect on disconnect (default)
+  reconnectDelayMs: 500,      // base delay; backs off up to 30s with jitter
+});
+
+await client.connect();
+
+const sub = client.subscribe(
+  "orders.order.status_changed.*",
+  (event, ctx) =&gt; {
+    console.log(ctx.subject, event.entity_id, event.data);
+  },
+);
+
+// later:
+sub.unsubscribe();
+await client.close();</code></pre>
+    </div>
+
+    <h3>Reconnect + subscription replay</h3>
+    <p>If the WebSocket drops, the client reconnects with jittered exponential backoff (capped at 30s) and replays every active subscription against the new connection. The application code doesn't need to handle this — same callbacks fire, same way.</p>
+
+    <h2>The three-layer cleanup hierarchy</h2>
+    <p>The bespoke design choice (one durable JetStream consumer per WS connection) means cleanup must be bulletproof. Three independent mechanisms:</p>
+
+    <div class="diagram">                ┌──────────────────────────────────────┐
+   Layer 1:     │  RAII drop guard in connection task  │
+   (~ms)        │  fires on EVERY exit path:           │
+                │    graceful close, panic, ping       │
+                │    timeout, slow-consumer eviction   │
+                │  → js.delete_consumer(name)          │
+                └──────────────────────────────────────┘
+                                ▼
+                ┌──────────────────────────────────────┐
+   Layer 2:     │  inactive_threshold on the consumer  │
+   (~5 min)     │  JetStream server-side auto-delete   │
+                │  if no activity for N seconds.       │
+                │  Catches:                            │
+                │   - kill -9 (drop guard never ran)   │
+                │   - OOM kill                         │
+                │   - pod evicted by k8s               │
+                └──────────────────────────────────────┘
+                                ▼
+                ┌──────────────────────────────────────┐
+   Layer 3:     │  Reaper task: every ~60s, list       │
+   (~min)       │  consumers under vs.t.&gt;.p.{me}.c.&gt;   │
+                │  and diff against THIS pod's         │
+                │  connection registry. Delete the     │
+                │  orphans.                            │
+                └──────────────────────────────────────┘</div>
+
+    <p>Each layer's tests live in <code>packages/example/cleanup-layers-test.mjs</code> — all three are run against a live NATS cluster with deterministic outcomes.</p>
+
+    <h3>Consumer naming</h3>
+    <p>Every consumer is named <code>vs-t-{tenant}-p-{pod_id}-c-{connection_id}</code>. The reaper substring-matches on <code>-p-{pod_id}-c-</code> to identify "consumers this pod owns" — no cross-pod coordination required for cleanup. Each pod cleans up after itself.</p>
+
+    <h2>Slow consumer disconnect</h2>
+    <p>A slow WS client cannot stall a fast publisher. The mailbox between the consumer pump and the WS writer task is bounded (default 256 events). When it overflows:</p>
+    <ol>
+      <li>The pump detects the <code>try_send</code> failure and calls <code>registry.remove(connection_id)</code>.</li>
+      <li>That drops the registry's Sender clone; the connection task's Receiver returns <code>None</code>.</li>
+      <li>The connection task closes the WebSocket and exits.</li>
+      <li>The RAII drop guard fires, deleting the JetStream consumer.</li>
+      <li>The client sees the WS close and reconnects (auto-reconnect default).</li>
+    </ol>
+    <p>Server-side this happens in ~20ms; client-side the close arrives once the OS+WS buffers drain (typically ~1s depending on how full they were).</p>
+
+    <h2>Test matrix</h2>
+    <p>Nine scenarios covered in <code>packages/example/scenarios.mjs</code>, all passing against a live engine:</p>
+    <table>
+      <thead><tr><th>#</th><th>Scenario</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Fan-out to 3 clients — same event reaches all</td></tr>
+        <tr><td>2</td><td>Unsubscribe stops delivery</td></tr>
+        <tr><td>3</td><td>Multiple subscriptions on one connection — independent handlers fire</td></tr>
+        <tr><td>4</td><td>Reconnect + subscription replay</td></tr>
+        <tr><td>5</td><td>500-event burst — no drops</td></tr>
+        <tr><td>6</td><td>Tenant gate — cross-tenant event blocked</td></tr>
+        <tr><td>7</td><td>Protocol — non-Hello first frame rejected</td></tr>
+        <tr><td>8</td><td>Slow consumer paused-reader force-closed (~1s)</td></tr>
+        <tr><td>9</td><td>Clean close exits without dangling timers (~0ms)</td></tr>
+      </tbody>
+    </table>
+
+    <p>Plus pong-timeout via raw TCP/WS framing in <code>packages/example/raw-pong-test.mjs</code> — necessary because the standard <code>ws</code> library auto-pongs unconditionally, so the timeout path requires hand-rolled framing to exercise.</p>
+
+    <div class="page-footer">
+      <span><a href="pipeline-a.html">← Pipeline A</a></span>
+      <span><a href="graphql.html">GraphQL gateway →</a></span>
+    </div>
+  </main>
+</div>
+</body>
+</html>

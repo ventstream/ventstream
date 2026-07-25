@@ -1,0 +1,232 @@
+---
+title: "Standalone engine on Kubernetes"
+description: "Run the open-core engine without Fleet using canonical configuration, Kubernetes Secrets, and persistent state."
+---
+
+A standalone engine has no control-plane identity or management stream. Kubernetes
+owns process lifecycle, while a ConfigMap owns non-secret engine configuration and
+a Secret supplies connector credentials.
+
+<Note>
+Standalone engines cannot be administered with `ventstreamctl`. To gain CLI
+lifecycle and managed-configuration operations, deploy a new
+[Fleet-managed engine](/deploy/kubernetes-managed-engine).
+</Note>
+
+## Standalone CDC
+
+The following Postgres example is a current baseline StatefulSet. Adapt the source
+section using the relevant connector guide for Neo4j, MongoDB, MySQL, or Kafka.
+
+Create the workload namespace once:
+
+```bash
+kubectl create namespace ventstream --dry-run=client -o yaml | kubectl apply -f -
+```
+
+### Create connector secrets
+
+Use External Secrets, Secrets Store CSI, SOPS, or another approved secret workflow
+in production. The resulting Secret must expose the environment variables
+referenced by `ventstream.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: orders-engine-secrets
+  namespace: ventstream
+type: Opaque
+stringData:
+  VS_PG_HOST: postgres.example.internal
+  VS_PG_USER: ventstream
+  VS_PG_PASSWORD: REPLACE_FROM_SECRET_MANAGER
+  VS_PG_DATABASE: shop
+  VS_PG_PUBLICATION: ventstream_shop
+  VS_PG_SLOT: ventstream_orders_slot
+  VS_OS_ENDPOINT: https://opensearch.example.internal:9200
+  VS_OS_API_KEY: REPLACE_FROM_SECRET_MANAGER
+```
+
+Do not commit the populated Secret.
+
+### Create canonical configuration
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orders-engine-config
+  namespace: ventstream
+data:
+  ventstream.yaml: |
+    schema_version: 1
+    roles: [cdc]
+    source:
+      kind: postgres
+      postgres:
+        host_ref: env:VS_PG_HOST
+        port: 5432
+        user_ref: env:VS_PG_USER
+        password_ref: env:VS_PG_PASSWORD
+        database_ref: env:VS_PG_DATABASE
+        publication_ref: env:VS_PG_PUBLICATION
+        slot_ref: env:VS_PG_SLOT
+        bootstrap: { mode: snapshot, chunk_size: 10000 }
+        denormalize_mode: sql
+    sink:
+      kind: opensearch
+      opensearch:
+        endpoint_ref: env:VS_OS_ENDPOINT
+        auth:
+          mode: api_key
+          api_key_ref: env:VS_OS_API_KEY
+        index_routing: { strategy: by_projection_target }
+    specs:
+      joins: /etc/ventstream/orders.yaml
+    runtime:
+      health_listen: 0.0.0.0:4043
+      dlq_path: /var/lib/ventstream/dlq.jsonl
+      joins:
+        state_dir: /var/lib/ventstream/joins
+  orders.yaml: |
+    joins:
+      - name: orders
+        primary: { table: shop.orders, pk: order_id }
+        target: { index: orders }
+        related: []
+```
+
+The example uses Postgres SQL denormalization mode. Add related tables and the
+required source indexes before production use. Use `memory` when you intentionally
+want the persisted in-process join engine instead.
+
+### Run the engine
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders-engine
+  namespace: ventstream
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: orders-engine
+  ports:
+    - { name: health, port: 4043, targetPort: health }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: orders-engine
+  namespace: ventstream
+spec:
+  serviceName: orders-engine
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orders-engine
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: orders-engine
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: engine
+          image: ghcr.io/your-org/ventstream-engine@sha256:REPLACE_DIGEST
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          env:
+            - name: VS_ENGINE_CONFIG
+              value: /etc/ventstream/ventstream.yaml
+            - name: RUST_LOG
+              value: info
+            - name: VS_LOG_FORMAT
+              value: json
+          envFrom:
+            - secretRef:
+                name: orders-engine-secrets
+          ports:
+            - { name: health, containerPort: 4043 }
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: health }
+            initialDelaySeconds: 15
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { memory: 1Gi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/ventstream, readOnly: true }
+            - { name: state, mountPath: /var/lib/ventstream }
+      volumes:
+        - name: config
+          configMap:
+            name: orders-engine-config
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: { storage: 5Gi }
+```
+
+The repository's engine image runs as numeric UID/GID `999`; the pod-level
+`fsGroup` makes a newly provisioned PVC writable without a root init container.
+If you replace the runtime stage or user in a custom image, change all three IDs
+to that image's fixed non-root UID/GID.
+
+Apply the namespace, Secret, ConfigMap, Service, and StatefulSet through your
+normal deployment repository, then verify:
+
+```bash
+kubectl -n ventstream rollout status statefulset/orders-engine
+kubectl -n ventstream logs statefulset/orders-engine --follow
+kubectl -n ventstream port-forward service/orders-engine 4043:4043
+curl --fail http://localhost:4043/readyz
+```
+
+After a ConfigMap change, trigger a controlled restart. The process resumes from
+the source cursor and PVC state:
+
+```bash
+kubectl -n ventstream rollout restart statefulset/orders-engine
+```
+
+## Standalone realtime gateways
+
+The engine repository's `ventstream-gateway` chart runs the horizontally scalable
+`ws`, `graphql`, or combined roles without Fleet:
+
+```bash
+cd ventstream
+helm upgrade --install realtime ./infra/helm/ventstream-gateway \
+  --namespace ventstream --create-namespace \
+  --set image.repository=ghcr.io/your-org/ventstream-engine \
+  --set image.tag=VERSION \
+  --set-string 'roles=ws\,graphql' \
+  --set replicas=3 \
+  --set nats.url=nats://nats.ventstream.svc:4222 \
+  --set graphql.schema.existingConfigMap=ventstream-graphql-schema
+```
+
+JetStream is required for GraphQL subscriptions and resumable WebSocket delivery.
+Use a Service or ingress appropriate for long-lived WebSocket connections, and
+validate client authorization before exposing either listener outside a trusted
+network.

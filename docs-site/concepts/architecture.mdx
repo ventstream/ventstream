@@ -1,0 +1,60 @@
+---
+title: "Architecture"
+description: "How VentStream separates engine data paths from optional Fleet management."
+---
+
+VentStream has an open-core data plane and an optional Fleet management plane.
+The separation is operational, security-sensitive, and deliberate.
+
+<img
+  src="/images/architecture.svg"
+  alt="VentStream architecture showing the optional Fleet management plane above a customer-hosted data plane. Fleet administers managed agents over outbound mTLS while CDC records and realtime NATS events flow only through the VentStream engine inside the workload environment."
+  className="rounded-lg"
+/>
+
+The purple path is management traffic. Teal and green show the CDC path from
+source connectors through projection and sink acknowledgement. Orange shows the
+independent NATS-to-WebSocket/GraphQL delivery path. Neither data path enters
+Fleet. The same engine binary can also run standalone without a supervisor or
+control-plane dependency.
+
+## Data plane
+
+An engine process runs one or more explicit roles:
+
+- `cdc` reads a source cursor/change stream, transforms records and joins, and
+  writes destinations such as OpenSearch.
+- `ws` and `graphql` consume NATS subjects and serve realtime clients.
+
+Connector credentials, source data, destination documents, NATS messages, and
+client traffic remain in the workload environment. Cursor and join state are
+persisted locally or in the source system so restarts can resume correctly.
+
+## Management plane
+
+Fleet stores tenant inventory, authorization, desired state, immutable
+configuration metadata, operations, agent status, and audit events. Managed agents
+initiate outbound mTLS connections to the gateway. Fleet never connects to source
+databases and never proxies engine traffic.
+
+## Managed process boundary
+
+The Fleet supervisor is PID 1 in the managed image. It owns workload identity,
+the control stream, cached desired state, operation receipts, and configuration
+staging. It supervises the unmodified open-core engine as a child process.
+
+The child receives connector settings and a local configuration path, but no Fleet
+private key or protocol implementation. Pause stops the child while retaining
+cursor state. Drain stops it and invokes connector-specific state cleanup.
+
+## Outage behavior
+
+- A standalone engine has no Fleet dependency.
+- A managed first boot without trusted desired state fails closed.
+- A running managed deployment continues its cached state during a temporary Fleet
+  outage.
+- A deployment cached as paused or drained remains stopped across restarts.
+- API acceptance never implies agent completion; durable operation state records
+  delivery and execution.
+
+See [Fleet overview](/fleet/overview) and [Resource model](/fleet/resource-model).

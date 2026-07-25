@@ -1,0 +1,7 @@
+# Terraform local artifacts — never commit (state holds the generated secrets).
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+crash.log

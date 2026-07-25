@@ -1,0 +1,12 @@
+joins:
+  - name: benchmark_events
+    primary:
+      table: bench.events
+      pk: id
+    target:
+      index: vsbench-postgres
+    related: []
+    state:
+      backend: memory
+    backfill:
+      mode: none

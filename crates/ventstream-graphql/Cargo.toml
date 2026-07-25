@@ -1,0 +1,40 @@
+[package]
+name = "ventstream-graphql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Apollo-Client-compatible GraphQL subscription gateway over VentStream realtime brokers."
+
+[dependencies]
+async-graphql = { workspace = true }
+async-graphql-axum = { workspace = true }
+async-nats = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+metrics = "0.24"
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+ventstream-core = { workspace = true }
+ventstream-jetstream = { workspace = true }
+ventstream-protocol = { workspace = true }
+ventstream-realtime = { workspace = true }
+ventstream-redis = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+redis = { workspace = true }
+tokio-tungstenite = { workspace = true }

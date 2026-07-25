@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VentStream — GraphQL gateway</title>
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="assets/docs.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="logo" href="index.html">VentStream</a>
+    <div class="tagline">CDC + denormalized indexing + durable WebSocket subscriptions, in a single Rust binary.</div>
+
+    <div class="nav-section">Start here</div>
+    <nav><ul>
+      <li><a data-page="index.html" href="index.html">Overview</a></li>
+      <li><a data-page="architecture.html" href="architecture.html">Architecture</a></li>
+      <li><a data-page="getting-started.html" href="getting-started.html">Getting started</a></li>
+    </ul></nav>
+
+    <div class="nav-section">Pipelines</div>
+    <nav><ul>
+      <li><a data-page="pipeline-a.html" href="pipeline-a.html">A · CDC + joins</a></li>
+      <li><a data-page="pipeline-b.html" href="pipeline-b.html">B · WS fan-out</a></li>
+      <li><a data-page="graphql.html" href="graphql.html">GraphQL gateway</a></li>
+    </ul></nav>
+
+    <div class="nav-section">Operations</div>
+    <nav><ul>
+      <li><a data-page="operations.html" href="operations.html">Deploy &amp; configure</a></li>
+      <li><a data-page="roadmap.html" href="roadmap.html">Roadmap</a></li>
+    </ul></nav>
+
+    <div class="footer-note">v0.1 · <a href="https://github.com/bashiru98/ventstream">bashiru98/ventstream</a></div>
+  </aside>
+
+  <main>
+    <h1>GraphQL gateway</h1>
+    <p class="subtitle">Speak <code>graphql-transport-ws</code> natively so Apollo Client connects out of the box, with no custom Link and no separate socket lifecycle. Optional: declare typed subscription fields in YAML and ship a federation-conformant subgraph.</p>
+
+    <h2>Why this exists</h2>
+    <p>The native VentStream WS protocol works great if you're starting from scratch — connect, hello, subscribe, receive events. But the most common situation isn't a greenfield: customers already have Apollo Client wired up to their GraphQL server. Asking them to "also maintain a separate WebSocket connection cycle for VentStream events" is friction they won't accept.</p>
+    <p>The GraphQL gateway exposes a standard <code>graphql-transport-ws</code> endpoint that any Apollo Client setup recognizes natively. The developer's existing <code>split()</code> link configuration just adds VentStream as the subscription destination — no custom transport, no custom SDK, no separate connection management.</p>
+
+    <h2>Two schema modes</h2>
+
+    <h3>Model 1 — Generic schema <span class="pill shipped">default</span></h3>
+    <p>One subscription field, payload is the full envelope. The developer doesn't write any GraphQL schema. Apollo codegen produces typed hooks for the envelope; <code>data</code> is JSON the developer casts client-side.</p>
+
+    <div class="code-block">
+<pre><code data-lang="graphql">type Subscription {
+  events(subject: String!): Event!
+}
+
+type Event {
+  id: ID!
+  event: String!
+  tenant: String!
+  entityId: String!
+  actor: Actor
+  occurredAt: DateTime!
+  receivedAt: DateTime!
+  schemaVersion: Int!
+  data: JSON
+  metadata: Metadata!
+  subject: String!
+}</code></pre>
+    </div>
+
+    <p>Client side:</p>
+    <div class="code-block">
+<pre><code data-lang="graphql">subscription OnOrderChanges($pattern: String!) {
+  events(subject: $pattern) {
+    id
+    event
+    occurredAt
+    entityId
+    data         # JSON scalar — cast client-side
+  }
+}</code></pre>
+    </div>
+
+    <h3>Model 2 — Typed subscriptions via manifest <span class="pill shipped">opt-in</span></h3>
+    <p>Set <code>VS_GRAPHQL_SUBSCRIPTIONS=path/to/vs-subscriptions.yaml</code> and the gateway builds a dynamic schema with typed subscription fields. Apollo codegen produces hooks where <code>data</code> is fully typed; federation routers can introspect the schema with entity references.</p>
+
+    <div class="code-block">
+<pre><code data-lang="yaml"># vs-subscriptions.yaml
+subscriptions:
+  # Inline return type — VentStream owns the full payload.
+  - name: orderStatusChanged
+    description: "Fires when an order's status transitions."
+    args:
+      - { name: orderId, type: ID, required: true }
+    return_type:
+      kind: inline
+      name: OrderStatusChange
+      fields:
+        - { name: orderId,   type: ID,       required: true, source: "{args.orderId}" }
+        - { name: from,      type: String,   required: true, source: "$data.from" }
+        - { name: to,        type: String,   required: true, source: "$data.to" }
+        - { name: changedAt, type: DateTime, required: true, source: "$event.occurredAt" }
+    subject: "orders.order.status_changed.{args.orderId}"
+
+  # Federated entity reference — router stitches the rest.
+  - name: orderUpdated
+    description: "Federated entity ref — router stitches remaining Order fields."
+    args:
+      - { name: orderId, type: ID, required: true }
+    return_type:
+      kind: entity_ref
+      type: Order
+      key:
+        id: "{args.orderId}"
+    subject: "orders.order.*.{args.orderId}"</code></pre>
+    </div>
+
+    <h2>Source expression mini-DSL</h2>
+    <p>Inside the manifest's <code>subject</code> templates and inline <code>source</code> fields, three substitution forms:</p>
+
+    <table>
+      <thead><tr><th>Expression</th><th>Meaning</th><th>Result type</th></tr></thead>
+      <tbody>
+        <tr><td><code>{args.NAME}</code></td><td>Value from subscription args</td><td>String</td></tr>
+        <tr><td><code>$data.PATH</code></td><td>Dot-path into the event's <code>data</code> JSON</td><td>JSON (any)</td></tr>
+        <tr><td><code>$event.FIELD</code></td><td>Envelope field — <code>id</code>, <code>event</code>, <code>entityId</code>, <code>tenant</code>, <code>occurredAt</code>, <code>receivedAt</code>, <code>subject</code>, <code>schemaVersion</code></td><td>String or Int</td></tr>
+        <tr><td>literal</td><td>Bare string passes through</td><td>String</td></tr>
+      </tbody>
+    </table>
+
+    <p>Examples:</p>
+    <ul>
+      <li><code>"{args.orderId}"</code> — set this field to whatever the client passed as <code>orderId</code></li>
+      <li><code>"$data.from"</code> — extract <code>data.from</code> from the published event</li>
+      <li><code>"$data.address.city"</code> — drill into nested JSON</li>
+      <li><code>"$event.occurredAt"</code> — set this field to the envelope's <code>occurred_at</code></li>
+    </ul>
+
+    <h2>Apollo Client integration</h2>
+    <p>This is the entire integration — same code a developer would write for any GraphQL endpoint:</p>
+
+    <div class="code-block">
+<pre><code data-lang="javascript">import { ApolloClient, InMemoryCache, HttpLink, split, gql } from "@apollo/client";
+import { GraphQLWsLink } from "@apollo/client/link/subscriptions";
+import { createClient } from "graphql-ws";
+import { getMainDefinition } from "@apollo/client/utilities";
+
+const httpLink = new HttpLink({
+  uri: "http://127.0.0.1:4041/graphql",
+  // HTTP queries authenticate via headers (introspection, availableSubjects)
+  headers: { Authorization: "Bearer demo", "X-VS-Tenant": "acme" },
+});
+
+const wsLink = new GraphQLWsLink(
+  createClient({
+    url: "ws://127.0.0.1:4041/graphql/ws",
+    // WS subscriptions authenticate via connection_init payload
+    connectionParams: () =&gt; ({ authToken: "demo", tenant: "acme" }),
+  }),
+);
+
+const link = split(
+  ({ query }) =&gt; {
+    const def = getMainDefinition(query);
+    return def.kind === "OperationDefinition" &amp;&amp; def.operation === "subscription";
+  },
+  wsLink,
+  httpLink,
+);
+
+export const apollo = new ApolloClient({ link, cache: new InMemoryCache() });</code></pre>
+    </div>
+
+    <p>Subscribe with the typed field from the manifest:</p>
+
+    <div class="code-block">
+<pre><code data-lang="javascript">apollo.subscribe({
+  query: gql`
+    subscription OnStatus($id: ID!) {
+      orderStatusChanged(orderId: $id) {
+        orderId
+        from
+        to
+        changedAt
+      }
+    }
+  `,
+  variables: { id: "order_001" },
+}).subscribe({
+  next({ data }) {
+    console.log(data.orderStatusChanged);
+    // Fully typed: { orderId, from, to, changedAt }
+  },
+});</code></pre>
+    </div>
+
+    <h2>Discovery — <code>availableSubjects</code></h2>
+    <p>A query for clients to discover what they can subscribe to. The result is filtered by the connection's tenant. The manifest lives at the path pointed to by <code>VS_GRAPHQL_MANIFEST</code>.</p>
+
+    <div class="code-block">
+<pre><code data-lang="graphql">query Discovery {
+  availableSubjects {
+    pattern
+    description
+    exampleEventType
+  }
+}</code></pre>
+    </div>
+
+    <p>This is in addition to GraphQL's normal introspection — Apollo Sandbox / DevTools / <code>graphql-codegen</code> all see the full type system, and <code>availableSubjects</code> tells operators which patterns are intentionally exposed for subscription.</p>
+
+    <h2>Federation Flavor B</h2>
+    <p>The gateway is a federation-conformant subgraph out of the box. Both <code>rover supergraph compose</code> (Apollo) and <code>wgc router compose</code> (Cosmo) succeed against it. The subscription Type is included in the composed supergraph; entity references work with any router that supports Federation v2.4+.</p>
+
+    <h3>Topology</h3>
+    <div class="diagram">     Apollo Client
+         │   ws://router/graphql
+         ▼
+   ┌─────────────┐
+   │   Router    │   parses operation, resolves federation
+   │   (Apollo   │
+   │   or Cosmo) │
+   └─────┬───────┘
+         │  subscription op
+         ▼
+   ┌─────────────┐         ┌─────────────────┐
+   │  VentStream │   ◄───  │  Orders subgraph │
+   │  GraphQL    │  _entities  (entity-owning)
+   │  gateway    │         └─────────────────┘
+   └─────┬───────┘
+         │  emits { __typename: Order, id: "o-42" }
+         ▼  router stitches Order's other fields
+     client receives full typed payload</div>
+
+    <h3>Entity reference example</h3>
+    <p>The <code>orderUpdated</code> subscription in the manifest above returns an <code>entity_ref</code>. When an event arrives, VentStream emits:</p>
+    <div class="code-block">
+<pre><code data-lang="json">{ "__typename": "Order", "id": "o-42" }</code></pre>
+    </div>
+    <p>The router takes this representation, calls the orders subgraph's <code>_entities</code> resolver, and merges the result into the response delivered to the client — who sees a fully-stitched Order with all the fields it requested.</p>
+
+    <h3>Verified end-to-end</h3>
+    <p><code>packages/example/federation/federated-subscription-test.mjs</code> runs:</p>
+    <ol>
+      <li>VentStream as a subgraph at <code>:4041</code></li>
+      <li>A mock orders subgraph (Apollo Server standalone) at <code>:4042</code> owning <code>Order @key(fields: "id")</code></li>
+      <li>Cosmo Router at <code>:4044</code> with the composed supergraph</li>
+      <li>Apollo Client at the router subscribing to <code>orderUpdated(orderId: "o-42") { id status total_cents customer_email }</code></li>
+      <li>Publisher emits via <code>@ventstream/sdk</code></li>
+      <li>Client receives the full stitched Order: <code>{ id: "o-42", status: "confirmed", total_cents: 12995, customer_email: "..." }</code></li>
+    </ol>
+
+    <h2>Two gotchas worth knowing</h2>
+    <div class="callout gotcha">
+      <strong><code>_service { sdl }</code> strips Subscription types.</strong> async-graphql's legacy Federation v1 behavior excludes subscription operations from the SDL emitted by <code>_service</code>. For composition to include subscriptions, dump the schema via regular GraphQL introspection (<code>__schema</code>) and feed the file to <code>rover</code>/<code>wgc</code> directly. See <code>packages/example/federation/dump-ventstream-sdl.mjs</code>.
+    </div>
+
+    <div class="callout gotcha">
+      <strong>Root types must be named <code>Query</code> and <code>Subscription</code></strong> — not the async-graphql default <code>QueryRoot</code> / <code>SubscriptionRoot</code>. Without this, the composer treats VentStream's query as a separate type from sibling subgraphs and merging fails silently. The gateway already does this rename internally.
+    </div>
+
+    <h2>Auth (v1 — trusted token)</h2>
+    <p>v1 accepts any non-empty token. JWT validation lands later. The auth seam is in <code>auth::extract</code> — a single function to swap.</p>
+    <ul>
+      <li><strong>WS subscriptions</strong>: tenant + token via <code>connection_init</code> payload (the Apollo Client <code>connectionParams</code>).</li>
+      <li><strong>HTTP queries</strong>: tenant + token via headers (<code>Authorization: Bearer ...</code>, <code>X-VS-Tenant: ...</code>).</li>
+    </ul>
+
+    <div class="page-footer">
+      <span><a href="pipeline-b.html">← Pipeline B</a></span>
+      <span><a href="operations.html">Deploy &amp; configure →</a></span>
+    </div>
+  </main>
+</div>
+</body>
+</html>

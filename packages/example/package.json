@@ -1,0 +1,21 @@
+{
+  "name": "@ventstream/example",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "demo": "node run-demo.mjs"
+  },
+  "dependencies": {
+    "@apollo/client": "^4.2.0",
+    "@apollo/server": "^5.5.1",
+    "@apollo/subgraph": "^2.14.0",
+    "@ventstream/client": "file:../client",
+    "@ventstream/sdk": "file:../sdk",
+    "graphql": "^16.14.0",
+    "graphql-tag": "^2.12.6",
+    "graphql-ws": "^6.0.8",
+    "nats": "^2.29.3",
+    "ws": "^8.21.0"
+  }
+}

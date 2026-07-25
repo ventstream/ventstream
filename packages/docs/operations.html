@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VentStream — Deploy &amp; configure</title>
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="assets/docs.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="logo" href="index.html">VentStream</a>
+    <div class="tagline">CDC + denormalized indexing + durable WebSocket subscriptions, in a single Rust binary.</div>
+
+    <div class="nav-section">Start here</div>
+    <nav><ul>
+      <li><a data-page="index.html" href="index.html">Overview</a></li>
+      <li><a data-page="architecture.html" href="architecture.html">Architecture</a></li>
+      <li><a data-page="getting-started.html" href="getting-started.html">Getting started</a></li>
+    </ul></nav>
+
+    <div class="nav-section">Pipelines</div>
+    <nav><ul>
+      <li><a data-page="pipeline-a.html" href="pipeline-a.html">A · CDC + joins</a></li>
+      <li><a data-page="pipeline-b.html" href="pipeline-b.html">B · WS fan-out</a></li>
+      <li><a data-page="graphql.html" href="graphql.html">GraphQL gateway</a></li>
+    </ul></nav>
+
+    <div class="nav-section">Operations</div>
+    <nav><ul>
+      <li><a data-page="operations.html" href="operations.html">Deploy &amp; configure</a></li>
+      <li><a data-page="roadmap.html" href="roadmap.html">Roadmap</a></li>
+    </ul></nav>
+
+    <div class="footer-note">v0.1 · <a href="https://github.com/bashiru98/ventstream">bashiru98/ventstream</a></div>
+  </aside>
+
+  <main>
+    <h1>Deploy &amp; configure</h1>
+    <p class="subtitle">Three deployment topologies, three roles, and the full environment-variable reference. v0.1 has no Helm chart yet — deploy as a standard Linux binary or in a custom container.</p>
+
+    <h2>Deployment topologies</h2>
+
+    <h3>Single-graph, no router</h3>
+    <p>Customer has a GraphQL server they already love. They want to add subscriptions. The whole VentStream story is "we are their WS endpoint." No federation router involved.</p>
+    <div class="diagram">  Apollo Client ──HTTP──► customer's GraphQL server  (queries / mutations)
+                  │
+                  └─WS──► VentStream gateway          (subscriptions)
+                            │
+                            ▼
+                          NATS JetStream</div>
+
+    <h3>Federated, Apollo Router</h3>
+    <p>Customer is on Apollo Federation. VentStream slots in as a subscription-owning subgraph.</p>
+    <div class="diagram">  Apollo Client ──► Apollo Router ──► [customer's subgraphs]
+                                    │
+                                    └► VentStream gateway
+                                            │
+                                            ▼
+                                          NATS JetStream
+
+  Note: Apollo Router OSS gates federated subscriptions behind a paid
+  GraphOS license. Cosmo Router (next) is the free alternative.</div>
+
+    <h3>Federated, Cosmo Router</h3>
+    <p>Cosmo Router supports federated subscriptions in its OSS build — and Cosmo's existing WS layer has the bug VentStream was designed to fix. Drop-in replacement story is strongest here.</p>
+    <div class="diagram">  Apollo Client ──► Cosmo Router ──► [customer's subgraphs]
+                                    │
+                                    └► VentStream gateway
+                                            │
+                                            ▼
+                                          NATS JetStream</div>
+
+    <h2>Roles</h2>
+    <p>The same binary runs as any subset of the three roles via <code>VS_ROLES</code>. Each role is independent — they share the engine kernel but their data paths don't intersect.</p>
+
+    <table>
+      <thead><tr><th>Role</th><th>What it does</th><th>Scales</th></tr></thead>
+      <tbody>
+        <tr><td><code>cdc</code></td><td>Postgres logical replication → join engine → OpenSearch sink</td><td>Vertical only (slot is single-consumer); use warm standbys for HA</td></tr>
+        <tr><td><code>ws</code></td><td>Native VentStream WebSocket gateway over NATS JetStream</td><td>Horizontal (stateless except local connections)</td></tr>
+        <tr><td><code>graphql</code></td><td>Apollo-Client-compatible <code>graphql-transport-ws</code> gateway</td><td>Horizontal (same as <code>ws</code>)</td></tr>
+      </tbody>
+    </table>
+
+    <h3>When run together (<code>VS_ROLES=ws,graphql</code>)</h3>
+    <p>The <code>ws</code> role bootstraps the JetStream stream on startup. The <code>graphql</code> role retries <code>get_stream</code> for up to 15 seconds, so there's no startup-order coupling between the two within the same process.</p>
+
+    <h2>Environment variable reference</h2>
+
+    <h3>Top-level</h3>
+    <table>
+      <thead><tr><th>Variable</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>VS_ROLES</code></td><td><code>cdc</code></td><td>Comma-separated subset of <code>cdc</code>, <code>ws</code>, <code>graphql</code>.</td></tr>
+        <tr><td><code>RUST_LOG</code></td><td>(none)</td><td>Standard <code>tracing_subscriber::EnvFilter</code> syntax.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>CDC role</h3>
+    <table>
+      <thead><tr><th>Variable</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>VS_PG_HOST</code></td><td>—</td><td>Required.</td></tr>
+        <tr><td><code>VS_PG_PORT</code></td><td><code>5432</code></td><td></td></tr>
+        <tr><td><code>VS_PG_USER</code></td><td>—</td><td>Must have <code>REPLICATION</code>.</td></tr>
+        <tr><td><code>VS_PG_PASSWORD</code></td><td>—</td><td></td></tr>
+        <tr><td><code>VS_PG_DATABASE</code></td><td>—</td><td></td></tr>
+        <tr><td><code>VS_PG_PUBLICATION</code></td><td>—</td><td>Created beforehand.</td></tr>
+        <tr><td><code>VS_PG_SLOT</code></td><td>—</td><td>Created beforehand.</td></tr>
+        <tr><td><code>VS_OS_ENDPOINT</code></td><td>—</td><td>OpenSearch URL.</td></tr>
+        <tr><td><code>VS_INDEX_TEMPLATE</code></td><td>—</td><td>e.g. <code>events-${header:ventstream.cdc.relation}-%Y-%m-%d</code></td></tr>
+        <tr><td><code>VS_OS_USERNAME</code> / <code>VS_OS_PASSWORD</code></td><td>—</td><td>Basic auth (optional).</td></tr>
+        <tr><td><code>VS_OS_API_KEY</code></td><td>—</td><td>OpenSearch API key (alternative auth).</td></tr>
+        <tr><td><code>VS_INSECURE_TLS</code></td><td><code>false</code></td><td>Accept self-signed certs — dev only.</td></tr>
+        <tr><td><code>VS_DLQ_PATH</code></td><td><code>./data/dlq.jsonl</code></td><td>Where poison events go.</td></tr>
+        <tr><td><code>VS_JOINS_YAML</code></td><td>(none)</td><td>Optional path to joins config.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>WS role</h3>
+    <table>
+      <thead><tr><th>Variable</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>VS_WS_LISTEN</code></td><td><code>0.0.0.0:4040</code></td><td>HTTP+WS listener.</td></tr>
+        <tr><td><code>VS_WS_NATS_URL</code></td><td><code>nats://127.0.0.1:4222</code></td><td></td></tr>
+        <tr><td><code>VS_WS_SUBJECTS</code></td><td><code>vs.t.&gt;</code></td><td>Comma-separated subject patterns to subscribe to.</td></tr>
+        <tr><td><code>VS_WS_MAILBOX</code></td><td><code>256</code></td><td>Per-connection outbound mailbox capacity (slow-consumer guard).</td></tr>
+        <tr><td><code>VS_WS_PING_INTERVAL_MS</code></td><td><code>10000</code></td><td>WebSocket ping cadence.</td></tr>
+        <tr><td><code>VS_WS_PONG_TIMEOUT_MS</code></td><td><code>30000</code></td><td>Pong deadline; missed = close.</td></tr>
+        <tr><td><code>VS_WS_JETSTREAM</code></td><td><code>0</code></td><td>Set to <code>1</code> for durable per-connection consumers.</td></tr>
+        <tr><td><code>VS_WS_JS_STREAM</code></td><td><code>ventstream</code></td><td>JetStream stream name.</td></tr>
+        <tr><td><code>VS_WS_JS_POD_ID</code></td><td>(fresh ULID)</td><td>Set to k8s pod name in prod.</td></tr>
+        <tr><td><code>VS_WS_JS_INACTIVE_THRESHOLD_MS</code></td><td><code>300000</code></td><td>JetStream consumer inactivity cleanup window.</td></tr>
+        <tr><td><code>VS_WS_JS_REAPER_INTERVAL_MS</code></td><td><code>60000</code></td><td>Layer-3 orphan-cleanup cadence.</td></tr>
+        <tr><td><code>VS_WS_JS_REPLICAS</code></td><td><code>1</code></td><td>JetStream stream replicas. 3 in prod clusters.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>GraphQL role</h3>
+    <table>
+      <thead><tr><th>Variable</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>VS_GRAPHQL_LISTEN</code></td><td><code>0.0.0.0:4041</code></td><td></td></tr>
+        <tr><td><code>VS_GRAPHQL_NATS_URL</code></td><td><code>nats://127.0.0.1:4222</code></td><td></td></tr>
+        <tr><td><code>VS_GRAPHQL_STREAM</code></td><td><code>ventstream</code></td><td>Must already exist (the <code>ws</code> role bootstraps it).</td></tr>
+        <tr><td><code>VS_GRAPHQL_POD_ID</code></td><td>(fresh ULID)</td><td>Set to k8s pod name in prod.</td></tr>
+        <tr><td><code>VS_GRAPHQL_INACTIVE_THRESHOLD_MS</code></td><td><code>300000</code></td><td>Same Layer-2 cleanup as the WS role.</td></tr>
+        <tr><td><code>VS_GRAPHQL_MANIFEST</code></td><td>(none)</td><td>Path to subject discovery manifest (Model 1 + 2).</td></tr>
+        <tr><td><code>VS_GRAPHQL_SUBSCRIPTIONS</code></td><td>(none)</td><td>Path to typed-subscriptions manifest (Model 2 / Flavor B).</td></tr>
+      </tbody>
+    </table>
+
+    <h2>NATS / JetStream prerequisites</h2>
+    <p>The WS and GraphQL roles both require NATS with JetStream enabled. Minimum dev setup:</p>
+    <div class="code-block">
+<pre><code data-lang="bash">brew install nats-server
+mkdir -p /var/ventstream-jetstream
+nats-server -js -sd /var/ventstream-jetstream</code></pre>
+    </div>
+    <p>For production: a 3-node NATS cluster with JetStream replicas set to 3. Persistent volumes for each node's <code>sd</code> directory. See <a href="https://docs.nats.io/running-a-nats-service/configuration/clustering/jetstream_clustering">NATS clustering docs</a>.</p>
+
+    <h2>Health endpoints</h2>
+    <p>Both gateway roles expose a <code>/healthz</code> endpoint returning <code>{"status":"ok"}</code>. Wire it into k8s liveness/readiness probes:</p>
+    <div class="code-block">
+<pre><code data-lang="yaml">livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 4040       # or 4041 for graphql role
+  initialDelaySeconds: 5
+  periodSeconds: 10
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: 4040
+  initialDelaySeconds: 2
+  periodSeconds: 5</code></pre>
+    </div>
+
+    <h2>What's not yet built</h2>
+    <div class="callout warn">
+      <strong>No Docker image / Helm chart.</strong> Deploy by copying the binary into a base image and writing your own k8s manifests. This is the first roadmap item we'd add to make VentStream operationally shippable.
+    </div>
+    <div class="callout warn">
+      <strong>JWT auth is a stub.</strong> Both connection_init payloads and HTTP headers currently accept any non-empty token string. The auth seam is in <code>auth::extract</code> for the GraphQL role and the WS Hello handler for the native protocol. Single function to swap.
+    </div>
+    <div class="callout warn">
+      <strong>No leader election yet.</strong> The CDC role is single-consumer by Postgres design, but failover between hot-standby pods needs a Kubernetes Lease or Postgres advisory lock — neither is wired up.
+    </div>
+    <div class="callout warn">
+      <strong>Observability is a stub.</strong> The <code>ventstream-telemetry</code> crate exists but doesn't yet emit Prometheus metrics or OpenTelemetry traces. Connection count, consumer count, JetStream lag — none wired.
+    </div>
+
+    <div class="page-footer">
+      <span><a href="graphql.html">← GraphQL gateway</a></span>
+      <span><a href="roadmap.html">Roadmap →</a></span>
+    </div>
+  </main>
+</div>
+</body>
+</html>

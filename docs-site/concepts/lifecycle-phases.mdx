@@ -1,0 +1,39 @@
+---
+title: "Lifecycle state"
+description: "Revisioned desired state, independently reported observed state, and durable operation progress."
+---
+
+Fleet separates what an operator requested from what an engine has observed.
+
+## Desired run state
+
+| State | Meaning |
+| --- | --- |
+| `running` | The supervisor should run the engine with the selected configuration |
+| `paused` | Stop the engine while retaining resumable connector and join state |
+| `drained` | Stop the engine and release or invalidate resumable state where supported |
+
+Each change creates a complete desired-state snapshot with a monotonically
+increasing pipeline revision. The agent persists a newer snapshot before acting,
+ignores stale revisions, and treats redelivery of the same revision idempotently.
+
+## Observed run state
+
+Agents report `starting`, `bootstrapping`, `running`, `paused`, `drained`,
+`degraded`, or `failed` together with the desired revision they are reconciling.
+Fleet does not infer successful pause or drain from heartbeat freshness.
+
+## Operation state
+
+```text
+queued -> delivered -> acknowledged -> running -> succeeded
+                                             \-> failed
+```
+
+Operations can also expire. Queued operations can be canceled; once execution has
+crossed a side-effect boundary, Fleet does not claim cancellation without an agent
+result. Agent receipts are persisted before acknowledgement so reconnect delivery
+does not repeat a completed destructive action.
+
+Use `ventstreamctl ... --wait` when a script requires terminal success rather than
+mere API acceptance.

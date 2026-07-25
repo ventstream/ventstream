@@ -1,0 +1,29 @@
+[package]
+name = "ventstream-joins"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Configurable, stateful joins between CDC streams for the VentStream engine."
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+redb = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+ventstream-core = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt", "macros"] }
+tokio-test = { workspace = true }
+
+[lints]
+workspace = true

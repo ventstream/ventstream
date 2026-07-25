@@ -1,0 +1,101 @@
+---
+title: "Fan-out & hot endpoints"
+description: "Why one change recomputes only the right documents — and how shared lookup nodes are kept from exploding."
+---
+
+When a change arrives, the engine has to answer one question: **which
+documents embed this thing, and therefore need recomputing?** Getting
+that set right — not too big, not too small — is what makes the engine
+both correct and fast.
+
+## The two directions of fan-out
+
+A change can be to the **primary itself** or to **something it embeds**.
+
+- **Primary change** (an `orders` row, a `Product` node): recompute that
+  one document. Easy.
+- **Embedded change** (a `customer` the order references, a `Region` two
+  hops from the product): recompute every primary that embeds it. This
+  is the fan-out, and it can touch many documents from one change.
+
+For Postgres, the engine keeps an in-memory reverse index of foreign
+keys to answer this. For Neo4j, it runs a Cypher query anchored on the
+changed element's ID, walking back to the affected primaries along the
+spec's declared paths.
+
+## Bounded by the spec
+
+Fan-out only follows paths the spec declares, up to `fan_out_max_hops`.
+A node whose label the spec never traverses produces **zero**
+recomputations — the change event is read and discarded. This is what
+keeps a single change from rippling across the whole graph.
+
+Measured on a 100k-node validation graph: renaming a shared lookup node
+(3 hops from the primary, embedded in the document) correctly recomputed
+the **5,715** documents that reference it — in **13 seconds** — and
+nothing else. Deleting that node cascaded the removal to the same 5,715
+in 23s. That's real, correct cascade work: the embedded value changed, so
+every document embedding it must update.
+
+## The hot-endpoint problem
+
+Now consider a **shared lookup node** — like a `Category` that thousands
+of products point at. In the validation graph there was a single shared
+status node referenced by ~99,000 documents through one relationship type.
+
+When a single document's edge to that shared node *changes*, the naive
+fan-out anchors on the relationship's endpoints — including the shared
+node — and asks "which documents reach this node?" The answer is *all
+99,000*, even though only one document's edge actually changed.
+
+Without handling, a single edge change triggered a **59,498-document
+recompute** in testing. A 1,000-operation burst queued ~5,800 such
+cascades — hours of wasted work for changes that should each touch one
+document.
+
+## The fix: hot-endpoint detection
+
+At startup, the engine probes each projection path's leaf cardinality.
+Any endpoint label below a threshold (default **100**, via
+`VS_NEO4J_HOT_NODE_THRESHOLD`) is flagged "hot" and its element IDs are
+captured in a small in-memory set.
+
+At event time, relationship events involving a hot endpoint have that
+endpoint filtered out of the fan-out anchor set — so only the
+**primary-side** key reaches the recompute path:
+
+```
+shared-node edge change
+  naive anchors:   [edge, primary-eid, shared-node-eid]  → 99,498 recompute
+  hot-filtered:    [edge, primary-eid]                    → 1 recompute
+```
+
+After the fix, the same 1,000-op burst drained in **seconds** with
+every event recomputing exactly **1** document, and engine memory
+stayed at 14–82 MB.
+
+## What is *not* filtered
+
+The filter applies to **relationship** events only. A **node-property
+change on a hot node** — say, renaming that shared status node from
+"Published" to "Live" — still cascades to all ~99,000 documents, because
+the embedded value genuinely changed for all of them. That's correct:
+
+| Event | Recomputes | Correct because |
+|---|---|---|
+| One document's edge to the shared node added/removed | 1 (that document) | only that document's membership changed |
+| The shared node's label property renamed | ~99,000 | the embedded value changed everywhere |
+
+The filter removes *spurious* fan-out (an edge change masquerading as a
+graph-wide change), never *legitimate* fan-out (a shared value actually
+changing).
+
+## Cost
+
+- **Startup:** one count query per projection path. Milliseconds.
+- **Memory:** tens of element-ID strings per spec. Kilobytes.
+- **Per event:** one `HashSet` membership check. Sub-microsecond.
+
+Set `VS_NEO4J_HOT_NODE_THRESHOLD=0` to disable detection entirely (the
+old behavior). Raise it if a genuine fan-out target sits just above the
+default and you'd rather treat it as hot.

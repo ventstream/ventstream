@@ -1,0 +1,216 @@
+---
+title: "Performance"
+description: "What drives throughput, indicative numbers, and how to measure your own."
+---
+
+VentStream has two distinct performance regimes: a one-shot **bootstrap**
+(scan the source, project every row/node) and the **live tail**
+(recompose only what each change touches). They behave very differently,
+and the shape of your projection — how many child relations, how many
+graph hops — drives the live cost far more than raw volume does.
+
+<Warning>
+**The numbers below are indicative, not guarantees.** They were measured
+on a single machine with everything (engine, Postgres/Neo4j, OpenSearch)
+in local Docker — no network, no replicas, modest CPU. Your throughput
+will differ with hardware, network latency to the source/sink, projection
+shape, data distribution, and index mapping. Treat these as *orders of
+magnitude* and **measure on your own infrastructure** — the method is at
+the bottom of this page.
+</Warning>
+
+## Why it's fast
+
+- **Bootstrap is one optimized query.** The snapshot projects the whole
+  source with a single streaming scan per table (Postgres) or one
+  Cypher per spec (Neo4j) — the database planner does the heavy lifting,
+  and rows stream straight into batched bulk-index requests.
+- **The live path recomposes only what changed.** A change fans out to
+  the affected primary document(s) and nothing else. For relational
+  children this uses a **reverse index** (a deleted/updated child row
+  resolves to its parent in O(1), without scanning).
+- **Writes are batched + idempotent.** Recomposed docs are coalesced
+  into bulk requests and upserted by deterministic doc id, so retries
+  and duplicate CDC deliveries are safe no-ops.
+
+## Indicative numbers
+
+Final engine, local Docker, single node. PG projections embed N child
+tables; the Neo4j projection walks a 3-hop graph (`User → Membership
+→ Group`, and `User → Membership ← Grant ← admin User`).
+
+### Bootstrap (one-shot scan)
+
+| Source / shape | Volume | Time | Throughput |
+|---|---|---|---|
+| Postgres — primary + 3 children | ~400k rows | 3.1s | ~160k rows/s |
+| Postgres — primary + 2 children | ~300k rows | 2.3s | ~133k rows/s |
+| Neo4j — 3-hop projection | 100k nodes | 4.3s | ~23k nodes/s |
+
+### Live tail (per-event recompose)
+
+| Operation | Shape | Throughput |
+|---|---|---|
+| Update (primary) | PG, 2 children | ~9,900 events/s |
+| Update (primary) | PG, 3 children | ~10,300 events/s |
+| Child delete (reverse-index) | PG, 1–3 children | ~8,400 events/s |
+| Recompose | **Neo4j, 3-hop graph** | **~4,000 events/s** |
+
+## The shape of the projection is what matters
+
+Two takeaways the numbers make obvious:
+
+1. **Bootstrap throughput barely moves with shape.** Adding a third
+   child table to the Postgres projection didn't slow the snapshot — it's
+   still one scan per table, and bulk indexing dominates.
+
+2. **Live cost is dominated by recompose depth.** A shallow relational
+   recompose (re-read a row + its embedded children) runs at ~10k/s — the
+   extra child relation is marginal. A **deep graph recompose** runs a
+   multi-hop Cypher query, which is far heavier than reading a relational
+   row. The tail **coalesces a poll's events** into chunked recompose
+   queries (rather than one query per event), which lifts the 3-hop graph
+   case from a per-event ~233/s to ~4,000/s — still slower than shallow
+   relational, but no longer query-overhead-bound. (The same projection
+   bootstraps at ~23k nodes/s, because one planner-optimized scan beats
+   even batched per-key lookups.) The chunk size is tunable via
+   `VS_NEO4J_RECOMPOSE_CHUNK` (default 128, the measured sweet spot);
+   going much larger regresses sharply — a giant element-id `IN`-list
+   degrades the fan-out query plan (Neo4j can drop the indexed element-id
+   seek on the projection branches in favour of a scan). The chunks also
+   run concurrently (`VS_NEO4J_RECOMPOSE_CONCURRENCY`, default 8, bounded
+   by the bolt pool) — that parallelizes cascade-heavy polls; beyond ~8
+   it's Neo4j-query-bound, not round-trip-bound.
+
+Practical guidance: **deep graph fan-out is fine for bootstrap and
+moderate live churn**; a very write-hot deep projection will still be
+bound by the source's multi-hop query cost, so keep the hottest
+projections shallow where you can.
+
+## Tuning: latency vs throughput, and what to set
+
+Two different things get called "speed", and they tune differently. Don't
+conflate them:
+
+- **Per-change latency** — one row changes; how fast does it appear in the
+  sink? This is what matters for real-time CDC.
+- **Bulk throughput** — a single statement changes millions of rows; how
+  fast does the backlog drain?
+
+### Latency is set by the flush/poll window, not the recompose
+
+The recompose itself is cheap when the projection is indexed (see below):
+a shallow PG recompose at 1M scale is **~2–3 ms**. End-to-end latency is
+dominated by the **batch-flush window**, which trades latency for
+sink-write efficiency:
+
+| `VS_DISPATCH_FLUSH_MS` | Measured commit→visible (PG, 1M, indexed) |
+|---|---|
+| `500` (default) | ~350 ms median |
+| `50` | **~3 ms median, ~14 ms p95** |
+
+For Neo4j the equivalent floor is `VS_NEO4J_POLL_INTERVAL_MS` (default
+`500`) on top of the flush. **Lower both for low-latency real-time;** keep
+them higher to coalesce more events per sink write under heavy churn.
+
+### Postgres denormalize mode: bulk speed vs bounded memory
+
+`VS_PG_DENORMALIZE_MODE` is the big one:
+
+| Mode | Bulk tail throughput | Memory | Use when |
+|---|---|---|---|
+| `memory` (default) | **~27k events/s** (in-memory recompose) | scales with the joined working set (~1.3 GB / 3M rows) | working set fits in the pod |
+| `sql` | ~3–5k events/s (one SQL recompose per event) | **flat / O(chunk) at any scale** | dataset is large or unbounded |
+
+Both **bootstrap fast** (~130–160k rows/s) and both have **ms-scale
+single-change latency** — the difference is only how a *bulk* burst of
+millions drains. Pick `sql` when you can't hold the working set in RAM;
+pick `memory` when you can and want maximum bulk speed.
+
+<Warning>
+**`sql` mode requires the join/FK columns to be indexed.** Each recompose
+queries the related tables by their join key; without an index it
+seq-scans on every event and collapses to a fraction of the throughput
+above. Index the FK side of every relation, e.g. for an order projection:
+`CREATE INDEX ON order_items(order_id)` (forward embed) and
+`CREATE INDEX ON orders(customer_id)` (reverse). Verify with
+`EXPLAIN` — you want **Index Scan**, not Seq Scan.
+</Warning>
+
+### Recommended settings by workload
+
+| Goal | Set |
+|---|---|
+| **Low-latency real-time** | `VS_DISPATCH_FLUSH_MS=50`, `VS_NEO4J_POLL_INTERVAL_MS=100`, smaller `VS_DISPATCH_MAX_EVENTS` (e.g. `200`) |
+| **High bulk throughput** | defaults (`VS_DISPATCH_FLUSH_MS=500`), `VS_DISPATCH_PARALLEL_BULKS=8`, `memory` mode if the working set fits |
+| **Large / unbounded dataset** | `VS_PG_DENORMALIZE_MODE=sql` + indexes on join columns; `VS_PG_BOOTSTRAP_CHUNK_SIZE=5000` |
+| **Neo4j deep projection** | `VS_NEO4J_RECOMPOSE_CHUNK=128`, `VS_NEO4J_RECOMPOSE_CONCURRENCY=8` (defaults; the measured sweet spot) |
+
+The engine ships with jemalloc + background decay
+(`_RJEM_MALLOC_CONF`, baked into the image), so RSS tracks the live
+working set rather than the high-water mark after a spike — no tuning
+needed. Full list in the [engine env reference](/reference/engine-env).
+
+## WebSocket fan-out (the `ws` role)
+
+The other pipeline is live fan-out: events arrive from NATS and are
+pushed to every connected WebSocket whose subscription matches. The cost
+that matters here is **fan-out width** — how many connections one event
+is delivered to.
+
+Final engine, local Docker, single node. 2,000 connections, a
+mixed-realistic shape (15% subscribed to a hot `orders.>`, the rest to a
+narrow per-entity pattern), 256-byte payloads, **Core mode**:
+
+| Scenario | Result |
+|---|---|
+| Peak fan-out throughput (burst) | **~640k deliveries/s**, 100% delivered, 0 drops |
+| Sustained 361k deliveries/s | p50 **7 ms** / p95 **10 ms** / p99 **16 ms**, ~4.4 cores |
+
+### Why it's fast — one event, one copy, one serialization
+
+A hot subject delivered to N connections does **not** copy or serialize
+the event N times:
+
+- **`Arc`-shared envelope.** The dispatcher clones the decoded event into
+  one `Arc` and hands every matching connection a refcount bump, not a
+  deep copy. (Removing the per-connection deep clone alone lifted burst
+  throughput ~25% and cut the sustained-load p99 from hundreds of
+  milliseconds to ~16 ms — the serial clone loop was stalling the
+  fan-out task.)
+- **Serialize once, splice many.** The bytes that arrived off the bus are
+  *already* the event's JSON, so they're reused verbatim — each delivery
+  is a cheap string assembly of the tiny per-connection envelope
+  (`subject`, matched subscription ids) around the shared event bytes,
+  not a fresh serialization of the whole envelope.
+- **No slow client stalls the publisher.** Each connection has a bounded
+  outbound mailbox; when it fills, that one connection is disconnected as
+  a slow consumer (it must reconnect) — the fast path keeps flowing.
+
+### Core vs JetStream throughput
+
+The numbers above are **Core mode** (`VS_WS_JETSTREAM` unset): a single
+NATS subscriber fans every event out to all connections — the high-
+throughput path. **JetStream mode** gives each connection its own durable
+consumer (per-connection cursor, replay-capable) and trades raw fan-out
+throughput for that durability: every consumer pulls and acks
+independently, so throughput is bound by NATS pull/ack volume rather than
+CPU. Pick Core for connection density and live-only delivery; pick
+JetStream when a connection needs per-cursor durability. Both share the
+serialize-once path above.
+
+## Measure your own
+
+The numbers above come from a burst-and-poll method you can run against
+your own deployment:
+
+1. Bootstrap your projection and let the agent reach the `tailing` phase.
+2. Issue a bounded burst of mutations in one transaction (e.g. `UPDATE …
+   WHERE id BETWEEN … ` for 10k rows), noting the commit time.
+3. Poll the **last** document in the range until it reflects the change —
+   that's the drain time for the whole burst.
+4. `events ÷ drain_time` is your end-to-end throughput (CDC decode →
+   recompose → bulk index), on *your* hardware and projection.
+
+For bootstrap, drop the slot/cursor and time a fresh snapshot; the engine
+logs per-table `elapsed_ms`.

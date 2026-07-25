@@ -1,0 +1,26 @@
+# Dependabot configuration.
+#
+# Goal: silence the unshipped demo (demo/webapp) without disturbing
+# Dependabot coverage on the real code.
+#
+# Note on SECURITY updates: there is no per-directory "exclude" for
+# security PRs — `exclude-paths` only suppresses VERSION updates
+# (dependabot/dependabot-core#14408). The documented workaround is to
+# register the directory's ecosystem with a wildcard `ignore`, which
+# suppresses BOTH version and security PRs for that path.
+#
+# Everything not listed here keeps GitHub's default behavior: no scheduled
+# version updates, but org-enabled security updates still apply (cargo
+# workspace, packages/*, github-actions). Add entries here later if you
+# want active version-update PRs for those.
+version: 2
+updates:
+  # demo/webapp — local demo, dev-only deps. Suppress all Dependabot PRs.
+  - package-ecosystem: "npm"
+    directories:
+      - "/demo/**"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0   # no version-update PRs
+    ignore:
+      - dependency-name: "*"      # the part that also suppresses security PRs

@@ -1,0 +1,36 @@
+# Apollo Router runtime configuration.
+#
+# - `subscription.enabled: true` turns on federated subscriptions.
+# - For the `ventstream` subgraph, force WebSocket mode (the
+#   alternative is callback, which needs Apollo Studio). The WS
+#   endpoint on VentStream is `/graphql/ws` per our gateway routes.
+# - `headers.all` forwards our X-VS-Tenant / Authorization headers
+#   to subgraphs so VentStream can resolve the tenant from HTTP
+#   queries (subscriptions use connection_init via the router's
+#   WS-pass-through).
+
+supergraph:
+  listen: 127.0.0.1:4044
+
+include_subgraph_errors:
+  all: true
+
+subscription:
+  enabled: true
+  mode:
+    passthrough:
+      all:
+        path: /ws
+      subgraphs:
+        ventstream:
+          # Explicit URL for the WS endpoint on VentStream's gateway.
+          path: /graphql/ws
+          heartbeat_interval: 10s
+
+headers:
+  all:
+    request:
+      - propagate:
+          named: "authorization"
+      - propagate:
+          named: "x-vs-tenant"

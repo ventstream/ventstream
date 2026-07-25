@@ -1,0 +1,40 @@
+name: dependency-policy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-policy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master on 2026-07-11
+        with:
+          toolchain: 1.94.0
+          components: clippy,rustfmt
+      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
+      - name: Verify security tool versions
+        run: |
+          test "$(cargo-audit --version)" = "cargo-audit 0.22.2"
+          test "$(cargo-deny --version)" = "cargo-deny 0.20.2"
+      - name: Check RustSec advisories
+        run: cargo-audit audit
+      - name: Enforce dependency policy
+        run: cargo-deny --log-level error check

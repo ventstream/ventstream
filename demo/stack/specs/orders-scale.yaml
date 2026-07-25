@@ -1,0 +1,32 @@
+# Postgres projection: one OpenSearch document per order, with the
+# customer embedded (1:1) and the line items embedded (1:many).
+#
+# A change to orders, customers, OR order_items recomputes the affected
+# order document(s). Demonstrates: row update, embedded-object update
+# (customer), embedded-array changes (items), deletes.
+
+joins:
+  - name: orders
+    primary:
+      table: shop.orders
+      pk: order_id
+    related:
+      - id: customer
+        table: shop.customers
+        pk: customer_id
+        join_on: { from: customer_id, to: customer_id }   # orders.customer_id → customers.customer_id
+        embed_as: customer
+        cardinality: one
+        select: [customer_id, name, email, tier]
+      - id: items
+        table: shop.order_items
+        pk: item_id
+        join_on: { from: order_id, to: order_id }          # order_items.order_id → orders.order_id
+        embed_as: items
+        cardinality: many
+        sort_by: item_id
+        select: [item_id, sku, qty, price]
+    state:
+      backend: memory
+    backfill:
+      mode: none

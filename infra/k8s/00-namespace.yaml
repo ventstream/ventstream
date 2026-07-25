@@ -1,0 +1,11 @@
+# Data-plane namespace: the CDC engine agents. Separate from the
+# control plane (ventstream-cp) so the two can have independent RBAC,
+# network policy, and resource quotas. An agent only needs egress to
+# its source DB, its OpenSearch sink, and the control-plane API.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ventstream-agents
+  labels:
+    app.kubernetes.io/part-of: ventstream
+    app.kubernetes.io/component: data-plane

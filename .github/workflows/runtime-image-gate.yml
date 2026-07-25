@@ -1,0 +1,183 @@
+name: runtime image gate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-image-gate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: validate main release candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      source_epoch: ${{ steps.release.outputs.source_epoch }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master on 2026-07-11
+        with:
+          toolchain: 1.94.0
+      - name: Validate release candidate
+        id: release
+        run: |
+          test "$GITHUB_REF" = "refs/heads/main" || {
+            echo "runtime image gates must run from main" >&2
+            exit 1
+          }
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" || {
+            echo "checked-out commit is not the current origin/main" >&2
+            exit 1
+          }
+          version=$(cargo metadata --format-version 1 --no-deps | jq -er '
+            [.packages[].version] | unique |
+            if length == 1 then .[0] else error("workspace package versions differ") end
+          ')
+          ./infra/release/validate-release.sh "v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source_epoch=$(git log -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
+
+  signing:
+    name: keyless signing
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      EXPECTED_CERTIFICATE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/runtime-image-gate.yml@${{ github.ref }}
+      EXPECTED_OIDC_ISSUER: https://token.actions.githubusercontent.com
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign and verify test payload
+        env:
+          CANDIDATE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          printf 'ventstream %s %s\n' "$CANDIDATE_VERSION" "$GITHUB_SHA" > signing-preflight.txt
+          cosign sign-blob --yes --bundle signing-preflight.sigstore.json signing-preflight.txt
+          cosign verify-blob \
+            --bundle signing-preflight.sigstore.json \
+            --certificate-identity "$EXPECTED_CERTIFICATE_IDENTITY" \
+            --certificate-oidc-issuer "$EXPECTED_OIDC_ISSUER" \
+            signing-preflight.txt >/dev/null
+
+  image:
+    name: native runtime (${{ matrix.platform }})
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            slug: linux-amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            slug: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      LOCAL_IMAGE: ventstream-runtime-gate:${{ github.run_id }}-${{ matrix.slug }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          version: v0.35.0
+          driver-opts: image=moby/buildkit:v0.31.1@sha256:6b59b7df63a8cb9902736f9ddf7fcff8261613d3e7449b8ea8b7537fc399c03a
+          cache-binary: false
+      - name: Build native runtime image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        env:
+          SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.source_epoch }}
+        with:
+          context: .
+          file: infra/docker/engine.Dockerfile
+          platforms: ${{ matrix.platform }}
+          tags: ${{ env.LOCAL_IMAGE }}
+          load: true
+          provenance: false
+          sbom: false
+      - name: Smoke-test runtime image
+        env:
+          EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          mkdir -p evidence
+          actual=$(docker run --rm --platform "$PLATFORM" "$LOCAL_IMAGE" --version)
+          test "$actual" = "ventstream $EXPECTED_VERSION"
+      - name: Generate retained vulnerability report
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.LOCAL_IMAGE }}
+          version: v0.72.0
+          scan-type: image
+          scanners: vuln
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          format: json
+          output: evidence/trivy-ventstream-${{ matrix.slug }}.json
+          exit-code: "0"
+          timeout: 15m0s
+          trivyignores: .trivyignore.yaml
+      - name: Enforce zero high or critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_SKIP_DB_UPDATE: "true"
+          TRIVY_SKIP_JAVA_DB_UPDATE: "true"
+        with:
+          image-ref: ${{ env.LOCAL_IMAGE }}
+          scan-type: image
+          scanners: vuln
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          format: table
+          exit-code: "1"
+          timeout: 15m0s
+          skip-setup-trivy: true
+          trivyignores: .trivyignore.yaml
+      - name: Generate platform SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.LOCAL_IMAGE }}
+          format: spdx-json
+          syft-version: v1.46.0
+          output-file: evidence/ventstream-${{ matrix.slug }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Verify application dependencies are present in the SBOM
+        env:
+          SBOM: evidence/ventstream-${{ matrix.slug }}.spdx.json
+        run: |
+          jq -e '
+            [.packages[].externalRefs[]?
+              | select(.referenceType == "purl")
+              | .referenceLocator
+              | select(startswith("pkg:cargo/"))]
+            | length > 0
+          ' "$SBOM" >/dev/null
+      - name: Retain runtime-gate evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runtime-gate-evidence-${{ matrix.slug }}
+          path: evidence/*
+          if-no-files-found: warn
+          retention-days: 30

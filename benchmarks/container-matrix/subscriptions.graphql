@@ -1,0 +1,10 @@
+type Subscription {
+  benchmarkEvents: BenchmarkEvent!
+    @vsSubscribe(subject: "benchmark.event.>")
+}
+
+type BenchmarkEvent {
+  id: ID! @source(from: "$event.entityId")
+  sequence: String! @source(from: "$data.sequence")
+  payload: String! @source(from: "$data.payload")
+}

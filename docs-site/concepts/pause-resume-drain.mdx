@@ -1,0 +1,69 @@
+---
+title: "Pause, resume, and drain"
+description: "Control managed engine execution without confusing queued intent with completed work."
+---
+
+Lifecycle actions target a pipeline and produce both a new desired-state revision
+and a durable convergence operation.
+
+## Pause
+
+Pause gracefully stops the supervised engine and retains resumable state. The
+deployment stays paused across gateway outages and pod restarts.
+
+```bash
+ventstreamctl pipelines pause orders-cdc \
+  --reason "database maintenance" --wait
+```
+
+## Resume
+
+Resume selects `running`. The supervisor starts the engine with the selected
+configuration and waits for local readiness. After a pause, the connector resumes
+from retained state, subject to the source's own retention window.
+
+```bash
+ventstreamctl pipelines resume orders-cdc --wait
+```
+
+## Drain
+
+Drain stops the engine and invokes connector-specific cleanup:
+
+| Source | Drain behavior |
+| --- | --- |
+| PostgreSQL | Drops the replication slot and local join state. |
+| Neo4j | Removes the local CDC cursor. |
+| MongoDB | Removes the local change-stream resume token. |
+| MySQL/MariaDB | Removes the local binlog position. |
+| Kafka/Redpanda | Leaves server-side consumer-group offsets unchanged; reset them through Kafka administration when a full replay is required. |
+
+Returning a drained database-source deployment to running can therefore require a
+fresh bootstrap. Kafka replay starts from the retained group offset unless an
+operator resets that group externally.
+
+```bash
+ventstreamctl pipelines drain orders-cdc \
+  --reason "decommission source" --wait
+```
+
+<Warning>
+Drain is not a long pause. It can invalidate the state required for lossless
+resume. Confirm source-specific behavior before using it in production.
+</Warning>
+
+## Reconcile and rebootstrap
+
+Reconcile removes destination documents no longer represented by the source for
+connectors that advertise the capability. Rebootstrap clears supported local
+cursor/join state and forces a fresh snapshot. Kafka is the exception: its cursor
+is the broker-side consumer-group offset, so Fleet reports the limitation and the
+operator must reset that group externally. These are explicit, auditable
+operations and never generic remote shell commands.
+
+Inspect progress with:
+
+```bash
+ventstreamctl operations list --pipeline orders-cdc
+ventstreamctl operations describe <operation-id> --attempts --wait
+```

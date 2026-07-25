@@ -1,0 +1,50 @@
+# DEPRECATED MIGRATION REFERENCE. The projection shapes remain illustrative, but
+# deploy new standalone engines from canonical ventstream.yaml as documented in
+# docs-site/deploy/kubernetes-standalone.mdx.
+#
+# Projection specs, mounted into the agents as files. These are the
+# same YAMLs from demo/stack/specs/ — keeping them in a ConfigMap means a
+# spec change is a `kubectl apply` + rollout-restart, no image rebuild.
+#
+# Regenerate from the repo:
+#   kubectl -n ventstream-agents create configmap ventstream-specs \
+#     --from-file=orders.yaml=demo/stack/specs/orders.yaml \
+#     --from-file=products.yaml=demo/stack/specs/products.yaml \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+# The inline copies below are a starting point; prefer the
+# --from-file form above to stay in sync with demo/stack/specs/.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ventstream-specs
+  namespace: ventstream-agents
+data:
+  orders.yaml: |
+    # Replace with demo/stack/specs/orders.yaml. Primary: shop.orders,
+    # related: customers + order_items. See the repo for the full copy.
+    joins:
+      - name: orders
+        primary:
+          table: shop.orders
+          pk: order_id
+        related:
+          - id: customer
+            table: shop.customers
+            pk: customer_id
+            join_on: { from: customer_id, to: customer_id }
+            embed_as: customer
+            cardinality: one
+        state:
+          backend: memory
+        backfill:
+          mode: sync_on_miss
+  products.yaml: |
+    # Replace with demo/stack/specs/products.yaml — the full catalog spec
+    # with the 2-hop fan-out. Stub shown for shape.
+    denormalize:
+      - primary_label: Product
+        output_table: products_denormalized
+        fan_out_max_hops: 2
+        cypher: |
+          RETURN elementId(p) AS primaryEid, { elementId: elementId(p) } AS doc

@@ -1,0 +1,34 @@
+schema_version: 1
+roles: [cdc]
+
+source:
+  kind: postgres
+  postgres:
+    host_ref: env:VS_PG_HOST
+    port: 5432
+    user_ref: env:VS_PG_USER
+    password_ref: env:VS_PG_PASSWORD
+    database_ref: env:VS_PG_DATABASE
+    publication_ref: env:VS_PG_PUBLICATION
+    slot_ref: env:VS_PG_SLOT
+    bootstrap:
+      mode: snapshot
+      chunk_size: 10000
+
+sink:
+  kind: opensearch
+  opensearch:
+    endpoint_ref: env:VS_OS_ENDPOINT
+    index_routing:
+      strategy: by_output_relation
+
+runtime:
+  health_listen: 127.0.0.1:4043
+  dlq_path: ./ventstream-state/dlq.jsonl
+  memory:
+    enabled: true
+    budget_bytes: 268435456
+    max_event_bytes: 33554432
+    recovery_ms: 1000
+  joins:
+    state_dir: ./ventstream-state/joins

@@ -1,0 +1,238 @@
+---
+title: "Neo4j source"
+description: "Stream a Neo4j graph into denormalized documents with multi-hop fan-out."
+---
+
+The Neo4j source reads Neo4j CDC and runs a Cypher projection to fold a
+node's neighborhood into one document. This guide uses the same
+`Product` catalog as the [quickstart](/quickstart): each Product document
+carries its category, its supplier and the supplier's region, and its
+tags — gathered across up to 2 hops.
+
+<Note>
+VentStream writes to a **target**. **OpenSearch and Elasticsearch** are
+the supported targets today — they share the `_bulk` API, so the same
+engine handles both. The examples here use OpenSearch; set the endpoint
+with `VS_OS_ENDPOINT`.
+</Note>
+
+## Source requirements
+
+Neo4j **5.17+ Enterprise** with CDC enabled per database. For VentStream's
+denormalized projections, **`DIFF` is the recommended enrichment mode** (see
+[below](#diff-vs-full-enrichment) for why):
+
+```cypher
+ALTER DATABASE neo4j SET OPTION txLogEnrichment 'DIFF';
+```
+
+CDC is Enterprise-only (not Community, not Aura Free/Pro). Confirm the
+procedures exist:
+
+```cypher
+CALL db.cdc.current() YIELD id RETURN id;
+```
+
+### `DIFF` vs `FULL` enrichment
+
+`txLogEnrichment` controls how much each change writes into the transaction
+log that CDC reads:
+
+- **`DIFF`** — records only what changed (changed properties; the full
+  before-state on deletes; labels and keys always present). About **+50%**
+  transaction-log write volume.
+- **`FULL`** — records a complete before+after copy of every changed entity.
+  About **+75%** tx-log write, and on update-heavy workloads with wide nodes
+  it's several× more than `DIFF` (we measured **~4× more** on the update
+  portion of a wide-node workload — `FULL` re-logs the whole node on every
+  update, `DIFF` only the changed field).
+
+**Use `DIFF`.** This connector builds denormalized documents by **re-running
+your projection Cypher against the live graph** on every change — the CDC
+event is only a *trigger* (which element changed), never the source of the
+document's data. So `DIFF`'s smaller payload loses nothing: deletes still
+carry the labels needed to tombstone, and every value is re-read from the
+graph. Validated end-to-end on a realistic shape across create / update /
+delete, multi-hop fan-out, temporal effective-dating (`fromDate`/`thruDate`),
+and multi-primary recompose — identical results to `FULL`.
+
+Why `DIFF` is more efficient:
+
+- **Less tx-log written per commit.** `FULL` re-logs the entire node
+  (including untouched properties) on every update; `DIFF` logs only the
+  delta. That means lower write amplification on the commit path, less
+  transaction-log disk, and less data the CDC poll reads back.
+- **No memory difference.** Neo4j's resident memory is dominated by heap +
+  page cache; enrichment mode doesn't move it (measured ~equal). The saving
+  is purely disk and write I/O, not RAM.
+- **Bootstrap is unaffected.** The snapshot scan reads the graph directly
+  (not the tx log), so full-sync behaves identically under `DIFF` or `FULL`.
+
+Choose `FULL` only if you consume the **raw CDC tail** (no projection spec)
+and a downstream consumer needs the complete entity state on every event —
+there, `DIFF` updates carry just the changed fields. VentStream's
+denormalize/projection mode (this connector) does not need that.
+
+## Production prerequisites
+
+In the [demo](/quickstart) the agent connects as `neo4j` — the default
+**admin** user — so it can enable CDC and read everything. A real
+production user usually isn't an admin, so split the setup:
+
+| Step | Who | Privilege needed |
+|------|-----|------------------|
+| Run Neo4j 5.17+ **Enterprise** | **operator** (infra) | — |
+| `ALTER DATABASE … SET OPTION txLogEnrichment 'DIFF'` | **operator** (one-time) | `admin` / `ALTER DATABASE` |
+| Read the CDC stream (`db.cdc.current`, `db.cdc.query`) | **engine** | `EXECUTE PROCEDURE db.cdc.*` |
+| Run the projection + snapshot Cypher | **engine** | `MATCH` (read) on the touched labels/rels |
+
+<Warning>
+**The engine never enables CDC** — it only reads it. An admin must run
+the `ALTER DATABASE … txLogEnrichment` once. The engine's own Neo4j user
+does **not** need to be an admin, but it **does** need execute access to
+the `db.cdc.*` procedures and read access to the data the projection
+touches.
+</Warning>
+
+### A non-admin engine user
+
+Grant a dedicated read role rather than handing the engine the `neo4j`
+admin account:
+
+```cypher
+CREATE ROLE ventstream_reader;
+GRANT ACCESS ON DATABASE neo4j TO ventstream_reader;
+GRANT MATCH {*} ON GRAPH neo4j ELEMENTS * TO ventstream_reader;   -- read all labels/rels
+GRANT EXECUTE PROCEDURE db.cdc.* ON DBMS TO ventstream_reader;
+GRANT ROLE ventstream_reader TO ventstream;                       -- the engine's login
+```
+
+Scope the `MATCH` grant to only the labels/relationships your projection
+reads if you'd rather not grant graph-wide read.
+
+<Note>
+**Why a dedicated role instead of the `neo4j` admin?** Security — least
+privilege. The engine only reads (CDC + `MATCH`), so it should run as a
+read-only role. If its credentials leak, the exposure is read access to
+the graph, not admin over the DBMS — and you can revoke or rotate it
+without touching the admin account. The engine works fine as the admin
+user (the demo does exactly that) — but in production, don't.
+</Note>
+
+<Note>
+**No server-side resource to clean up.** Unlike a Postgres slot, the
+Neo4j CDC cursor lives on the **agent's PVC**, not the server — retiring
+an agent leaves nothing behind on Neo4j. The flip side: if an agent is
+down longer than the database's transaction-log **retention**
+(`db.tx_log.rotation.retention_policy`), its cursor expires and it must
+re-bootstrap. Size retention to cover your worst-case agent downtime.
+</Note>
+
+<Note>
+Enabling `txLogEnrichment` enriches transactions **going forward** only —
+it does not back-enrich existing data. That's fine: the snapshot
+bootstrap (`VS_NEO4J_BOOTSTRAP_MODE=snapshot`) reads existing nodes
+directly, and CDC carries every change after enrichment is on.
+</Note>
+
+## TLS / Bolt cert
+
+For `neo4j+s://` connections the engine validates the server cert via
+the OS trust store. Supply the Bolt CA cert and point the engine at it:
+
+```bash
+# extract from a local container, or get it from your Neo4j admin
+docker exec vs-neo4j cat /ssl/bolt/public.crt > /etc/ventstream/neo4j-ca.crt
+```
+
+```bash
+VS_NEO4J_TRUST_CERT_FILE=/etc/ventstream/neo4j-ca.crt
+```
+
+In Kubernetes this cert is mounted from a Secret — see
+[Kubernetes](/deploy/kubernetes).
+
+## The projection
+
+```yaml
+denormalize:
+  - primary_label: Product
+    output_table: products_denormalized
+    fan_out_max_hops: 2
+    cypher: |
+      OPTIONAL MATCH (p)-[:IN_CATEGORY]->(cat:Category)
+      OPTIONAL MATCH (p)-[:SUPPLIED_BY]->(sup:Supplier)-[:LOCATED_IN]->(reg:Region)
+      OPTIONAL MATCH (p)-[:HAS_TAG]->(tag:Tag)
+      WITH p, cat, sup, reg, collect(DISTINCT tag.name) AS tags
+      RETURN elementId(p) AS primaryEid, {
+        id:        p.id,
+        elementId: elementId(p),
+        name:      p.name,
+        category:  CASE WHEN cat IS NOT NULL THEN {id: cat.id, name: cat.name} ELSE null END,
+        supplier:  CASE WHEN sup IS NOT NULL
+                       THEN {id: sup.id, name: sup.name,
+                             region: CASE WHEN reg IS NOT NULL THEN {id: reg.id, name: reg.name} ELSE null END}
+                       ELSE null END,
+        tags:      tags
+      } AS doc
+```
+
+The body must:
+
+- bind the primary as `p` (the engine injects the anchor),
+- return `primaryEid` (a string element ID) and `doc` (the document map).
+
+`fan_out_max_hops: 2` lets a change up to 2 hops from a Product recompute
+that Product's document — covering Category (1 hop), Supplier (1 hop),
+and the Supplier→Region chain (2 hops). The full version is in
+[`demo/stack/specs/products.yaml`](https://github.com/bashiru98/ventstream/blob/main/demo/stack/specs/products.yaml).
+
+## Run the agent
+
+```bash
+VS_AGENT_NAME=products-cdc \
+VS_ROLES=cdc VS_CDC_SOURCE=neo4j \
+VS_NEO4J_URI=neo4j+s://…:7687 \
+VS_NEO4J_USER=neo4j VS_NEO4J_PASSWORD=… \
+VS_NEO4J_DATABASE=neo4j VS_NEO4J_NAMESPACE=neo4j \
+VS_NEO4J_TRUST_CERT_FILE=/etc/ventstream/neo4j-ca.crt \
+VS_NEO4J_DENORMALIZE_YAML=demo/stack/specs/products.yaml \
+VS_NEO4J_STATE_DIR=/var/lib/ventstream/state \
+VS_NEO4J_BOOTSTRAP_MODE=snapshot \
+VS_OS_ENDPOINT=http://localhost:9200 \
+VS_INDEX_TEMPLATE='${header:ventstream.cdc.relation}' \
+./target/release/ventstream
+```
+
+At startup you'll see **hot-endpoint detection** log lines — the engine
+probing each path's leaf cardinality and flagging shared lookup nodes
+(here `Category` and `Region`, each referenced by many products). This is
+what keeps a single edge change from cascading across the graph. See
+[Fan-out](/concepts/fan-out).
+
+## The temporal-contract gotcha
+
+The catalog spec above has no validity windows, so every edge shows up
+immediately. But many graphs gate relationships on a time window —
+`fromDate`/`thruDate` on the edge — and that introduces a subtle trap.
+
+<Warning>
+If your spec gates a relationship on `fromDate <= now` and you **create**
+such an edge directly (e.g. in a test) without setting `fromDate`, the
+spec's `WHERE` filters it out and the embedded field comes back empty —
+looking like the cascade didn't fire, when really the row was correctly
+excluded.
+</Warning>
+
+The fan-out *does* fire (you'll see `recomposed=N` in the log) — the
+projection just returns nothing for that edge because `null <= now`
+evaluates to null (falsy). Fix: set `fromDate` on edges your spec gates:
+
+```cypher
+MATCH (p:Product {id:"prod-1"}), (promo:Promotion {id:"promo-summer"})
+CREATE (p)-[:IN_PROMOTION {fromDate: datetime("2026-01-01")}]->(promo);
+```
+
+Application writes normally set `fromDate`; only ad-hoc Cypher inserts
+tend to forget. To diagnose: query the edge and check
+`r.fromDate IS NOT NULL`.

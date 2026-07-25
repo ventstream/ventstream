@@ -1,0 +1,106 @@
+# Default values for a ventstream-gateway release.
+# The gateway is STATELESS (no slot/cursor), so unlike the cdc-agent it
+# runs as a Deployment you can scale horizontally / behind an HPA.
+#
+#   helm install vs-gateway ./infra/helm/ventstream-gateway -n ventstream -f my.yaml
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/bashiru98/ventstream
+  tag: ""              # "" → Chart.appVersion
+  # When set, renders repository@digest and takes precedence over tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# Which gateway roles this Deployment runs: "ws", "graphql", or "ws,graphql".
+# Run them together for small deployments, or split into two releases
+# (one role each) to scale/route them independently.
+roles: "ws,graphql"
+
+# Replica count. Stateless, so scale freely. Ignored when autoscaling.enabled.
+replicas: 2
+
+nats:
+  # In-cluster NATS URL (the bus). JetStream must be enabled on the server.
+  url: "nats://ventstream-nats.ventstream.svc:4222"
+
+# --- native WebSocket gateway (role: ws) ---
+ws:
+  listen: "0.0.0.0:4040"
+  subjects: "vs.t.>"          # bus subscription; shard per-tenant for scale
+  mailbox: 256                # per-connection outbound queue depth
+  # Per-pod hard connection cap (the OOM backstop). 0 = unlimited.
+  # A WS upgrade past this count is rejected with 503 + Retry-After
+  # BEFORE the per-connection consumer + mailbox are allocated, and
+  # /readyz remains 503 during gateway initialization and flips back to 503
+  # at ~90% of this cap so the LB diverts new connections first. Size to the
+  # memory limit: roughly
+  #   maxConns ≈ (limits.memory - ~50Mi base) / 165KiB-per-conn
+  # e.g. a 1Gi pod → ~5000. Set 0 only if you bound memory another way.
+  maxConns: 5000
+  jetstream:
+    # Durable per-connection consumers. REQUIRED when the graphql role
+    # runs, because graphql consumes the stream this role bootstraps.
+    # Leave false for a pure-ws, core-mode (at-most-once) high-throughput
+    # fan-out with zero consumers.
+    enabled: true
+    stream: ventstream
+    storage: file             # file | memory
+    maxAgeSecs: 600           # live-buffer window
+    maxBytes: 536870912       # 512 MiB ceiling
+    reaperIntervalMs: 60000
+    inactiveThresholdMs: 300000
+
+# --- GraphQL subscription gateway (role: graphql) ---
+graphql:
+  listen: "0.0.0.0:4041"
+  stream: ventstream          # must match ws.jetstream.stream
+  reaperIntervalMs: 60000
+  inactiveThresholdMs: 300000
+  # Per-connection in-process fan-out buffer depth. A subscription that
+  # falls more than this many events behind is cut with a lag error (the
+  # client reconnects and resumes). Raise for bursty/slow clients with
+  # memory headroom; lower to shed sooner. Min 1.
+  broadcastCap: 1024
+  # Typed subscriptions schema (recommended: GraphQL SDL with
+  # @vsSubscribe/@source). Provide inline OR reference an existing
+  # ConfigMap. When both empty, only the generic events(subject) field
+  # is exposed.
+  schema:
+    inline: ""
+    existingConfigMap: ""
+    existingConfigMapKey: subscriptions.graphql
+  # Serve the in-browser GraphiQL playground at /graphiql. Off by default
+  # (don't expose it in production).
+  playground: false
+
+service:
+  type: ClusterIP
+  wsPort: 4040
+  graphqlPort: 4041
+  # Shared health endpoint. /healthz is process liveness; /readyz waits for
+  # enabled gateway initialization and enforces the WS capacity gate.
+  healthPort: 4043
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  # Memory is the right scale-out signal for the WS gateway: idle
+  # connections cost RAM, not CPU, so a memory target tracks connection
+  # load where CPU wouldn't. jemalloc's background decay keeps RSS
+  # tracking the live working set, so this metric is honest. The
+  # connection cap is the fast local backstop; this is the slow global
+  # scale-out. Set either/both target to null to disable that metric.
+  targetMemoryUtilizationPercentage: 70
+  targetCPUUtilizationPercentage: null
+
+resources:
+  requests: { cpu: 250m, memory: 256Mi }
+  limits:   { memory: 1Gi }
+
+rustLog: info
+logFormat: json

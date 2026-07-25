@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VentStream — Getting started</title>
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="assets/docs.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="logo" href="index.html">VentStream</a>
+    <div class="tagline">CDC + denormalized indexing + durable WebSocket subscriptions, in a single Rust binary.</div>
+
+    <div class="nav-section">Start here</div>
+    <nav><ul>
+      <li><a data-page="index.html" href="index.html">Overview</a></li>
+      <li><a data-page="architecture.html" href="architecture.html">Architecture</a></li>
+      <li><a data-page="getting-started.html" href="getting-started.html">Getting started</a></li>
+    </ul></nav>
+
+    <div class="nav-section">Pipelines</div>
+    <nav><ul>
+      <li><a data-page="pipeline-a.html" href="pipeline-a.html">A · CDC + joins</a></li>
+      <li><a data-page="pipeline-b.html" href="pipeline-b.html">B · WS fan-out</a></li>
+      <li><a data-page="graphql.html" href="graphql.html">GraphQL gateway</a></li>
+    </ul></nav>
+
+    <div class="nav-section">Operations</div>
+    <nav><ul>
+      <li><a data-page="operations.html" href="operations.html">Deploy &amp; configure</a></li>
+      <li><a data-page="roadmap.html" href="roadmap.html">Roadmap</a></li>
+    </ul></nav>
+
+    <div class="footer-note">v0.1 · <a href="https://github.com/bashiru98/ventstream">bashiru98/ventstream</a></div>
+  </aside>
+
+  <main>
+    <h1>Getting started</h1>
+    <p class="subtitle">Clone, build, run NATS, fire your first event from a TypeScript publisher and receive it in an Apollo Client subscriber — in under ten minutes.</p>
+
+    <h2>Prerequisites</h2>
+    <table>
+      <thead><tr><th>Tool</th><th>Used for</th><th>Required for</th></tr></thead>
+      <tbody>
+        <tr><td>Rust 1.94+</td><td>Building the engine</td><td>Always</td></tr>
+        <tr><td>nats-server (with <code>-js</code>)</td><td>Event bus / JetStream</td><td>Pipeline B + GraphQL gateway</td></tr>
+        <tr><td>Node 18+</td><td>SDKs and demos</td><td>SDK usage / running demos</td></tr>
+        <tr><td>PostgreSQL 14+</td><td>CDC source</td><td>Pipeline A only</td></tr>
+        <tr><td>OpenSearch 2.x</td><td>Default sink</td><td>Pipeline A only</td></tr>
+      </tbody>
+    </table>
+
+    <p>For Pipeline B (the simplest setup), you only need Rust + nats-server. The walkthrough below uses that path.</p>
+
+    <h2>1. Clone and build</h2>
+    <div class="code-block">
+<pre><code data-lang="bash">git clone https://github.com/bashiru98/ventstream
+cd ventstream
+cargo build --release -p ventstream</code></pre>
+    </div>
+    <p>First build pulls a few hundred dependencies — give it a few minutes. Subsequent builds are incremental.</p>
+
+    <h2>2. Start NATS with JetStream</h2>
+    <div class="code-block">
+<pre><code data-lang="bash"># macOS
+brew install nats-server
+
+# Run in a separate terminal
+mkdir -p /tmp/ventstream-jetstream
+nats-server -js -sd /tmp/ventstream-jetstream</code></pre>
+    </div>
+    <p><code>-js</code> enables JetStream. <code>-sd</code> picks a data directory — JetStream writes durable messages there.</p>
+
+    <h2>3. Run the engine in WS mode</h2>
+    <p>The minimum config to start the WS gateway with JetStream:</p>
+    <div class="code-block">
+<pre><code data-lang="bash">VS_ROLES=ws \
+VS_WS_LISTEN=127.0.0.1:4040 \
+VS_WS_NATS_URL=nats://127.0.0.1:4222 \
+VS_WS_JETSTREAM=1 \
+VS_WS_JS_STREAM=ventstream \
+VS_WS_JS_POD_ID=podA \
+RUST_LOG=info \
+  ./target/release/ventstream</code></pre>
+    </div>
+    <p>You should see logs ending with:</p>
+    <div class="code-block">
+<pre><code data-lang="text">INFO ventstream_ws::jetstream: JetStream stream created stream=ventstream
+INFO ventstream_ws::server:    JetStream mode active stream=ventstream pod_id=podA
+INFO ventstream_ws::server:    ws gateway listening listen=127.0.0.1:4040 jetstream=true</code></pre>
+    </div>
+
+    <h2>4. Run the GraphQL gateway alongside (optional)</h2>
+    <p>If you want Apollo Client to be able to connect via standard <code>graphql-transport-ws</code>, also enable the <code>graphql</code> role:</p>
+    <div class="code-block">
+<pre><code data-lang="bash">VS_ROLES=ws,graphql \
+VS_WS_LISTEN=127.0.0.1:4040 VS_WS_NATS_URL=nats://127.0.0.1:4222 \
+VS_WS_JETSTREAM=1 VS_WS_JS_STREAM=ventstream VS_WS_JS_POD_ID=podA \
+VS_GRAPHQL_LISTEN=127.0.0.1:4041 VS_GRAPHQL_NATS_URL=nats://127.0.0.1:4222 \
+VS_GRAPHQL_STREAM=ventstream VS_GRAPHQL_POD_ID=podA \
+RUST_LOG=info \
+  ./target/release/ventstream</code></pre>
+    </div>
+    <p>The GraphQL HTTP endpoint is at <code>http://127.0.0.1:4041/graphql</code>, the WS endpoint at <code>ws://127.0.0.1:4041/graphql/ws</code>.</p>
+
+    <h2>5. Publish your first event</h2>
+    <p>From a Node project (or run inside <code>packages/example</code>):</p>
+    <div class="code-block">
+<pre><code data-lang="javascript">import { VentStream } from "@ventstream/sdk";
+
+const vs = new VentStream({
+  servers: "nats://127.0.0.1:4222",
+  name: "demo",
+});
+await vs.connect();
+
+await vs.publish({
+  tenant: "acme",
+  domain: "orders",
+  action: "status_changed",
+  entity: { kind: "order", id: "order_001" },
+  actor:  { kind: "user",  id: "user_alice" },
+  data: { from: "pending", to: "confirmed" },
+});
+
+await vs.close();</code></pre>
+    </div>
+    <p>The SDK builds the protocol-v2 envelope (ULID id, timestamps, schema version), validates the subject grammar, and publishes to NATS subject <code>vs.t.acme.orders.order.status_changed.order_001</code>.</p>
+
+    <h2>6. Subscribe from a client</h2>
+
+    <h3>Option A — Native VentStream client</h3>
+    <div class="code-block">
+<pre><code data-lang="javascript">import { VentStreamClient } from "@ventstream/client";
+
+const client = new VentStreamClient({
+  url: "ws://127.0.0.1:4040/ws",
+  tenant: "acme",
+  token: "demo",
+});
+await client.connect();
+
+client.subscribe("orders.order.status_changed.*", (event) => {
+  console.log(event.entity_id, event.data.from, "->", event.data.to);
+});</code></pre>
+    </div>
+    <p>The subscription pattern is unanchored — the gateway prepends the tenant from the connection token.</p>
+
+    <h3>Option B — Apollo Client via the GraphQL gateway</h3>
+    <div class="code-block">
+<pre><code data-lang="javascript">import { ApolloClient, InMemoryCache, gql, split, HttpLink } from "@apollo/client";
+import { GraphQLWsLink } from "@apollo/client/link/subscriptions";
+import { createClient } from "graphql-ws";
+import { getMainDefinition } from "@apollo/client/utilities";
+
+const httpLink = new HttpLink({
+  uri: "http://127.0.0.1:4041/graphql",
+  headers: { Authorization: "Bearer demo", "X-VS-Tenant": "acme" },
+});
+
+const wsLink = new GraphQLWsLink(
+  createClient({
+    url: "ws://127.0.0.1:4041/graphql/ws",
+    connectionParams: () => ({ authToken: "demo", tenant: "acme" }),
+  }),
+);
+
+const link = split(
+  ({ query }) => {
+    const def = getMainDefinition(query);
+    return def.kind === "OperationDefinition" && def.operation === "subscription";
+  },
+  wsLink,
+  httpLink,
+);
+
+const apollo = new ApolloClient({ link, cache: new InMemoryCache() });
+
+const sub = apollo.subscribe({
+  query: gql`
+    subscription OnOrderChanges($pattern: String!) {
+      events(subject: $pattern) {
+        id
+        event
+        occurredAt
+        entityId
+        data
+      }
+    }
+  `,
+  variables: { pattern: "orders.order.status_changed.*" },
+});
+
+sub.subscribe({ next: ({ data }) =&gt; console.log(data.events) });</code></pre>
+    </div>
+
+    <h2>7. What you just exercised</h2>
+    <ul>
+      <li>A durable JetStream stream named <code>ventstream</code> capturing all subjects under <code>vs.t.&gt;</code></li>
+      <li>One per-connection JetStream consumer for the subscriber, with a name like <code>vs-t-acme-p-podA-c-01KSA...</code></li>
+      <li>When the subscriber disconnects, the consumer is deleted within milliseconds by the RAII drop guard</li>
+      <li>Tenant gate — events with <code>tenant: "other"</code> would not be delivered to a connection scoped to <code>"acme"</code></li>
+    </ul>
+
+    <h2>Where to go next</h2>
+    <ul>
+      <li><a href="pipeline-b.html">Pipeline B</a> — the full subscription model: subject grammar, envelope, slow-consumer behavior, cleanup hierarchy</li>
+      <li><a href="graphql.html">GraphQL gateway</a> — Model 1 vs Model 2 schemas, typed subscriptions, federation</li>
+      <li><a href="pipeline-a.html">Pipeline A</a> — the CDC side, if you want Postgres → search</li>
+      <li><a href="operations.html">Deploy &amp; configure</a> — env var reference, role topologies</li>
+    </ul>
+
+    <div class="page-footer">
+      <span><a href="architecture.html">← Architecture</a></span>
+      <span><a href="pipeline-a.html">Pipeline A →</a></span>
+    </div>
+  </main>
+</div>
+</body>
+</html>

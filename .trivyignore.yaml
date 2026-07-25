@@ -1,0 +1,3 @@
+# Release vulnerability exceptions must be package-scoped, owner-approved, and
+# time-bounded. Keep the list empty unless an upstream fix is unavailable.
+vulnerabilities: []

@@ -1,0 +1,33 @@
+{
+  "name": "@ventstream/client",
+  "version": "0.1.0",
+  "description": "VentStream WebSocket client SDK — browser + Node, with auto-reconnect and subscription replay.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "test": "npm run build && tsc -p tsconfig.test.json"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "isomorphic-ws": "^5.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.4.0"
+  },
+  "license": "Apache-2.0"
+}

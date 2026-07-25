@@ -1,0 +1,127 @@
+---
+title: "MongoDB source"
+description: "Stream a MongoDB replica set or sharded cluster into the sink via change streams."
+---
+
+The MongoDB source reads **change streams** and streams documents into the
+sink. In v1 each MongoDB document maps to **one** sink document (raw 1:1) —
+which fits MongoDB well, since documents are usually already denormalized.
+Cross-collection joins (embedding a referenced collection) are on the
+[roadmap](#limitations-v1).
+
+<Note>
+VentStream writes to a **target**. **OpenSearch and Elasticsearch** are the
+supported targets today — they share the `_bulk` API, so the same engine
+handles both. Set the endpoint with `VS_OS_ENDPOINT`.
+</Note>
+
+## Source requirements
+
+Change streams require a **replica set or sharded cluster** — they are **not**
+supported on a standalone `mongod`. Works on self-hosted MongoDB 4.0+ and
+**Atlas** (`mongodb+srv://`).
+
+Connect via the replica-set URI or a `mongos`. The engine's user needs read
+access plus the change-stream / find privileges on the watched database
+(`read` on the database is enough on most deployments).
+
+```bash
+# self-hosted replica set
+mongodb://user:pass@host1:27017,host2:27017/?replicaSet=rs0
+# Atlas (SRV)
+mongodb+srv://user:pass@cluster.example.net/?retryWrites=true
+```
+
+## How it works
+
+- **Trigger, then re-read.** Each change event is only a *trigger*. With
+  `fullDocument: updateLookup` (the default) the source carries the current
+  whole document on every insert/update/replace, so the sink always reflects
+  the latest state — the change payload never needs to be complete.
+- **Bootstrap.** On cold start the source captures a change-stream resume
+  token, scans every in-scope collection by `_id` (paged), emits each document
+  as an insert, then tails the change stream from the captured token. A row
+  mutated during the scan is re-emitted by the tail and de-duplicated by the
+  deterministic doc id at the (idempotent) sink.
+- **Resume.** The resume token is persisted to a file in `VS_MONGO_STATE_DIR`
+  (a PVC in Kubernetes), flushed every `VS_MONGO_TOKEN_FLUSH_MS`. A restart
+  resumes from there. If the token has aged out of the **oplog**, the source
+  detects it, wipes the cursor, and re-bootstraps.
+- **Deletes** become tombstones — the deterministic doc id targets the exact
+  document to remove.
+
+## The `_id` mapping
+
+The sink document id is the canonical, namespaced form
+**`{database}.{collection}:["<_id>"]`** (e.g. `shop.orders:["64f0…"]`),
+matching the Postgres source's `shop.orders:["…"]` shape. An `ObjectId` is
+rendered as its plain hex string; `DateTime` as RFC 3339; `Decimal128` as its
+decimal string.
+
+<Warning>
+MongoDB's `_id` is **relocated to `id`** in the document body. OpenSearch (and
+Elasticsearch) reserve `_id` as a metadata field and reject it inside the body,
+so the source moves it to `id` (the original value is preserved as the sink's
+`_id` via the doc id). If your document already has an `id` field, the `_id` is
+dropped rather than clobbering it.
+</Warning>
+
+## Run the agent
+
+```bash
+VS_ROLES=cdc VS_CDC_SOURCE=mongodb \
+VS_MONGO_URI='mongodb+srv://user:pass@cluster.example.net/?retryWrites=true' \
+VS_MONGO_DATABASE=shop \
+VS_MONGO_COLLECTIONS=orders,customers \
+VS_MONGO_STATE_DIR=/var/lib/ventstream/state \
+VS_MONGO_BOOTSTRAP_MODE=snapshot \
+VS_OS_ENDPOINT=http://localhost:9200 \
+VS_INDEX_TEMPLATE='${header:ventstream.cdc.relation}' \
+./target/release/ventstream
+```
+
+`VS_MONGO_COLLECTIONS` is optional — omit it to watch **every** collection in
+the database. The index template renders one index per collection
+(`orders`, `customers`, …).
+
+## Key environment variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `VS_MONGO_URI` | — (required) | Connection string (`mongodb://` / `mongodb+srv://`), incl. replica-set / mongos host(s), auth, TLS. Carries credentials — source it from a Secret in Kubernetes. |
+| `VS_MONGO_DATABASE` | — (required) | Database to watch and namespace documents under. |
+| `VS_MONGO_NAMESPACE` | = database | Logical namespace stamped on subjects/headers. |
+| `VS_MONGO_COLLECTIONS` | unset (all) | CSV of collections to watch; empty = every collection in the database. |
+| `VS_MONGO_FULL_DOCUMENT` | `updateLookup` | `updateLookup` re-reads the post-image on updates (always-current; one extra read). `default` sends deltas only — not usable for raw 1:1. |
+| `VS_MONGO_BOOTSTRAP_MODE` | `snapshot` | `snapshot` (scan then tail) or `none`. |
+| `VS_MONGO_BOOTSTRAP_CHUNK_SIZE` | `1000` | Documents per snapshot `find` batch. |
+| `VS_MONGO_TOKEN_FLUSH_MS` | `1000` | How often the resume token is flushed to disk (batched, not per-event, so a slow PVC doesn't cap tail throughput). |
+| `VS_MONGO_STATE_DIR` | `./data/mongo-state` | Resume-token cursor-file directory (a PVC in Kubernetes). |
+
+Full list in the [engine env reference](/reference/engine-env).
+
+## Index mapping for mixed-type numeric arrays
+
+<Warning>
+If a collection has an array that mixes integers and floats — e.g.
+`[4.5, 3.2, 5]` where `5` is stored as an `int32` — OpenSearch **dynamic
+mapping** infers the field type from the first value and can then reject later
+documents whose values don't fit. This is source-agnostic OpenSearch behavior,
+not a MongoDB-specific issue. The engine handles it gracefully — the offending
+document is routed to the **DLQ** with a precise reason and the pipeline keeps
+running — but it won't be indexed until the mapping accepts it. Fix it with an
+explicit **index template** that maps such fields to `double` (or define the
+mapping up front).
+</Warning>
+
+## Limitations (v1)
+
+- **Raw 1:1 only.** One document → one sink document; there are no
+  cross-collection joins yet, so a change to a *referenced* collection does
+  not recompose a parent document. (Phase 2: cross-collection joins via the
+  shared join engine.)
+- **Replica set / sharded cluster required** — change streams don't run on a
+  standalone `mongod`.
+- **Oplog-bounded resume.** A resume reaches back only as far as the oplog
+  retains. Size the oplog to cover worst-case agent downtime, or the agent
+  re-bootstraps after a long outage.

@@ -1,0 +1,33 @@
+ventstream-gateway "{{ .Release.Name }}" deployed — roles: {{ .Values.roles }}
+
+Service: {{ include "gateway.fullname" . }} ({{ .Values.service.type }})
+{{- if include "gateway.hasWs" . }}
+  ws       :{{ .Values.service.wsPort }}   → native WebSocket  (/ws)
+{{- end }}
+{{- if include "gateway.hasGraphql" . }}
+  graphql  :{{ .Values.service.graphqlPort }}   → GraphQL        (/graphql, /graphql/ws){{ if .Values.graphql.playground }}, GraphiQL (/graphiql){{ end }}
+{{- end }}
+
+Port-forward to try it locally:
+{{- if include "gateway.hasWs" . }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "gateway.fullname" . }} {{ .Values.service.wsPort }}:{{ .Values.service.wsPort }}
+{{- end }}
+{{- if include "gateway.hasGraphql" . }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "gateway.fullname" . }} {{ .Values.service.graphqlPort }}:{{ .Values.service.graphqlPort }}
+{{- end }}
+
+{{- if and (include "gateway.hasGraphql" .) (not (include "gateway.hasSchema" .)) }}
+
+NOTE: no GraphQL SDL schema provided (graphql.schema.inline / .existingConfigMap)
+      → only the generic events(subject:) subscription is exposed.
+{{- end }}
+{{- if and .Values.ws.jetstream.enabled (not (include "gateway.hasWs" .)) }}
+
+WARNING: ws.jetstream.enabled has no effect without the `ws` role.
+{{- end }}
+{{- if and (include "gateway.hasGraphql" .) (not .Values.ws.jetstream.enabled) }}
+
+WARNING: the graphql role consumes the JetStream stream, but ws.jetstream
+         is disabled. Enable it (or ensure another ws release bootstraps
+         stream "{{ .Values.graphql.stream }}").
+{{- end }}

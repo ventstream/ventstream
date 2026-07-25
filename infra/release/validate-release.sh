@@ -1,0 +1,96 @@
+#!/bin/sh
+set -eu
+
+tag=${1:-}
+if [ -z "$tag" ]; then
+  echo "usage: $0 vMAJOR.MINOR.PATCH" >&2
+  exit 2
+fi
+
+case "$tag" in
+  v[0-9]*.[0-9]*.[0-9]*) ;;
+  *)
+    echo "release tag must start with v and contain a semantic version: $tag" >&2
+    exit 1
+    ;;
+esac
+
+metadata=$(cargo metadata --format-version 1 --no-deps)
+version=$(printf '%s' "$metadata" | jq -er '
+  [.packages[].version] | unique |
+  if length == 1 then .[0] else error("workspace package versions differ") end
+')
+
+if ! printf '%s' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+  echo "release version must be a stable MAJOR.MINOR.PATCH version: $version" >&2
+  exit 1
+fi
+
+if [ "$tag" != "v$version" ]; then
+  echo "release tag $tag does not match workspace version $version" >&2
+  exit 1
+fi
+
+for chart in infra/helm/ventstream-agent infra/helm/ventstream-gateway; do
+  chart_version=$(awk '$1 == "version:" { gsub(/"/, "", $2); print $2; exit }' "$chart/Chart.yaml")
+  app_version=$(awk '$1 == "appVersion:" { gsub(/"/, "", $2); print $2; exit }' "$chart/Chart.yaml")
+  if [ "$chart_version" != "$version" ] || [ "$app_version" != "$version" ]; then
+    echo "$chart/Chart.yaml must use version and appVersion $version" >&2
+    exit 1
+  fi
+done
+
+if ! grep -q 'repository: ghcr.io/bashiru98/ventstream$' infra/helm/ventstream-gateway/values.yaml; then
+  echo "the supported gateway chart must default to the release image repository" >&2
+  exit 1
+fi
+
+if ! grep -q '^ARG CARGO_AUDITABLE_VERSION=0.7.5$' infra/docker/engine.Dockerfile; then
+  echo "the release image must use pinned cargo-auditable 0.7.5" >&2
+  exit 1
+fi
+
+for dockerfile in infra/docker/*.Dockerfile; do
+  if ! awk '
+    toupper($1) == "FROM" {
+      image_field = ($2 ~ /^--platform=/) ? 3 : 2
+      image = $image_field
+      if (image != "scratch" && !(image in stages) && image !~ /@sha256:[0-9a-f]{64}$/) {
+        exit 1
+      }
+      for (i = image_field + 1; i < NF; i++) {
+        if (toupper($i) == "AS") {
+          stages[$(i + 1)] = 1
+        }
+      }
+    }
+  ' "$dockerfile"; then
+    echo "$dockerfile contains an unpinned base image" >&2
+    exit 1
+  fi
+done
+
+if grep -R -n -E 'ghcr.io/REPLACE_ME|ventstream-engine:latest|repository:.*:latest|appVersion: *"?latest"?' \
+  infra/helm infra/k8s; then
+  echo "release packaging contains a placeholder or floating latest reference" >&2
+  exit 1
+fi
+
+if grep -Eq '^[[:space:]]+COSIGN_(CERTIFICATE_IDENTITY|OIDC_ISSUER):' \
+  .github/workflows/release.yml; then
+  echo "release verification values must not use reserved COSIGN_* environment names" >&2
+  exit 1
+fi
+
+if [ "${RELEASE_REQUIRE_MAIN:-0}" = "1" ]; then
+  if ! git show-ref --verify --quiet refs/remotes/origin/main; then
+    echo "origin/main is required for the release ancestry check" >&2
+    exit 1
+  fi
+  if ! git merge-base --is-ancestor HEAD origin/main; then
+    echo "release commit must be reachable from origin/main" >&2
+    exit 1
+  fi
+fi
+
+printf 'release contract valid for %s\n' "$tag"

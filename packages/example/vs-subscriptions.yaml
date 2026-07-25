@@ -1,0 +1,41 @@
+# Subscriptions manifest — declares typed GraphQL subscription
+# fields the gateway should expose. When this file is configured
+# (`VS_GRAPHQL_SUBSCRIPTIONS=path/to/vs-subscriptions.yaml`), the
+# gateway builds an async-graphql dynamic schema with these fields
+# AND keeps the generic `events(subject)` field for catch-alls.
+#
+# Federation: when set, the gateway emits the federation v2
+# `_service { sdl }` query so Apollo Router / Cosmo Router can
+# introspect us at compose time. `kind: entity_ref` fields produce
+# entity references the router stitches with the owning subgraph.
+
+subscriptions:
+  # Inline return type — full payload owned by VentStream.
+  # Apollo codegen produces a fully-typed hook for this.
+  - name: orderStatusChanged
+    description: "Fires when an order's status transitions."
+    args:
+      - { name: orderId, type: ID, required: true }
+    return_type:
+      kind: inline
+      name: OrderStatusChange
+      fields:
+        - { name: orderId,   type: ID,       required: true, source: "{args.orderId}" }
+        - { name: from,      type: String,   required: true, source: "$data.from" }
+        - { name: to,        type: String,   required: true, source: "$data.to" }
+        - { name: changedAt, type: DateTime, required: true, source: "$event.occurredAt" }
+    subject: "orders.order.status_changed.{args.orderId}"
+
+  # Entity reference — federation Flavor B. The router stitches
+  # the remaining `Order` fields from the orders subgraph using
+  # the `@key(fields: "id")` directive that this stub publishes.
+  - name: orderUpdated
+    description: "Federated entity ref — router stitches the rest from the orders subgraph."
+    args:
+      - { name: orderId, type: ID, required: true }
+    return_type:
+      kind: entity_ref
+      type: Order
+      key:
+        id: "{args.orderId}"
+    subject: "orders.order.*.{args.orderId}"

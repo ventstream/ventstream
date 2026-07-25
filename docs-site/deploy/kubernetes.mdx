@@ -1,0 +1,56 @@
+---
+title: "Kubernetes deployment"
+description: "Choose standalone engine workloads or Fleet-managed engines, then follow the matching Kubernetes runbook."
+---
+
+VentStream has two distinct Kubernetes operating modes. Choose the mode before
+creating workloads because a standalone engine cannot be attached to Fleet in
+place.
+
+| Mode | Engine process | Configuration owner | Operations | Control plane |
+| --- | --- | --- | --- | --- |
+| Standalone | `ventstream` is PID 1 | ConfigMap and Secret | Helm/Kubernetes restart and rollout | None |
+| Fleet-managed | Fleet supervisor is PID 1 and starts `ventstream` as a child | Immutable Fleet revision plus workload-local Secret | `ventstreamctl` durable operations | Required |
+
+## Standalone
+
+Use standalone mode when each workload should be entirely self-contained and
+restart-based lifecycle control is sufficient.
+
+- [Deploy a standalone engine](/deploy/kubernetes-standalone)
+- [Canonical engine configuration](/reference/engine-env#canonical-engine-config)
+
+The engine repository's current `ventstream-agent` CDC chart and numbered CDC
+manifests predate the present Fleet protocol and still contain the retired
+`VS_CONTROL_PLANE_KEY` telemetry integration. They are retained only as migration
+references and are not a supported installation path for new deployments. The
+standalone guide provides a current canonical-config StatefulSet instead.
+
+The separate `ventstream-gateway` chart remains the supported standalone path for
+replicated native WebSocket and GraphQL subscription roles.
+
+## Fleet-managed
+
+Use managed mode when operators need organization-scoped inventory, immutable
+configuration, agent health, audit events, and CLI pause, resume, drain,
+reconcile, or rebootstrap operations.
+
+1. [Deploy the Fleet control plane](/deploy/kubernetes-fleet).
+2. [Deploy a managed engine](/deploy/kubernetes-managed-engine).
+3. [Administer it with ventstreamctl](/fleet/cli).
+
+Fleet never enters the CDC or realtime data path. Managed engines connect
+outbound to the agent gateway over mTLS; source records, sink writes, NATS events,
+WebSocket connections, and GraphQL subscriptions remain inside the workload
+environment.
+
+## Common production requirements
+
+- Pin container images by digest and promote the same digest between environments.
+- Keep connector credentials and private keys in a managed secret provider.
+- Persist source cursors, join state, Fleet identity, and applied configuration.
+- Give every CDC pipeline its own replication slot or cursor and exactly one
+  active engine instance.
+- Run `helm lint` and `helm template` against production values in CI.
+- Back up Fleet PostgreSQL before control-plane schema upgrades.
+- Never delete managed-agent PVCs during routine upgrades.

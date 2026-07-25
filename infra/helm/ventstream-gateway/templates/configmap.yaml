@@ -1,0 +1,11 @@
+{{- if and (include "gateway.hasGraphql" .) .Values.graphql.schema.inline (not .Values.graphql.schema.existingConfigMap) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gateway.schemaConfigMap" . }}
+  labels:
+    {{- include "gateway.labels" . | nindent 4 }}
+data:
+  subscriptions.graphql: |
+    {{- .Values.graphql.schema.inline | nindent 4 }}
+{{- end }}

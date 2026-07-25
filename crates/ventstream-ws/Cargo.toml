@@ -1,0 +1,41 @@
+[package]
+name = "ventstream-ws"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WebSocket fan-out gateway for the VentStream engine."
+
+[dependencies]
+async-nats = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+# Vendor-neutral metrics facade — emits the active-connection gauge to
+# whatever recorder the binary installs (Prometheus). Same version the
+# telemetry crate pins.
+metrics = "0.24"
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+ventstream-core = { workspace = true }
+ventstream-jetstream = { workspace = true }
+ventstream-protocol = { workspace = true }
+ventstream-realtime = { workspace = true }
+ventstream-redis = { workspace = true }
+
+[dev-dependencies]
+redis = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "rt", "macros"] }
+tokio-tungstenite = { workspace = true }
+
+[lints]
+workspace = true

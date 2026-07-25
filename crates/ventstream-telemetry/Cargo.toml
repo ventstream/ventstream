@@ -1,0 +1,31 @@
+[package]
+name = "ventstream-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Outbound heartbeats to the hosted VentStream control plane."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+chrono = { workspace = true, features = ["serde"] }
+sysinfo = "0.32"
+rand = "0.8"
+# Vendor-neutral metrics export (Prometheus scrape), independent of the
+# control plane. default-features=false drops the built-in HTTP/push-gateway
+# exporter — we render via a handle from our own health server.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+ventstream-core = { version = "0.1.12", path = "../ventstream-core" }
+async-trait = { workspace = true }
+
+[lints]
+workspace = true

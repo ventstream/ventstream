@@ -1,0 +1,221 @@
+---
+title: "MySQL / MariaDB source"
+description: "Stream a MySQL or MariaDB database into the sink by tailing the row-based binary log."
+---
+
+The MySQL source tails the **binary log** (binlog) in `ROW` format and streams
+each changed row into the sink. A raw pipeline maps each table row to **one**
+sink document keyed by the table's primary key. Projection pipelines can embed
+related tables through the same join specification used by PostgreSQL.
+
+MariaDB is supported through the same binlog protocol — set
+`VS_CDC_SOURCE=mariadb` (an alias) or `mysql`.
+
+<Note>
+VentStream writes to a **target**. **OpenSearch and Elasticsearch** are the
+supported targets today — they share the `_bulk` API, so the same engine
+handles both. Set the endpoint with `VS_OS_ENDPOINT`.
+</Note>
+
+## Source requirements
+
+- **`binlog_format=ROW`** (with `binlog_row_image=FULL`, the default). Statement
+  or mixed formats don't carry per-row images.
+- A **`server_id`** unique across the replication topology — the agent registers
+  as a replica. Set it with `VS_MYSQL_SERVER_ID`.
+- The login user needs **`REPLICATION SLAVE`** and **`REPLICATION CLIENT`** plus
+  `SELECT` on the watched tables.
+
+```sql
+-- my.cnf
+[mysqld]
+server-id        = 1
+log-bin          = mysql-bin
+binlog-format    = ROW
+binlog-row-image = FULL
+```
+
+## How it works
+
+- **Trigger, then re-read.** A binlog event is only a *trigger*. The source
+  re-`SELECT`s the current row by primary key and serializes that, so the sink
+  always reflects the latest committed state — the binlog value images are never
+  decoded directly. This keeps column types correct and avoids JSON/blob
+  internals.
+- **Bootstrap.** On cold start the source reads `SHOW MASTER STATUS` to pin the
+  current binlog position, keyset-paginates every in-scope table by primary key
+  (`WHERE (pk) > (?) ORDER BY pk LIMIT n`), emits each row as an insert, then
+  tails the binlog from the pinned position. A row mutated during the scan is
+  re-emitted by the tail and de-duplicated by the deterministic doc id at the
+  (idempotent) sink.
+- **Resume.** The binlog position (`file:pos`) is persisted to a file in
+  `VS_MYSQL_STATE_DIR` (a PVC in Kubernetes), flushed every
+  `VS_MYSQL_POS_FLUSH_MS`. The source places an internal acknowledgement
+  barrier after all output derived from a binlog position. The dispatcher
+  consumes that barrier and confirms it only after the ordered sink batch
+  prefix is durable; the barrier is never written as a customer document.
+  MySQL sink batches are serialized so two changes to the same document cannot
+  land out of order across parallel bulk requests. Batch size and recomposition
+  concurrency still provide throughput without weakening document ordering.
+  A crash before confirmation replays from the previous persisted position, so
+  recovery is at-least-once and deterministic document IDs make duplicates
+  idempotent. A restart resumes from the confirmed position with no
+  re-bootstrap.
+  If the saved position has been **purged** from the server (or is gone after a
+  failover to a different primary), the source detects it
+  (`ER_MASTER_FATAL_ERROR_READING_BINLOG`) and fails closed. It does not silently
+  wipe the cursor and re-bootstrap, because a fresh snapshot cannot emit
+  tombstones for rows deleted before that snapshot. Reconcile the destination
+  or perform an explicit drain/reset, then bootstrap from the new position.
+- **Deletes** become tombstones — the deterministic doc id targets the exact
+  row to remove.
+
+## The doc-id mapping
+
+The sink document id is the canonical, namespaced form
+**`{database}.{table}:[<pk>]`** — e.g. `shop.orders:["1"]` for a single-column
+key and `shop.order_items:["1","2"]` for a composite key, matching the Postgres
+source's shape. `JSON`-typed columns are parsed into nested JSON; `DATETIME`
+renders as ISO-8601, and `DECIMAL` as its exact decimal string (precision
+preserved).
+
+## Run the agent
+
+```bash
+VS_ROLES=cdc VS_CDC_SOURCE=mysql \
+VS_MYSQL_HOST=db.example.net VS_MYSQL_PORT=3306 \
+VS_MYSQL_USER=ventstream VS_MYSQL_PASSWORD=secret \
+VS_MYSQL_DATABASE=shop \
+VS_MYSQL_TABLES=orders,order_items \
+VS_MYSQL_SERVER_ID=4000000001 \
+VS_MYSQL_STATE_DIR=/var/lib/ventstream/state \
+VS_MYSQL_BOOTSTRAP_MODE=snapshot \
+VS_OS_ENDPOINT=http://localhost:9200 \
+VS_INDEX_TEMPLATE='${header:ventstream.cdc.relation}' \
+./target/release/ventstream
+```
+
+`VS_MYSQL_TABLES` is optional — omit it to watch **every** table in the
+database. The index template renders one index per table (`orders`,
+`order_items`, …).
+
+## Key environment variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `VS_MYSQL_HOST` | — (required) | Server host. |
+| `VS_MYSQL_PORT` | `3306` | Server port. |
+| `VS_MYSQL_USER` | `root` | Login user; needs `REPLICATION SLAVE` + `REPLICATION CLIENT` + `SELECT`. |
+| `VS_MYSQL_PASSWORD` | empty | Login password. Carries credentials — source it from a Secret in Kubernetes. |
+| `VS_MYSQL_DATABASE` | — (required) | Database to watch and namespace rows under. |
+| `VS_MYSQL_NAMESPACE` | = database | Logical namespace stamped on subjects/headers. |
+| `VS_MYSQL_TABLES` | unset (all) | CSV of tables to watch; empty = every table in the database. |
+| `VS_MYSQL_SERVER_ID` | `4000000000` | Replica `server_id` the agent registers as; must be unique in the topology. |
+| `VS_MYSQL_BOOTSTRAP_MODE` | `snapshot` | `snapshot` (scan then tail) or `none`. |
+| `VS_MYSQL_BOOTSTRAP_CHUNK_SIZE` | `1000` | Rows per keyset-paginated snapshot batch. |
+| `VS_MYSQL_POS_FLUSH_MS` | `1000` | How often sink-confirmed binlog positions are flushed to disk (batched, not per-event). |
+| `VS_MYSQL_STATE_DIR` | `./data/mysql-state` | Binlog-position cursor-file directory (a PVC in Kubernetes). |
+
+Full list in the [engine env reference](/reference/engine-env).
+
+## Denormalization / joins
+
+Point `VS_JOINS_YAML` at a join spec and the MySQL source feeds the **same join
+engine the Postgres source uses** — embedding related tables into one
+denormalized document. A change to any table (primary or related) recomposes
+the affected parent docs.
+
+```yaml
+# VS_JOINS_YAML
+joins:
+  - name: orders
+    primary: { table: shop.orders, pk: id }
+    related:
+      - id: customer
+        table: shop.customers
+        pk: id
+        join_on: { from: customer_id, to: id }
+        embed_as: customer
+        cardinality: one
+        select: [id, name, tier]
+      - id: items
+        table: shop.order_items
+        pk: id
+        join_on: { from: id, to: order_id }
+        embed_as: items
+        cardinality: many
+        sort_by: id
+    backfill: { mode: sync_on_miss }
+```
+
+- A row arriving before its related rows is backfilled on demand: the source
+  re-`SELECT`s the missing rows (`backfill: sync_on_miss`), so order-of-arrival
+  doesn't matter.
+- Related tables are consumed into the join (they don't get their own index);
+  only the primary's denormalized doc is written.
+- All primary + related tables are watched/snapshotted automatically, even if
+  `VS_MYSQL_TABLES` filters.
+- Memory-mode joins require `VS_JOINS_STATE_DIR` on durable storage. The
+  engine refuses to start without it so binlog progress cannot move beyond
+  join state that would be lost on restart.
+
+<Warning>
+Set **`VS_MYSQL_STATE_DIR`** to a writable path (the binlog-position cursor
+lives there — distinct from `VS_JOINS_STATE_DIR`). It defaults to
+`./data/mysql-state`, which a container's non-root app user usually can't
+create, and the engine exits on startup with a permission error. In Kubernetes,
+mount persistent storage and set the value explicitly, for example
+`VS_MYSQL_STATE_DIR=/var/lib/ventstream/mysql-state`.
+</Warning>
+
+The spec format and semantics (`cardinality`, `embed_as`, `on_missing`,
+composite keys) are shared with the [Postgres connector](/connectors/sources/postgres).
+
+### Memory modes: in-memory vs SQL
+
+The join can run in two modes (same `joins:` spec):
+
+| | **In-memory** (default) | **SQL** (`VS_MYSQL_DENORMALIZE_MODE=sql`) |
+|---|---|---|
+| How | Holds related rows + reverse indexes in RAM; recompose is in-process | Pushes the join into MySQL (`JSON_OBJECT`/`JSON_ARRAYAGG`); recompose re-queries per change |
+| Memory | **Scales with the joined working set** (~1 KiB/row; can OOM at large scale) | **Bounded — O(chunk)**, independent of dataset (measured ~77 MiB for 100k orders / 200k items / 5k customers) |
+| Latency | Lowest (no per-change DB round-trip) | Adds an indexed query per affected primary |
+| Best for | Small/medium datasets, lowest tail latency | Large datasets / strict pod memory limits |
+
+<Warning>
+**SQL mode requires indexes on the FK / join columns** (`join_on.to` on each
+related table, and `join_on.from` on the primary for many:1). Without them the
+per-primary compose subqueries full-scan the related tables and bootstrap
+crawls. The in-memory mode doesn't need them.
+</Warning>
+
+In SQL mode the binlog source skips its snapshot (the denormalizer does the
+SQL-join bootstrap) and only tails for live changes. `JSON_ARRAYAGG` doesn't
+guarantee element order, so `sort_by` is applied to each doc's array after the
+query. 1:many child deletes are resolved to their parent via a sink
+reverse-lookup (on by default; `VS_MYSQL_SINK_REVERSE_LOOKUP=false` to disable),
+including **composite child PKs** — each PK column is matched and AND-ed, and
+any over-match is harmless since the parent is recomposed from current DB truth.
+
+## Limitations (v1)
+
+- **Joins are raw, not recursive.** One level of embedding per related entry
+  (no nested joins-of-joins yet). Cross-source joins are not supported — all
+  tables in a spec come from the one MySQL database.
+- **Primary key required.** Doc ids and tombstones key on the primary key; a
+  table without one is **logged with a warning and skipped** at bootstrap, and
+  its binlog events are skipped in the tail.
+- **`ROW` binlog format required** — statement/mixed formats carry no per-row
+  images. The source tails **positions, not GTIDs**, in v1: position resume is
+  robust on a single server, but a failover to a different primary is recovered
+  by re-bootstrap rather than seamless reposition. GTID resume is a v2
+  robustness play.
+- **Schema cache is not invalidated on DDL.** Per-table PK/column metadata is
+  cached on first use. An `ALTER TABLE` that changes the primary key or columns
+  mid-stream is not picked up until the agent restarts — restart after such a
+  migration.
+- **Binlog-bounded resume.** A resume reaches back only as far as the binlog is
+  retained (`binlog_expire_logs_seconds`); past that the source re-bootstraps
+  automatically (see [How it works](#how-it-works)).
+- **MySQL 8.4+ compatible.** Uses `SHOW BINARY LOG STATUS` where available,
+  falling back to the deprecated `SHOW MASTER STATUS` on older MySQL / MariaDB.

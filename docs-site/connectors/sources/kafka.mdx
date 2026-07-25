@@ -1,0 +1,125 @@
+---
+title: "Kafka / Redpanda source"
+description: "Consume Debezium change topics (or raw JSON topics) and stream them into the sink."
+---
+
+The Kafka source is a **consumer**: it reads change data that's already on a
+Kafka topic — typically produced by a **Debezium** source connector — and
+unwraps each message into a sink document. In v1 each message maps to **one**
+sink document (raw 1:1), keyed by the row's primary key. Cross-topic joins
+(denormalizing several Debezium topics into one document) are on the
+[roadmap](#limitations-v1).
+
+Works against Apache Kafka, **Redpanda**, **AWS MSK**, Confluent Cloud, and any
+Kafka-API broker. Set `VS_CDC_SOURCE=kafka` (or `redpanda`).
+
+<Note>
+VentStream is **not** a Kafka Connect plugin — it's a standalone consumer that
+talks to the brokers directly, with its own lifecycle. It also doesn't capture
+anything: a Debezium source connector (which you run) puts change data on the
+topic; VentStream reads it out. If you only have a database and no Kafka, use
+the native [Postgres](/connectors/sources/postgres) / [MySQL](/connectors/sources/mysql)
+sources instead — don't stand up Kafka just for this.
+</Note>
+
+## How it works
+
+- **The message is the body.** Unlike the database sources there's no capture
+  and no re-read — the Debezium `after` image (or the raw value) is the
+  document. No database connection is opened.
+- **Unwrap.** In `debezium` mode the source reads the change envelope:
+  `op` `c`/`r` → insert, `u` → update, `d` → delete; the body is `after`
+  (`before`'s key for deletes). It handles both the JSON-Converter
+  `{schema, payload}` wrapper and the schemaless form. In `raw` mode the value
+  is the document as-is and a null value is a delete.
+- **Bootstrap = consume from earliest.** There's no separate snapshot scan; the
+  topic is the log. Start at `earliest` to replay history (Debezium snapshot
+  records arrive as `op:"r"` inserts), or `latest` for live only.
+- **Resume = committed offsets, sink-gated.** Each message gets a monotonic
+  consume-seq; the source commits the consumer group's offsets only up to the
+  seq the **sink has durably written** (via the shared sink-progress
+  watermark). A crash redelivers anything not yet sink-confirmed, and the
+  deterministic doc id makes redelivery an idempotent overwrite — no-loss
+  at-least-once. No state directory.
+- **Deletes** become tombstones — the doc id targets the exact document to
+  remove. Debezium's trailing null-value (log-compaction) tombstone is skipped.
+
+## The doc-id mapping
+
+The sink document id is the canonical, namespaced form
+**`{namespace}.{relation}:[<pk>]`** — e.g. `shop.orders:["1"]`, matching the
+Postgres/MySQL sources. The primary-key components come from the **message
+key** (Debezium keys by PK); namespace/relation come from the envelope `source`
+block (`schema`/`db` + `table`/`collection`), or from the topic name as a
+fallback. Composite keys honor the key's schema field order.
+
+## Run the agent
+
+```bash
+VS_ROLES=cdc VS_CDC_SOURCE=kafka \
+VS_KAFKA_BROKERS=broker1:9092,broker2:9092 \
+VS_KAFKA_TOPICS=dbserver1.shop.orders,dbserver1.shop.order_items \
+VS_KAFKA_GROUP_ID=ventstream-shop \
+VS_KAFKA_AUTO_OFFSET_RESET=earliest \
+VS_OS_ENDPOINT=http://localhost:9200 \
+VS_INDEX_TEMPLATE='${header:ventstream.cdc.relation}' \
+./target/release/ventstream
+```
+
+The index template renders one index per relation (`orders`, `order_items`, …).
+
+### Connecting to a secured cluster (SASL/TLS)
+
+```bash
+VS_KAFKA_SECURITY_PROTOCOL=SASL_SSL \
+VS_KAFKA_SASL_MECHANISM=SCRAM-SHA-512 \
+VS_KAFKA_SASL_USERNAME=ventstream \
+VS_KAFKA_SASL_PASSWORD=secret
+```
+
+This covers **AWS MSK** with SASL/SCRAM, Confluent Cloud (`PLAIN`), and Redpanda
+Cloud. MSK **IAM** auth (and therefore MSK Serverless, which is IAM-only) is not
+supported in v1 — it needs an AWS SigV4 token provider (planned).
+
+## Key environment variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `VS_KAFKA_BROKERS` | — (required) | `bootstrap.servers` (CSV of host:port). |
+| `VS_KAFKA_TOPICS` | — (required) | CSV of topics; a single `^…` entry is a subscription regex. |
+| `VS_KAFKA_GROUP_ID` | `VS_AGENT_NAME` | Consumer group id — offsets commit under it. |
+| `VS_KAFKA_UNWRAP` | `debezium` | `debezium` (unwrap the change envelope) or `raw` (value is the document; null = delete). |
+| `VS_KAFKA_NAMESPACE` | from envelope | Override the namespace; default is the Debezium `source` schema/db (or topic). |
+| `VS_KAFKA_AUTO_OFFSET_RESET` | `earliest` | Where a group with no committed offset starts (`earliest` = replay, `latest` = live). |
+| `VS_KAFKA_SECURITY_PROTOCOL` | unset (plaintext) | e.g. `SASL_SSL`, `SSL`. |
+| `VS_KAFKA_SASL_MECHANISM` | — | e.g. `SCRAM-SHA-512`, `PLAIN`. |
+| `VS_KAFKA_SASL_USERNAME` / `VS_KAFKA_SASL_PASSWORD` | — | SASL credentials. Source from a Secret in Kubernetes. |
+| `VS_KAFKA_SSL_CA_LOCATION` | system store | PEM CA bundle path. |
+| `VS_KAFKA_RAW_KEY_FIELD` | — | Raw mode: value field used as the doc id when there's no message key. |
+| `VS_KAFKA_COMMIT_MS` | `1000` | Offset-commit cadence (batched, gated on sink durability). |
+
+Full list in the [engine env reference](/reference/engine-env).
+
+## Limitations (v1)
+
+- **Raw 1:1 only.** One message → one sink document; no cross-topic joins yet,
+  so a change on a *referenced* table's topic doesn't recompose a parent
+  document. (Phase 2: cross-topic joins via the shared join engine — this is
+  what makes the Kafka source worth more than a stock Kafka→ES sink connector.)
+- **JSON values only.** Debezium JSON (with-schema and schemaless) and raw JSON.
+  **Avro + Confluent Schema Registry** — the most common enterprise Debezium
+  setup — is not supported yet (v2).
+- **Schema changes aren't tracked.** A Debezium DDL/schema-change event carries
+  no row image and is skipped; the next data record reflects the new shape
+  (OpenSearch dynamic mapping permitting). Explicit schema-evolution handling is
+  planned for v2.
+- **Primary key required.** A message with no key (and no `VS_KAFKA_RAW_KEY_FIELD`
+  match in raw mode) can't form a doc id and is logged + skipped.
+- **MSK IAM / MSK Serverless** need an AWS SigV4 token provider — not in v1.
+- **Single consumer per agent.** No partition-parallel scaling / rebalance
+  handling yet; run one agent per consumer group.
+- **Offsets commit on a single global prefix.** Offsets advance only through
+  the contiguous sink-durable prefix across all partitions, so an event stalled
+  on one partition holds back commits on the others until it's durable.
+  Conservative and safe (never commits past un-written data); just less
+  granular under a multi-partition stall.

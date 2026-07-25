@@ -1,0 +1,100 @@
+---
+title: "Authoring projection specs"
+description: "Design a projection that captures what you need without over-fanning-out."
+---
+
+A projection spec is the contract between your source and your index.
+This page covers the design decisions that matter: what to embed, how
+deep to fan out, and how to keep changes cheap.
+
+## Start from the document you want
+
+Write the target OpenSearch document first, then work backwards to the
+spec. If a search result needs an order's customer name and its line
+items, those are what you embed — nothing more. Every embedded field is a
+path the engine must watch for changes, so embedding less means less
+fan-out.
+
+If a projection should land in a specific index, put that on the projection:
+
+```yaml
+joins:
+  - name: orders
+    target:
+      index: tenant_a_orders
+    primary:
+      table: shop.orders
+      pk: order_id
+```
+
+Then configure the OpenSearch sink to route by
+`${header:ventstream.target.index}`. This strategy requires every PostgreSQL or
+MySQL join definition to set `target.index`; the engine rejects incomplete
+configuration at startup. Use `by_output_relation` instead when the source
+relation should own the index name.
+
+## Cardinality (Postgres)
+
+- `cardinality: one` — embed a single related object (an order's customer).
+- `cardinality: many` — embed an array (an order's line items).
+
+For `many`, use `sort_by` to get a stable array order across
+recomputes.
+
+## Hop depth (Neo4j)
+
+`fan_out_max_hops` is the single most important performance knob. It
+bounds how far a change can be from a primary and still recompute it.
+
+- Set it to the **deepest path your `RETURN` actually walks**, no more.
+- Each extra hop widens the set of changes that trigger a recompute and
+  the cost of each recompute's Cypher.
+
+The catalog spec uses `2` because its deepest embedded value (the
+supplier's region) is 2 hops out. A change 3 hops away is ignored.
+
+## Watch for hot endpoints
+
+A low-cardinality node that many primaries reference (a status enum, a
+region list, a product category) is a **hot endpoint**. The engine
+auto-detects these and prevents a single edge change from cascading
+across every primary that shares the node — see
+[Fan-out](/concepts/fan-out).
+
+You don't configure anything per-spec for this; just be aware that:
+
+- **Relationship** changes to a hot node recompute one primary.
+- **Property** changes on a hot node recompute *all* primaries that
+  embed it — so embedding a frequently-edited shared value is
+  expensive by nature. Embed stable values; reference volatile ones by
+  ID if the cascade cost is too high.
+
+Tune the detection floor with `VS_NEO4J_HOT_NODE_THRESHOLD` (default 100).
+
+## Respect temporal contracts
+
+If your graph uses validity windows (`fromDate`/`thruDate` on edges),
+gate every traversed relationship on them in the spec's `WHERE`, and
+make sure any edges you create carry `fromDate`. An edge missing
+`fromDate` is silently excluded — the
+[temporal-contract gotcha](/connectors/sources/neo4j#the-temporal-contract-gotcha).
+
+## Changing a spec safely
+
+A spec change means existing documents have the old shape. Options:
+
+- **Postgres:** set `VS_PG_AUTO_RESYNC_ON_YAML_CHANGE=true`. The agent
+  fingerprints the spec, and on a change drops the slot, wipes join
+  state, and re-bootstraps — every doc rewritten with the new shape.
+- **Manual:** restart and let new changes use the new spec while old
+  docs update lazily as their rows are touched.
+
+In Kubernetes the spec lives in a ConfigMap, so a change is a
+`kubectl apply` + rollout restart — no image rebuild.
+
+## The scoping guarantee
+
+Whatever you put in the spec is the entire surface area. A node or
+table the spec never references can change all day and never cause a
+write. This is deliberate: the spec is the boundary, which is what
+makes fan-out predictable and the index clean.

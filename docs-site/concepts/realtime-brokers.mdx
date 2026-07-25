@@ -1,0 +1,192 @@
+---
+title: "Realtime brokers"
+description: "Choose NATS Core, NATS JetStream, or Redis Streams for native WebSocket and GraphQL subscriptions."
+---
+
+VentStream keeps the client protocols independent from the event broker. Native
+WebSocket and GraphQL subscriptions use the same provider-neutral session and
+cursor contract.
+
+| Provider | Native WebSocket | GraphQL | Replay | Cursor |
+|---|---:|---:|---:|---|
+| `nats_core` | yes | no | no | none |
+| `nats_jetstream` | yes | yes | yes | decimal, for example `42` |
+| `redis_streams` | yes | yes | yes | prefixed, for example `rs:1712345678901-0` |
+
+NATS remains the default. Existing configurations with a `runtime.ws.jetstream`
+block still select JetStream, and configurations without it still select NATS
+Core for the native gateway.
+
+## Redis Streams configuration
+
+Use the shared block when the same engine runs both realtime roles:
+
+```yaml
+schema_version: 1
+roles: [ws, graphql]
+
+runtime:
+  tenant: acme
+  realtime:
+    provider: redis_streams
+    redis_streams:
+      url_ref: env:VS_REDIS_URL
+      key_prefix: ventstream
+      read_batch: 256
+      block_timeout_ms: 5000
+      broadcast_capacity: 2048
+      max_tenant_hubs: 1024
+      max_length: 1000000
+      connect_timeout_ms: 5000
+      response_timeout_ms: 5000
+  ws:
+    listen: 0.0.0.0:4040
+    mailbox: 256
+  graphql:
+    listen: 0.0.0.0:4041
+    broadcast_capacity: 1024
+```
+
+Set the secret-bearing URL in the deployment environment:
+
+```bash
+export VS_REDIS_URL='rediss://ventstream-user:password@redis.example.com:6380/0'
+```
+
+For an environment-only deployment, set `VS_REALTIME_PROVIDER=redis_streams`
+and `VS_REDIS_URL`. Role-specific `VS_WS_REDIS_*` and
+`VS_GRAPHQL_REDIS_*` variables can override tuning when the roles run in
+separate processes.
+
+<Warning>
+Do not put a credential-bearing Redis URL directly in `ventstream.yaml` or a
+Fleet configuration. The schema accepts `url_ref: env:...`, and the secret is
+resolved only inside the customer workload.
+</Warning>
+
+## Redis wire contract
+
+One Redis Stream is used per tenant:
+
+```text
+<key_prefix>:{<tenant>}:events
+ventstream:{acme}:events
+```
+
+The braces are intentional Redis Cluster hash tags. Every entry has exactly the
+fields needed by the gateways:
+
+| Field | Value |
+|---|---|
+| `subject` | Anchored subject such as `vs.t.acme.orders.order.updated.order_1` |
+| `event` | Canonical VentStream event envelope encoded as JSON |
+
+The gateway parses Redis IDs numerically as `(milliseconds, sequence)`, never
+lexically. A wrong-provider, expired, malformed, or ahead cursor is rejected;
+it never silently falls back to live-only delivery.
+
+## Publishing to Redis
+
+The TypeScript SDK builds the same envelope used by the NATS publisher:
+
+```ts
+import { RedisVentStream } from "@ventstream/sdk";
+
+const publisher = new RedisVentStream({
+  url: process.env.VS_REDIS_URL!,
+  maxLength: 1_000_000,
+});
+
+await publisher.connect();
+const result = await publisher.publish({
+  tenant: "acme",
+  domain: "orders",
+  action: "updated",
+  entity: { kind: "order", id: "order_1" },
+  data: { status: "ready" },
+});
+
+console.log(result.cursor); // rs:1712345678901-0
+```
+
+Any Redis client can publish without the SDK:
+
+```text
+XADD ventstream:{acme}:events MAXLEN ~ 1000000 * \
+  subject vs.t.acme.orders.order.updated.order_1 \
+  event '{"id":"01...","event":"orders.order.updated",...}'
+```
+
+`maxLength` on the SDK bounds growth atomically with `XADD`. The gateway also
+applies the configured `max_length` periodically as a retention backstop for
+publishers that omit `MAXLEN`. Managed publishers should still set `MAXLEN` so
+retention remains bounded while gateways are offline.
+
+## Scaling model
+
+Redis mode does not run one blocking `XREAD` per browser. Each gateway process
+opens one shared tailer per active tenant and fans live events through a bounded
+local broadcast. A reconnecting client reads only its missing range with
+`XRANGE`, up to a captured live watermark, then joins live fan-out without a
+replay/live gap.
+
+The tailer retries transient Redis read failures with bounded backoff. After six
+consecutive failures it terminates attached sessions explicitly and rejects new
+sessions until its last-ID read loop recovers; sockets are not left silently
+parked behind a permanently unavailable broker.
+
+This keeps Redis connection count proportional to gateway replicas and active
+tenants, not connected clients. Live-only GraphQL operations share a logical
+socket source. Resumed GraphQL operations open subject-filtered logical sessions
+over the shared tenant tailer so each operation replays independently.
+
+## Client cursor contract
+
+New clients should select and persist `cursor`, then send it only after event
+processing succeeds:
+
+```jsonc
+// Native WebSocket hello
+{
+  "type": "hello",
+  "tenant": "acme",
+  "token": "...",
+  "resume_from_cursor": "rs:1712345678901-0"
+}
+```
+
+For GraphQL, pass the cursor to the generic or typed subscription operation:
+
+```graphql
+subscription Orders($cursor: String) {
+  events(
+    subject: "orders.updated.*"
+    resumeFromCursor: $cursor
+  ) {
+    id
+    cursor
+  }
+}
+```
+
+The GraphQL `connection_init.resume_from_cursor` field remains a compatibility
+fallback. Prefer `resumeFromCursor` per operation when multiplexing.
+
+`seq` and `resume_from_seq` remain available for existing JetStream clients.
+Redis events omit the native numeric `seq`; GraphQL keeps `seq` as a string
+alias of `cursor` for schema compatibility.
+
+## Production security
+
+- Use `rediss://` with server certificate validation outside trusted local
+  networks.
+- Use a dedicated Redis ACL user limited to the configured stream prefix and
+  the commands required by the provider: `PING`, `XREAD`, `XRANGE`,
+  `XREVRANGE`, `XTRIM`, and publisher-side `XADD` where applicable.
+- Put gateways and publishers on private networks; do not expose Redis to
+  browsers or the public internet.
+- Keep `runtime.tenant` configured. The server-authorized tenant chooses the
+  stream key; clients cannot select another tenant's stream.
+- Monitor broker session failures, replay rejection, local fan-out lag, and
+  stream length. A local lag error is terminal so the client reconnects from
+  its last processed cursor instead of continuing across a silent gap.

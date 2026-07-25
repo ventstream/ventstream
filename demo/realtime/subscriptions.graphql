@@ -1,0 +1,24 @@
+# Typed GraphQL subscriptions for the real-time demo.
+#
+# Each field maps to an event via @vsSubscribe(subject: …) — id last, so
+# `{orderId}` is woven into the routing subject. Return the built-in
+# `Event` (opaque envelope, `data` as JSON) or a custom type whose fields
+# carry an optional @source(from: …) (defaults to `$data.{field}`).
+#
+# Wired in via VS_GRAPHQL_SCHEMA (see docker-compose.yml).
+
+type Subscription {
+  "Raw envelope — read `data` yourself."
+  orderEvents(orderId: ID!): Event!
+    @vsSubscribe(subject: "orderStatusChanged.{orderId}")
+
+  "Flattened, typed view of an order status change."
+  orderStatusChanged(orderId: ID!): OrderStatusChange!
+    @vsSubscribe(subject: "orderStatusChanged.{orderId}")
+}
+
+type OrderStatusChange {
+  id: ID!             @source(from: "$event.entityId")
+  status: String!     # defaults to $data.status
+  changedAt: DateTime @source(from: "$event.occurredAt")
+}

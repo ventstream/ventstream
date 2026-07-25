@@ -1,0 +1,12 @@
+apiVersion: v2
+name: ventstream-agent
+description: Deprecated legacy telemetry-based VentStream CDC agent chart
+type: application
+deprecated: true
+version: 0.1.12
+appVersion: "0.1.12"
+keywords:
+  - ventstream
+  - cdc
+  - agent
+home: https://github.com/bashiru98/ventstream

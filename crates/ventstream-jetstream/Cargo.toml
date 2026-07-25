@@ -1,0 +1,28 @@
+[package]
+name = "ventstream-jetstream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared JetStream per-connection consumer lifecycle: bespoke consumer creation, RAII delete-on-drop, and the orphan reaper used by both the native WS and GraphQL gateways."
+
+[dependencies]
+async-nats = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+metrics = "0.24"
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+ventstream-core = { workspace = true }
+ventstream-realtime = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

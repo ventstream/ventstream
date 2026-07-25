@@ -1,0 +1,60 @@
+[package]
+name = "ventstream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VentStream engine — single binary for CDC, broker, and SDK ingest with search sinks and WebSocket fan-out."
+
+[[bin]]
+name = "ventstream"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+metrics = "0.24"
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+ventstream-core = { workspace = true }
+ventstream-sources = { workspace = true }
+ventstream-sinks = { workspace = true }
+ventstream-graphql = { workspace = true }
+ventstream-joins = { workspace = true }
+ventstream-ws = { workspace = true }
+ventstream-config = { workspace = true }
+ventstream-telemetry = { workspace = true }
+serde_yaml = { workspace = true }
+rustls = { workspace = true }
+sha2 = "0.10"
+tokio-postgres = { workspace = true }
+mysql_async = { workspace = true }
+
+# jemalloc with background decay so freed pages return to the OS — keeps
+# RSS tracking the live working set instead of sticking at the high-water
+# mark (matters for the WS gateway under connection churn). Skipped on
+# Windows/MSVC where jemalloc isn't supported.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt", "rt-multi-thread", "macros", "process"] }
+# Integration tests (crates/ventstream/tests/) spin real source and sink
+# containers and drive the actual engine binary end-to-end.
+testcontainers = "0.27"
+reqwest = { workspace = true }
+mongodb = { workspace = true }
+rdkafka = { workspace = true }
+
+[lints]
+workspace = true

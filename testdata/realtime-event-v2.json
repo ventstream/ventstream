@@ -1,0 +1,14 @@
+{
+  "id": "01KSA000000000000000000000",
+  "event": "orders.order.status_changed",
+  "tenant": "acme",
+  "entity_id": "order_123",
+  "occurred_at": "2026-05-23T03:55:01.000Z",
+  "received_at": "2026-05-23T03:55:01.000Z",
+  "schema_version": 2,
+  "data": {
+    "from": "pending",
+    "to": "confirmed"
+  },
+  "metadata": {}
+}

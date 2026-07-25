@@ -1,0 +1,176 @@
+# DEPRECATED: these values target the retired API-key telemetry control plane.
+# Use the canonical standalone Kubernetes guide or the Fleet managed-agent chart
+# for new deployments.
+#
+# Default values for one legacy ventstream-agent release.
+# Install one release per agent — the release name becomes the
+# StatefulSet/PVC name, so each agent gets its own slot + state.
+#
+#   helm install orders ./infra/helm/ventstream-agent -n ventstream-agents -f orders.yaml
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: ghcr.io/bashiru98/ventstream
+  tag: ""              # "" → Chart.appVersion
+  digest: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# Which source this agent reads: "postgres", "neo4j", "mongodb", "mysql", or
+# "kafka" ("mariadb" aliases mysql; "redpanda" aliases kafka).
+source:
+  type: postgres
+
+# Legacy telemetry agent name. This is not a Fleet deployment identity.
+agentName: my-agent
+
+controlPlane:
+  # Retired telemetry API URL. This is not the Fleet agent gateway.
+  url: "http://ventstream-cp-api.ventstream-cp.svc:8080"
+  intervalSecs: 10
+  # Credentials. create:false → bring an existing Secret holding
+  # VS_CONTROL_PLANE_KEY and the source secret (VS_PG_PASSWORD,
+  # VS_NEO4J_PASSWORD, or VS_MONGO_URI — the Mongo connection string carries
+  # its own credentials), plus neo4j-ca.crt if you use trustCert.
+  # create:true → render a Secret from the values below (dev only).
+  create: false
+  existingSecret: ""
+  apiKey: ""           # used only when create: true
+
+# --- Postgres source (used when source.type == postgres) ---
+pg:
+  host: ""
+  port: 5432
+  user: ventstream
+  password: ""         # used only when controlPlane.create: true
+  database: ""
+  publication: ""
+  slot: ""             # unique per agent; engine auto-creates it
+  bootstrapMode: snapshot
+  # denormalizeMode: how the joins spec is executed.
+  #   memory — in-memory join engine (default; lowest-latency tail, RSS
+  #            scales with the joined working set; uses VS_JOINS_STATE_DIR).
+  #   sql    — push the join into Postgres (bounded ~O(chunk) memory at any
+  #            scale; needs indexes on the join/FK columns; holds no state).
+  denormalizeMode: memory
+  autoResyncOnYamlChange: true
+
+# --- Neo4j source (used when source.type == neo4j) ---
+neo4j:
+  uri: ""              # e.g. neo4j+s://host:7687 (public CA) or bolt://host:7687
+  user: neo4j
+  password: ""         # used only when controlPlane.create: true
+  database: neo4j
+  namespace: neo4j
+  bootstrapMode: snapshot
+  bootstrapBatchSize: 2000
+  pollIntervalMs: 500
+  hotNodeThreshold: 100
+  # Live multi-hop recompose tuning (see docs concepts/performance).
+  recomposeChunk: 128         # max affected primaries per recompose query
+  recomposeConcurrency: 8     # concurrent recompose chunks (≤ bolt pool)
+  # Only for private-CA / self-signed neo4j+s servers. NOT needed for
+  # Aura or any public-CA cert (the engine image trusts the system store).
+  trustCert:
+    enabled: false
+    # PEM, used only when controlPlane.create: true; otherwise put
+    # neo4j-ca.crt in your existingSecret.
+    pem: ""
+
+# --- MongoDB source (used when source.type == mongodb) ---
+# The connection string (VS_MONGO_URI) carries credentials, so it is read
+# from the Secret key VS_MONGO_URI — set it in your existingSecret (or via
+# controlPlane.create + mongo.uri for dev). Change streams require a replica
+# set or sharded cluster. v1 is raw 1:1 (no projection spec needed).
+mongo:
+  uri: ""              # dev only (controlPlane.create: true); else use the Secret
+  database: ""         # database to watch + namespace under
+  namespace: ""        # optional; defaults to `database`
+  collections: ""      # optional CSV; empty = all collections
+  fullDocument: updateLookup   # updateLookup | default
+  bootstrapMode: snapshot      # snapshot | none
+  bootstrapChunkSize: 1000
+  tokenFlushMs: 1000
+
+# --- MySQL / MariaDB source (used when source.type == mysql|mariadb) ---
+# Requires binlog_format=ROW and a server_id unique in the topology. The
+# password is read from the Secret key VS_MYSQL_PASSWORD (set it in your
+# existingSecret, or via controlPlane.create + mysql.password for dev).
+mysql:
+  host: ""             # server host
+  port: 3306
+  user: root           # needs REPLICATION SLAVE + REPLICATION CLIENT + SELECT
+  password: ""         # used only when controlPlane.create: true
+  database: ""         # database to watch + namespace under
+  namespace: ""        # optional; defaults to `database`
+  tables: ""           # optional CSV; empty = all tables
+  serverId: "4000000000"   # replica server_id; must be unique
+  bootstrapMode: snapshot  # snapshot | none
+  bootstrapChunkSize: 1000
+  posFlushMs: 1000
+
+# --- Kafka / Redpanda source (used when source.type == kafka|redpanda) ---
+# Consumes Debezium change topics (run the Debezium source connector
+# yourself). The SASL password is read from the Secret key
+# VS_KAFKA_SASL_PASSWORD (set it in your existingSecret, or via
+# controlPlane.create + kafka.saslPassword for dev).
+kafka:
+  brokers: ""              # bootstrap.servers, CSV of host:port
+  topics: ""               # CSV of topics, or a single ^regex
+  groupId: ""              # defaults to agentName
+  unwrap: debezium         # debezium | raw
+  namespace: ""            # optional; default = Debezium source schema/db
+  autoOffsetReset: earliest  # earliest | latest
+  commitMs: "1000"
+  securityProtocol: ""     # e.g. SASL_SSL (empty = plaintext)
+  saslMechanism: ""        # e.g. SCRAM-SHA-512, PLAIN
+  saslUsername: ""         # setting this wires VS_KAFKA_SASL_PASSWORD from the Secret
+  saslPassword: ""         # used only when controlPlane.create: true
+  sslCaLocation: ""        # PEM CA path (empty = system trust store)
+  rawKeyField: ""          # raw mode: value field used as the doc id
+
+# Projection spec, mounted at /etc/ventstream/spec.yaml.
+spec:
+  # Inline spec content (rendered into a ConfigMap). Replace with yours.
+  inline: |
+    # Postgres example — replace with your projection:
+    # joins:
+    #   - name: orders
+    #     primary: { table: shop.orders, pk: order_id }
+    #     ...
+  # OR point at an existing ConfigMap instead of inline:
+  existingConfigMap: ""
+  existingConfigMapKey: spec.yaml
+
+sink:
+  endpoint: "http://opensearch.example.internal:9200"
+  indexTemplate: "${header:ventstream.cdc.relation}"
+  # For a secured OpenSearch, set auth via `extraEnv` below —
+  # VS_OS_USERNAME / VS_OS_PASSWORD (or VS_OS_API_KEY), and
+  # VS_INSECURE_TLS=1 only for self-signed dev clusters.
+
+persistence:
+  storage: 5Gi
+  storageClassName: ""   # "" → cluster default
+
+resources:
+  requests: { cpu: 250m, memory: 256Mi }
+  limits:   { memory: 1Gi }
+
+rustLog: info
+logFormat: json
+
+# Always-on health endpoint — liveness/readiness probes hit /healthz here.
+healthPort: 4043
+
+# Escape hatch for any other engine env var (OpenSearch auth, the
+# performance knobs, VS_ADMIN_LISTEN, VS_PG_BOOTSTRAP_CHUNK_SIZE, …).
+# Raw container env entries — supports `value` and `valueFrom`. Example:
+#   extraEnv:
+#     - { name: VS_OS_USERNAME, value: ventstream }
+#     - name: VS_OS_PASSWORD
+#       valueFrom: { secretKeyRef: { name: orders-agent-secrets, key: VS_OS_PASSWORD } }
+#     - { name: VS_DISPATCH_PARALLEL_BULKS, value: "8" }
+extraEnv: []

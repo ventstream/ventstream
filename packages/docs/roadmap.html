@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VentStream — Roadmap</title>
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="assets/docs.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="logo" href="index.html">VentStream</a>
+    <div class="tagline">CDC + denormalized indexing + durable WebSocket subscriptions, in a single Rust binary.</div>
+
+    <div class="nav-section">Start here</div>
+    <nav><ul>
+      <li><a data-page="index.html" href="index.html">Overview</a></li>
+      <li><a data-page="architecture.html" href="architecture.html">Architecture</a></li>
+      <li><a data-page="getting-started.html" href="getting-started.html">Getting started</a></li>
+    </ul></nav>
+
+    <div class="nav-section">Pipelines</div>
+    <nav><ul>
+      <li><a data-page="pipeline-a.html" href="pipeline-a.html">A · CDC + joins</a></li>
+      <li><a data-page="pipeline-b.html" href="pipeline-b.html">B · WS fan-out</a></li>
+      <li><a data-page="graphql.html" href="graphql.html">GraphQL gateway</a></li>
+    </ul></nav>
+
+    <div class="nav-section">Operations</div>
+    <nav><ul>
+      <li><a data-page="operations.html" href="operations.html">Deploy &amp; configure</a></li>
+      <li><a data-page="roadmap.html" href="roadmap.html">Roadmap</a></li>
+    </ul></nav>
+
+    <div class="footer-note">v0.1 · <a href="https://github.com/bashiru98/ventstream">bashiru98/ventstream</a></div>
+  </aside>
+
+  <main>
+    <h1>Roadmap</h1>
+    <p class="subtitle">Honest list of what's shipped, what's planned, and what's intentionally out of scope. v0.1 prioritized correctness over polish — production-readiness items are clearly flagged.</p>
+
+    <h2>Shipped <span class="pill shipped">v0.1</span></h2>
+
+    <table>
+      <thead><tr><th>Capability</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr><td>Postgres logical-replication source via pgwire-replication</td><td><span class="pill shipped">shipped</span></td></tr>
+        <tr><td>Stateful join engine: 1-1, 1-N, composite PKs, partial-FK</td><td><span class="pill shipped">shipped</span></td></tr>
+        <tr><td>Foreign-side re-emit + sync-on-miss backfill</td><td><span class="pill shipped">shipped</span></td></tr>
+        <tr><td>Deterministic doc IDs (dedupe by construction)</td><td><span class="pill shipped">shipped</span></td></tr>
+        <tr><td>OpenSearch bulk sink with DLQ + partial-failure retry</td><td><span class="pill shipped">shipped</span></td></tr>
+        <tr><td>Native WebSocket gateway (axum + NATS Core or JetStream)</td><td><span class="pill shipped">shipped</span></td></tr>
+        <tr><td>Per-connection durable JetStream consumers + 3-layer cleanup</td><td><span class="pill shipped">shipped</span></td></tr>
+        <tr><td>Slow-consumer disconnect; ping/pong heartbeat</td><td><span class="pill shipped">shipped</span></td></tr>
+        <tr><td>@ventstream/sdk publisher (Node)</td><td><span class="pill shipped">shipped</span></td></tr>
+        <tr><td>@ventstream/client subscriber (browser + Node, auto-reconnect)</td><td><span class="pill shipped">shipped</span></td></tr>
+        <tr><td>GraphQL gateway speaking graphql-transport-ws</td><td><span class="pill shipped">shipped</span></td></tr>
+        <tr><td>Model 1 (generic) + Model 2 (typed manifest) schemas</td><td><span class="pill shipped">shipped</span></td></tr>
+        <tr><td>Federation Flavor B (Apollo Federation v2 subgraph)</td><td><span class="pill shipped">shipped</span></td></tr>
+        <tr><td>Verified runtime through Cosmo Router 0.318 with entity stitching</td><td><span class="pill shipped">shipped</span></td></tr>
+        <tr><td>Role-based binary: <code>cdc</code> / <code>ws</code> / <code>graphql</code></td><td><span class="pill shipped">shipped</span></td></tr>
+      </tbody>
+    </table>
+
+    <h2>Production readiness <span class="pill partial">~1 week</span></h2>
+    <p>The work that takes v0.1 from "demo-quality" to "I can put this in front of a paying customer."</p>
+    <ul>
+      <li><strong>JWT auth</strong> on connection_init payloads and HTTP headers. Today: trust any non-empty token. Single seam (<code>auth::extract</code>) to swap.</li>
+      <li><strong>Persistent join state via redb</strong> for Pipeline A. Engine restart shouldn't require full WAL replay from the slot's earliest LSN.</li>
+      <li><strong>Leader election</strong> (k8s Lease or Postgres advisory lock) so the CDC role can run as active + warm standbys.</li>
+      <li><strong>Observability</strong>: wire <code>ventstream-telemetry</code> into Prometheus metrics + OpenTelemetry tracing. Connection count, consumer count, throughput, JetStream lag.</li>
+      <li><strong>Docker image + Helm chart</strong> so customers can <code>helm install ventstream</code>.</li>
+    </ul>
+
+    <h2>Cosmo replacement story <span class="pill partial">~3-5 days · commercial</span></h2>
+    <p>Focused commercial work to convert the v0.1 engine into something we can pitch to federated-GraphQL deployments.</p>
+    <ul>
+      <li><strong>"Drop-in replacement" guide</strong>: step-by-step swap of Cosmo's built-in WebSocket layer with VentStream while keeping Cosmo as the federation router.</li>
+      <li><strong>Side-by-side benchmark</strong>: same federated supergraph, Cosmo's WS vs VentStream's. Consumer count over a 1-hour churn workload. Real numbers.</li>
+      <li><strong>Cosmo NATS-subject compatibility notes</strong>: Cosmo expects specific subject shapes for its <code>@edfs__natsSubscribe</code> directive. Document the translation so existing Cosmo subgraph code works against VentStream as the backbone.</li>
+      <li><strong>Landing page</strong>: positioning, the consumer-leak story, real benchmark numbers.</li>
+    </ul>
+
+    <h2>Pipeline A depth <span class="pill planned">~1-2 weeks</span></h2>
+    <p>Only worth doing if customers are asking for CDC specifically rather than the WS / federated-subs story.</p>
+    <ul>
+      <li><strong>Nested joins</strong> (multi-level chains: <code>order → buyer → contact_person</code>) — currently one level only.</li>
+      <li><strong>Junction-table M-to-M</strong> (e.g. orders ↔ tags via a junction table).</li>
+      <li><strong>Eager bootstrap via slot snapshot</strong>: adding a new join to an existing dataset can replay history instead of starting from "now".</li>
+      <li><strong>TRUNCATE handling</strong> in join state (currently logs and skips).</li>
+      <li><strong>AWS SigV4 auth</strong> for OpenSearch Service (AWS-hosted).</li>
+      <li><strong>More sinks</strong>: Algolia, Typesense, Elasticsearch, custom HTTP.</li>
+    </ul>
+
+    <h2>Pipeline B polish <span class="pill planned">smaller items</span></h2>
+    <ul>
+      <li>Pong-timeout integration test wired into CI (currently runs locally via raw TCP/WS framing).</li>
+      <li>Multipart subscription transport (Apollo's <code>multipart/mixed</code> alternative to WS) — useful where WS is blocked.</li>
+      <li>Persistence on the WS side: per-pod connection registry survives soft restart.</li>
+      <li>Tenant-scoped subject permissions in the manifest (currently a tenant can subscribe to any pattern under their prefix).</li>
+    </ul>
+
+    <h2>Future / not in scope for v1</h2>
+    <ul>
+      <li><strong>gRPC SDK ingest</strong> — explicitly rejected during design. Developers publish direct to NATS via the SDK. Adding an engine ingest gateway between them adds a debugging layer with no commensurate value.</li>
+      <li><strong>Schema registry for <code>data</code></strong> — opaque payloads in v1. May add JSON Schema registration in v2 if customers ask.</li>
+      <li><strong>VentStream as a federation router</strong> — we're a subgraph, not a router. Apollo Router and Cosmo Router are the routers; we cooperate via standards.</li>
+      <li><strong>Multi-tenancy at the NATS-account level</strong> — currently tenant scoping is via subject prefix + auth-time check. NATS accounts give physical isolation; v2.</li>
+    </ul>
+
+    <h2>Architectural invariants — do not violate</h2>
+    <p>These are the non-negotiable contracts established in v0.1. Any change to the code paths involved must preserve these:</p>
+    <ol>
+      <li><strong>One JetStream consumer per WebSocket connection.</strong> Not per subscription. Not per service. Per connection. This is what enables resume-on-reconnect and per-client flow control.</li>
+      <li><strong>Three-layer cleanup hierarchy.</strong> RAII drop guard + <code>inactive_threshold</code> + reaper. Removing any one of them brings the Cosmo leak back.</li>
+      <li><strong>Strict subject grammar.</strong> 7 segments, character classes enforced, validated by both SDK and gateway.</li>
+      <li><strong>Deterministic doc IDs on Pipeline A.</strong> Re-emits overwrite, never duplicate.</li>
+      <li><strong>Workspace lints</strong> — <code>unwrap_used</code>, <code>expect_used</code>, <code>panic</code>, <code>indexing_slicing</code> denied outside tests. Don't relax.</li>
+    </ol>
+
+    <h2>Open questions worth thinking about</h2>
+    <ul>
+      <li>Should the WS gateway support <code>multipart/mixed</code> subscriptions for clients behind WS-blocking proxies?</li>
+      <li>Does Pipeline B want at-least-once semantics by default, or stay at the JetStream "ack to advance cursor" model?</li>
+      <li>Is there a clean way to expose Pipeline A's join state for "snapshot this entity as it looks right now" reads — turning the engine into a queryable cache?</li>
+      <li>When do we add multiple sinks per pipeline? (Today: source → joins → ONE sink. Multi-sink is a Phase 1+ config schema decision.)</li>
+    </ul>
+
+    <div class="page-footer">
+      <span><a href="operations.html">← Deploy &amp; configure</a></span>
+      <span><a href="index.html">Overview ↑</a></span>
+    </div>
+  </main>
+</div>
+</body>
+</html>

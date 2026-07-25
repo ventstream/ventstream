@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VentStream deployment documentation</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+      line-height: 1.55;
+    }
+    body {
+      margin: 0;
+      padding: 48px 24px;
+    }
+    main {
+      max-width: 760px;
+      margin: 0 auto;
+    }
+    h1 {
+      font-size: 30px;
+      letter-spacing: 0;
+    }
+    a {
+      color: #2563eb;
+    }
+    li {
+      margin: 10px 0;
+    }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Deployment documentation moved</h1>
+    <p>
+      This file previously duplicated the retired web and API-key control-plane
+      deployment. The maintained documentation now lives in <code>docs-site</code>
+      and separates standalone engines from Fleet-managed engines.
+    </p>
+    <ul>
+      <li><a href="../docs-site/deploy/kubernetes.mdx">Choose a Kubernetes mode</a></li>
+      <li><a href="../docs-site/deploy/kubernetes-standalone.mdx">Deploy a standalone engine</a></li>
+      <li><a href="../docs-site/deploy/kubernetes-fleet.mdx">Deploy the Fleet control plane</a></li>
+      <li><a href="../docs-site/deploy/kubernetes-managed-engine.mdx">Deploy a managed engine</a></li>
+      <li><a href="../docs-site/fleet/cli.mdx">Administer Fleet with ventstreamctl</a></li>
+    </ul>
+    <p>
+      For rendered navigation and code blocks, run <code>mint dev</code> from the
+      <code>docs-site</code> directory.
+    </p>
+  </main>
+</body>
+</html>

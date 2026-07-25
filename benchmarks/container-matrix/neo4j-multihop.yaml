@@ -1,0 +1,48 @@
+denormalize:
+  - primary_label: Customer
+    output_table: customer_orders
+    fan_out_max_hops: 2
+    cypher: |
+      MATCH (p)-[:PLACED]->(order:Order)-[:CONTAINS]->(product:Product)
+      RETURN elementId(p) AS primaryEid, {
+        id: p.id,
+        name: p.name,
+        order: order { .id, .status },
+        product: product { .id, .sku, .category }
+      } AS doc
+
+  - primary_label: Seller
+    output_table: seller_catalogs
+    fan_out_max_hops: 2
+    cypher: |
+      MATCH (p)-[:LISTS]->(listing:Listing)-[:IN_CATEGORY]->(category:Category)
+      RETURN elementId(p) AS primaryEid, {
+        id: p.id,
+        name: p.name,
+        listing: listing { .id, .price },
+        category: category { .id, .name }
+      } AS doc
+
+  - primary_label: Shipment
+    output_table: shipment_routes
+    fan_out_max_hops: 2
+    cypher: |
+      MATCH (p)-[:HANDLED_BY]->(carrier:Carrier)-[:BASED_IN]->(region:Region)
+      RETURN elementId(p) AS primaryEid, {
+        id: p.id,
+        trackingNumber: p.tracking_number,
+        carrier: carrier { .id, .name },
+        region: region { .id, .name, .zone }
+      } AS doc
+
+  - primary_label: SupportCase
+    output_table: support_assignments
+    fan_out_max_hops: 2
+    cypher: |
+      MATCH (p)-[:ASSIGNED_TO]->(agent:Agent)-[:MEMBER_OF]->(team:Team)
+      RETURN elementId(p) AS primaryEid, {
+        id: p.id,
+        subject: p.subject,
+        agent: agent { .id, .name },
+        team: team { .id, .name, .tier }
+      } AS doc

@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VentStream — Architecture</title>
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="assets/docs.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="logo" href="index.html">VentStream</a>
+    <div class="tagline">CDC + denormalized indexing + durable WebSocket subscriptions, in a single Rust binary.</div>
+
+    <div class="nav-section">Start here</div>
+    <nav><ul>
+      <li><a data-page="index.html" href="index.html">Overview</a></li>
+      <li><a data-page="architecture.html" href="architecture.html">Architecture</a></li>
+      <li><a data-page="getting-started.html" href="getting-started.html">Getting started</a></li>
+    </ul></nav>
+
+    <div class="nav-section">Pipelines</div>
+    <nav><ul>
+      <li><a data-page="pipeline-a.html" href="pipeline-a.html">A · CDC + joins</a></li>
+      <li><a data-page="pipeline-b.html" href="pipeline-b.html">B · WS fan-out</a></li>
+      <li><a data-page="graphql.html" href="graphql.html">GraphQL gateway</a></li>
+    </ul></nav>
+
+    <div class="nav-section">Operations</div>
+    <nav><ul>
+      <li><a data-page="operations.html" href="operations.html">Deploy &amp; configure</a></li>
+      <li><a data-page="roadmap.html" href="roadmap.html">Roadmap</a></li>
+    </ul></nav>
+
+    <div class="footer-note">v0.1 · <a href="https://github.com/bashiru98/ventstream">bashiru98/ventstream</a></div>
+  </aside>
+
+  <main>
+    <h1>Architecture</h1>
+    <p class="subtitle">Two pipelines, one binary. Each independently deployable; both share the engine kernel and the runtime invariants.</p>
+
+    <h2>Two pipelines</h2>
+
+    <h3>Pipeline A — Postgres CDC → joins → search index</h3>
+    <div class="diagram">          Postgres
+        ┌───────────┐
+        │  WAL slot │
+        └─────┬─────┘
+              │ pgoutput
+              ▼
+       ┌────────────┐
+       │  Source    │  decodes RELATION / INSERT / UPDATE / DELETE
+       └─────┬──────┘
+             │
+             ▼
+       ┌────────────┐
+       │  Join      │  forward + reverse + foreign_by_fk indexes
+       │  engine    │  sync-on-miss for absent rows
+       └─────┬──────┘  re-emit primary doc on foreign-side change
+             │
+             ▼
+       ┌────────────┐
+       │ Dispatcher │  batches events, writes DLQ on poison
+       └─────┬──────┘
+             │
+             ▼
+       ┌────────────┐
+       │ Sink       │  OpenSearch bulk, deterministic _id
+       └────────────┘</div>
+
+    <p>Single-leader by design — Postgres replication slots are single-consumer. Multiple pods can run as warm standbys, but only one is active at a time. Horizontal scale on this tier is fundamentally limited; vertical scale on the WAL apply side handles tens of thousands of events/sec on commodity hardware.</p>
+
+    <h3>Pipeline B — Durable WebSocket fan-out</h3>
+    <div class="diagram">          SDK / app server
+                │  publish()
+                ▼
+        ┌───────────────┐
+        │  NATS         │  acts as the event bus
+        │  + JetStream  │  durable retention
+        └───────┬───────┘
+                │
+                ▼
+       ┌──────────────────┐
+       │  WS gateway      │  one durable consumer
+       │  (axum)          │  per WS connection
+       └────────┬─────────┘
+                │
+                ▼
+            WS clients</div>
+
+    <p>Horizontally scalable. Each pod independently subscribes to NATS, terminates its own WebSocket connections, and creates one durable JetStream consumer per active subscription. There is no shared state between pods — adding pods is purely additive.</p>
+
+    <h3>How they fit together</h3>
+    <p>The two pipelines are orthogonal. Pipeline A produces denormalized search docs from a transactional database; Pipeline B fans application events out to interested browser/mobile clients. A customer can use either, neither, or both. When both are enabled in the same process, they share the JetStream stream (the WS role bootstraps it) but otherwise don't interact.</p>
+
+    <h2>Key design decisions</h2>
+
+    <h3>Per-connection durable consumers <span class="pill">bespoke</span></h3>
+    <p>The WS path creates <strong>one JetStream durable consumer per WebSocket connection</strong>, not one per service. This is unusual — standard NATS patterns use one consumer per service or queue groups for work distribution. We do it because:</p>
+    <ul>
+      <li>A client that briefly disconnects (tab sleep, mobile blip, redeploy) can reconnect and <strong>replay its own cursor</strong>. The consumer state is the <em>client's</em> state.</li>
+      <li>Per-client flow control. A slow client's cursor lags, but doesn't affect anyone else.</li>
+      <li>Per-client ack semantics. Client confirms event N, JetStream advances <em>that client's</em> cursor. Crash mid-handler → reconnect → N redelivered.</li>
+    </ul>
+    <p>The cost is N consumers per pod (N = concurrent WS clients). NATS handles tens of thousands per stream cleanly. Above that, shard streams or hybridize.</p>
+
+    <h3>Three-layer cleanup hierarchy <span class="pill">Cosmo-not-trap</span></h3>
+    <p>One consumer per connection means cleanup is load-bearing. If we don't tear down consumers when clients disappear, memory leaks. The same bug bit Cosmo Router — 733 orphan consumers in production for one team. We make leaks structurally hard with three independent mechanisms:</p>
+    <div class="diagram">                ┌──────────────────────────────────────┐
+   Layer 1:     │  RAII drop guard in connection task  │
+   (~ms)        │  fires on EVERY exit path:           │
+                │    graceful close, panic, ping       │
+                │    timeout, slow-consumer eviction   │
+                │  → js.delete_consumer(name)          │
+                └──────────────────────────────────────┘
+                                ▼
+                ┌──────────────────────────────────────┐
+   Layer 2:     │  inactive_threshold on the consumer  │
+   (~5 min)     │  JetStream server-side auto-delete   │
+                │  if no activity for N seconds.       │
+                │  Catches:                            │
+                │   - kill -9 (drop guard never ran)   │
+                │   - OOM kill                         │
+                │   - pod evicted by k8s               │
+                └──────────────────────────────────────┘
+                                ▼
+                ┌──────────────────────────────────────┐
+   Layer 3:     │  Reaper task: every ~60s, list       │
+   (~min)       │  consumers under vs.t.>.p.{me}.c.>   │
+                │  and diff against THIS pod's         │
+                │  connection registry. Delete the     │
+                │  orphans.                            │
+                └──────────────────────────────────────┘</div>
+    <p>The reaper only deletes consumers it owns (matched by <code>p.{pod_id}</code> in the consumer name) so each pod cleans up after itself — no cross-pod coordination needed.</p>
+
+    <h3>Subject grammar <span class="pill">enforced</span></h3>
+    <p>Strict ID-last NATS subject grammar enforced by the SDK and validated by the gateway:</p>
+    <div class="code-block">
+<pre><code data-lang="text">vs.t.{tenant}.{event}.{entity_id}</code></pre>
+    </div>
+    <p>Examples:</p>
+    <ul>
+      <li><code>vs.t.acme.orders.order.status_changed.order_123</code></li>
+      <li><code>vs.t.acme.users.user.profile_updated.user_456</code></li>
+      <li><code>vs.t.acme.billing.report.summary_generated.billing_2026_05_23</code> — system event</li>
+    </ul>
+    <p>Subscribe patterns naturally fall out: <code>vs.t.acme.orders.&gt;</code>, <code>vs.t.acme.orders.order.status_changed.*</code>. Clients see the unanchored form; the gateway prepends the tenant from auth.</p>
+
+    <h3>Deterministic doc IDs <span class="pill">dedupe by construction</span></h3>
+    <p>The CDC pipeline emits one document per logical row, even when the row is re-emitted multiple times (foreign-side updates, replays). The OpenSearch sink uses a <code>ventstream.doc.id</code> header set by the join engine as the <code>_id</code> — overwriting the same document instead of leaving lifecycle copies.</p>
+    <p>The header format: <code>{primary_table}:{primary_pk}</code>, e.g. <code>public.orders:["order-002"]</code>.</p>
+
+    <h3>Opaque event payloads <span class="pill">v1 simplicity</span></h3>
+    <p>The <code>data</code> field on the event envelope is <code>serde_json::Value</code> — opaque to the engine. The envelope structure (id, event, tenant, entity_id, actor, occurred_at, etc.) is strict; the application-defined payload inside <code>data</code> is the developer's contract with their own clients. v1 doesn't validate it; a schema registry is a v1.5 feature gated on customer ask.</p>
+
+    <h2>Crate layout</h2>
+    <p>The workspace under <code>crates/</code> is split by concern, not by feature. Each crate has a narrow job:</p>
+    <table>
+      <thead><tr><th>Crate</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>ventstream</code></td><td>The binary. Loads config from env, picks roles, supervises the role tasks.</td></tr>
+        <tr><td><code>ventstream-core</code></td><td>Engine kernel — <code>Event</code>, <code>Bus</code>, <code>Source</code>, <code>Sink</code> traits, <code>ShutdownToken</code>.</td></tr>
+        <tr><td><code>ventstream-protocol</code></td><td>The WS wire schema. Envelope, 7-segment subject grammar, validators.</td></tr>
+        <tr><td><code>ventstream-sources</code></td><td>Postgres CDC source (pgoutput decoder, slot management, sync-on-miss fetcher).</td></tr>
+        <tr><td><code>ventstream-sinks</code></td><td>OpenSearch bulk sink. Other sinks slot in here later.</td></tr>
+        <tr><td><code>ventstream-joins</code></td><td>The join engine — state, reverse indexes, foreign-side re-emit, sync-on-miss.</td></tr>
+        <tr><td><code>ventstream-ws</code></td><td>WebSocket gateway. Connection registry, per-connection JetStream consumers, three-layer cleanup.</td></tr>
+        <tr><td><code>ventstream-graphql</code></td><td>graphql-transport-ws gateway. Static + dynamic schemas, federation directives.</td></tr>
+        <tr><td><code>ventstream-config</code></td><td>YAML config loader stub. <code>pipeline.yaml</code> support lands here in Phase 1+.</td></tr>
+        <tr><td><code>ventstream-telemetry</code></td><td>Observability stub. Prometheus / OpenTelemetry wiring lands here.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Workspace lints</h2>
+    <p>Aggressive — designed to catch real bugs early. These apply to every crate in the workspace:</p>
+    <div class="code-block">
+<pre><code data-lang="toml">[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+mem_forget        = "deny"
+unwrap_used       = "deny"
+expect_used       = "deny"
+panic             = "deny"
+todo              = "deny"
+unimplemented     = "deny"
+indexing_slicing  = "deny"</code></pre>
+    </div>
+    <p>Tests can use <code>unwrap</code> / <code>expect</code> under a localized <code>#[allow(...)]</code>. Production code paths cannot.</p>
+
+    <h2>What's intentionally not here</h2>
+    <ul>
+      <li><strong>No gRPC SDK ingest path.</strong> Developers publish directly to NATS via <code>@ventstream/sdk</code>. The "engine ingest" gateway we sketched early on was rejected — too many debuggable layers.</li>
+      <li><strong>No router code.</strong> VentStream is a subgraph / gateway, not a federation router. Apollo Router and Cosmo Router are the routers; we cooperate with them via standards (graphql-transport-ws + Apollo Federation v2 SDL).</li>
+      <li><strong>No schema registry for <code>data</code>.</strong> v1 keeps payloads opaque. Customers can layer Zod or similar client-side.</li>
+      <li><strong>No persistent state on Pipeline A.</strong> Restart = WAL replay from the last LSN. <code>redb</code>-backed state is a roadmap item.</li>
+    </ul>
+
+    <div class="page-footer">
+      <span><a href="index.html">← Overview</a></span>
+      <span><a href="getting-started.html">Getting started →</a></span>
+    </div>
+  </main>
+</div>
+</body>
+</html>

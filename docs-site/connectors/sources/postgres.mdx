@@ -1,0 +1,397 @@
+---
+title: "Postgres source"
+description: "Stream a Postgres table and its related rows into your target."
+---
+
+The Postgres source reads logical replication and embeds related rows
+into each primary's document. This guide uses the same `shop.orders`
+example as the [quickstart](/quickstart): each order document carries its
+customer (1:1) and its line items (1:many).
+
+<Note>
+VentStream writes to a **target**. **OpenSearch and Elasticsearch** are
+the supported targets today — they share the `_bulk` API, so the same
+engine handles both. The examples here use OpenSearch; set the endpoint
+with `VS_OS_ENDPOINT`.
+</Note>
+
+## Production prerequisites
+
+In the [demo](/quickstart) the agent appears to "just work" with zero
+setup — but only because the demo's `ventstream` user is the container's
+**bootstrap superuser**. It owns every table and has `REPLICATION`
+implicitly, so it can create the publication *and* the slot itself. A
+real production database user almost never has that.
+
+Here's the split of who does what:
+
+| Step | Who | Privilege needed |
+|------|-----|------------------|
+| `wal_level = logical` | **operator** (server param + restart) | superuser / cloud admin |
+| `CREATE PUBLICATION …` | **operator** (one-time) | must **own** the tables (or superuser) |
+| Grant the engine's role `REPLICATION` | **operator** (one-time) | superuser / cloud admin |
+| Create the replication **slot** | **engine** (auto, on first boot) | the engine role's own `REPLICATION` |
+| Stream changes | **engine** | the engine role's own `REPLICATION` |
+
+The three operator steps, as commands you run **once** with a privileged
+account (self-managed Postgres shown — for RDS/Aurora and Cloud SQL see
+the accordions below):
+
+```sql
+-- 1. enable logical replication (then RESTART Postgres)
+ALTER SYSTEM SET wal_level = logical;
+
+-- 2. publish the tables your projection touches
+CREATE PUBLICATION ventstream_shop
+  FOR TABLE shop.orders, shop.customers, shop.order_items;
+
+-- 3. create the engine's login role and give it REPLICATION + read
+CREATE ROLE ventstream WITH LOGIN PASSWORD '…';
+ALTER ROLE ventstream WITH REPLICATION;
+GRANT USAGE ON SCHEMA shop TO ventstream;
+GRANT SELECT ON ALL TABLES IN SCHEMA shop TO ventstream;
+```
+
+That's everything the operator does. The engine — logging in as
+`ventstream` — then creates the slot and starts streaming on its own; you
+run no commands for steps 4–5.
+
+Every table the projection touches must be in the publication (step 2) —
+otherwise its changes never reach the engine.
+
+<Note>
+**Why a dedicated role instead of the admin account?** Security —
+least privilege. The engine only needs `REPLICATION` + `SELECT`, so it
+should run as a role that *only* has those. If its credentials ever leak,
+the blast radius is read + replication on these tables, not admin over
+the whole database. It also lets you rotate or revoke the engine's
+password independently of the app, and makes its sessions/slots easy to
+identify in `pg_stat_activity`. The engine works fine as a superuser (the
+demo does exactly that) — but in production, don't.
+</Note>
+
+<Warning>
+**The engine never creates the publication or sets `wal_level`** — it
+only creates *slots*. An operator must do those two first, with a
+privileged role. The engine's own DB user does **not** need to be admin
+or root, but it **does** need the `REPLICATION` role attribute.
+</Warning>
+
+### Can a non-admin engine user create the slot?
+
+Yes — **`REPLICATION` is a role attribute, not superuser.** A DBA grants
+it once and the engine (running as that non-admin role) auto-creates and
+consumes its own slot:
+
+```sql
+ALTER ROLE ventstream WITH REPLICATION;   -- self-managed
+GRANT rds_replication TO ventstream;      -- RDS / Aurora
+```
+
+There's no narrower grant to worry about: `REPLICATION` is required to
+**open the logical stream at all**, so any role that can *stream* can
+also *create* the slot. A role **without** `REPLICATION` can do neither —
+in that case an operator must pre-create the slot **and** the engine
+still won't be able to consume it. So the engine role needs `REPLICATION`
+regardless; the only question is whether you also let it manage the slot
+(it can) or pin slot lifecycle to your IaC (see below).
+
+The role also needs `SELECT` on every published table — the snapshot
+bootstrap reads them directly.
+
+<Warning>
+If an operator (or your IaC) **pre-creates the slot**, the engine detects
+it already exists and **skips the snapshot bootstrap entirely** — it
+starts with empty join state and only tails *new* changes. Pre-creating
+the slot trades the initial backfill away. Let the engine create the slot
+if you want the one-shot snapshot of existing rows.
+</Warning>
+
+<AccordionGroup>
+  <Accordion title="RDS / Aurora PostgreSQL" icon="aws">
+    RDS/Aurora has **no true superuser** — the master user is
+    `rds_superuser` — and `ALTER SYSTEM` is blocked. So the replication
+    setup is a little different. Recommended path:
+
+    **1. Enable logical replication** (an AWS admin, not a SQL user):
+    set `rds.logical_replication = 1` in the **DB cluster parameter
+    group**, then **reboot** the cluster. This is what makes
+    `wal_level = logical`.
+
+    **2. Create a dedicated engine role** (don't put the master admin in
+    the connection string) and grant it replication via the RDS role —
+    `rds_superuser` does **not** include this automatically:
+    ```sql
+    CREATE ROLE ventstream LOGIN PASSWORD '…';
+    GRANT rds_replication TO ventstream;          -- RDS's stand-in for the REPLICATION attribute
+    GRANT USAGE ON SCHEMA <schema> TO ventstream;
+    GRANT SELECT ON ALL TABLES IN SCHEMA <schema> TO ventstream;
+    ```
+
+    **3. Create the publication** as the table owner (or `rds_superuser`).
+
+    <Warning>
+    **Point the engine at the writer (cluster) endpoint** —
+    `…cluster-….rds.amazonaws.com`, not a reader. Replication slots live
+    only on the primary. Also note Aurora has historically **not**
+    carried logical slots across a **failover**; after one, the agent may
+    need to re-bootstrap. Verify slot-failover support for your Aurora
+    engine version before relying on it in prod.
+    </Warning>
+  </Accordion>
+  <Accordion title="Cloud SQL for PostgreSQL" icon="google">
+    - Set the `cloudsql.logical_decoding = on` flag, then restart.
+    - `ALTER USER <engine_role> WITH REPLICATION;`
+    - Grant `SELECT` on the published tables to the engine role.
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+**Decommissioning an agent:** a slot the engine created keeps pinning WAL
+until it's dropped — Postgres won't recycle that WAL, and the disk
+eventually fills. When you retire an agent, drop its slot:
+`SELECT pg_drop_replication_slot('ventstream_orders_slot');`
+</Note>
+
+## The projection
+
+```yaml
+joins:
+  - name: orders
+    # Optional: with VS_INDEX_TEMPLATE='${header:ventstream.target.index}',
+    # this projection writes to the manual index below.
+    target:
+      index: tenant_a_orders
+    primary:
+      table: shop.orders
+      pk: order_id
+    related:
+      - id: customer
+        table: shop.customers
+        pk: customer_id
+        join_on: { from: customer_id, to: customer_id }   # orders.customer_id → customers.customer_id
+        embed_as: customer
+        cardinality: one
+        select: [customer_id, name, email, tier]
+      - id: items
+        table: shop.order_items
+        pk: item_id
+        join_on: { from: order_id, to: order_id }          # order_items.order_id → orders.order_id
+        embed_as: items
+        cardinality: many
+        sort_by: item_id
+        select: [item_id, sku, qty, price]
+    state:
+      backend: memory
+    backfill:
+      mode: sync_on_miss
+```
+
+- `cardinality: one` embeds a single object; `many` embeds an array.
+- `select` projects only the columns you want; omit it to embed the
+  whole row.
+- Reserved-word column names (e.g. `from`, `to`, `order`) are fine — the
+  fetcher double-quotes every column name.
+
+## Denormalize modes: in-memory vs SQL
+
+The same `joins:` spec can run two ways, chosen with `VS_PG_DENORMALIZE_MODE`:
+
+- **`memory` (default)** — the in-memory join engine. It keeps the related
+  rows and reverse indexes resident, so a change recomposes a doc with no
+  re-query — lowest tail latency. The trade-off is that **RSS scales with
+  the joined working set**, so it fits when that working set fits RAM.
+- **`sql`** — pushes the join into Postgres. Bootstrap runs
+  one keyset-chunked denormalizing `SELECT` per primary (PG composes each
+  doc; the engine streams them to the sink); the tail recomposes only the
+  affected primaries via SQL on each change. **Memory is bounded by the
+  chunk, not the dataset** — flat at tens of MB whether the source has
+  hundreds of thousands or tens of millions of rows. The trade-off is an
+  indexed re-query per change instead of an in-memory lookup.
+
+  Use `sql` when the working set is too large to hold in memory. It
+  **requires indexes on the join / foreign-key columns** — the per-chunk
+  bootstrap, the child→parent fan-out, and the foreign-row reverse lookup
+  all rely on them (without them they degrade to sequential scans). Works
+  with single, UUID, and composite primary keys, and with multiple
+  primaries in one spec (each → its own index).
+
+<Note>
+`sql` mode is the bounded-memory path for very large sources; `memory`
+mode stays the default for the lowest-latency tail when the working set
+fits RAM. Both consume the identical `joins:` spec.
+</Note>
+
+## Run the agent
+
+```bash
+VS_AGENT_NAME=orders-cdc \
+VS_ROLES=cdc VS_CDC_SOURCE=postgres \
+VS_PG_HOST=… VS_PG_PORT=5432 VS_PG_USER=ventstream VS_PG_PASSWORD=… \
+VS_PG_DATABASE=shop \
+VS_PG_PUBLICATION=ventstream_shop \
+VS_PG_SLOT=ventstream_orders_slot \
+VS_JOINS_YAML=demo/stack/specs/orders.yaml \
+VS_JOINS_STATE_DIR=/var/lib/ventstream/state \
+VS_PG_BOOTSTRAP_MODE=snapshot \
+VS_OS_ENDPOINT=http://localhost:9200 \
+VS_INDEX_TEMPLATE='${header:ventstream.cdc.relation}' \
+./target/release/ventstream
+```
+
+## Connection resilience
+
+If the replication connection drops mid-stream — a transient network
+blip, or a load balancer killing an idle connection — the source
+**reconnects in-process** with bounded exponential backoff and resumes
+from the slot's confirmed LSN. No committed change is missed (events
+since the last ack are re-delivered, and the sink upserts idempotently
+by doc id). A connection that streams for a sustained period resets the
+backoff budget, so brief blips recover instantly; only a genuinely-dead
+upstream (rapid flapping past the budget) bubbles up and lets Kubernetes
+restart the pod — keeping a dead database visible to liveness rather
+than silently spinning.
+
+`status_interval` (default 10s) sends standby status messages that
+double as an application-level keepalive, below typical LB idle
+timeouts, so idle replication connections aren't dropped in the first
+place.
+
+## Bootstrap then tail
+
+With `VS_PG_BOOTSTRAP_MODE=snapshot` and no existing slot, the agent
+snapshots every published table before opening the stream, so the index
+is fully populated before live changes flow. The snapshot and the live
+stream share a slot created *before* the scan, so changes during the
+snapshot window aren't lost — deterministic IDs dedupe any row seen
+both ways.
+
+## Changing the projection
+
+Edit the YAML and restart. With `VS_PG_AUTO_RESYNC_ON_YAML_CHANGE=true`,
+the agent fingerprints the spec; if it changed, it drops the slot,
+wipes its join state, and re-bootstraps so every document is rewritten
+with the new shape. Without that flag, it warns and keeps running —
+new changes use the new spec, existing docs update as their rows are
+touched.
+
+<Warning>
+**Primary-row** deletes propagate immediately — logical replication
+emits the delete keyed on the primary key (the document id), so the
+document is tombstoned. The only primary-delete gap is during a
+**drained** window — see [Reconciliation](/concepts/reconciliation).
+</Warning>
+
+## Source schema changes
+
+The section above is about changing **your spec**. This is about the
+**source schema** changing underneath you — a column added, dropped,
+renamed, or retyped in Postgres.
+
+The agent notices on the next `RELATION` message and emits a structured
+signal: a `metric=schema.drift` log (`table`, `column`, `kind`, plus
+`from_type_oid`/`to_type_oid` for a type change) and the
+`vs_schema_drift_total{table,kind}` counter on
+[`/metrics`](/reference/engine-env). Today this is **warn-only** — the
+pipeline keeps flowing:
+
+- A **new, unmapped** column is ignored (the projection only reads what it
+  references).
+- A **dropped/renamed** column the projection maps degrades that field
+  (null/missing) until you act.
+- A **type change** the sink can't accept surfaces downstream as a rejected
+  write → the DLQ.
+
+### Recovering
+
+The drift logs name exactly which columns changed. To recover, make the
+projection compatible and re-emit — the same resync path as above:
+
+1. Edit the joins YAML to match the new source schema (map the renamed
+   column, drop the removed one, adjust the field).
+2. Restart with `VS_PG_AUTO_RESYNC_ON_YAML_CHANGE=true` (or
+   `VS_PG_FORCE_RESYNC=true`). The fingerprint changes, so the agent drops
+   the slot, wipes join state, and **re-bootstraps every row against the
+   new schema** — see [Changing the projection](#changing-the-projection).
+
+If the change was purely additive and the YAML didn't need editing, a
+`POST /admin/resync` re-scans the tables without a restart.
+
+<Note>
+Operator-selectable drift **responses** (route affected events to the DLQ,
+or halt loudly instead of warning) are planned. Today the engine detects
+and warns; recovery is the resync above.
+</Note>
+
+## Child-row deletes
+
+Deleting a row from a **child/embedded table** (e.g. one line item out of
+an order) propagates on the **default replica identity** — no special table
+configuration needed.
+
+This is worth understanding, because Postgres makes it non-obvious. The
+default replica identity logs **only the primary key** in a `DELETE`'s old
+tuple — so a deleted line item's event carries `item_id` but **not** the
+foreign key `order_id` the engine needs to find the parent order. The engine
+closes that gap from its **own join state**: it cached the full child row
+(including `order_id`) when the row was inserted or bootstrapped, so on
+delete it recovers the FK from there, locates the order, and recomposes the
+document without the removed item. Inserts and updates were never affected
+(they carry the full new row); neither is deleting the **primary**.
+
+<Note>
+The one residual case is a child row the engine **never indexed** — e.g. it
+was inserted and deleted entirely while the agent was down and didn't
+re-bootstrap that row. With nothing cached, the FK can't be recovered from
+state. If your workload can produce that and you need the delete to still
+propagate, set `REPLICA IDENTITY FULL` on the child table so the FK rides
+along in the delete event itself:
+
+```sql
+ALTER TABLE shop.order_items REPLICA IDENTITY FULL;
+```
+
+`FULL` writes the entire old row image to the WAL on every `UPDATE`/`DELETE`
+(heavier WAL + logical-decode, proportional to row width × write rate), so
+only reach for it when that cold-cache case actually applies — the steady
+state doesn't need it.
+</Note>
+
+<Warning>
+**Memory-mode joins require a persistent state directory.** Set
+`VS_JOINS_STATE_DIR` to a redb directory backed by durable storage (a PVC in
+Kubernetes). The engine refuses to start a stateful memory join without it.
+On restart the engine reloads that state **before** it resumes streaming, so a
+child delete that happened while it was down still recomposes.
+
+This is governed by `VS_JOINS_STATE_DIR`, **not** by the spec's
+`state.backend` field — `state.backend` only selects the in-memory store and
+does not control redb persistence. See
+[Deploy → Kubernetes](/deploy/kubernetes).
+</Warning>
+
+## Soft deletes
+
+A soft delete (`UPDATE … SET deleted_at = now()`) is an **`UPDATE`, not a
+`DELETE`** — the row still exists in the table. So CDC emits an update,
+the engine re-composes and **upserts**, and the document **stays in the
+target** (now carrying `deleted_at`). Only a hard `DELETE` tombstones a
+document; a soft delete never removes it on its own.
+
+You have two ways to handle this:
+
+1. **Filter at read time (recommended).** Leave the document in place and
+   exclude soft-deleted rows in your search queries — your target's
+   equivalent of `WHERE deleted_at IS NULL`. Simplest, and keeps the
+   record around for audit.
+2. **Hard-delete to remove it.** If the document must disappear from the
+   index, the row has to be physically `DELETE`d in Postgres — that emits
+   the delete event the engine tombstones on.
+
+<Note>
+There is currently **no spec rule** that converts a soft-delete `UPDATE`
+into a document deletion (a "delete-on-predicate" / tombstone-when-column-
+flips feature). The spec controls the *shape* of the document, not whether
+an update removes it. If you need that, use the read-side filter above —
+delete-on-predicate is a possible future addition.
+</Note>

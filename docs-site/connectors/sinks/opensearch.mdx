@@ -1,0 +1,83 @@
+---
+title: "OpenSearch / Elasticsearch sink"
+description: "Write denormalized documents to OpenSearch or Elasticsearch with idempotent bulk upserts."
+---
+
+The sink writes the engine's output documents to **OpenSearch** or
+**Elasticsearch** — the same connector handles both, since they share the
+`_bulk` API and document model.
+
+## Configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `VS_OS_ENDPOINT` | — | base URL, e.g. `http://localhost:9200` (required) |
+| `VS_OS_USERNAME` / `VS_OS_PASSWORD` | — | HTTP basic auth |
+| `VS_OS_API_KEY` | — | `ApiKey`-header auth (alternative to basic) |
+| `VS_INDEX_TEMPLATE` | — | how each document's target index name is built |
+
+Bulk batching, parallelism, and the dead-letter path are tuned with the
+shared dispatcher knobs (`VS_DISPATCH_*`) — see the
+[engine env reference](/reference/engine-env).
+
+## Index naming
+
+`VS_INDEX_TEMPLATE` is expanded **per document** at write time. A literal
+string is used as-is; tokens let you route by event/time:
+
+| Token | Expands to |
+|-------|-----------|
+| `${header:NAME}` | the value of header `NAME` (e.g. `ventstream.cdc.relation`) |
+| `${subject}` / `${subject:N}` | the event subject, or its N-th dot-segment |
+| `%Y` `%m` `%d` `%H` | UTC time components of the write |
+
+All substitutions are lowercased and sanitized to `[a-z0-9_-]` (index
+names must be lowercase). Example: `events-${subject:1}-%Y-%m-%d`. A plain
+value like `orders` just targets the `orders` index.
+
+For raw table/collection sync, route by the output relation:
+
+```bash
+VS_INDEX_TEMPLATE='${header:ventstream.cdc.relation}'
+```
+
+For PostgreSQL or MySQL projection-owned index names, add `target.index` to
+every join/projection and route by the target header:
+
+```bash
+VS_INDEX_TEMPLATE='${header:ventstream.target.index}'
+```
+
+That keeps the sink responsible for the OpenSearch connection while the
+projection spec owns the document stream's index name. Canonical engine
+configuration using `strategy: by_projection_target` fails startup if the
+joins file is empty or any projection omits `target.index`.
+
+## Idempotent writes
+
+Every document's `_id` is derived from the source key (see
+[deterministic document IDs](/concepts/architecture#deterministic-document-ids)),
+so each write is an **upsert** that targets exactly one document:
+
+- Postgres: `shop.orders:["<order_id>"]`
+- Neo4j: `products_denormalized:<elementId>`
+
+Because the ID is a pure function of the key, bootstrap, live updates,
+re-syncs, and reconciliation all converge on the same state no matter how
+many times a record is re-emitted. A source delete becomes a document
+**tombstone** (delete by `_id`).
+
+## Reliability
+
+- **Bulk upserts** are batched and flushed with bounded parallelism.
+- **Rejects** (mapping conflicts, etc.) go to the dead-letter queue
+  (`VS_DLQ_PATH`) for inspection/replay rather than blocking the stream.
+- The source cursor only advances once the sink **confirms** the write —
+  so a crash resumes from the last durably-written position. See
+  [Architecture](/concepts/architecture#crash-safety-the-cursor-watermark).
+
+<Warning>
+The local demo disables the OpenSearch security plugin for convenience.
+In production, set `VS_OS_USERNAME`/`VS_OS_PASSWORD` (or `VS_OS_API_KEY`)
+and use TLS — never run an unauthenticated sink.
+</Warning>

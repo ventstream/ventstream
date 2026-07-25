@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VentStream — Pipeline A · CDC + joins</title>
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="assets/docs.js" defer></script>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="logo" href="index.html">VentStream</a>
+    <div class="tagline">CDC + denormalized indexing + durable WebSocket subscriptions, in a single Rust binary.</div>
+
+    <div class="nav-section">Start here</div>
+    <nav><ul>
+      <li><a data-page="index.html" href="index.html">Overview</a></li>
+      <li><a data-page="architecture.html" href="architecture.html">Architecture</a></li>
+      <li><a data-page="getting-started.html" href="getting-started.html">Getting started</a></li>
+    </ul></nav>
+
+    <div class="nav-section">Pipelines</div>
+    <nav><ul>
+      <li><a data-page="pipeline-a.html" href="pipeline-a.html">A · CDC + joins</a></li>
+      <li><a data-page="pipeline-b.html" href="pipeline-b.html">B · WS fan-out</a></li>
+      <li><a data-page="graphql.html" href="graphql.html">GraphQL gateway</a></li>
+    </ul></nav>
+
+    <div class="nav-section">Operations</div>
+    <nav><ul>
+      <li><a data-page="operations.html" href="operations.html">Deploy &amp; configure</a></li>
+      <li><a data-page="roadmap.html" href="roadmap.html">Roadmap</a></li>
+    </ul></nav>
+
+    <div class="footer-note">v0.1 · <a href="https://github.com/bashiru98/ventstream">bashiru98/ventstream</a></div>
+  </aside>
+
+  <main>
+    <h1>Pipeline A · CDC + joins</h1>
+    <p class="subtitle">Stream Postgres changes through stateful joins to a denormalized index. Foreign-side mutations re-emit the primary doc; sync-on-miss covers ordering gaps. One document per logical row in the sink, even across replays.</p>
+
+    <h2>What this pipeline does</h2>
+    <p>Standard CDC tools push raw row changes — you receive an event saying "the <code>orders</code> table had row X updated." If you want a denormalized view (an Order document containing the line items, the buyer's name, the shipping address), you either pre-build it on every update or you assemble it in a downstream pipeline.</p>
+    <p>VentStream lets you declare the join graph in YAML. The join engine maintains the necessary indexes in memory, applies sync-on-miss when a row is referenced before its primary arrives, and re-emits the primary document whenever any of its dependencies change. Output: one composed document per logical row, idempotent via deterministic <code>_id</code>.</p>
+
+    <h2>Postgres setup</h2>
+    <p>The source uses <code>pgwire-replication</code> (pgoutput plugin), so the database needs logical replication enabled.</p>
+
+    <h3>1. Enable logical replication</h3>
+    <div class="code-block">
+<pre><code data-lang="bash"># postgresql.conf
+wal_level = logical
+max_wal_senders = 10
+max_replication_slots = 10</code></pre>
+    </div>
+    <p>Restart Postgres after the change.</p>
+
+    <h3>2. REPLICA IDENTITY FULL on every table you join across</h3>
+    <p>This makes UPDATE and DELETE WAL records carry the full old row, not just the primary key. Without it, foreign-side updates may miss state needed for join maintenance.</p>
+    <div class="code-block">
+<pre><code data-lang="sql">ALTER TABLE orders         REPLICA IDENTITY FULL;
+ALTER TABLE shipments        REPLICA IDENTITY FULL;
+ALTER TABLE order_addresses    REPLICA IDENTITY FULL;
+ALTER TABLE order_buyers    REPLICA IDENTITY FULL;
+ALTER TABLE line_items         REPLICA IDENTITY FULL;</code></pre>
+    </div>
+
+    <h3>3. Publication + replication slot</h3>
+    <div class="code-block">
+<pre><code data-lang="sql">CREATE PUBLICATION vspub FOR TABLE orders, shipments, order_addresses, order_buyers, line_items;
+SELECT pg_create_logical_replication_slot('vsslot', 'pgoutput');</code></pre>
+    </div>
+
+    <h2>Engine config</h2>
+    <p>Env vars for the CDC role:</p>
+    <table>
+      <thead><tr><th>Variable</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>VS_ROLES</code></td><td>—</td><td>Include <code>cdc</code>.</td></tr>
+        <tr><td><code>VS_PG_HOST</code></td><td>—</td><td>Postgres host.</td></tr>
+        <tr><td><code>VS_PG_PORT</code></td><td><code>5432</code></td><td></td></tr>
+        <tr><td><code>VS_PG_USER</code></td><td>—</td><td>Must have <code>REPLICATION</code> attribute.</td></tr>
+        <tr><td><code>VS_PG_PASSWORD</code></td><td>—</td><td>SCRAM-SHA-256 is supported.</td></tr>
+        <tr><td><code>VS_PG_DATABASE</code></td><td>—</td><td></td></tr>
+        <tr><td><code>VS_PG_PUBLICATION</code></td><td>—</td><td>Created above.</td></tr>
+        <tr><td><code>VS_PG_SLOT</code></td><td>—</td><td>Created above.</td></tr>
+        <tr><td><code>VS_OS_ENDPOINT</code></td><td>—</td><td>OpenSearch URL.</td></tr>
+        <tr><td><code>VS_INDEX_TEMPLATE</code></td><td>—</td><td>e.g. <code>events-${header:ventstream.cdc.relation}-%Y-%m-%d</code></td></tr>
+        <tr><td><code>VS_JOINS_YAML</code></td><td>—</td><td>Path to the joins config (below).</td></tr>
+        <tr><td><code>VS_DLQ_PATH</code></td><td><code>./data/dlq.jsonl</code></td><td>Where poison events go.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Join configuration</h2>
+    <p>The YAML declares one or more <em>join definitions</em>. Each has a <strong>primary</strong> table (the one whose changes produce the composed document) and any number of <strong>related</strong> tables that get embedded into the document.</p>
+
+    <div class="code-block">
+<pre><code data-lang="yaml"># joins.yaml — the orders example we tested with
+joins:
+  - name: orders_denormalized
+    primary:
+      table: public.orders
+      pk: order_id          # single-column PK
+
+    related:
+      # 1-to-1 simple FK
+      - id: shipment
+        table: public.shipments
+        pk: shipment_id
+        join_on: { from: shipment_id, to: shipment_id }
+        cardinality: one
+
+      # 1-to-1 simple FK
+      - id: address
+        table: public.order_addresses
+        pk: address_id
+        join_on: { from: address_id, to: address_id }
+        cardinality: one
+
+      # 1-to-1 with COMPOSITE PK (order_id, buyer_id) but joined on order_id only.
+      # The engine resolves this via its `foreign_by_fk` secondary index.
+      - id: buyer
+        table: public.order_buyers
+        pk: [order_id, buyer_id]
+        join_on: { from: order_id, to: order_id }
+        cardinality: one
+
+      # 1-to-many
+      - id: line_items
+        table: public.line_items
+        join_on: { from: order_id, to: order_id }
+        cardinality: many
+        sort_by: date          # optional ordering of the embedded array</code></pre>
+    </div>
+
+    <h3>Key fields</h3>
+    <ul>
+      <li><strong><code>primary.pk</code></strong> — single-column or composite. Composite is <code>[col_a, col_b]</code>.</li>
+      <li><strong><code>related[].pk</code></strong> — same. Used to identify each row in the related table for state storage.</li>
+      <li><strong><code>related[].join_on.from</code> / <code>to</code></strong> — columns on the primary and related sides. Don't have to be primary keys (see <code>buyer</code> above — joined on <code>order_id</code>, not the full composite PK).</li>
+      <li><strong><code>cardinality</code></strong> — <code>one</code> embeds a single object; <code>many</code> embeds an array.</li>
+      <li><strong><code>sort_by</code></strong> — orders the embedded array. Optional.</li>
+      <li><strong><code>select</code></strong> — columns to project into the embedded object; omit to embed the whole row. <strong>If you set <code>select</code> on a <code>many</code> child whose deletes must propagate under <code>REPLICA IDENTITY DEFAULT</code>, you must include the child's PK in the list.</strong> A child DELETE under <code>DEFAULT</code> only carries the child PK in the WAL (not the parent FK), so the engine recovers the parent by looking up the embedded child PK in the sink — if the PK isn't embedded, the lookup matches nothing and the child delete won't propagate. An empty <code>select</code> embeds everything, so the PK is always present.</li>
+    </ul>
+
+    <h2>What the engine does on each event</h2>
+    <p>For a primary INSERT or UPDATE:</p>
+    <ol>
+      <li>Update reverse indexes so the engine remembers which primaries reference which foreign rows.</li>
+      <li>For each related definition, look up the related row(s) in state. If missing, fetch via <code>SELECT</code> on a separate connection (sync-on-miss).</li>
+      <li>Compose the document by embedding the related rows into the primary's JSON.</li>
+      <li>Emit the composed document with a deterministic <code>ventstream.doc.id</code> header.</li>
+    </ol>
+    <p>For a related INSERT, UPDATE, or DELETE:</p>
+    <ol>
+      <li>Look up the reverse index: which primaries reference this foreign row?</li>
+      <li>For each affected primary, re-compose with the new related state and re-emit.</li>
+    </ol>
+    <p>This is the "foreign-side re-emit" mechanism — the same primary document gets re-published every time anything it depends on changes, so the sink stays consistent without any extra logic.</p>
+
+    <h2>Deterministic <code>_id</code> for the sink</h2>
+    <p>Re-emitting the same primary document many times would normally create lifecycle copies in OpenSearch. We avoid that by setting a <code>ventstream.doc.id</code> header on every emit:</p>
+    <div class="code-block">
+<pre><code data-lang="text">ventstream.doc.id = {primary_table}:{primary_pk}
+
+# Examples:
+#   public.orders:["order-002"]
+#   public.users:["user_alice"]
+#   public.invoices:["INV-2026","line-3"]   # composite PK</code></pre>
+    </div>
+    <p>The OpenSearch sink uses this header as <code>_id</code>, overwriting the same document instead of indexing a new one.</p>
+
+    <h2>What's tested</h2>
+    <p>The orders schema (orders × shipments × order_addresses × order_buyers[composite-PK] × line_items) seeded into a local Postgres on port 5433. Every foreign-side mutation was exercised:</p>
+    <ul>
+      <li>UPDATE on a parent — all dependent primaries re-emitted with the new field</li>
+      <li>UPDATE on a address (1-to-1 child) — only the affected primaries re-emitted</li>
+      <li>UPDATE on a buyer (composite-PK 1-to-1 child) — only the affected primaries re-emitted</li>
+      <li>UPDATE on a line item (1-to-many child) — the nested array reflects the change</li>
+      <li>INSERT of a new line item — the array grows</li>
+      <li>DELETE of a line item — the array shrinks</li>
+      <li>Idempotency check — 3 orders produce 3 OpenSearch documents regardless of how many re-emits happened</li>
+    </ul>
+
+    <h2>Snapshot bootstrap (full sync for existing data) <span class="pill shipped">v0.1</span></h2>
+    <p>By default the CDC pipeline only sees changes that happened <em>after</em> the slot was created. To populate the sink with <strong>existing</strong> rows on first deployment, opt in:</p>
+
+    <div class="code-block">
+<pre><code data-lang="bash">VS_ROLES=cdc \
+VS_PG_BOOTSTRAP_MODE=snapshot \
+VS_PG_BOOTSTRAP_CHUNK_SIZE=10000 \
+VS_JOINS_YAML=joins.yaml \
+VS_PG_* VS_OS_* ... \
+  ./ventstream</code></pre>
+    </div>
+
+    <p>When the engine starts:</p>
+    <ol>
+      <li>Connects to Postgres on a standalone connection (separate from the replication slot).</li>
+      <li>Checks <code>pg_replication_slots</code>. If the slot already exists, skips the bootstrap and starts streaming normally.</li>
+      <li>If the slot doesn't exist, creates it (pgoutput plugin) — concurrent writes get captured in the WAL.</li>
+      <li>For each table participating in the joins (related tables first, then primaries), SELECTs all rows in chunked pages ordered by primary key.</li>
+      <li>Emits each row as a synthetic INSERT event into the source bus. The join engine treats them identically to WAL-derived inserts.</li>
+      <li>Hands off to pgwire-replication for normal streaming.</li>
+    </ol>
+
+    <p>Tables and primary keys are derived from your joins YAML — no second list to maintain. Composite PKs use Postgres row-tuple comparison (<code>(a,b) &gt; ($1,$2)</code>) for pagination.</p>
+
+    <h3>v1 caveats</h3>
+    <div class="callout warn">
+      <strong>Non-transactional.</strong> v1 reads with a regular REPEATABLE READ transaction, not the slot's exported snapshot. A row updated during the snapshot window can race — the deterministic doc-ID in the sink makes this mostly harmless for search-index workloads, but for audit/compliance use cases that require transactional consistency, v2 will use <code>CREATE_REPLICATION_SLOT ... USE_SNAPSHOT</code>.
+    </div>
+    <div class="callout warn">
+      <strong>No resumability.</strong> Engine death mid-snapshot restarts from scratch. Pairs naturally with the redb persistent-state work on the roadmap.
+    </div>
+    <div class="callout warn">
+      <strong>No per-join trigger.</strong> Adding a new join to an existing pipeline still relies on sync-on-miss for backfill. Per-join scan (Mode 2) is a follow-up.
+    </div>
+
+    <h2>Manual resync at any time <span class="pill shipped">v0.1</span></h2>
+    <p>Once the engine is running you can trigger a full re-sync on demand. Opt in with <code>VS_ADMIN_LISTEN</code> and the binary exposes a small admin HTTP server alongside the CDC engine. Useful for drift repair, adding new joins, or periodic reconciliation.</p>
+
+    <div class="code-block">
+<pre><code data-lang="bash">VS_ADMIN_LISTEN=127.0.0.1:4042 \
+... other config ... \
+  ./ventstream
+
+# Then, while it's running:
+curl -X POST http://127.0.0.1:4042/admin/resync                          # all tables
+curl -X POST http://127.0.0.1:4042/admin/resync?tables=public.orders      # scoped
+curl http://127.0.0.1:4042/admin/healthz                                 # liveness</code></pre>
+    </div>
+
+    <p>Response:</p>
+    <div class="code-block">
+<pre><code data-lang="json">{
+  "tables_processed": ["public.shipments", "public.orders"],
+  "stats": { "total": 4, "elapsed_ms": 1 }
+}</code></pre>
+    </div>
+
+    <p><strong>Concurrency:</strong> single-flight. A second resync while one is running returns <code>409 Conflict</code> immediately; the first continues uninterrupted.</p>
+
+    <p><strong>Safety:</strong> the resync runs <em>alongside</em> normal WAL streaming. A row that arrives via both paths (snapshot and WAL) overwrites the same destination doc thanks to the deterministic <code>_id</code> — no duplicates, no consistency drift.</p>
+
+    <p><strong>Auth:</strong> none in v1. Bind to <code>127.0.0.1</code> only and rely on network isolation, or front it with a reverse proxy that adds auth.</p>
+
+    <h2>Persistent join state <span class="pill shipped">v0.1</span></h2>
+    <p>By default the join engine keeps state in memory. Restart = cold start. For large pipelines, set <code>VS_JOINS_STATE_DIR=/path/to/dir</code> and every mutation gets mirrored to a redb database under that directory. On startup, the saved state is loaded into the in-memory maps before WAL streaming resumes.</p>
+
+    <div class="code-block">
+<pre><code data-lang="bash">VS_ROLES=cdc \
+VS_JOINS_STATE_DIR=/var/ventstream/state \
+VS_JOINS_YAML=joins.yaml \
+VS_PG_* VS_OS_* ... \
+  ./ventstream</code></pre>
+    </div>
+
+    <p>Why this matters: foreign-side re-emit relies on the <code>primary_reverse</code> index that says "this primary row references this FK value." Without persistence, that index is empty after restart, so a foreign UPDATE after restart wouldn't re-emit the primary docs that depend on it. With redb the index survives, and re-emit Just Works the same way it did before restart.</p>
+
+    <h3>What's persisted</h3>
+    <table>
+      <thead><tr><th>redb table</th><th>Mirror of</th><th>Used for</th></tr></thead>
+      <tbody>
+        <tr><td><code>foreign_rows</code></td><td>raw foreign row by <code>(table, pk)</code></td><td>compose</td></tr>
+        <tr><td><code>primary_rows</code></td><td>primary state (raw + fk_values)</td><td>compose, delete cleanup</td></tr>
+        <tr><td><code>primary_reverse</code></td><td>FK → set of primaries</td><td>foreign-side re-emit</td></tr>
+        <tr><td><code>foreign_by_fk</code></td><td>FK → set of foreign PKs</td><td>1-to-many compose</td></tr>
+      </tbody>
+    </table>
+
+    <h3>v1 caveats</h3>
+    <div class="callout warn">
+      <strong>Not event-atomic.</strong> A CDC event triggers multiple state mutations; v1 commits each as its own redb transaction. A crash mid-event leaves the on-disk state with the partial set applied. Sync-on-miss + foreign-side re-emit eventually correct most cases. Full event atomicity comes with sink-ACK-gated LSN advance.
+    </div>
+    <div class="callout warn">
+      <strong>Write-through, per-mutation fsync.</strong> One redb commit per state mutation. Fine for most workloads; for very high event rates (10k+/sec sustained), batched commits are a v2 add. Documented in <code>persistence.rs</code>.
+    </div>
+    <div class="callout warn">
+      <strong>Nested joins.</strong> One level of join is supported. <code>order → buyer → contact_person</code> requires manual JSON post-processing for now.
+    </div>
+    <div class="callout warn">
+      <strong>TRUNCATE.</strong> If you <code>TRUNCATE</code> a participating table, the engine logs a warning and skips it. State doesn't auto-clear. Restart the engine for a clean slate.
+    </div>
+
+    <div class="page-footer">
+      <span><a href="getting-started.html">← Getting started</a></span>
+      <span><a href="pipeline-b.html">Pipeline B →</a></span>
+    </div>
+  </main>
+</div>
+</body>
+</html>

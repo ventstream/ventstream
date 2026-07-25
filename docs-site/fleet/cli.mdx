@@ -1,0 +1,275 @@
+---
+title: "CLI administration"
+description: "Install ventstreamctl, select a Fleet context, and administer pipelines, agents, configuration, and operations."
+---
+
+`ventstreamctl` is an HTTPS client for the control-plane API. It never connects
+directly to an engine, source database, sink, or agent gateway.
+
+<Note>
+A standalone engine has no Fleet API and cannot be administered with
+`ventstreamctl`. Use the CLI only for engines running under the Fleet supervisor.
+</Note>
+
+## Install
+
+`ventstreamctl` is distributed with VentStream Fleet as a signed,
+platform-specific binary. It is not built from this open-core engine
+repository. Install the archive matching the Fleet release and verify its
+checksum and provenance using the release instructions supplied with that
+version:
+
+```bash
+ventstreamctl version
+```
+
+Place the verified binary on `PATH`. A standalone engine does not require
+`ventstreamctl`.
+
+## Authenticate
+
+Create and verify a built-in account or use an operator-configured OIDC device
+flow. The complete account lifecycle, secure password input, recovery, refresh,
+and logout commands are covered in [Authentication](/fleet/authentication).
+
+```bash
+ventstreamctl auth status
+ventstreamctl auth whoami
+```
+
+## Profiles and context
+
+A profile stores the control-plane origin, credentials, and optional organization
+and environment defaults. Use separate profiles for separate control planes or
+identities:
+
+```bash
+ventstreamctl config use-profile production
+ventstreamctl config show
+```
+
+List the organizations visible to the authenticated principal and select one:
+
+```bash
+ventstreamctl orgs list
+ventstreamctl config set-org <organization-id>
+```
+
+Then list and select an environment:
+
+```bash
+ventstreamctl environments list
+ventstreamctl config set-env <environment-id>
+ventstreamctl config show
+```
+
+After context is selected, routine commands do not need repeated URLs or UUIDs:
+
+```bash
+ventstreamctl pipelines list
+ventstreamctl agents list --pipeline orders-cdc
+ventstreamctl operations list --status running
+```
+
+Use `--profile <name>` for a one-command profile override. Use
+`--organization` and `--environment` only for a one-command context override.
+
+## Organizations and environments
+
+Organization creation is a platform-administrator operation. It creates the
+organization, owner role binding, and optional initial environments atomically.
+The first environment becomes the profile default unless `--no-set-default` is
+supplied.
+
+```bash
+ventstreamctl orgs create acme \
+  --display-name "Acme" \
+  --region us-east \
+  --environment development:Development \
+  --environment production:Production
+```
+
+Create another environment inside the selected organization:
+
+```bash
+ventstreamctl environments create staging \
+  --display-name "Staging"
+```
+
+Regular users can belong to multiple organizations. Once an administrator grants
+or invites the identity through the V1 API, it appears in `orgs list`. Invitation,
+role-binding, billing, settings, audit, and service-account administration are API
+operations in the current release; they do not yet have `ventstreamctl` command
+groups. See [Fleet API](/reference/control-plane-api).
+
+## Pipelines
+
+Create one logical workload in the selected environment:
+
+```bash
+ventstreamctl pipelines create orders-cdc \
+  --description "Orders search projection" \
+  --workload-kind cdc \
+  --source-kind postgres \
+  --sink-kind opensearch
+
+ventstreamctl pipelines list
+ventstreamctl pipelines describe orders-cdc
+```
+
+Pipeline arguments accept an exact name, full UUID, or unambiguous UUID prefix of
+at least eight characters within the selected environment.
+
+### Lifecycle
+
+Lifecycle mutations create durable operations:
+
+```bash
+ventstreamctl pipelines pause orders-cdc \
+  --reason "schema maintenance" --wait
+
+ventstreamctl pipelines resume orders-cdc --wait
+
+ventstreamctl pipelines drain orders-cdc \
+  --reason "retire source" --wait
+
+ventstreamctl pipelines reconcile orders-cdc \
+  --reason "verify sink parity" --wait
+
+ventstreamctl pipelines rebootstrap orders-cdc \
+  --reason "replace source history" --confirm --wait
+```
+
+`--wait` returns success only when the operation reaches `succeeded`. Without it,
+the command returns after the operation is durably queued. `rebootstrap` is
+destructive and requires both `--reason` and `--confirm`.
+
+Use `--expected-revision` for explicit CI concurrency control. Interactive use can
+omit it; the CLI reads the current revision and supplies the required `If-Match`
+value.
+
+## Managed configuration
+
+Create an immutable configuration revision from a canonical `ventstream.yaml` and
+its referenced non-secret files:
+
+```bash
+ventstreamctl pipelines configurations create orders-cdc \
+  --engine-config ./ventstream.yaml \
+  --file projections/orders.yaml=./orders.yaml \
+  --file graphql/schema.graphql=./schema.graphql
+```
+
+Then validate, select, apply, and start it:
+
+```bash
+ventstreamctl pipelines configurations list orders-cdc
+ventstreamctl pipelines configurations validate orders-cdc <revision> \
+  --reason "pre-deployment validation"
+ventstreamctl pipelines configurations select orders-cdc <revision> \
+  --reason "release 2026-07"
+ventstreamctl pipelines configurations apply orders-cdc <revision> \
+  --reason "release 2026-07" --wait
+ventstreamctl pipelines resume orders-cdc --wait
+```
+
+Applying stages configuration but does not implicitly resume a new paused
+pipeline. Roll back by selecting and applying an earlier valid revision:
+
+```bash
+ventstreamctl pipelines configurations rollback orders-cdc <previous-revision> \
+  --reason "rollback failed release" --wait
+```
+
+See [Managed configuration](/fleet/configuration) for the bundle and secret
+boundary.
+
+## Deployments and enrollment
+
+The CLI calls engine installations *deployments* under the `agents` command
+group. Kubernetes or another scheduler creates the actual workload.
+
+```bash
+ventstreamctl agents create orders-primary --pipeline orders-cdc
+ventstreamctl agents list --pipeline orders-cdc
+ventstreamctl agents describe <deployment-id> --pipeline orders-cdc
+```
+
+Generate one short-lived, single-use enrollment grant:
+
+```bash
+ventstreamctl agents enroll-token create <deployment-id> \
+  --pipeline orders-cdc
+```
+
+The token command prints only the secret to stdout and deliberately has no table
+or JSON wrapper. Send it directly to a secret-management workflow; do not log it.
+
+After the workload enrolls, inspect aggregate and per-instance health:
+
+```bash
+ventstreamctl agents status \
+  --pipeline orders-cdc \
+  --deployment <deployment-id>
+```
+
+Irreversibly revoke active workload identities when a deployment is retired or
+compromised:
+
+```bash
+ventstreamctl agents identity revoke <deployment-id> \
+  --pipeline orders-cdc \
+  --reason "host retired" \
+  --confirm
+```
+
+Revocation requires re-enrollment before that deployment can reconnect. See
+[Agent enrollment](/fleet/enrollment).
+
+## Operations
+
+List operation history for the selected environment or one pipeline:
+
+```bash
+ventstreamctl operations list
+ventstreamctl operations list --pipeline orders-cdc --status running
+```
+
+Inspect terminal results and delivery attempts:
+
+```bash
+ventstreamctl operations describe <operation-id> --attempts
+ventstreamctl operations describe <operation-id> --wait
+ventstreamctl operations attempts <operation-id>
+```
+
+Only a queued operation can be canceled. Cancellation does not roll back desired
+state; issue a new lifecycle action when desired state must change.
+
+```bash
+ventstreamctl operations cancel <operation-id> \
+  --reason "request withdrawn"
+```
+
+## Automation
+
+- Add `--output json` to commands that support structured output.
+- Collection commands accept `--limit` and an opaque `--cursor` returned by the
+  preceding page.
+- Set `VENTSTREAMCTL_PROFILE` to select a profile without a command-line flag.
+- Set `VENTSTREAMCTL_ACCESS_TOKEN` to provide a short-lived OIDC access token in
+  ephemeral automation.
+- Use `--idempotency-key` when a workflow needs a stable retry identity; otherwise
+  the CLI creates one.
+- Waited commands exit non-zero for failed, canceled, expired, or timed-out
+  operations.
+- One-time verification/reset secrets should use `--token-env`; passwords should
+  use `--password-env` or `--password-stdin`.
+
+Run `ventstreamctl <group> <command> --help` for every supported flag and default.
+
+<Note>
+For localhost development only, pass `--allow-insecure-localhost` during the first
+auth command. The allowance is retained in that profile and rejected for
+non-loopback hosts.
+</Note>

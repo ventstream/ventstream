@@ -1,0 +1,163 @@
+{{- include "gateway.validate" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gateway.fullname" . }}
+  labels:
+    {{- include "gateway.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "gateway.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gateway.labels" . | nindent 8 }}
+      {{- if include "gateway.hasSchema" . }}
+      annotations:
+        # Roll pods when the SDL schema changes.
+        checksum/schema: {{ .Values.graphql.schema.inline | default "external" | sha256sum }}
+      {{- end }}
+    spec:
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: engine
+          image: {{ include "gateway.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: VS_ROLES
+              value: {{ .Values.roles | quote }}
+            # pod id → consumer naming, so each replica reaps only its own
+            # JetStream consumers (the orphan-cleanup safety net).
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- if include "gateway.hasWs" . }}
+            # --- native WebSocket gateway (role: ws) ---
+            - name: VS_WS_LISTEN
+              value: {{ .Values.ws.listen | quote }}
+            - name: VS_WS_NATS_URL
+              value: {{ .Values.nats.url | quote }}
+            - name: VS_WS_SUBJECTS
+              value: {{ .Values.ws.subjects | quote }}
+            - name: VS_WS_MAILBOX
+              value: {{ .Values.ws.mailbox | quote }}
+            {{- if gt (int .Values.ws.maxConns) 0 }}
+            # Per-pod hard connection cap (OOM backstop). A WS upgrade
+            # past this count is rejected with 503 + Retry-After before
+            # the per-connection consumer/mailbox are allocated. Size to
+            # the memory limit: ~(limit - base) / 165KiB-per-conn.
+            - name: VS_WS_MAX_CONNS
+              value: {{ .Values.ws.maxConns | quote }}
+            {{- end }}
+            {{- if .Values.ws.jetstream.enabled }}
+            - name: VS_WS_JETSTREAM
+              value: "1"
+            - name: VS_WS_JS_STREAM
+              value: {{ .Values.ws.jetstream.stream | quote }}
+            - name: VS_WS_JS_STORAGE
+              value: {{ .Values.ws.jetstream.storage | quote }}
+            - name: VS_WS_JS_MAX_AGE_SECS
+              value: {{ .Values.ws.jetstream.maxAgeSecs | quote }}
+            - name: VS_WS_JS_MAX_BYTES
+              # int64 to avoid Go rendering a large number in scientific
+              # notation (e.g. 5.36e+08), which the engine can't parse.
+              value: {{ .Values.ws.jetstream.maxBytes | int64 | quote }}
+            - name: VS_WS_JS_REAPER_INTERVAL_MS
+              value: {{ .Values.ws.jetstream.reaperIntervalMs | quote }}
+            - name: VS_WS_JS_INACTIVE_THRESHOLD_MS
+              value: {{ .Values.ws.jetstream.inactiveThresholdMs | quote }}
+            - name: VS_WS_JS_POD_ID
+              value: "$(POD_NAME)"
+            {{- end }}
+            {{- end }}
+            {{- if include "gateway.hasGraphql" . }}
+            # --- GraphQL subscription gateway (role: graphql) ---
+            - name: VS_GRAPHQL_LISTEN
+              value: {{ .Values.graphql.listen | quote }}
+            - name: VS_GRAPHQL_NATS_URL
+              value: {{ .Values.nats.url | quote }}
+            - name: VS_GRAPHQL_STREAM
+              value: {{ .Values.graphql.stream | quote }}
+            - name: VS_GRAPHQL_REAPER_INTERVAL_MS
+              value: {{ .Values.graphql.reaperIntervalMs | quote }}
+            - name: VS_GRAPHQL_INACTIVE_THRESHOLD_MS
+              value: {{ .Values.graphql.inactiveThresholdMs | quote }}
+            - name: VS_GRAPHQL_BROADCAST_CAP
+              value: {{ .Values.graphql.broadcastCap | quote }}
+            - name: VS_GRAPHQL_POD_ID
+              value: "$(POD_NAME)"
+            {{- if .Values.graphql.playground }}
+            - name: VS_GRAPHQL_PLAYGROUND
+              value: "1"
+            {{- end }}
+            {{- if include "gateway.hasSchema" . }}
+            - name: VS_GRAPHQL_SCHEMA
+              value: /etc/ventstream/subscriptions.graphql
+            {{- end }}
+            {{- end }}
+            # --- ops ---
+            - name: RUST_LOG
+              value: {{ .Values.rustLog | quote }}
+            - name: VS_LOG_FORMAT
+              value: {{ .Values.logFormat | quote }}
+            # Shared health server — the single liveness/readiness target
+            # for every role (served by the engine's health module, not
+            # on the ws/graphql traffic ports).
+            - name: VS_HEALTH_LISTEN
+              value: "0.0.0.0:{{ .Values.service.healthPort }}"
+          ports:
+            - name: health
+              containerPort: {{ .Values.service.healthPort }}
+            {{- if include "gateway.hasWs" . }}
+            - name: ws
+              containerPort: {{ .Values.service.wsPort }}
+            {{- end }}
+            {{- if include "gateway.hasGraphql" . }}
+            - name: graphql
+              containerPort: {{ .Values.service.graphqlPort }}
+            {{- end }}
+          # Readiness stays 503 until every enabled gateway initializes and
+          # binds its listener. It also flips to 503 at ~90% of the WS
+          # connection cap so the Service stops routing NEW connections to a
+          # near-full pod. Probe faster than the default 3×10s so a pod leaves
+          # rotation within ~10s of filling up.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 2
+            successThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          {{- if include "gateway.hasSchema" . }}
+          volumeMounts:
+            - name: schema
+              mountPath: /etc/ventstream
+              readOnly: true
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- if include "gateway.hasSchema" . }}
+      volumes:
+        - name: schema
+          configMap:
+            name: {{ include "gateway.schemaConfigMap" . }}
+            items:
+              - key: {{ include "gateway.schemaKey" . }}
+                path: subscriptions.graphql
+      {{- end }}

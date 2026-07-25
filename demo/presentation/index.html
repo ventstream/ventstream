@@ -1,0 +1,1398 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>VentStream — Engineering Review</title>
+
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reset.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+
+    <style>
+      :root {
+        --bg: #0a0e1a;
+        --bg-2: #131826;
+        --fg: #e6edf3;
+        --muted: #8b96a8;
+        --accent: #5eead4;
+        --accent-2: #f97316;
+        --green: #4ade80;
+        --red: #f87171;
+        --border: #1f2937;
+      }
+      body { background: var(--bg); }
+      .reveal { font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif; font-weight: 400; }
+      .reveal .slides { text-align: left; }
+      .reveal .slides section { text-align: left; padding: 0; }
+
+      /* Headings */
+      .reveal h1, .reveal h2, .reveal h3 {
+        color: var(--fg);
+        font-weight: 600;
+        letter-spacing: -0.02em;
+        text-transform: none;
+        margin: 0;
+      }
+      .reveal h1 { font-size: 2.4em; line-height: 1.1; margin-bottom: 0.4em; }
+      .reveal h2 { font-size: 1.7em; line-height: 1.15; margin-bottom: 0.45em; }
+      .reveal h3 {
+        font-size: 0.6em;
+        color: var(--accent);
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        font-weight: 500;
+        margin-bottom: 0.8em;
+      }
+
+      .reveal p, .reveal li {
+        color: var(--fg);
+        line-height: 1.55;
+        font-size: 0.7em;
+      }
+      .reveal ul { margin-left: 0; padding-left: 0; list-style: none; }
+      .reveal ul li {
+        position: relative;
+        padding-left: 1.2em;
+        margin-bottom: 0.55em;
+      }
+      .reveal ul li::before {
+        content: '';
+        position: absolute;
+        left: 0;
+        top: 0.65em;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--accent);
+      }
+      .reveal strong { color: var(--fg); font-weight: 600; }
+
+      .reveal .lede {
+        font-size: 0.9em;
+        color: var(--muted);
+        font-weight: 300;
+        margin-bottom: 1em;
+        line-height: 1.5;
+      }
+      .reveal .muted { color: var(--muted); }
+      .reveal .accent { color: var(--accent); }
+      .reveal .accent-2 { color: var(--accent-2); }
+
+      .reveal code {
+        color: var(--accent);
+        background: var(--bg-2);
+        padding: 0.1em 0.35em;
+        border-radius: 4px;
+        font-size: 0.85em;
+        border: 1px solid var(--border);
+      }
+
+      /* Tables */
+      .reveal table {
+        font-size: 0.65em;
+        border-collapse: collapse;
+        width: 100%;
+        margin: 0;
+      }
+      .reveal th, .reveal td {
+        padding: 0.6em 0.9em;
+        border-bottom: 1px solid var(--border);
+        text-align: left;
+      }
+      .reveal th {
+        color: var(--muted);
+        font-weight: 500;
+        font-size: 0.85em;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+      .reveal td.num { font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 500; }
+      .reveal td.good { color: var(--green); font-weight: 500; }
+      .reveal td.bad { color: var(--red); font-weight: 500; }
+
+      /* Stat grids */
+      .reveal .stat-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 1em;
+        margin-top: 0.5em;
+      }
+      .reveal .stat {
+        padding: 1em 1.2em;
+        background: var(--bg-2);
+        border-left: 3px solid var(--accent);
+        border-radius: 4px;
+      }
+      .reveal .stat .v {
+        font-size: 1.4em;
+        color: var(--accent);
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        line-height: 1;
+      }
+      .reveal .stat .l {
+        font-size: 0.55em;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        margin-top: 0.6em;
+        line-height: 1.3;
+      }
+
+      /* Two-column */
+      .reveal .two-col {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1.4em;
+        margin-top: 0.4em;
+      }
+      .reveal .col-card {
+        background: var(--bg-2);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 1.2em 1.3em;
+      }
+      .reveal .col-card.left-accent { border-left: 3px solid var(--accent); }
+      .reveal .col-card.left-accent-2 { border-left: 3px solid var(--accent-2); }
+      .reveal .col-card h4 {
+        font-size: 0.75em;
+        color: var(--fg);
+        margin: 0 0 0.6em 0;
+        font-weight: 600;
+      }
+      .reveal .col-card p, .reveal .col-card li { font-size: 0.6em; }
+
+      /* Title slides */
+      .reveal section.title { text-align: center; padding-top: 2em; }
+      .reveal section.title h1 {
+        font-size: 4em;
+        background: linear-gradient(90deg, var(--accent), var(--accent-2));
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+        margin-bottom: 0.3em;
+      }
+      .reveal section.title .sub {
+        color: var(--muted);
+        font-size: 0.8em;
+        font-weight: 300;
+      }
+
+      /* Demo slide */
+      .reveal section.demo { text-align: center; padding-top: 1.5em; }
+      .reveal section.demo h1 {
+        font-size: 6em;
+        color: var(--accent-2);
+        letter-spacing: 0.08em;
+        margin-bottom: 0.2em;
+      }
+      .reveal section.demo .sub {
+        font-size: 0.9em;
+        color: var(--muted);
+        max-width: 700px;
+        margin: 1em auto 0 auto;
+        line-height: 1.5;
+      }
+
+      /* Architecture diagram (CSS-based, not ASCII) */
+      .reveal .arch {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1.2em;
+        margin-top: 0.4em;
+      }
+      .reveal .arch-row {
+        background: var(--bg-2);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 1em 1.2em;
+        display: flex;
+        align-items: center;
+        gap: 0.8em;
+      }
+      .reveal .arch-row .label {
+        font-size: 0.55em;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        min-width: 80px;
+      }
+      .reveal .arch-row .flow {
+        flex: 1;
+        font-size: 0.62em;
+        color: var(--fg);
+        font-family: ui-monospace, monospace;
+      }
+      .reveal .arch-row .flow .node {
+        display: inline-block;
+        padding: 0.25em 0.6em;
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        margin: 0 0.2em;
+      }
+      .reveal .arch-row .flow .node.accent { border-color: var(--accent); color: var(--accent); }
+      .reveal .arch-row .flow .node.accent-2 { border-color: var(--accent-2); color: var(--accent-2); }
+      .reveal .arch-row .flow .arrow { color: var(--accent); margin: 0 0.15em; }
+
+      /* ====== Detailed engine architecture diagram ====== */
+      /* Sized to fit 1280x800 — every value here is intentional;
+         loosening any one starts pushing the bottom row off the slide. */
+      .reveal .engine-arch {
+        display: grid;
+        grid-template-columns: 1.1fr 1.55fr 1.1fr;
+        grid-template-rows: auto auto auto;
+        gap: 0.35em 0.5em;
+        margin-top: 0.25em;
+        font-size: 0.46em;
+        line-height: 1.25;
+      }
+      .reveal .ea-col {
+        background: var(--bg-2);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 0.45em 0.6em;
+        position: relative;
+      }
+      .reveal .ea-col h5 {
+        font-size: 0.92em;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-weight: 500;
+        margin: 0 0 0.35em 0;
+      }
+      .reveal .ea-col.sources { border-left: 3px solid var(--accent); }
+      .reveal .ea-col.engine  { border-left: 3px solid #a78bfa; }
+      .reveal .ea-col.sinks   { border-left: 3px solid var(--green); }
+      .reveal .ea-col.broker  { border-left: 3px solid var(--accent-2); }
+      .reveal .ea-col.gateway { border-left: 3px solid var(--accent-2); }
+      .reveal .ea-col.clients { border-left: 3px solid var(--green); }
+      .reveal .ea-col.control { border-top: 3px solid #f87171; grid-column: 1 / -1; padding-top: 0.4em; }
+
+      .reveal .ea-box {
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 3px;
+        padding: 0.25em 0.45em;
+        margin-bottom: 0.25em;
+      }
+      .reveal .ea-box:last-child { margin-bottom: 0; }
+      .reveal .ea-box .title {
+        color: var(--fg);
+        font-weight: 600;
+        font-size: 0.95em;
+        line-height: 1.2;
+      }
+      .reveal .ea-box .sub {
+        color: var(--muted);
+        font-size: 0.78em;
+        margin-top: 0.08em;
+        font-family: ui-monospace, monospace;
+        line-height: 1.25;
+      }
+      .reveal .ea-box.live { border-color: var(--green); }
+      .reveal .ea-box.planned { border-style: dashed; opacity: 0.55; }
+      .reveal .ea-box.planned .title::after { content: " · planned"; color: var(--accent-2); font-weight: 400; font-size: 0.82em; }
+
+      .reveal .ea-flow {
+        display: flex;
+        flex-direction: column;
+        gap: 0.2em;
+        font-family: ui-monospace, monospace;
+        font-size: 0.9em;
+      }
+      .reveal .ea-flow .stage {
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 3px;
+        padding: 0.22em 0.5em;
+        color: var(--fg);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 0.4em;
+      }
+      .reveal .ea-flow .stage .label { color: var(--fg); font-weight: 500; }
+      .reveal .ea-flow .stage .hint  { color: var(--muted); font-size: 0.82em; }
+      .reveal .ea-flow .stage.cdc    { border-color: rgba(94, 234, 212, 0.5); }
+      .reveal .ea-flow .stage.join   { border-color: rgba(167, 139, 250, 0.5); }
+      .reveal .ea-flow .stage.disp   { border-color: rgba(74, 222, 128, 0.5); }
+      .reveal .ea-flow .down {
+        text-align: center;
+        color: var(--muted);
+        font-size: 0.78em;
+        margin: -0.08em 0;
+        line-height: 1;
+      }
+
+      .reveal .ea-control-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 0.3em;
+      }
+      .reveal .ea-control-grid .cell {
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 3px;
+        padding: 0.25em 0.45em;
+      }
+      .reveal .ea-control-grid .cell .name {
+        color: var(--fg);
+        font-size: 0.92em;
+        font-weight: 600;
+        line-height: 1.2;
+      }
+      .reveal .ea-control-grid .cell .desc {
+        color: var(--muted);
+        font-size: 0.78em;
+        margin-top: 0.05em;
+        line-height: 1.2;
+      }
+
+      .reveal .ea-legend {
+        display: flex;
+        gap: 1em;
+        font-size: 0.45em;
+        color: var(--muted);
+        margin-top: 0.3em;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .reveal .ea-legend .swatch {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 2px;
+        margin-right: 0.3em;
+        vertical-align: middle;
+      }
+
+      /* ====== Deployment topology diagram ====== */
+      .reveal .deploy {
+        display: grid;
+        grid-template-columns: 1fr 2.4fr 1fr;
+        gap: 0.45em 0.55em;
+        margin-top: 0.25em;
+        font-size: 0.48em;
+        line-height: 1.25;
+      }
+      .reveal .deploy .ext {
+        background: var(--bg-2);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 0.45em 0.55em;
+        display: flex;
+        flex-direction: column;
+        gap: 0.3em;
+        align-self: start;
+      }
+      .reveal .deploy .ext h6 {
+        margin: 0 0 0.15em 0;
+        color: var(--muted);
+        font-size: 0.92em;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-weight: 500;
+      }
+      .reveal .deploy .ext .item {
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 3px;
+        padding: 0.25em 0.5em;
+        color: var(--fg);
+        font-size: 0.95em;
+      }
+      .reveal .deploy .ext .item .sub {
+        color: var(--muted);
+        font-size: 0.85em;
+        font-family: ui-monospace, monospace;
+        margin-top: 0.05em;
+      }
+
+      .reveal .deploy .cluster {
+        background: var(--bg-2);
+        border: 1.5px dashed rgba(94, 234, 212, 0.5);
+        border-radius: 8px;
+        padding: 0.55em 0.65em;
+        position: relative;
+      }
+      .reveal .deploy .cluster::before {
+        content: "k8s namespace · ventstream";
+        position: absolute;
+        top: -0.65em;
+        left: 0.8em;
+        background: var(--bg);
+        padding: 0 0.4em;
+        font-size: 0.85em;
+        color: var(--accent);
+        letter-spacing: 0.05em;
+      }
+      .reveal .deploy .lane {
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        padding: 0.4em 0.55em;
+        margin-bottom: 0.4em;
+      }
+      .reveal .deploy .lane:last-child { margin-bottom: 0; }
+      .reveal .deploy .lane .lane-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        margin-bottom: 0.3em;
+      }
+      .reveal .deploy .lane .lane-head .label {
+        color: var(--fg);
+        font-weight: 600;
+        font-size: 0.98em;
+      }
+      .reveal .deploy .lane .lane-head .kind {
+        color: var(--muted);
+        font-size: 0.82em;
+        font-family: ui-monospace, monospace;
+      }
+      .reveal .deploy .lane .pods {
+        display: flex;
+        gap: 0.35em;
+        flex-wrap: wrap;
+      }
+      .reveal .deploy .lane .pod {
+        background: var(--bg-2);
+        border: 1px solid var(--border);
+        border-radius: 3px;
+        padding: 0.22em 0.45em;
+        font-size: 0.9em;
+        font-family: ui-monospace, monospace;
+        color: var(--fg);
+      }
+      .reveal .deploy .lane .pod .tag {
+        color: var(--muted);
+        font-size: 0.82em;
+        margin-left: 0.4em;
+      }
+      .reveal .deploy .lane.cdc      { border-left: 3px solid var(--accent); }
+      .reveal .deploy .lane.broker   { border-left: 3px solid var(--accent-2); }
+      .reveal .deploy .lane.gateway  { border-left: 3px solid #a78bfa; }
+      .reveal .deploy .lane .stateful {
+        display: inline-block;
+        font-size: 0.78em;
+        color: var(--accent-2);
+        margin-left: 0.4em;
+        font-family: ui-monospace, monospace;
+      }
+      .reveal .deploy .lane .horiz {
+        display: inline-block;
+        font-size: 0.78em;
+        color: var(--green);
+        margin-left: 0.4em;
+        font-family: ui-monospace, monospace;
+      }
+
+      .reveal .deploy-notes {
+        grid-column: 1 / -1;
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 0.35em;
+        margin-top: 0.2em;
+      }
+      .reveal .deploy-notes .note {
+        background: var(--bg-2);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 0.35em 0.5em;
+      }
+      .reveal .deploy-notes .note .h {
+        color: var(--fg);
+        font-weight: 600;
+        font-size: 0.92em;
+      }
+      .reveal .deploy-notes .note .d {
+        color: var(--muted);
+        font-size: 0.82em;
+        margin-top: 0.1em;
+        line-height: 1.25;
+      }
+
+      /* Footer */
+      .reveal .footer {
+        position: absolute;
+        bottom: 0.6em;
+        left: 1em;
+        right: 1em;
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.4em;
+        color: var(--muted);
+      }
+
+      /* Pills */
+      .reveal .pill {
+        display: inline-block;
+        padding: 0.2em 0.7em;
+        border-radius: 999px;
+        background: var(--bg-2);
+        border: 1px solid var(--border);
+        color: var(--muted);
+        font-size: 0.5em;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-weight: 500;
+        vertical-align: middle;
+      }
+      .reveal .pill.ok { color: var(--green); border-color: rgba(74, 222, 128, 0.4); }
+      .reveal .pill.warn { color: var(--accent-2); border-color: rgba(249, 115, 22, 0.4); }
+
+      /* Connector rows */
+      .reveal .connector-row {
+        display: flex;
+        align-items: baseline;
+        gap: 1em;
+        padding: 0.5em 0;
+        border-bottom: 1px dashed var(--border);
+      }
+      .reveal .connector-row:last-child { border-bottom: none; }
+      .reveal .connector-label {
+        font-size: 0.6em;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        min-width: 70px;
+        flex-shrink: 0;
+      }
+      .reveal .connector-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.4em;
+      }
+      .reveal .connector-list .pill { font-size: 0.55em; padding: 0.25em 0.7em; }
+
+      .reveal section { font-size: 1em; }
+    </style>
+  </head>
+  <body>
+    <div class="reveal">
+      <div class="slides">
+
+        <!-- 1. Title -->
+        <section class="title">
+          <h1>VentStream</h1>
+          <p class="sub">Real-time data flow for distributed systems</p>
+          <p class="sub" style="margin-top: 3em;">Engineering review</p>
+        </section>
+
+        <!-- 2. Problem -->
+        <section>
+          <h3>Why VentStream exists</h3>
+          <h2>A specialised solution for streaming &mdash; without the platform overhead</h2>
+          <div class="two-col" style="font-size: 0.85em;">
+            <div class="col-card left-accent">
+              <h4 class="accent">General platforms bring weight beyond streaming</h4>
+              <p>The usual options &mdash; broker stacks, processing engines, full data platforms &mdash; cover streaming alongside schemas, connectors, state backends, analytics. Adopt any one and you take on the full surface, even when streaming is all you needed.</p>
+              <p class="muted">For a streaming-only workload that&rsquo;s a lot of moving parts &mdash; and a lot of ops &mdash; you didn&rsquo;t come for.</p>
+            </div>
+            <div class="col-card left-accent-2">
+              <h4 class="accent-2">Pieces don&rsquo;t add up to a pipeline</h4>
+              <p>CDC tool, broker, sink, gateway &mdash; each handles its layer, none handles the seams. You own the joins, the recovery, the reconnect logic, the auth glue between them. The bridge is where outages live.</p>
+              <p class="muted">VentStream owns the full path: source to client, one binary, one ops surface.</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- 3. Solution -->
+        <section>
+          <h3>What VentStream is</h3>
+          <h2>Real-time data flow, both directions</h2>
+          <div class="two-col" style="margin-top: 1.4em;">
+            <div class="col-card left-accent">
+              <h4 class="accent">Server &rarr; server</h4>
+              <p>Source database change &rarr; pre-joined document in the target store, in milliseconds.</p>
+            </div>
+            <div class="col-card left-accent-2">
+              <h4 class="accent-2">Server &rarr; client</h4>
+              <p>One published event &rarr; every subscribed client app, live, at scale.</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- 4. Architecture -->
+        <section>
+          <h3>How it fits together</h3>
+          <h2>End-to-end data flow</h2>
+          <div class="arch" style="margin-top: 1em;">
+            <div class="arch-row" style="grid-column: span 2;">
+              <div class="label">Pipeline A</div>
+              <div class="flow">
+                <span class="node">Postgres</span>
+                <span class="arrow">&rarr;</span>
+                <span class="node accent">CDC role</span>
+                <span class="arrow">&rarr;</span>
+                <span class="node">OpenSearch</span>
+              </div>
+            </div>
+            <div class="arch-row" style="grid-column: span 2;">
+              <div class="label">Pipeline B</div>
+              <div class="flow">
+                <span class="node">Publishers</span>
+                <span class="arrow">&rarr;</span>
+                <span class="node">NATS JetStream</span>
+                <span class="arrow">&rarr;</span>
+                <span class="node accent-2">graphql role</span>
+                <span class="arrow">&rarr;</span>
+                <span class="node accent-2">Apollo Client</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 4b. Software architecture diagram (SVG, real boxes-and-arrows) -->
+        <section>
+          <h2 style="font-size: 1.3em; margin-bottom: 0.1em;">Architecture</h2>
+          <p class="muted" style="font-size: 0.5em; margin: 0 0 0.3em 0;">Data flow through the binary, end to end</p>
+
+          <svg viewBox="0 0 1200 600" xmlns="http://www.w3.org/2000/svg"
+               style="width: 100%; height: 580px; display: block;
+                      font-family: 'Inter', system-ui, sans-serif;">
+
+            <defs>
+              <!-- arrow marker -->
+              <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5"
+                      markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#5eead4"/>
+              </marker>
+              <marker id="arrOrange" viewBox="0 0 10 10" refX="9" refY="5"
+                      markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#f97316"/>
+              </marker>
+              <marker id="arrMuted" viewBox="0 0 10 10" refX="9" refY="5"
+                      markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+              </marker>
+            </defs>
+
+            <!-- ============= SOURCE DATABASES (top row) ============= -->
+            <g class="dbs">
+              <rect x="60"  y="20" width="140" height="56" rx="6"
+                    fill="#0a0e1a" stroke="#5eead4" stroke-width="1.5"/>
+              <text x="130" y="44"  text-anchor="middle" fill="#e6edf3"
+                    font-size="15" font-weight="600">Postgres</text>
+              <text x="130" y="62"  text-anchor="middle" fill="#8b96a8"
+                    font-size="10" font-family="ui-monospace, monospace">RDS / Aura</text>
+
+              <rect x="240" y="20" width="140" height="56" rx="6"
+                    fill="#0a0e1a" stroke="#5eead4" stroke-width="1.5"/>
+              <text x="310" y="44"  text-anchor="middle" fill="#e6edf3"
+                    font-size="15" font-weight="600">Neo4j</text>
+              <text x="310" y="62"  text-anchor="middle" fill="#8b96a8"
+                    font-size="10" font-family="ui-monospace, monospace">Aura VDC / EE</text>
+
+              <rect x="420" y="20" width="140" height="56" rx="6"
+                    fill="#0a0e1a" stroke="#5eead4" stroke-width="1.5"
+                    stroke-dasharray="5 3" opacity="0.55"/>
+              <text x="490" y="44"  text-anchor="middle" fill="#e6edf3"
+                    font-size="15" font-weight="600">MongoDB</text>
+              <text x="490" y="62"  text-anchor="middle" fill="#8b96a8"
+                    font-size="10" font-family="ui-monospace, monospace">planned</text>
+            </g>
+
+            <!-- arrows from DBs down into the binary -->
+            <line x1="130" y1="76" x2="130" y2="120" stroke="#5eead4" stroke-width="1.5"
+                  marker-end="url(#arr)"/>
+            <text x="135" y="100" fill="#8b96a8" font-size="10"
+                  font-family="ui-monospace, monospace">pgoutput</text>
+
+            <line x1="310" y1="76" x2="310" y2="120" stroke="#5eead4" stroke-width="1.5"
+                  marker-end="url(#arr)"/>
+            <text x="315" y="100" fill="#8b96a8" font-size="10"
+                  font-family="ui-monospace, monospace">Bolt CDC</text>
+
+            <line x1="490" y1="76" x2="490" y2="120" stroke="#5eead4" stroke-width="1.5"
+                  stroke-dasharray="4 3" marker-end="url(#arr)" opacity="0.55"/>
+            <text x="495" y="100" fill="#8b96a8" font-size="10"
+                  font-family="ui-monospace, monospace">change streams</text>
+
+            <!-- ============= VENTSTREAM BINARY BOUNDARY ============= -->
+            <rect x="30" y="120" width="900" height="430" rx="10"
+                  fill="#131826" stroke="#a78bfa" stroke-width="1.5"
+                  stroke-dasharray="6 4"/>
+            <text x="50" y="142" fill="#a78bfa" font-size="11"
+                  font-family="ui-monospace, monospace"
+                  letter-spacing="0.05em">VENTSTREAM BINARY · ROLE=cdc</text>
+
+            <!-- source plugins row (inside binary) -->
+            <g class="sources">
+              <rect x="60"  y="158" width="140" height="50" rx="4"
+                    fill="#0a0e1a" stroke="#5eead4"/>
+              <text x="130" y="180" text-anchor="middle" fill="#5eead4"
+                    font-size="13" font-weight="600">PG source</text>
+              <text x="130" y="196" text-anchor="middle" fill="#8b96a8"
+                    font-size="9.5" font-family="ui-monospace, monospace">slot · LSN cursor</text>
+
+              <rect x="240" y="158" width="140" height="50" rx="4"
+                    fill="#0a0e1a" stroke="#5eead4"/>
+              <text x="310" y="180" text-anchor="middle" fill="#5eead4"
+                    font-size="13" font-weight="600">Neo4j source</text>
+              <text x="310" y="196" text-anchor="middle" fill="#8b96a8"
+                    font-size="9.5" font-family="ui-monospace, monospace">YAML denorm · N-hop</text>
+
+              <rect x="420" y="158" width="140" height="50" rx="4"
+                    fill="#0a0e1a" stroke="#5eead4" stroke-dasharray="4 3" opacity="0.55"/>
+              <text x="490" y="180" text-anchor="middle" fill="#5eead4"
+                    font-size="13" font-weight="600">Mongo source</text>
+              <text x="490" y="196" text-anchor="middle" fill="#8b96a8"
+                    font-size="9.5" font-family="ui-monospace, monospace">resume token</text>
+            </g>
+
+            <!-- arrows from sources converging to bus -->
+            <path d="M 130 208 L 130 235 L 460 235 L 460 250" fill="none" stroke="#5eead4"
+                  stroke-width="1.5" marker-end="url(#arr)"/>
+            <path d="M 310 208 L 310 235 L 460 235" fill="none" stroke="#5eead4"
+                  stroke-width="1.5"/>
+            <path d="M 490 208 L 490 235 L 460 235" fill="none" stroke="#5eead4"
+                  stroke-width="1.5" opacity="0.55" stroke-dasharray="4 3"/>
+
+            <!-- ============= ENGINE CORE VERTICAL STACK ============= -->
+            <!-- Bus -->
+            <rect x="340" y="250" width="240" height="50" rx="4"
+                  fill="#0a0e1a" stroke="#a78bfa"/>
+            <text x="460" y="272" text-anchor="middle" fill="#a78bfa"
+                  font-size="14" font-weight="600">Event Bus</text>
+            <text x="460" y="288" text-anchor="middle" fill="#8b96a8"
+                  font-size="10" font-family="ui-monospace, monospace">bounded mpsc · backpressure</text>
+
+            <line x1="460" y1="300" x2="460" y2="320" stroke="#a78bfa" stroke-width="1.5"
+                  marker-end="url(#arr)"/>
+
+            <!-- Joins / Denormalize -->
+            <rect x="340" y="320" width="240" height="50" rx="4"
+                  fill="#0a0e1a" stroke="#a78bfa"/>
+            <text x="460" y="342" text-anchor="middle" fill="#a78bfa"
+                  font-size="14" font-weight="600">Joins · Denormalize</text>
+            <text x="460" y="358" text-anchor="middle" fill="#8b96a8"
+                  font-size="10" font-family="ui-monospace, monospace">redb state · user Cypher · fan-out</text>
+
+            <line x1="460" y1="370" x2="460" y2="390" stroke="#a78bfa" stroke-width="1.5"
+                  marker-end="url(#arr)"/>
+
+            <!-- Dispatcher -->
+            <rect x="340" y="390" width="240" height="50" rx="4"
+                  fill="#0a0e1a" stroke="#a78bfa"/>
+            <text x="460" y="412" text-anchor="middle" fill="#a78bfa"
+                  font-size="14" font-weight="600">Dispatcher</text>
+            <text x="460" y="428" text-anchor="middle" fill="#8b96a8"
+                  font-size="10" font-family="ui-monospace, monospace">N-parallel bulks · DLQ · sink-ACK gating</text>
+
+            <line x1="460" y1="440" x2="460" y2="460" stroke="#a78bfa" stroke-width="1.5"
+                  marker-end="url(#arr)"/>
+
+            <!-- Sink trait (splits to two outputs) -->
+            <rect x="340" y="460" width="240" height="50" rx="4"
+                  fill="#0a0e1a" stroke="#a78bfa"/>
+            <text x="460" y="482" text-anchor="middle" fill="#a78bfa"
+                  font-size="14" font-weight="600">Sink trait</text>
+            <text x="460" y="498" text-anchor="middle" fill="#8b96a8"
+                  font-size="10" font-family="ui-monospace, monospace">batch · deterministic doc_id</text>
+
+            <!-- ============= PIPELINE A OUTPUT — OpenSearch (right of binary) ============= -->
+            <path d="M 580 485 L 660 485" fill="none" stroke="#4ade80"
+                  stroke-width="1.5" marker-end="url(#arr)"/>
+
+            <rect x="660" y="460" width="140" height="50" rx="4"
+                  fill="#0a0e1a" stroke="#4ade80"/>
+            <text x="730" y="482" text-anchor="middle" fill="#4ade80"
+                  font-size="13" font-weight="600">OpenSearch</text>
+            <text x="730" y="498" text-anchor="middle" fill="#8b96a8"
+                  font-size="9.5" font-family="ui-monospace, monospace">_bulk · upsert by doc_id</text>
+
+            <!-- ============= PIPELINE B (independent flow, lives above OS column) ============= -->
+            <!-- Server publishers — external apps that emit events into NATS -->
+            <rect x="660" y="105" width="140" height="50" rx="6"
+                  fill="#0a0e1a" stroke="#5eead4" stroke-width="1.5"/>
+            <text x="730" y="128" text-anchor="middle" fill="#e6edf3"
+                  font-size="13" font-weight="600">Server publishers</text>
+            <text x="730" y="145" text-anchor="middle" fill="#8b96a8"
+                  font-size="9.5" font-family="ui-monospace, monospace">apps · services · SDK</text>
+
+            <!-- Pipeline-B section label -->
+            <text x="660" y="95" fill="#f97316" font-size="10"
+                  font-family="ui-monospace, monospace" letter-spacing="0.05em">PIPELINE B · LIVE FAN-OUT</text>
+
+            <!-- Server publishers → NATS -->
+            <line x1="730" y1="155" x2="730" y2="180" stroke="#5eead4"
+                  stroke-width="1.5" marker-end="url(#arr)"/>
+            <text x="735" y="172" fill="#8b96a8" font-size="9"
+                  font-family="ui-monospace, monospace">publish vs.t.&gt;</text>
+
+            <!-- NATS JetStream — broker -->
+            <rect x="660" y="180" width="140" height="50" rx="4"
+                  fill="#0a0e1a" stroke="#f97316"/>
+            <text x="730" y="202" text-anchor="middle" fill="#f97316"
+                  font-size="13" font-weight="600">NATS JetStream</text>
+            <text x="730" y="218" text-anchor="middle" fill="#8b96a8"
+                  font-size="9.5" font-family="ui-monospace, monospace">replicated x3</text>
+
+            <!-- NATS → WS gateway pod (single feed; both internal boxes read the same broker) -->
+            <path d="M 800 205 L 825 205 L 825 265 L 855 265" fill="none" stroke="#f97316"
+                  stroke-width="1.5" marker-end="url(#arrOrange)"/>
+            <text x="828" y="260" fill="#8b96a8" font-size="9"
+                  font-family="ui-monospace, monospace">subscribe</text>
+
+            <!-- Gateway pods (separate role) -->
+            <rect x="855" y="180" width="170" height="140" rx="8"
+                  fill="#131826" stroke="#a78bfa" stroke-width="1.5"
+                  stroke-dasharray="6 4"/>
+            <text x="870" y="200" fill="#a78bfa" font-size="11"
+                  font-family="ui-monospace, monospace">VENTSTREAM · ROLE=ws</text>
+
+            <rect x="870" y="220" width="140" height="40" rx="4"
+                  fill="#0a0e1a" stroke="#a78bfa"/>
+            <text x="940" y="237" text-anchor="middle" fill="#a78bfa"
+                  font-size="12" font-weight="600">WS gateway</text>
+            <text x="940" y="251" text-anchor="middle" fill="#8b96a8"
+                  font-size="9" font-family="ui-monospace, monospace">graphql-transport-ws</text>
+
+            <rect x="870" y="270" width="140" height="40" rx="4"
+                  fill="#0a0e1a" stroke="#a78bfa"/>
+            <text x="940" y="287" text-anchor="middle" fill="#a78bfa"
+                  font-size="12" font-weight="600">GraphQL</text>
+            <text x="940" y="301" text-anchor="middle" fill="#8b96a8"
+                  font-size="9" font-family="ui-monospace, monospace">Apollo compatible</text>
+
+            <!-- Clients column (right of gateway pods) -->
+            <line x1="1025" y1="240" x2="1070" y2="240" stroke="#4ade80"
+                  stroke-width="1.5" marker-end="url(#arr)"/>
+            <line x1="1025" y1="290" x2="1070" y2="290" stroke="#4ade80"
+                  stroke-width="1.5" marker-end="url(#arr)"/>
+
+            <rect x="1070" y="180" width="120" height="140" rx="6"
+                  fill="#0a0e1a" stroke="#4ade80"/>
+            <text x="1130" y="206" text-anchor="middle" fill="#4ade80"
+                  font-size="12" font-weight="600">Clients</text>
+            <text x="1130" y="232" text-anchor="middle" fill="#e6edf3"
+                  font-size="10.5">Apollo Client</text>
+            <text x="1130" y="248" text-anchor="middle" fill="#8b96a8"
+                  font-size="9" font-family="ui-monospace, monospace">useSubscription</text>
+            <text x="1130" y="278" text-anchor="middle" fill="#e6edf3"
+                  font-size="10.5">Native WebSocket</text>
+            <text x="1130" y="294" text-anchor="middle" fill="#8b96a8"
+                  font-size="9" font-family="ui-monospace, monospace">browser / mobile</text>
+
+            <!-- ============= CONTROL PLANE STRIP (inside binary, bottom) ============= -->
+            <text x="50" y="540" fill="#f87171" font-size="11"
+                  font-family="ui-monospace, monospace" letter-spacing="0.05em">CROSS-CUTTING</text>
+
+            <g font-size="10.5" font-family="ui-monospace, monospace" fill="#8b96a8">
+              <rect x="50" y="555" width="170" height="32" rx="3"
+                    fill="#0a0e1a" stroke="#1f2937"/>
+              <text x="135" y="575" text-anchor="middle" fill="#e6edf3">cursor file · resume</text>
+
+              <rect x="240" y="555" width="170" height="32" rx="3"
+                    fill="#0a0e1a" stroke="#1f2937"/>
+              <text x="325" y="575" text-anchor="middle" fill="#e6edf3">retry · reconnect</text>
+
+              <rect x="430" y="555" width="170" height="32" rx="3"
+                    fill="#0a0e1a" stroke="#1f2937"/>
+              <text x="515" y="575" text-anchor="middle" fill="#e6edf3">YAML · EXPLAIN · lint</text>
+
+              <rect x="620" y="555" width="140" height="32" rx="3"
+                    fill="#0a0e1a" stroke="#1f2937"/>
+              <text x="690" y="575" text-anchor="middle" fill="#e6edf3">DLQ · jsonl</text>
+
+              <rect x="780" y="555" width="140" height="32" rx="3"
+                    fill="#0a0e1a" stroke="#1f2937"/>
+              <text x="850" y="575" text-anchor="middle" fill="#e6edf3">metrics · heartbeat</text>
+            </g>
+          </svg>
+        </section>
+
+        <!-- 4c. (hidden — replaced by the SVG above) -->
+        <section data-skipped="true" style="display: none;">
+          <h2 style="font-size: 1.3em; margin-bottom: 0.15em;">Inside the engine</h2>
+          <p class="muted" style="font-size: 0.55em; margin: 0;">Plug-in sources · shared core · plug-in sinks</p>
+
+          <div class="engine-arch">
+
+            <!-- ROW 1, COL 1 — Sources -->
+            <div class="ea-col sources">
+              <h5>Sources</h5>
+              <div class="ea-box live">
+                <div class="title">Postgres CDC</div>
+                <div class="sub">pgoutput · slot + publication · LSN cursor</div>
+              </div>
+              <div class="ea-box live">
+                <div class="title">Neo4j CDC</div>
+                <div class="sub">Bolt · db.cdc.query · YAML denormalize · N-hop</div>
+              </div>
+              <div class="ea-box planned">
+                <div class="title">MongoDB CDC</div>
+                <div class="sub">change streams + resume token</div>
+              </div>
+              <div class="ea-box planned">
+                <div class="title">SDK ingress</div>
+                <div class="sub">gRPC publish · native lib</div>
+              </div>
+            </div>
+
+            <!-- ROW 1, COL 2 — Engine core -->
+            <div class="ea-col engine">
+              <h5>Engine core (Rust, single binary)</h5>
+              <div class="ea-flow">
+                <div class="stage cdc">
+                  <span class="label">Source trait</span>
+                  <span class="hint">poll · validate · cursor</span>
+                </div>
+                <div class="down">↓</div>
+                <div class="stage">
+                  <span class="label">Bus (mpsc, bounded)</span>
+                  <span class="hint">backpressure to source</span>
+                </div>
+                <div class="down">↓</div>
+                <div class="stage join">
+                  <span class="label">Joins / Denormalize</span>
+                  <span class="hint">redb state · user Cypher</span>
+                </div>
+                <div class="down">↓</div>
+                <div class="stage disp">
+                  <span class="label">Dispatcher</span>
+                  <span class="hint">N-parallel bulks · DLQ</span>
+                </div>
+                <div class="down">↓</div>
+                <div class="stage">
+                  <span class="label">Sink trait</span>
+                  <span class="hint">bulk batches · deterministic doc_id</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- ROW 1, COL 3 — Sinks -->
+            <div class="ea-col sinks">
+              <h5>Sinks</h5>
+              <div class="ea-box live">
+                <div class="title">OpenSearch / Elastic</div>
+                <div class="sub">_bulk · index template · idempotent doc_id</div>
+              </div>
+              <div class="ea-box planned">
+                <div class="title">S3 / Parquet</div>
+                <div class="sub">time-partitioned archive</div>
+              </div>
+              <div class="ea-box planned">
+                <div class="title">Webhook</div>
+                <div class="sub">per-event POST · retry</div>
+              </div>
+            </div>
+
+            <!-- ROW 2, COL 1 — Broker (also a sink) -->
+            <div class="ea-col broker">
+              <h5>Broker (Pipeline B fan-out)</h5>
+              <div class="ea-box live">
+                <div class="title">NATS JetStream</div>
+                <div class="sub">vs.t.&gt; subjects · per-conn durable consumer</div>
+              </div>
+            </div>
+
+            <!-- ROW 2, COL 2 — Gateways -->
+            <div class="ea-col gateway">
+              <h5>Gateways (horizontal pods)</h5>
+              <div class="ea-box live">
+                <div class="title">WebSocket fan-out</div>
+                <div class="sub">graphql-transport-ws + raw WS</div>
+              </div>
+              <div class="ea-box live">
+                <div class="title">GraphQL endpoint</div>
+                <div class="sub">Apollo Client compatible</div>
+              </div>
+            </div>
+
+            <!-- ROW 2, COL 3 — Clients -->
+            <div class="ea-col clients">
+              <h5>Clients</h5>
+              <div class="ea-box live">
+                <div class="title">Apollo Client</div>
+                <div class="sub">useSubscription native</div>
+              </div>
+              <div class="ea-box live">
+                <div class="title">Browser / Native WS</div>
+                <div class="sub">no SDK required</div>
+              </div>
+            </div>
+
+            <!-- ROW 3 — Control plane (spans all columns) -->
+            <div class="ea-col control">
+              <h5>Cross-cutting · control plane</h5>
+              <div class="ea-control-grid">
+                <div class="cell">
+                  <div class="name">Cursor persistence</div>
+                  <div class="desc">per-source · crash-safe · sink-ACK gating</div>
+                </div>
+                <div class="cell">
+                  <div class="name">Retry &amp; reconnect</div>
+                  <div class="desc">exp backoff 100ms→30s</div>
+                </div>
+                <div class="cell">
+                  <div class="name">Config &amp; lint</div>
+                  <div class="desc">YAML · EXPLAIN · hop analyzer</div>
+                </div>
+                <div class="cell">
+                  <div class="name">Telemetry</div>
+                  <div class="desc">tracing · 30s heartbeat · metrics</div>
+                </div>
+                <div class="cell">
+                  <div class="name">Admin HTTP</div>
+                  <div class="desc">/healthz · /admin/resync</div>
+                </div>
+                <div class="cell">
+                  <div class="name">TLS</div>
+                  <div class="desc">rustls · bolt+s · neo4j+s</div>
+                </div>
+                <div class="cell">
+                  <div class="name">DLQ</div>
+                  <div class="desc">jsonl · operator replay</div>
+                </div>
+                <div class="cell">
+                  <div class="name">Roles</div>
+                  <div class="desc">cdc / ws / graphql per pod</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="ea-legend">
+            <span><span class="swatch" style="background: var(--green)"></span>shipping today</span>
+            <span><span class="swatch" style="background: var(--accent-2)"></span>on roadmap</span>
+            <span><span class="swatch" style="background: #a78bfa"></span>engine core</span>
+            <span><span class="swatch" style="background: var(--accent)"></span>source plugin</span>
+            <span><span class="swatch" style="background: #f87171"></span>cross-cutting</span>
+          </div>
+        </section>
+
+        <!-- 4c. Deployment topology -->
+        <section data-skipped="true" style="display: none;">
+          <h2 style="font-size: 1.3em; margin-bottom: 0.15em;">Production deployment</h2>
+          <p class="muted" style="font-size: 0.55em; margin: 0;">One namespace · three workload classes · shared brokers</p>
+
+          <div class="deploy">
+
+            <!-- Left column: external sources -->
+            <div class="ext">
+              <h6>Source databases</h6>
+              <div class="item">
+                <div>Postgres</div>
+                <div class="sub">RDS / Aurora / Aura<br/>sslmode=require</div>
+              </div>
+              <div class="item">
+                <div>Neo4j Enterprise</div>
+                <div class="sub">Aura VDC / self-hosted<br/>neo4j+s:// · CDC enabled</div>
+              </div>
+              <div class="item" style="opacity: 0.55;">
+                <div>MongoDB</div>
+                <div class="sub">Atlas · planned</div>
+              </div>
+            </div>
+
+            <!-- Middle column: the cluster -->
+            <div class="cluster">
+              <div class="lane cdc">
+                <div class="lane-head">
+                  <span class="label">CDC sources</span>
+                  <span class="kind">StatefulSet · 1 pod each · PVC-backed cursor</span>
+                </div>
+                <div class="pods">
+                  <div class="pod">vs-cdc-pg-orders<span class="tag">512Mi · 200m</span></div>
+                  <div class="pod">vs-cdc-neo4j-catalog<span class="tag">512Mi · 200m</span></div>
+                  <div class="pod">vs-cdc-pg-deals<span class="tag">512Mi · 200m</span></div>
+                </div>
+                <div style="margin-top: 0.3em;">
+                  <span class="stateful">stateful · single-active per source (slot is single-consumer)</span>
+                </div>
+              </div>
+
+              <div class="lane broker">
+                <div class="lane-head">
+                  <span class="label">Broker (Pipeline B)</span>
+                  <span class="kind">StatefulSet · replicas=3 · JetStream cluster</span>
+                </div>
+                <div class="pods">
+                  <div class="pod">nats-0<span class="tag">2Gi · 500m</span></div>
+                  <div class="pod">nats-1<span class="tag">2Gi · 500m</span></div>
+                  <div class="pod">nats-2<span class="tag">2Gi · 500m</span></div>
+                </div>
+                <div style="margin-top: 0.3em;">
+                  <span class="stateful">stateful · stream replicated · subjects vs.t.&gt;</span>
+                </div>
+              </div>
+
+              <div class="lane gateway">
+                <div class="lane-head">
+                  <span class="label">Gateways (Pipeline B)</span>
+                  <span class="kind">Deployment · HPA · 10k clients/pod</span>
+                </div>
+                <div class="pods">
+                  <div class="pod">vs-ws-gateway × N<span class="tag">512Mi · 250m</span></div>
+                  <div class="pod">vs-graphql-gateway × N<span class="tag">512Mi · 250m</span></div>
+                </div>
+                <div style="margin-top: 0.3em;">
+                  <span class="horiz">horizontal · per-pod durable consumer · scales with concurrent clients</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Right column: external destinations -->
+            <div class="ext">
+              <h6>Destinations</h6>
+              <div class="item">
+                <div>OpenSearch / Elastic</div>
+                <div class="sub">cluster of 3 typical<br/>HTTPS · bulk API</div>
+              </div>
+              <div class="item">
+                <div>Apollo Clients</div>
+                <div class="sub">browsers / native<br/>over LB + WSS</div>
+              </div>
+              <div class="item" style="opacity: 0.55;">
+                <div>S3 / Parquet</div>
+                <div class="sub">archive · planned</div>
+              </div>
+            </div>
+
+            <!-- Bottom row: operational notes spanning all columns -->
+            <div class="deploy-notes">
+              <div class="note">
+                <div class="h">CDC scaling</div>
+                <div class="d">Vertical only — replication slot is single-consumer. One pod per source DB.</div>
+              </div>
+              <div class="note">
+                <div class="h">Gateway scaling</div>
+                <div class="d">Horizontal. ~165 KB RSS per WS connection · 10k conns/pod validated · 2-pod scaling proven.</div>
+              </div>
+              <div class="note">
+                <div class="h">Pod state</div>
+                <div class="d">CDC pods need PVC (cursor + redb join state). Gateway pods are stateless.</div>
+              </div>
+              <div class="note">
+                <div class="h">Failure domains</div>
+                <div class="d">CDC pod death = restart from cursor file (zero drift drill validated). Gateway death = clients reconnect to surviving pod.</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 5. Connectors -->
+        <section>
+          <h3>Connectors</h3>
+          <h2>What plugs in today</h2>
+          <div class="two-col" style="margin-top: 1em;">
+            <div class="col-card left-accent">
+              <h4 class="accent">Pipeline A &middot; CDC</h4>
+              <div class="connector-row">
+                <span class="connector-label">Source</span>
+                <span class="connector-list">
+                  <span class="pill ok">Postgres</span>
+                  <span class="pill ok">Neo4j</span>
+                  <span class="pill warn">MongoDB &middot; soon</span>
+                  <span class="pill warn">SDK ingress &middot; soon</span>
+                </span>
+              </div>
+              <div class="connector-row">
+                <span class="connector-label">Target</span>
+                <span class="connector-list">
+                  <span class="pill ok">OpenSearch</span>
+                  <span class="pill ok">Elasticsearch</span>
+                  <span class="pill warn">S3 / Parquet &middot; soon</span>
+                  <span class="pill warn">Webhook &middot; soon</span>
+                </span>
+              </div>
+            </div>
+            <div class="col-card left-accent-2">
+              <h4 class="accent-2">Pipeline B &middot; WS</h4>
+              <div class="connector-row">
+                <span class="connector-label">Broker</span>
+                <span class="connector-list">
+                  <span class="pill ok">NATS</span>
+                  <span class="pill warn">Kafka &middot; soon</span>
+                  <span class="pill warn">Redis &middot; soon</span>
+                </span>
+              </div>
+              <div class="connector-row">
+                <span class="connector-label">Client</span>
+                <span class="connector-list">
+                  <span class="pill ok">Apollo Client</span>
+                  <span class="pill ok">Native WebSocket</span>
+                </span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 6. Pipeline A engineering -->
+        <section>
+          <h3>Pipeline A · how it works</h3>
+          <h2>Replication that handles the join for you</h2>
+          <p class="lede">You declare the join once. The engine maintains the denormalized view through every change.</p>
+          <ul>
+            <li><strong>Snapshot bootstrap.</strong> First start: reads the source tables, builds the in-memory join state, dumps to disk in one transaction.</li>
+            <li><strong>Stateful multi-entity join.</strong> A change to a related row fans out to every parent document that references it &mdash; automatically, no extra consumer.</li>
+            <li><strong>Crash-safe.</strong> Persistent join state on disk; the replication slot only advances past events the sink has durably written. Kill the pod and restart &mdash; no drift.</li>
+            <li><strong>Composite keys, partial updates, deletes &mdash; all handled.</strong></li>
+          </ul>
+        </section>
+
+        <!-- 6. Pipeline A numbers -->
+        <section>
+          <h3>Pipeline A · measured</h3>
+          <h2>Headline numbers</h2>
+          <div class="stat-grid">
+            <div class="stat"><div class="v">11 s</div><div class="l">Bootstrap, 300k state rows</div></div>
+            <div class="stat"><div class="v">27 k/s</div><div class="l">Steady-state with fanout</div></div>
+            <div class="stat"><div class="v">0 %</div><div class="l">Drift after kill -9</div></div>
+            <div class="stat"><div class="v">6 s</div><div class="l">Catch-up after restart</div></div>
+            <div class="stat"><div class="v">0</div><div class="l">DLQ in 3-hour soak</div></div>
+            <div class="stat"><div class="v">1.27 KB</div><div class="l">RSS per state row</div></div>
+          </div>
+        </section>
+
+        <!-- 7. Pipeline B engineering + numbers -->
+        <section>
+          <h3>Pipeline B · how it works</h3>
+          <h2>The boring-but-critical parts, done once</h2>
+          <div class="two-col">
+            <div class="col-card">
+              <h4>What's in the box</h4>
+              <ul>
+                <li><strong>Standard protocol</strong> &mdash; <code>graphql-transport-ws</code>, Apollo-native.</li>
+                <li><strong>Idle resilience</strong> &mdash; long-poll keeps consumers alive, pings keep TCP warm.</li>
+                <li><strong>Backpressure</strong> &mdash; slow clients evicted, never stall publishers.</li>
+                <li><strong>Auto cleanup</strong> &mdash; three layers of consumer reaping, no leaks.</li>
+              </ul>
+            </div>
+            <div class="col-card">
+              <h4>Measured density</h4>
+              <table>
+                <tr><th>Conns</th><th>RSS</th><th>Time</th></tr>
+                <tr><td>100</td><td class="num">27 MB</td><td class="num">0.1 s</td></tr>
+                <tr><td>1k</td><td class="num">174 MB</td><td class="num">0.6 s</td></tr>
+                <tr><td>5k</td><td class="num">831 MB</td><td class="num">3.4 s</td></tr>
+                <tr><td>10k</td><td class="num">1.65 GB</td><td class="num">7 s</td></tr>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- 8. Idle resilience -->
+        <section>
+          <h3>Pipeline B · the property that matters</h3>
+          <h2>Live through long idle, no drops</h2>
+          <p class="lede">The most common failure mode in real-time systems: the client subscription "looks alive" but server-side state has drifted. VentStream is built so this can't happen.</p>
+          <ul>
+            <li>Tested with idle gaps of <strong>60 s</strong>, <strong>5 min</strong>, <strong>30 min</strong>, and <strong>2 hours</strong> between traffic bursts.</li>
+            <li>Every event delivered in order. No duplicates, no reorders. <span class="pill ok">250 / 250</span></li>
+            <li>Mechanism: long-poll requests refresh the broker's consumer activity timer; server-side WebSocket pings keep TCP warm; pod-scoped reapers catch any orphans.</li>
+          </ul>
+        </section>
+
+        <!-- 9. Pod sizing -->
+        <section>
+          <h3>Operational · sizing</h3>
+          <h2>What fits a 768 MB pod</h2>
+          <table>
+            <tr><th>Workload</th><th>Footprint</th><th>Verdict</th></tr>
+            <tr><td>CDC at 300k state rows</td><td class="num">376 MB idle &middot; 614 MB burst</td><td class="good">comfortable</td></tr>
+            <tr><td>Gateway, 4k WS clients</td><td class="num">660 MB</td><td class="good">comfortable</td></tr>
+            <tr><td>Both roles, one pod</td><td class="num">682 MB</td><td class="good">86 MB headroom</td></tr>
+            <tr><td>Restart catch-up peak</td><td class="num">780 MB transient</td><td class="bad">~12 MB over briefly</td></tr>
+          </table>
+          <p class="muted" style="margin-top: 1em; font-size: 0.6em;">Recommendation: 1 GB pod, or a 10-second readiness-probe delay to gate traffic during recovery.</p>
+        </section>
+
+        <!-- 10. Multi-pod -->
+        <section>
+          <h3>Operational · horizontal scale</h3>
+          <h2>One CDC pod, N gateway pods</h2>
+          <div class="two-col">
+            <div class="col-card left-accent">
+              <h4 class="accent">CDC role</h4>
+              <p><code>replicas: 1</code></p>
+              <p class="muted">Postgres replication slot is exclusive. Use a single Deployment replica, or pair with leader election.</p>
+            </div>
+            <div class="col-card left-accent-2">
+              <h4 class="accent-2">Gateway role</h4>
+              <p><code>replicas: N</code></p>
+              <p class="muted">Each pod owns its own consumers via a stable pod_id. JetStream fans out natively. Reapers are pod-scoped &mdash; safe rolling restarts.</p>
+            </div>
+          </div>
+          <p style="margin-top: 1.4em;">Empirically verified: 2 gateway pods &times; 5,000 clients = <strong>10,000 concurrent</strong> with 0 errors. Linear from there. <span class="pill ok">multi-pod tested</span></p>
+        </section>
+
+        <!-- 11. Reliability -->
+        <section>
+          <h3>Reliability</h3>
+          <h2>What we tried to break it with</h2>
+          <table>
+            <tr><th>Failure injected</th><th>Outcome</th><th>Recovery</th></tr>
+            <tr><td>kill -9 CDC mid-batch</td><td class="good">no drift</td><td>6 s catch-up</td></tr>
+            <tr><td>3-hour mixed-workload soak</td><td class="good">0 DLQ, no leak</td><td>&mdash;</td></tr>
+            <tr><td>WS idle 2 h 36 m</td><td class="good">all events delivered</td><td>&mdash;</td></tr>
+            <tr><td>kill -9 a gateway pod</td><td class="good">peers untouched</td><td>orphan reaped</td></tr>
+            <tr><td>50k mutations / 1.8 s burst</td><td class="good">source = sink exact</td><td>~7 s drain</td></tr>
+            <tr><td>10k concurrent WS connects</td><td class="good">0 errors</td><td>1,400 / sec ramp</td></tr>
+          </table>
+        </section>
+
+        <!-- 12. Demo divider -->
+        <section class="demo">
+          <h1>DEMO</h1>
+          <p class="sub">Live event dashboard &middot; real engine &middot; real Postgres &middot; real Apollo Client</p>
+        </section>
+
+        <!-- 13. Roadmap -->
+        <section>
+          <h3>What's next</h3>
+          <h2>Roadmap</h2>
+          <div class="two-col">
+            <div class="col-card left-accent">
+              <h4 class="accent">Near-term</h4>
+              <ul>
+                <li>Production deployment hardening (k8s manifests, observability)</li>
+                <li>Lossless-across-reconnect delivery (start-sequence cursor)</li>
+                <li>Per-pod connection cap with 503 backpressure</li>
+              </ul>
+            </div>
+            <div class="col-card left-accent-2">
+              <h4 class="accent-2">Longer-term</h4>
+              <ul>
+                <li>LRU eviction for very large in-memory state</li>
+                <li>Multi-stream sharding for &gt;50k concurrent consumers</li>
+                <li>Cross-pod presence layer</li>
+                <li>SDK polish for first-party publishers</li>
+              </ul>
+            </div>
+          </div>
+        </section>
+
+        <!-- 14. Q&A -->
+        <section class="title">
+          <h1>Questions</h1>
+        </section>
+
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+    <script>
+      Reveal.initialize({
+        width: 1280,
+        height: 800,
+        margin: 0.06,
+        minScale: 0.4,
+        maxScale: 1.8,
+        hash: true,
+        slideNumber: 'c/t',
+        controls: true,
+        progress: true,
+        transition: 'fade',
+        backgroundTransition: 'fade',
+        center: false,
+      });
+    </script>
+  </body>
+</html>

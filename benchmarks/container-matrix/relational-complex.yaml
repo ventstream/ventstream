@@ -1,0 +1,112 @@
+joins:
+  - name: orders
+    primary: { table: bench.orders, pk: id }
+    target: { index: vsbench-complex-orders }
+    related:
+      - id: customer
+        table: bench.customers
+        pk: id
+        join_on: { from: customer_id, to: id }
+        embed_as: customer
+        cardinality: one
+        select: [id, name, tier]
+      - id: product
+        table: bench.products
+        pk: id
+        join_on: { from: product_id, to: id }
+        embed_as: product
+        cardinality: one
+        select: [id, sku, category]
+      - id: region
+        table: bench.regions
+        pk: id
+        join_on: { from: region_id, to: id }
+        embed_as: region
+        cardinality: one
+        select: [id, name, zone]
+    state: { backend: memory }
+    backfill: { mode: sync_on_miss }
+
+  - name: shipments
+    primary: { table: bench.shipments, pk: id }
+    target: { index: vsbench-complex-shipments }
+    related:
+      - id: customer
+        table: bench.customers
+        pk: id
+        join_on: { from: customer_id, to: id }
+        embed_as: customer
+        cardinality: one
+        select: [id, name, tier]
+      - id: warehouse
+        table: bench.warehouses
+        pk: id
+        join_on: { from: warehouse_id, to: id }
+        embed_as: warehouse
+        cardinality: one
+        select: [id, name, capacity]
+      - id: carrier
+        table: bench.carriers
+        pk: id
+        join_on: { from: carrier_id, to: id }
+        embed_as: carrier
+        cardinality: one
+        select: [id, name, service_level]
+    state: { backend: memory }
+    backfill: { mode: sync_on_miss }
+
+  - name: invoices
+    primary: { table: bench.invoices, pk: id }
+    target: { index: vsbench-complex-invoices }
+    related:
+      - id: customer
+        table: bench.customers
+        pk: id
+        join_on: { from: customer_id, to: id }
+        embed_as: customer
+        cardinality: one
+        select: [id, name, tier]
+      - id: account
+        table: bench.accounts
+        pk: id
+        join_on: { from: account_id, to: id }
+        embed_as: account
+        cardinality: one
+        select: [id, name, segment]
+      - id: currency
+        table: bench.currencies
+        pk: id
+        join_on: { from: currency_id, to: id }
+        embed_as: currency
+        cardinality: one
+        select: [id, code, precision_digits]
+    state: { backend: memory }
+    backfill: { mode: sync_on_miss }
+
+  - name: support_cases
+    primary: { table: bench.support_cases, pk: id }
+    target: { index: vsbench-complex-support-cases }
+    related:
+      - id: customer
+        table: bench.customers
+        pk: id
+        join_on: { from: customer_id, to: id }
+        embed_as: customer
+        cardinality: one
+        select: [id, name, tier]
+      - id: agent
+        table: bench.agents
+        pk: id
+        join_on: { from: agent_id, to: id }
+        embed_as: agent
+        cardinality: one
+        select: [id, name, level]
+      - id: support_queue
+        table: bench.support_queues
+        pk: id
+        join_on: { from: queue_id, to: id }
+        embed_as: support_queue
+        cardinality: one
+        select: [id, name, priority]
+    state: { backend: memory }
+    backfill: { mode: sync_on_miss }

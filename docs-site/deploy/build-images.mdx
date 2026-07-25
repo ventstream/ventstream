@@ -1,0 +1,61 @@
+---
+title: "Build container images"
+description: "Build the open-core engine, Fleet services, and managed engine distribution."
+---
+
+Use immutable version tags in CI and promote tested digests between environments.
+
+```bash
+export REG=ghcr.io/your-org
+export TAG=0.1.12
+```
+
+## Open-core engine
+
+```bash
+cd ventstream
+docker build -f infra/docker/engine.Dockerfile \
+  -t "$REG/ventstream-engine:$TAG" .
+docker push "$REG/ventstream-engine:$TAG"
+```
+
+## Fleet services
+
+```bash
+cd ventstream-control-plane
+./infra/docker/build-control-api-image.sh "$REG/ventstream-control-api:$TAG"
+./infra/docker/build-control-worker-image.sh "$REG/ventstream-control-worker:$TAG"
+./infra/docker/build-agent-gateway-image.sh "$REG/ventstream-agent-gateway:$TAG"
+```
+
+The control API image also includes `ventstream-fleet-migrate`; the Helm chart runs
+that binary as a one-shot hook with a separate migrator database credential.
+Migrations never run in API startup.
+
+## Managed engine and agent
+
+Place the engine and control-plane repositories next to one another, then run:
+
+```bash
+cd ventstream-control-plane
+./infra/docker/build-managed-image.sh \
+  "$REG/ventstream-managed-engine:$TAG"
+```
+
+The build creates a bounded temporary context from both Rust workspaces and
+packages the Fleet supervisor with a matching engine binary. JavaScript
+dependencies, Git history, local state, and demo data are excluded.
+
+## Release checks
+
+- Run Rust, OpenAPI, Compose, and Helm checks from the control-plane
+  README.
+- Scan images and publish an SBOM plus provenance.
+- Sign released images and deploy by digest.
+- Run the managed enrollment and lifecycle smoke test against a real PostgreSQL
+  instance and gateway before promotion.
+
+<Warning>
+Never bake connector credentials, enrollment grants, workload private keys, or CA
+private keys into an image. Supply them at runtime from a secret manager.
+</Warning>

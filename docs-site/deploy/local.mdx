@@ -1,0 +1,210 @@
+---
+title: "Run locally"
+description: "Build the engine and run it natively on macOS (no Docker) — Postgres CDC to OpenSearch, or the real-time WebSocket/GraphQL gateways."
+---
+
+Run the engine as a standalone process on your Mac — no Docker, no control
+plane — against Homebrew-installed services. This is the fastest native path to
+see CDC or the real-time gateways work.
+
+<Note>
+This guide is specifically for **macOS** and Homebrew. On Linux or Windows, use
+the Docker [Quickstart](/quickstart), or adapt the same environment variables to
+your local services.
+</Note>
+
+## Install or build the engine
+
+Install the release binary without a Rust toolchain once the open-core release
+assets are public:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://github.com/bashiru98/ventstream/releases/latest/download/ventstream-installer.sh \
+  | sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+<Note>
+The repository and its release assets are currently private. For a working
+installation today, use the [authenticated portable
+install](/deploy/native-binary#authenticated-portable-install). It places
+`ventstream`, `ventstream.yaml`, and the example configuration together under
+`~/ventstream` and requires no Rust toolchain.
+</Note>
+
+See [Install the engine binary](/deploy/native-binary) for specific versions,
+manual downloads, checksums, and build-provenance verification.
+
+To build from source instead, install Rust via
+[rustup](https://rustup.rs) (the repo pins the toolchain via
+`rust-toolchain.toml`), then build the single binary:
+
+```bash
+cd ventstream
+cargo build --release -p ventstream   # → ./target/release/ventstream
+```
+
+The commands below use `ventstream`. When building from source, replace it with
+`./target/release/ventstream`.
+
+A standalone engine needs **no control plane**. Do not set the legacy
+`VS_CONTROL_PLANE_URL` or `VS_CONTROL_PLANE_KEY` telemetry variables. Lifecycle
+is restart-based: stop the process to pause, and it resumes from its retained
+cursor on restart.
+
+Pick a mode:
+
+## Mode A — Postgres CDC → OpenSearch
+
+Stream a Postgres database into denormalized OpenSearch documents. Uses the
+demo `shop` schema (orders + customers + line items) and the `orders`
+projection spec.
+
+**1. Postgres** (logical replication needs `wal_level=logical` + a restart):
+
+```bash
+brew install postgresql@16
+# postgresql@16 is keg-only — put its tools on PATH for this shell:
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+brew services start postgresql@16
+
+psql postgres -c "ALTER SYSTEM SET wal_level = logical;"
+brew services restart postgresql@16
+
+# create the demo DB + seed schema, sample rows, and the publication
+createdb shop
+psql shop -f demo/stack/seed/postgres.sql   # creates publication ventstream_shop
+```
+
+**2. OpenSearch** (disable the security plugin for plaintext local http):
+
+```bash
+brew install opensearch
+echo "plugins.security.disabled: true" >> "$(brew --prefix)/etc/opensearch/opensearch.yml"
+brew services start opensearch
+curl -s localhost:9200 | jq -r .version.number   # confirm it's up
+```
+
+**3. Run the engine** (recommended defaults — snapshot bootstrap, per-relation
+index, local state dir; the engine creates the replication slot):
+
+```bash
+cd ventstream
+VS_ROLES=cdc VS_CDC_SOURCE=postgres \
+VS_PG_HOST=localhost VS_PG_PORT=5432 \
+VS_PG_USER=$USER VS_PG_DATABASE=shop \
+VS_PG_PUBLICATION=ventstream_shop \
+VS_PG_SLOT=ventstream_orders_slot \
+VS_JOINS_YAML=demo/stack/specs/orders.yaml \
+VS_JOINS_STATE_DIR=./.vs-state \
+VS_PG_BOOTSTRAP_MODE=snapshot \
+VS_OS_ENDPOINT=http://localhost:9200 \
+VS_INDEX_TEMPLATE='${header:ventstream.cdc.relation}' \
+ventstream
+```
+
+(Local Postgres uses `trust` auth, so no `VS_PG_PASSWORD` is needed.)
+
+**4. Watch it work** — the snapshot lands, then live changes flow in ~a second:
+
+```bash
+curl -s 'localhost:9200/orders/_count' | jq .count
+
+psql shop -c "UPDATE shop.orders SET status='shipped' WHERE order_id='ord-0001';"
+curl -s 'localhost:9200/orders/_doc/shop.orders:%5B%22ord-0001%22%5D' | jq -r '._source.status'
+# → shipped
+```
+
+See the [Postgres source guide](/connectors/sources/postgres) for the full
+projection model and the [testing guide](/guides/testing) for more recipes.
+
+## Mode B — Real-time subscriptions (WebSocket + Apollo)
+
+Run the real-time gateways (no source DB, no sink) and watch typed GraphQL
+subscriptions update live. This path needs only NATS.
+
+**1. NATS with JetStream** (in its own terminal — `-js` is required for the
+resumable per-connection mode the graphql role consumes):
+
+```bash
+brew install nats-server
+nats-server -js -m 8222
+```
+
+**2. Run the gateways** (recommended defaults — listeners on 4040/4041, the
+`ventstream` stream, GraphiQL on):
+
+```bash
+cd ventstream
+VS_ROLES=ws,graphql \
+VS_WS_JETSTREAM=1 \
+VS_GRAPHQL_SCHEMA=demo/realtime/subscriptions.graphql \
+VS_GRAPHQL_PLAYGROUND=1 \
+ventstream
+#  GraphiQL → http://localhost:4041/graphiql   (resume-aware playground)
+#  raw WS   → ws://localhost:4040/ws
+```
+
+**3. Subscribe + publish.** Open
+[http://localhost:4041/graphiql](http://localhost:4041/graphiql) and run:
+
+```graphql
+subscription {
+  orderStatusChanged(orderId: "order_1") { id status changedAt seq }
+}
+```
+
+Then publish an event with the NATS CLI (the subject ends with the `orderId`;
+`id` must be a valid ULID):
+
+```bash
+brew install nats-io/nats-tools/nats
+nats pub vs.t.acme.orderStatusChanged.order_1 \
+  '{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","event":"orderStatusChanged","tenant":"acme","entity_id":"order_1","occurred_at":"2026-01-01T00:00:00Z","received_at":"2026-01-01T00:00:00Z","schema_version":2,"data":{"status":"confirmed"}}'
+```
+
+GraphiQL updates live. The typed subscription exposes `seq` (the resume
+cursor) and the playground tracks it, so reloading and reconnecting replays
+what you missed. For the Apollo Client wiring (`graphql-transport-ws` link +
+`resume_from_seq`), see
+[Real-time subscriptions](/concepts/real-time-subscriptions) and the
+[real-time demo](/guides/realtime-demo).
+
+## Clean up
+
+Stop the engine (and `nats-server`) with `Ctrl-C` first, then remove whatever
+you created.
+
+**Mode A — Postgres + OpenSearch:**
+
+```bash
+# drop the replication slot (must be inactive — stop the agent first),
+# then the demo DB (its publication goes with it) and local state
+psql shop -c "SELECT pg_drop_replication_slot('ventstream_orders_slot');"
+dropdb shop
+rm -rf ./.vs-state
+
+# delete the OpenSearch index
+curl -s -X DELETE 'localhost:9200/orders'
+
+# stop the services
+brew services stop postgresql@16
+brew services stop opensearch
+```
+
+**Mode B — NATS:**
+
+```bash
+# remove the JetStream stream the ws role created (needs the nats CLI)
+nats stream rm ventstream -f
+# nats-server was foreground — Ctrl-C already stopped it
+```
+
+**Optional — reclaim disk / remove tools:**
+
+```bash
+cargo clean                                    # delete ./target build output
+brew uninstall postgresql@16 opensearch nats-server
+brew uninstall nats-io/nats-tools/nats
+```

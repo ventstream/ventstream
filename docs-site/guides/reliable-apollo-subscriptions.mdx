@@ -1,0 +1,466 @@
+---
+title: "Reliable Apollo subscriptions"
+description: "Checkpoint, multiplex, reconnect, and replay VentStream GraphQL subscriptions without silently skipping events."
+---
+
+VentStream can replay GraphQL subscriptions after a disconnect or operation
+replacement when the gateway uses JetStream or Redis Streams. Reliability is
+operation-scoped:
+
+1. Start the first subscription without a cursor.
+2. Process each event successfully.
+3. Persist that operation's opaque `cursor`.
+4. Recreate the operation with `resumeFromCursor`.
+
+The gateway resumes strictly after that cursor. Multiple operations can share
+one `graphql-transport-ws` connection while maintaining independent cursors.
+
+This provides at-least-once processing within the broker retention window.
+Handlers must be idempotent because a disconnect between applying a side effect
+and saving its cursor can replay the event.
+
+<Warning>
+Checkpoint only after every required side effect succeeds. Saving a cursor when
+the event is merely received can permanently skip unfinished work.
+</Warning>
+
+## Typed schema contract
+
+Author the subscription normally. `resumeFromCursor` is a reserved operation
+argument that VentStream adds to the effective runtime schema. VentStream also
+adds `cursor` and `seq` to an inline result type when those fields are absent:
+
+```graphql
+type Subscription {
+  orderStatusChanged(orderId: ID!): OrderStatusChange!
+    @vsSubscribe(subject: "orderStatusChanged.{orderId}")
+
+  auditRecorded(accountId: ID!): AuditRecord!
+    @vsSubscribe(subject: "auditRecorded.{accountId}")
+}
+
+type OrderStatusChange {
+  id: ID! @source(from: "$event.entityId")
+  status: String!
+  changedAt: DateTime! @source(from: "$event.occurredAt")
+}
+
+type AuditRecord {
+  id: ID! @source(from: "$event.entityId")
+  action: String!
+  actorId: ID!
+  recordedAt: DateTime! @source(from: "$event.occurredAt")
+}
+```
+
+The effective schema exposed through GraphQL introspection includes:
+
+```graphql
+type Subscription {
+  orderStatusChanged(
+    orderId: ID!
+    resumeFromCursor: String
+  ): OrderStatusChange!
+
+  auditRecorded(
+    accountId: ID!
+    resumeFromCursor: String
+  ): AuditRecord!
+}
+
+type OrderStatusChange {
+  id: ID!
+  status: String!
+  changedAt: DateTime!
+  cursor: String!
+  seq: String!
+}
+```
+
+`cursor` is provider-neutral. Keep it as a string: JetStream currently emits
+decimal strings while Redis Streams emits values such as
+`rs:1712345678901-0`.
+
+For reliability-critical operations, do not author application fields named
+`cursor` or `seq`. Existing schemas that define either name retain their
+application mapping for backward compatibility, which shadows the corresponding
+broker checkpoint field.
+
+## First connection
+
+The client has no checkpoint on its first subscription. Omit
+`resumeFromCursor` or pass `null`:
+
+```graphql
+subscription Orders($orderId: ID!, $resumeFromCursor: String) {
+  orderStatusChanged(
+    orderId: $orderId
+    resumeFromCursor: $resumeFromCursor
+  ) {
+    id
+    status
+    changedAt
+    cursor
+  }
+}
+```
+
+```json
+{
+  "orderId": "order-42",
+  "resumeFromCursor": null
+}
+```
+
+No cursor means live-only delivery from the time the operation attaches. It
+does not request historical events.
+
+## Requirements
+
+- Run the engine with the `graphql` role and a replay-capable provider:
+  JetStream or Redis Streams.
+- Select `cursor` and stable event `id` in every reliability-critical
+  operation.
+- Maintain one cursor store per logical operation and argument scope. An order
+  stream and an audit stream must not overwrite each other's checkpoint.
+- Use idempotent handlers keyed by event `id`.
+- Size broker retention for the longest outage plus worst-case catch-up time.
+- Treat `RESUME_EXPIRED` and `INVALID_CURSOR` as terminal recovery decisions;
+  never silently clear a bad checkpoint.
+
+## Install Apollo
+
+```bash
+npm install @apollo/client graphql graphql-ws
+```
+
+## Store cursors per operation
+
+Keep the storage boundary small so browser `localStorage` can later be replaced
+with IndexedDB or a backend checkpoint service:
+
+```ts
+export interface CursorStore {
+  load(): string | null;
+  save(cursor: string): void;
+  clear(): void;
+}
+
+export const browserCursorStore = (key: string): CursorStore => ({
+  load: () => window.localStorage.getItem(key),
+  save: (cursor) => window.localStorage.setItem(key, cursor),
+  clear: () => window.localStorage.removeItem(key),
+});
+
+const orderCursor = browserCursorStore(
+  "ventstream:orderStatusChanged:order-42",
+);
+const auditCursor = browserCursorStore(
+  "ventstream:auditRecorded:account-7",
+);
+```
+
+For side effects that change durable business state, store the event ID, side
+effect, and cursor transactionally whenever possible.
+
+## Multiplex operations on one Apollo connection
+
+`graphql-ws` normally replays an active operation with the variables it had
+when it was first created. Those variables may contain an old cursor. Therefore
+the reconnect hook below removes active observers and recreates every operation
+after the new socket is acknowledged, reading the latest cursor from each
+store.
+
+The `getCurrentAccessToken`, `apply*Idempotently`, `report*`, and
+`readGraphQLErrorCode` functions in this example are application-owned
+integration points. Implement them using your identity provider, durable
+business store, and telemetry system.
+
+<Warning>
+VentStream's current gateway only requires a non-empty token and trusts the
+tenant asserted during connection initialization. Put the gateway behind an
+authenticating proxy that validates the token and binds its claims to the
+allowed tenant before exposing it to untrusted clients.
+</Warning>
+
+```ts
+import {
+  ApolloClient,
+  InMemoryCache,
+  gql,
+  type TypedDocumentNode,
+} from "@apollo/client";
+import { GraphQLWsLink } from "@apollo/client/link/subscriptions";
+import { createClient } from "graphql-ws";
+
+type OrderStatusEvent = {
+  id: string;
+  status: string;
+  changedAt: string;
+  cursor: string;
+};
+
+type AuditEvent = {
+  id: string;
+  action: string;
+  actorId: string;
+  recordedAt: string;
+  cursor: string;
+};
+
+type OrdersData = { orderStatusChanged: OrderStatusEvent };
+type OrdersVariables = {
+  orderId: string;
+  resumeFromCursor: string | null;
+};
+type AuditsData = { auditRecorded: AuditEvent };
+type AuditsVariables = {
+  accountId: string;
+  resumeFromCursor: string | null;
+};
+
+const ORDER_STATUS: TypedDocumentNode<OrdersData, OrdersVariables> = gql`
+  subscription Orders($orderId: ID!, $resumeFromCursor: String) {
+    orderStatusChanged(
+      orderId: $orderId
+      resumeFromCursor: $resumeFromCursor
+    ) {
+      id
+      status
+      changedAt
+      cursor
+    }
+  }
+`;
+
+const AUDIT_RECORDED: TypedDocumentNode<AuditsData, AuditsVariables> = gql`
+  subscription Audits($accountId: ID!, $resumeFromCursor: String) {
+    auditRecorded(
+      accountId: $accountId
+      resumeFromCursor: $resumeFromCursor
+    ) {
+      id
+      action
+      actorId
+      recordedAt
+      cursor
+    }
+  }
+`;
+
+let generation = 0;
+let connected = false;
+let stopped = false;
+let terminal = false;
+let orderQueue = Promise.resolve();
+let auditQueue = Promise.resolve();
+let orderSubscription: { unsubscribe(): void } | undefined;
+let auditSubscription: { unsubscribe(): void } | undefined;
+let apollo: ApolloClient;
+
+const wsClient = createClient({
+  url: "wss://events.example.com/graphql/ws",
+  lazy: false,
+  retryAttempts: Infinity,
+  connectionAckWaitTimeout: 10_000,
+  connectionParams: async () => ({
+    authToken: await getCurrentAccessToken(),
+    tenant: "acme",
+  }),
+  on: {
+    connecting(isRetry) {
+      if (!isRetry) return;
+      generation += 1;
+      connected = false;
+      stopOperations();
+      reportSubscriptionState("recovering");
+    },
+    connected() {
+      connected = true;
+      reportSubscriptionState("live");
+      startOperations();
+    },
+    closed() {
+      connected = false;
+      reportSubscriptionState("closed");
+    },
+  },
+});
+
+apollo = new ApolloClient({
+  link: new GraphQLWsLink(wsClient),
+  cache: new InMemoryCache(),
+});
+
+function stopOperations() {
+  orderSubscription?.unsubscribe();
+  auditSubscription?.unsubscribe();
+  orderSubscription = undefined;
+  auditSubscription = undefined;
+  orderQueue = Promise.resolve();
+  auditQueue = Promise.resolve();
+}
+
+function recover(error: unknown) {
+  if (stopped || terminal) return;
+  reportSubscriptionFailure(error);
+  generation += 1;
+  connected = false;
+  stopOperations();
+  wsClient.terminate();
+}
+
+function startOperations() {
+  if (
+    stopped ||
+    terminal ||
+    !connected ||
+    orderSubscription ||
+    auditSubscription
+  ) {
+    return;
+  }
+  const operationGeneration = generation;
+
+  orderSubscription = apollo
+    .subscribe({
+      query: ORDER_STATUS,
+      variables: {
+        orderId: "order-42",
+        resumeFromCursor: orderCursor.load(),
+      },
+      errorPolicy: "all",
+    })
+    .subscribe({
+      next(result) {
+        if (result.error) {
+          handleOperationError(result.error);
+          return;
+        }
+        const event = result.data?.orderStatusChanged;
+        if (!event) return;
+        orderQueue = orderQueue
+          .then(async () => {
+            if (!connected || operationGeneration !== generation) return;
+            await applyOrderStatusIdempotently(event);
+            if (connected && operationGeneration === generation) {
+              orderCursor.save(event.cursor);
+            }
+          })
+          .catch(recover);
+      },
+      error: handleOperationError,
+      complete: () => handleUnexpectedComplete("Orders", operationGeneration),
+    });
+
+  auditSubscription = apollo
+    .subscribe({
+      query: AUDIT_RECORDED,
+      variables: {
+        accountId: "account-7",
+        resumeFromCursor: auditCursor.load(),
+      },
+      errorPolicy: "all",
+    })
+    .subscribe({
+      next(result) {
+        if (result.error) {
+          handleOperationError(result.error);
+          return;
+        }
+        const event = result.data?.auditRecorded;
+        if (!event) return;
+        auditQueue = auditQueue
+          .then(async () => {
+            if (!connected || operationGeneration !== generation) return;
+            await applyAuditIdempotently(event);
+            if (connected && operationGeneration === generation) {
+              auditCursor.save(event.cursor);
+            }
+          })
+          .catch(recover);
+      },
+      error: handleOperationError,
+      complete: () => handleUnexpectedComplete("Audits", operationGeneration),
+    });
+}
+
+function handleOperationError(error: unknown) {
+  const code = readGraphQLErrorCode(error);
+  if (code === "RESUME_EXPIRED" || code === "INVALID_CURSOR") {
+    terminal = true;
+    generation += 1;
+    connected = false;
+    stopOperations();
+    reportTerminalSubscriptionError(error);
+    return;
+  }
+  recover(error);
+}
+
+function handleUnexpectedComplete(name: string, operationGeneration: number) {
+  if (
+    stopped ||
+    terminal ||
+    !connected ||
+    operationGeneration !== generation
+  ) {
+    return;
+  }
+  recover(new Error(`${name} completed unexpectedly`));
+}
+
+export async function stopSubscriptions() {
+  stopped = true;
+  generation += 1;
+  connected = false;
+  stopOperations();
+  await apollo.stop();
+  await wsClient.dispose();
+}
+```
+
+The two promise queues preserve processing order independently. An order
+handler cannot advance the audit cursor, and a slow audit handler does not
+prevent a successfully processed order from checkpointing. The generation
+guard drops queued work that has not started when recovery begins. A handler
+already in progress cannot be cancelled safely, which is why durable side
+effects still need event-ID idempotency.
+
+## Connection cursor compatibility
+
+`resume_from_cursor` in `connection_init` remains supported. It is a fallback
+for clients with one operation or clients that maintain one globally
+coordinated checkpoint across every operation on the socket. When an operation
+supplies `resumeFromCursor`, the operation value takes precedence.
+
+For multiplexed applications, prefer operation cursors. They let operations
+attach at different times without one operation acknowledging another
+operation's replay.
+
+## Recovery behavior
+
+| Condition | Client action |
+| --- | --- |
+| First subscription with no cursor | Start live; persist the first cursor only after processing succeeds. |
+| Retryable socket disconnect | Recreate each operation using its own latest stored cursor. |
+| Handler or checkpoint failure | Do not advance the cursor; terminate and recover from the previous checkpoint. |
+| `RESUME_EXPIRED` | Stop automatic recovery and rebuild from an authoritative source. |
+| `INVALID_CURSOR` | Investigate corrupted, wrong-provider, or ahead-of-stream state. |
+| `EVENT_STREAM_*`, `EVENT_PUMP_FAILED`, `SUBSCRIPTION_LAGGED` | Recreate the affected operation from its stored cursor. |
+| Duplicate event ID | Return the recorded outcome without applying the side effect twice. |
+
+## Production checklist
+
+- Persist each operation cursor after processing, never before it.
+- Recreate multiplexed operations with fresh cursor variables after reconnect.
+- Make handlers idempotent using event `id`.
+- Expose connecting, live, recovering, terminal-error, replay-lag, and handler
+  failure states to application telemetry.
+- Test socket termination while publishing and verify every event after each
+  operation's checkpoint is eventually processed.
+- Test a cursor outside retention and require an explicit rebuild.
+- Size retention for the maximum outage plus worst-case replay time.
+
+See [Realtime brokers](/concepts/realtime-brokers) for provider configuration,
+cursor semantics, retention, and gateway observability.

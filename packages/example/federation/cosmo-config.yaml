@@ -1,0 +1,39 @@
+version: "1"
+
+# Listener and graph config.
+listen_addr: "0.0.0.0:4044"
+
+# Disable telemetry and noisy features for the local test.
+telemetry:
+  metrics:
+    prometheus:
+      enabled: false
+  tracing:
+    enabled: false
+
+# Subgraph error propagation so client sees real errors during testing.
+subgraph_error_propagation:
+  enabled: true
+  propagate_status_codes: true
+  attach_service_name: true
+
+# Where the compiled router config lives.
+execution_config:
+  file:
+    path: "./cosmo-router-config.json"
+
+# Disable Cosmo Studio integration (we run standalone).
+graph:
+  token: ""
+
+# Forward auth headers from clients to subgraphs so VentStream's
+# tenant gate resolves correctly. The Apollo Client / @ventstream
+# stack sends `Authorization: Bearer ...` and `X-VS-Tenant`; the
+# router needs to know to relay them.
+headers:
+  all:
+    request:
+      - op: "propagate"
+        named: "authorization"
+      - op: "propagate"
+        named: "x-vs-tenant"

@@ -1,0 +1,236 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ventstream-core",
+    "crates/ventstream-sources",
+    "crates/ventstream-sinks",
+    "crates/ventstream-graphql",
+    "crates/ventstream-jetstream",
+    "crates/ventstream-joins",
+    "crates/ventstream-protocol",
+    "crates/ventstream-realtime",
+    "crates/ventstream-redis",
+    "crates/ventstream-ws",
+    "crates/ventstream-config",
+    "crates/ventstream-telemetry",
+    "crates/ventstream",
+]
+
+[workspace.package]
+version = "0.1.12"
+edition = "2021"
+rust-version = "1.94"
+authors = ["VentStream Authors"]
+license = "Apache-2.0"
+repository = "https://github.com/bashiru98/ventstream"
+readme = "README.md"
+
+# Centralized dependency versions. Crate-level Cargo.toml files reference
+# these via `dep = { workspace = true }` so versions stay aligned across the
+# workspace and Renovate/Dependabot only has one place to bump.
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.41", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "io-util", "net", "fs"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-tungstenite = "0.29"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Async trait objects (until native async-fn-in-dyn-trait is stable for our use cases)
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+
+# Zero-copy bytes & ULIDs
+bytes = "1.8"
+ulid = { version = "1.1", features = ["serde"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde", "clock"], default-features = false }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# Synchronization primitives
+parking_lot = "0.12"
+
+# Redis Streams broker provider for realtime gateways. The connection
+# manager supplies bounded reconnects; rustls matches the rest of the engine.
+redis = { version = "1.4", default-features = false, features = ["connection-manager", "streams", "tokio-rustls-comp"] }
+
+# Big-endian binary parsing for the pgoutput logical replication format
+byteorder = "1.5"
+
+# HTTP client for the OpenSearch / Elasticsearch sink. rustls keeps the
+# build statically linked; `gzip` enables request compression which
+# materially cuts bulk-API egress for large index batches.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "gzip"] }
+
+# rustls 0.23+ requires the application to install a CryptoProvider
+# once at process start before any TLS handshake. Both neo4rs (Bolt
+# over TLS for Aura) and reqwest (HTTPS to OpenSearch / Elastic Cloud)
+# rely on rustls but neither installs the default provider on their
+# own. We pin the same version neo4rs and reqwest pull in and call
+# `install_default()` from main() before the tokio runtime starts.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+# HTTP mocking for sink integration tests (used as a dev-dependency).
+wiremock = "0.6"
+
+# Postgres logical-replication transport.
+#
+# `tokio-postgres` (published or master) does not expose replication APIs,
+# so we use `pgwire-replication` — a tokio-based logical replication
+# client that handles connection, SCRAM auth, TLS, slot management,
+# keepalive responses, and outer-frame decoding. We supply our own
+# `pgoutput` decoder for the inner row-level messages because we want
+# precise control over how RELATION/INSERT/UPDATE/DELETE/TRUNCATE map
+# to events.
+#
+# RECALL: if `tokio-postgres` ever ships first-class replication APIs in
+# a tagged release, evaluate switching — `pgwire-replication` is a small
+# vendor but well-documented and battle-tested enough for Phase 0.
+pgwire-replication = "0.3"
+futures-util = "0.3"
+
+# Standalone Postgres client for sync-on-miss backfill SELECTs (no
+# replication mode — that lives in pgwire-replication). The
+# `with-serde_json-1` feature lets us pull `to_jsonb(t.*)` results out
+# as `serde_json::Value` without manual per-type decoding.
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime", "with-serde_json-1", "with-chrono-0_4"] }
+
+# Neo4j Bolt driver. Used by the Neo4j CDC source — we drive db.cdc.query
+# directly via Cypher, so we don't need a CDC-specific abstraction. The
+# crate handles Bolt 4.x and basic 5.x protocol negotiation, connection
+# pooling, and reconnection. Validated against neo4j:5.26-enterprise.
+neo4rs = "0.8"
+
+# MongoDB official async driver — change streams (live tail) + collection
+# scan (bootstrap) for the Mongo CDC source. Bundles `bson`, used via
+# `mongodb::bson`. Default features include the rustls TLS stack and the
+# SRV/DNS resolver (Atlas `mongodb+srv://` URIs), matching the workspace's
+# rustls posture.
+mongodb = "3"
+
+# MySQL/MariaDB async driver — binlog stream (live tail) + SELECT scan
+# (bootstrap) for the MySQL CDC source. rustls TLS to match the workspace.
+mysql_async = { version = "0.36", default-features = false, features = ["binlog", "default-rustls"] }
+
+# Kafka client (librdkafka bindings) for the Kafka/Redpanda CDC source —
+# consumer groups, manual offset commit, SASL + TLS. The justified exception
+# to the workspace's pure-Rust lean: rdkafka is the only production-grade Rust
+# Kafka client with consumer groups + broad SASL/TLS. `ssl-vendored` builds
+# OpenSSL from source (no cmake needed; uses librdkafka's mklove build).
+rdkafka = { version = "0.36", features = ["ssl-vendored", "zstd"] }
+
+# HTTP + WebSocket server for the WS fan-out gateway. axum gives us
+# one server for healthchecks, metrics, and WS upgrades. The `ws`
+# feature is the WebSocket upgrade extractor; `tokio` is the runtime
+# binding; we leave `macros` off because we don't use the routing DSL
+# beyond `Router::new().route(...)`.
+axum = { version = "0.8", default-features = false, features = ["ws", "tokio", "http1", "http2"] }
+
+# Official NATS client (maintained by Synadia). We use Core for v1 —
+# JetStream durable consumers land with task #7 (orphan-cleanup story).
+async-nats = "0.47"
+
+# GraphQL execution engine for the Apollo-compatible WS endpoint.
+# We use it for: graphql-transport-ws transport, introspection,
+# schema definition via Rust types, and subscription stream
+# coordination. Subscription resolvers create per-stream JetStream
+# consumers; cleanup falls out of stream Drop.
+async-graphql = { version = "7", default-features = false, features = ["chrono", "dynamic-schema", "graphiql"] }
+async-graphql-axum = "7"
+async-stream = "0.3"
+
+# Embedded ACID key-value store for persistent join state. Pure
+# Rust, no native deps, copy-on-write B+ tree with crash recovery.
+# Used by the optional persistent-state backend in
+# `crates/ventstream-joins/src/persistence.rs`.
+redb = "2"
+
+# Testing
+tokio-test = "0.4"
+proptest = "1.5"
+hex = "0.4"
+
+# Internal crates referenced as workspace deps
+ventstream-core = { version = "0.1.12", path = "crates/ventstream-core" }
+ventstream-sources = { version = "0.1.12", path = "crates/ventstream-sources" }
+ventstream-sinks = { version = "0.1.12", path = "crates/ventstream-sinks" }
+ventstream-graphql = { version = "0.1.12", path = "crates/ventstream-graphql" }
+ventstream-jetstream = { version = "0.1.12", path = "crates/ventstream-jetstream" }
+ventstream-joins = { version = "0.1.12", path = "crates/ventstream-joins" }
+ventstream-protocol = { version = "0.1.12", path = "crates/ventstream-protocol" }
+ventstream-realtime = { version = "0.1.12", path = "crates/ventstream-realtime" }
+ventstream-redis = { version = "0.1.12", path = "crates/ventstream-redis" }
+ventstream-ws = { version = "0.1.12", path = "crates/ventstream-ws" }
+ventstream-config = { version = "0.1.12", path = "crates/ventstream-config" }
+ventstream-telemetry = { version = "0.1.12", path = "crates/ventstream-telemetry" }
+
+# YAML config parsing (will land alongside the join engine)
+serde_yaml = "0.9"
+
+# Lints applied to every crate in the workspace. Per-crate Cargo.toml files
+# inherit these via `[lints] workspace = true`.
+#
+# Philosophy: hard-deny things that cause real bugs (unsafe, panic paths,
+# leaked memory, unhandled errors). Warn on hygiene. Skip the pedantic +
+# nursery groups in Phase 0 — they generate high churn for low real
+# return; we'll opt back in selectively once the engine has shape.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+nonstandard_style = { level = "warn", priority = -1 }
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+# Hard denies — correctness, not style.
+mem_forget = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+
+# Selected pedantic warnings we want from day one without taking the
+# whole group. Add more here when we observe them catching real bugs.
+clone_on_ref_ptr = "warn"
+explicit_into_iter_loop = "warn"
+explicit_iter_loop = "warn"
+inefficient_to_string = "warn"
+needless_pass_by_value = "warn"
+redundant_clone = "warn"
+
+# Release profile favors throughput; debug profile favors fast feedback.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+
+# Optimized binaries with symbols retained for `perf` and flamegraphs. This
+# profile is never used by release packaging unless explicitly requested.
+[profile.profiling]
+inherits = "release"
+strip = "none"
+debug = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+# Faster CI runs without sacrificing correctness signal.
+[profile.ci]
+inherits = "release"
+lto = "thin"
+codegen-units = 16

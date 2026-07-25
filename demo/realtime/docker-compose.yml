@@ -1,0 +1,83 @@
+# VentStream real-time demo stack.
+#
+#   nats     NATS server with JetStream
+#   engine   VentStream in BOTH gateway roles:
+#              ws      → native WebSocket fan-out  (ws://localhost:4040/ws)
+#              graphql → graphql-transport-ws      (ws://localhost:4041/graphql/ws)
+#
+# The `ws` role (with VS_WS_JETSTREAM=1) bootstraps the JetStream stream
+# `vsws`; the `graphql` role consumes from it. Publishers push events to
+# NATS subjects `vs.t.<tenant>.…` and both gateways fan them out to
+# subscribed clients.
+#
+# Drive it with the example scripts in packages/example/ (see README):
+#   - run-demo.mjs    → raw WebSocket transport (@ventstream/client)
+#   - apollo-demo.mjs → Apollo Client transport (graphql-transport-ws)
+
+name: ventstream-realtime
+
+services:
+  nats:
+    image: nats:2.10-alpine
+    # JetStream on. No storage tuning needed — the engine's stream is
+    # self-bounding (512 MiB / 10 min ceiling by default).
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"   # client
+      - "8222:8222"   # monitoring
+
+  # NATS CLI helper. The `nats:*` server image has no client binary, so
+  # publish examples use this box: `docker compose exec nats-box nats pub …`.
+  # NATS_URL points it at the server; it just idles otherwise.
+  nats-box:
+    image: natsio/nats-box:latest
+    depends_on:
+      - nats
+    environment:
+      NATS_URL: nats://nats:4222
+    entrypoint: ["sleep", "infinity"]
+
+  engine:
+    build:
+      context: ../..
+      dockerfile: infra/docker/engine.Dockerfile
+    image: ventstream-engine:demo
+    depends_on:
+      - nats
+    environment:
+      VS_ROLES: ws,graphql
+      # --- native WebSocket gateway (role: ws) ---
+      VS_WS_LISTEN: 0.0.0.0:4040
+      VS_WS_NATS_URL: nats://nats:4222
+      VS_WS_SUBJECTS: vs.t.>
+      # JetStream durable mode — also bootstraps the stream the graphql
+      # role reads from.
+      VS_WS_JETSTREAM: "1"
+      VS_WS_JS_STREAM: vsws
+      # --- GraphQL subscription gateway (role: graphql) ---
+      VS_GRAPHQL_LISTEN: 0.0.0.0:4041
+      VS_GRAPHQL_NATS_URL: nats://nats:4222
+      VS_GRAPHQL_STREAM: vsws
+      # Discovery metadata returned by query { availableSubjects { ... } }.
+      VS_GRAPHQL_MANIFEST: /specs/subjects.yaml
+      # Typed subscriptions declared in GraphQL SDL (the recommended way).
+      VS_GRAPHQL_SCHEMA: /specs/subscriptions.graphql
+      # In-browser GraphiQL playground at http://localhost:4041/graphiql
+      # (demo only — leave off in production).
+      VS_GRAPHQL_PLAYGROUND: "1"
+      # verbose, non-sensitive logs
+      RUST_LOG: "info,ventstream_ws=debug,ventstream_graphql=debug"
+      VS_LOG_FORMAT: pretty
+    volumes:
+      - ../../packages/example/vs-subjects.yaml:/specs/subjects.yaml:ro
+      - ./subscriptions.graphql:/specs/subscriptions.graphql:ro
+    ports:
+      - "4040:4040"   # native WebSocket gateway
+      - "4041:4041"   # GraphQL gateway (HTTP + /graphql/ws)
+      - "4043:4043"   # shared health endpoint (/healthz, /readyz)
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/ventstream", "--healthcheck", "127.0.0.1:4043", "/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s

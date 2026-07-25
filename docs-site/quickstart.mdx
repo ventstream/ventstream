@@ -1,0 +1,374 @@
+---
+title: "Quickstart"
+description: "A fully self-contained demo — stream Postgres and Neo4j into OpenSearch in one `docker compose up`."
+---
+
+This is the fastest way to *see* VentStream's **CDC / capture pipeline**
+work — source changes flowing into continuously-synced documents. It's a
+self-contained Docker stack with **pre-seeded data** in both source types
+— no control plane, no cloud, no source of your own to wire up. Copy the
+commands top to bottom and watch changes propagate to OpenSearch in real
+time.
+
+<Note>
+This covers the **capture** pipeline (source → synced documents). For the
+**real-time delivery** pipeline — live events over WebSocket / GraphQL —
+see the [real-time demo](https://github.com/bashiru98/ventstream/tree/main/demo/realtime)
+and [Real-time subscriptions](/concepts/real-time-subscriptions).
+</Note>
+
+<Note>
+The demo runs the engines **standalone**. A running standalone process cannot be
+attached to Fleet in place. To exercise CLI configuration and pause/resume, run a
+new supervised workload with the
+[Engine + Fleet local demo](/guides/local-engine-fleet-demo).
+</Note>
+
+The dataset is a small **e-commerce** domain so the scenarios are easy to
+follow, but the pipeline shape is identical to production:
+
+| Source | Target | What one document looks like |
+|--------|--------|------------------------------|
+| Postgres `shop.orders` | OS index `orders` | order + embedded customer (1:1) + line items (1:many) |
+| Neo4j `Product` | OS index `products` | product + category + supplier→region (2 hops) + tags |
+
+Everything lives in [`demo/stack/`](https://github.com/bashiru98/ventstream/tree/main/demo/stack):
+the `docker-compose.yml`, the seed data, and the two projection specs.
+
+## Prerequisites
+
+- Docker + Docker Compose v2 (`docker compose version`)
+- ~4 GB free RAM for the containers
+- Free ports: `5544` (pg), `7474`/`7687` (neo4j), `9200` (opensearch), `5601` (dashboards, optional)
+
+```bash
+cd ventstream/demo/stack
+```
+
+### Preflight: clean up and check port 9200
+
+Remove containers from an earlier demo run before starting a new one. This
+keeps stale containers and networks from obscuring the results, but preserves
+the source and engine volumes:
+
+```bash
+docker compose --profile dashboards down --remove-orphans
+```
+
+The demo must have exclusive access to host port `9200`. Check for another
+Docker container or local OpenSearch process before continuing:
+
+```bash
+docker ps --filter publish=9200 --format 'table {{.Names}}\t{{.Ports}}'
+lsof -nP -iTCP:9200 -sTCP:LISTEN   # macOS and most developer workstations
+```
+
+<Warning>
+On Docker Desktop, the demo container can sometimes appear to start even when
+a host process already owns `localhost:9200`. In that state, the verification
+`curl` commands may reach the wrong OpenSearch cluster. Stop the process shown
+by the checks above before continuing. For a Homebrew-managed OpenSearch, use
+`brew services stop opensearch`. For another Compose stack, run `docker compose
+down` from that stack's directory. Do not kill an unrelated process without
+first identifying it.
+</Warning>
+
+## 1. Start the sources + target
+
+`--wait` blocks until all three pass their healthchecks, so you don't
+have to poll:
+
+```bash
+docker compose up -d --wait postgres neo4j opensearch
+```
+
+(Check status any time with `docker compose ps`.)
+
+<Note>
+First boot pulls images (Postgres, Neo4j Enterprise, OpenSearch). Postgres
+seeds itself from `seed/postgres.sql` — 200 orders, 5 customers, line
+items, and the `ventstream_shop` publication.
+</Note>
+
+## 2. Seed Neo4j + enable CDC
+
+Postgres is already seeded. Neo4j needs two one-time commands — enable CDC,
+then load the catalog graph:
+
+```bash
+# Enable CDC (DIFF enrichment) on the default database. This is a
+# per-database setting, NOT a server config. DIFF is the recommended
+# mode for projections — see the Neo4j connector docs for why.
+docker compose exec -T neo4j cypher-shell -u neo4j -p ventstream \
+  "ALTER DATABASE neo4j SET OPTION txLogEnrichment 'DIFF';"
+
+# Load the catalog (2,000 products, 4 categories, 20 suppliers, 3 regions).
+docker compose exec -T neo4j cypher-shell -u neo4j -p ventstream \
+  < seed/neo4j.cypher
+```
+
+## 3. Start the engines
+
+The engines build from source via cargo-chef. **Allow 5–10 minutes for the
+first build**, depending on CPU and network speed; later runs are cached and
+start in seconds.
+
+```bash
+docker compose up -d --build engine-orders engine-products
+```
+
+Watch them bootstrap and switch to tailing. Logs are intentionally
+verbose (`RUST_LOG=…=debug`, pretty format) and **never print
+credentials** — only host/db/slot identifiers, event counts, and
+document IDs:
+
+<CodeGroup>
+```bash Postgres → OpenSearch
+docker compose logs -f engine-orders
+```
+
+```bash Neo4j → OpenSearch
+docker compose logs -f engine-products
+```
+</CodeGroup>
+
+Each engine moves through its lifecycle:
+
+<Steps>
+  <Step title="STARTING">Process up, source connection opening.</Step>
+  <Step title="BOOTSTRAPPING">Snapshot scan — existing rows/nodes stream into OpenSearch.</Step>
+  <Step title="TAILING">Steady state — live CDC changes flow as they happen.</Step>
+</Steps>
+
+## 4. Verify the initial load
+
+```bash
+curl -s 'http://localhost:9200/orders/_count'   | jq .count   # → 200
+curl -s 'http://localhost:9200/products/_count' | jq .count   # → 2000
+```
+
+Inspect one denormalized **order** (Postgres source) — note the embedded
+`customer` and `items`:
+
+```bash
+curl -s 'http://localhost:9200/orders/_doc/shop.orders:%5B%22ord-0001%22%5D' | jq '._source'
+```
+
+Inspect one denormalized **product** (Neo4j source) — note the embedded
+`category`, `supplier` → `region` (2 hops), and `tags`:
+
+```bash
+curl -s 'http://localhost:9200/products/_search' -H 'content-type: application/json' -d '
+  {"size":1,"query":{"term":{"id.keyword":"prod-2"}}}' | jq '.hits.hits[0]._source'
+```
+
+<Note>
+The Postgres doc `_id` is the **fully-qualified** table name plus the PK
+as a JSON array: `shop.orders:["ord-0001"]` (URL-encoded above), so a
+`GET …/_doc/<id>` works directly. The Neo4j doc `_id` is
+`products_denormalized:<elementId>`, so search by a field (above) rather
+than guessing the elementId.
+</Note>
+
+## 5. Watch changes propagate
+
+Keep the engine logs visible while you run these. Each change should
+appear in the log within ~1s and update OpenSearch.
+
+<Tabs>
+  <Tab title="Postgres">
+    **Update a row (1-hop)**
+    ```bash
+    docker compose exec -T postgres psql -U ventstream -d shop -c \
+      "UPDATE shop.orders SET status='shipped', total=999.99 WHERE order_id='ord-0001';"
+
+    curl -s 'http://localhost:9200/orders/_doc/shop.orders:%5B%22ord-0001%22%5D' \
+      | jq '._source | {status, total}'
+    ```
+
+    **Rename a customer (1:1 cascade)** — every order for `cust-002` recomposes:
+    ```bash
+    docker compose exec -T postgres psql -U ventstream -d shop -c \
+      "UPDATE shop.customers SET tier='platinum', name='Alan T. (VIP)' WHERE customer_id='cust-002';"
+
+    curl -s 'http://localhost:9200/orders/_doc/shop.orders:%5B%22ord-0001%22%5D' \
+      | jq '._source.customer'
+    ```
+
+    **Add a line item (1:many cascade)**
+    ```bash
+    docker compose exec -T postgres psql -U ventstream -d shop -c \
+      "INSERT INTO shop.order_items (item_id, order_id, sku, qty, price)
+       VALUES ('item-0001-new', 'ord-0001', 'SKU-9999', 5, 49.99);"
+
+    curl -s 'http://localhost:9200/orders/_doc/shop.orders:%5B%22ord-0001%22%5D' \
+      | jq '._source.items'
+    ```
+
+    **Delete (reconciliation)** — items first (FK), then the order:
+    ```bash
+    docker compose exec -T postgres psql -U ventstream -d shop -c \
+      "DELETE FROM shop.order_items WHERE order_id='ord-0001';
+       DELETE FROM shop.orders WHERE order_id='ord-0001';"
+
+    # A GET by _id is real-time; _count lags ~1s on OpenSearch's refresh.
+    curl -s -o /dev/null -w '%{http_code}\n' \
+      'http://localhost:9200/orders/_doc/shop.orders:%5B%22ord-0001%22%5D'   # → 404
+    ```
+  </Tab>
+
+  <Tab title="Neo4j">
+    **Rename a hot shared node (bounded fan-out)** — `Category` is a
+    low-cardinality lookup (~500 products each). A *property change* on
+    the node correctly cascades to every product in that category;
+    hot-endpoint detection only filters *relationship* churn that would
+    explode the fan-out.
+    ```bash
+    docker compose exec -T neo4j cypher-shell -u neo4j -p ventstream \
+      "MATCH (c:Category {id:'cat-electronics'}) SET c.name='Electronics & Gadgets';"
+
+    # Exact match via .keyword — a plain `match` would also hit the old
+    # "Electronics" through the shared "electronics" token.
+    curl -s 'http://localhost:9200/products/_search' -H 'content-type: application/json' -d '
+      {"size":0,
+       "query":{"term":{"category.id.keyword":"cat-electronics"}},
+       "aggs":{"names":{"terms":{"field":"category.name.keyword"}}}}' \
+      | jq '.aggregations.names.buckets'
+    # → [ { "key": "Electronics & Gadgets", "doc_count": 500 } ]
+    ```
+
+    **Multi-hop cascade (Supplier → Region)** — move a supplier's region;
+    every product of that supplier recomposes 2 hops out:
+    ```bash
+    docker compose exec -T neo4j cypher-shell -u neo4j -p ventstream \
+      "MATCH (s:Supplier {id:'sup-1'})-[r:LOCATED_IN]->() DELETE r
+       WITH s MATCH (reg:Region {id:'reg-apac'}) CREATE (s)-[:LOCATED_IN]->(reg);"
+
+    curl -s 'http://localhost:9200/products/_search' -H 'content-type: application/json' -d '
+      {"size":1,"query":{"term":{"supplier.id.keyword":"sup-1"}}}' \
+      | jq '.hits.hits[0]._source.supplier'   # → region.name = "Asia Pacific"
+    ```
+
+    **Delete a product (reconciliation)**
+    ```bash
+    docker compose exec -T neo4j cypher-shell -u neo4j -p ventstream \
+      "MATCH (p:Product {id:'prod-1'}) DETACH DELETE p;"
+
+    curl -s 'http://localhost:9200/products/_count' | jq .count   # → 1999
+    ```
+  </Tab>
+</Tabs>
+
+### Stream it continuously (optional)
+
+To *see* the pipeline move, fire updates fast and watch the engine react.
+We stream the statements into a **single** psql connection (a per-command
+`docker exec` would cap the rate at the container-exec overhead) and pace
+server-side with `pg_sleep`:
+
+```bash
+# terminal 1 — one update roughly every 100 ms over a single connection
+while true; do
+  printf "UPDATE shop.orders SET status=(ARRAY['pending','paid','shipped','delivered'])[1+floor(random()*4)], total=round((random()*1000)::numeric,2) WHERE order_id='ord-0001';\nSELECT pg_sleep(0.1);\n"
+done | docker compose exec -T postgres psql -U ventstream -d shop -q
+```
+
+```bash
+# terminal 2 — watch the engine: flush → ack → cursor advance
+docker compose logs -f engine-orders
+```
+
+Or watch the document change in lockstep:
+
+```bash
+while true; do
+  curl -s 'http://localhost:9200/orders/_doc/shop.orders:%5B%22ord-0001%22%5D' \
+    | jq -c '._source | {status, total}'
+  sleep 0.2
+done
+```
+
+Ctrl-C to stop. Tune the pace with `pg_sleep(0.1)` — `0.02` for ~20 ms,
+or drop it entirely for max throughput. Each update still recomputes only
+that one document (`batch_size=1` in the logs). Swap the `WHERE` to
+`order_id='ord-'||lpad((1+floor(random()*200))::int::text,4,'0')` to
+spread updates across all 200 orders.
+
+## 6. Optional — inspection UIs
+
+<AccordionGroup>
+  <Accordion title="OpenSearch Dashboards" icon="magnifying-glass-chart">
+    ```bash
+    docker compose --profile dashboards up -d dashboards
+    ```
+    Open **http://localhost:5601** → *Dev Tools*:
+    ```
+    GET orders/_search
+    GET products/_search
+    ```
+  </Accordion>
+  <Accordion title="Neo4j Browser" icon="circle-nodes">
+    Always on at **http://localhost:7474** (user `neo4j`, password
+    `ventstream`). Explore the source graph:
+    ```cypher
+    MATCH (p:Product)-[:IN_CATEGORY]->(c:Category) RETURN p, c LIMIT 25
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## 7. Verify data flow
+
+```bash
+# Source counts
+docker compose exec -T postgres psql -U ventstream -d shop -tc \
+  "SELECT count(*) FROM shop.orders;"
+docker compose exec -T neo4j cypher-shell -u neo4j -p ventstream \
+  "MATCH (p:Product) RETURN count(p);"
+
+# Target counts (match the source, minus anything you deleted)
+curl -s localhost:9200/orders/_count   | jq .count
+curl -s localhost:9200/products/_count | jq .count
+
+# Is the Postgres replication slot active?
+docker compose exec -T postgres psql -U ventstream -d shop -c \
+  "SELECT slot_name, active FROM pg_replication_slots;"
+
+# Any dead-lettered events? (should be 0)
+docker compose exec -T engine-orders   sh -c 'cat /var/lib/ventstream/dlq.jsonl 2>/dev/null | wc -l'
+docker compose exec -T engine-products sh -c 'cat /var/lib/ventstream/dlq.jsonl 2>/dev/null | wc -l'
+```
+
+## 8. Teardown
+
+```bash
+# Keep your data — stop + remove containers/networks but KEEP volumes
+# (fast re-run; engines resume from cursor/state, sources keep their data):
+docker compose --profile dashboards down --remove-orphans
+
+# Full reset — also drop Postgres data, Neo4j store, and engine state:
+docker compose --profile dashboards down -v --remove-orphans
+```
+
+<Warning>
+`-v` drops the volumes (Postgres data, Neo4j store, engine state) and the
+next `up` re-seeds from scratch — omit it to keep your data.
+`--remove-orphans` clears leftover containers from old runs so a re-run
+doesn't hit name/port clashes.
+</Warning>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Author a projection" icon="file-code" href="/guides/authoring-specs">
+    The `orders` and `products` specs, field by field.
+  </Card>
+  <Card title="How fan-out works" icon="diagram-project" href="/concepts/fan-out">
+    Why renaming a category updates 500 docs without exploding.
+  </Card>
+  <Card title="Add the control plane" icon="gauge" href="/fleet/local-control-plane">
+    Enroll and administer an engine fleet with `ventstreamctl`.
+  </Card>
+  <Card title="Deploy to Kubernetes" icon="server" href="/deploy/kubernetes">
+    Ship the whole stack with the bundled manifests.
+  </Card>
+</CardGroup>

@@ -1,0 +1,111 @@
+---
+title: "Real-time demo (GraphiQL)"
+description: "Stream typed GraphQL subscriptions over NATS — live, in the browser, zero code."
+---
+
+VentStream's real-time gateways turn NATS events into **typed GraphQL
+subscriptions**. This demo brings up NATS + the engine (in `ws,graphql`
+mode) and lets you watch events arrive live in the in-browser **GraphiQL**
+playground — nothing to install, no client code to write.
+
+<Note>
+The typed subscription fields come from an SDL file
+(`demo/realtime/subscriptions.graphql`) wired in via `VS_GRAPHQL_SCHEMA`.
+See [Real-time subscriptions](/concepts/real-time-subscriptions) for how
+`@vsSubscribe` maps a field to a subject.
+</Note>
+
+## Prerequisites
+
+- Docker + Docker Compose v2
+- Free ports: `4041` (GraphQL), `4222` (NATS), `4043` (health)
+
+## 1. Start the stack
+
+```bash
+cd demo/realtime
+docker compose up -d --build
+```
+
+This starts NATS (JetStream) and the engine in `ws,graphql` mode — the
+`ws` role bootstraps the `vsws` stream, the `graphql` role serves
+subscriptions from it. Confirm it's up:
+
+```bash
+docker compose ps   # engine → "healthy"
+```
+
+## 2. Subscribe in GraphiQL
+
+Open **[http://localhost:4041/graphiql](http://localhost:4041/graphiql)** —
+the subscription endpoint and connection params are pre-wired. Run (▶):
+
+```graphql
+subscription {
+  orderStatusChanged(orderId: "order_1") {
+    id
+    status
+    changedAt
+  }
+}
+```
+
+It stays open, waiting for events. (Browse the **Docs** panel on the right
+to see `orderStatusChanged`, the raw `orderEvents`, and the generic
+`events(subject:)`.)
+
+## 3. Publish an event
+
+In a second terminal, publish one event through the bundled `nats-box` CLI
+helper (the `nats` server image has no client). The subject ends with the
+`orderId`, and `id` must be a valid **ULID**:
+
+```bash
+cd demo/realtime
+docker compose exec -T nats-box nats pub vs.t.acme.orderStatusChanged.order_1 \
+  '{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","event":"orderStatusChanged","tenant":"acme","entity_id":"order_1","occurred_at":"2026-01-01T00:00:00Z","received_at":"2026-01-01T00:00:00Z","schema_version":2,"data":{"status":"confirmed"}}'
+```
+
+GraphiQL updates instantly:
+
+```json
+{ "id": "order_1", "status": "confirmed", "changedAt": "2026-01-01T00:00:00Z" }
+```
+
+The result field names differ from the payload because the SDL maps them with `@source`: `id ← $event.entityId`, `status ← $data.status`, `changedAt ← $event.occurredAt` (see [`subscriptions.graphql`](https://github.com/bashiru98/ventstream/blob/main/demo/realtime/subscriptions.graphql) and [Real-time subscriptions](/concepts/real-time-subscriptions)).
+
+## 4. Optional — stream continuous changing events
+
+To watch the subscription tick live, publish a changing event **every
+second**. Leave the GraphiQL subscription running and run this in another
+terminal (`Ctrl-C` to stop):
+
+```bash
+cd demo/realtime
+i=0
+while true; do
+  ulid="0$(LC_ALL=C tr -dc '0123456789ABCDEFGHJKMNPQRSTVWXYZ' </dev/urandom | head -c 25)"
+  if [ $((i % 2)) -eq 0 ]; then st=paid; else st=shipped; fi
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  docker compose exec -T nats-box nats pub vs.t.acme.orderStatusChanged.order_1 \
+    "{\"id\":\"$ulid\",\"event\":\"orderStatusChanged\",\"tenant\":\"acme\",\"entity_id\":\"order_1\",\"occurred_at\":\"$ts\",\"received_at\":\"$ts\",\"schema_version\":2,\"data\":{\"status\":\"$st\"}}"
+  i=$((i + 1)); sleep 1
+done
+```
+
+GraphiQL ticks once per second — `status` flipping `paid` → `shipped`,
+`changedAt` advancing. That's your live subscription stream. (`st`, not
+`status` — `status` is a read-only variable in zsh.)
+
+<Note>
+Every event needs a fresh, valid **ULID** for `id` and `schema_version: 2`.
+The subject grammar is `vs.t.<tenant>.<event>.<id>` (id last) — publishing
+to `…orderStatusChanged.order_1` is what routes it to the
+`orderId: "order_1"` subscription.
+</Note>
+
+## 5. Teardown
+
+```bash
+docker compose down -v --remove-orphans
+```

@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 440" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif" role="img" aria-label="VentStream architecture: one Rust binary with a change-streaming pipeline and a real-time socket-delivery pipeline">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#3b82f6"/>
+    </marker>
+    <style>
+      .bg{fill:#0b1220;stroke:#1e293b;stroke-width:1.5}
+      .box{fill:#111a2e;stroke:#2563eb;stroke-width:1.5;rx:10}
+      .eng{fill:#0f2742;stroke:#38bdf8;stroke-width:2;rx:12}
+      .t{fill:#e6edf3;font-size:14px;font-weight:600}
+      .s{fill:#8aa0b8;font-size:11.5px}
+      .lane{fill:#7dd3fc;font-size:13px;font-weight:700;letter-spacing:.3px}
+      .cap{fill:#64748b;font-size:11.5px}
+      .ln{stroke:#3b82f6;stroke-width:1.6;fill:none}
+      .title{fill:#e6edf3;font-size:30px;font-weight:800}
+      .sub{fill:#94a3b8;font-size:14px}
+    </style>
+  </defs>
+
+  <rect class="bg" x="1" y="1" width="978" height="438" rx="18"/>
+  <text class="title" x="34" y="50">VentStream</text>
+  <text class="sub" x="200" y="50">one Rust binary · change streaming + real-time socket delivery</text>
+
+  <!-- Lane 1: CDC -->
+  <text class="lane" x="34" y="96">① Change streaming → any target</text>
+  <rect class="box" x="34"  y="112" width="118" height="38" rx="10"/>
+  <text class="t" x="93" y="130" text-anchor="middle">PostgreSQL</text>
+  <text class="s" x="93" y="144" text-anchor="middle">logical replication</text>
+  <rect class="box" x="34"  y="160" width="118" height="38" rx="10"/>
+  <text class="t" x="93" y="178" text-anchor="middle">Neo4j</text>
+  <text class="s" x="93" y="192" text-anchor="middle">CDC</text>
+
+  <rect class="eng" x="372" y="118" width="184" height="74" rx="12"/>
+  <text class="t" x="464" y="146" text-anchor="middle">VentStream · cdc</text>
+  <text class="s" x="464" y="164" text-anchor="middle">in-memory joins</text>
+  <text class="s" x="464" y="180" text-anchor="middle">denormalize → bulk upsert</text>
+
+  <rect class="box" x="788" y="124" width="158" height="62" rx="10"/>
+  <text class="t" x="867" y="148" text-anchor="middle">Target sink</text>
+  <text class="s" x="867" y="164" text-anchor="middle">OpenSearch today</text>
+  <text class="s" x="867" y="178" text-anchor="middle">pluggable interface</text>
+
+  <path class="ln" d="M152 131 L372 150" marker-end="url(#ar)"/>
+  <path class="ln" d="M152 179 L372 162" marker-end="url(#ar)"/>
+  <path class="ln" d="M556 155 L788 155" marker-end="url(#ar)"/>
+  <text class="cap" x="600" y="148" text-anchor="middle">idempotent, bounded</text>
+
+  <!-- divider -->
+  <line x1="34" y1="232" x2="946" y2="232" stroke="#1e293b" stroke-width="1"/>
+
+  <!-- Lane 2: real-time -->
+  <text class="lane" x="34" y="270">② Real-time socket delivery → clients</text>
+  <rect class="box" x="34"  y="290" width="118" height="48" rx="10"/>
+  <text class="t" x="93" y="312" text-anchor="middle">Publishers</text>
+  <text class="s" x="93" y="328" text-anchor="middle">{event, id, data}</text>
+
+  <rect class="box" x="200" y="290" width="138" height="48" rx="10"/>
+  <text class="t" x="269" y="312" text-anchor="middle">NATS</text>
+  <text class="s" x="269" y="328" text-anchor="middle">JetStream bus</text>
+
+  <rect class="eng" x="386" y="288" width="170" height="52" rx="12"/>
+  <text class="t" x="471" y="310" text-anchor="middle">VentStream</text>
+  <text class="s" x="471" y="326" text-anchor="middle">ws · graphql roles</text>
+
+  <rect class="box" x="788" y="280" width="158" height="40" rx="10"/>
+  <text class="t" x="867" y="305" text-anchor="middle">WebSocket clients</text>
+  <rect class="box" x="788" y="328" width="158" height="40" rx="10"/>
+  <text class="t" x="867" y="353" text-anchor="middle">Apollo / GraphQL</text>
+
+  <path class="ln" d="M152 314 L200 314" marker-end="url(#ar)"/>
+  <path class="ln" d="M338 314 L386 314" marker-end="url(#ar)"/>
+  <path class="ln" d="M556 312 L788 300" marker-end="url(#ar)"/>
+  <path class="ln" d="M556 320 L788 348" marker-end="url(#ar)"/>
+
+  <text class="cap" x="490" y="418" text-anchor="middle">role-selected on one binary — VS_ROLES=cdc,ws,graphql</text>
+</svg>

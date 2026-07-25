@@ -1,0 +1,10 @@
+federation_version: 2
+subgraphs:
+  ventstream:
+    routing_url: http://localhost:4041/graphql
+    schema:
+      file: ./ventstream.graphql
+  orders:
+    routing_url: http://localhost:4042/
+    schema:
+      subgraph_url: http://localhost:4042/

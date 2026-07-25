@@ -1,0 +1,27 @@
+[package]
+name = "ventstream-redis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Redis realtime broker providers for VentStream."
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+metrics = "0.24"
+redis = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+ventstream-realtime = { workspace = true }
+ventstream-protocol = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

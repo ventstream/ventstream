@@ -1,0 +1,142 @@
+# DEPRECATED MIGRATION REFERENCE. This manifest includes the retired API-key
+# telemetry integration. Use docs-site/deploy/kubernetes-standalone.mdx for a
+# current standalone StatefulSet or the Fleet managed-agent chart.
+#
+# Neo4j CDC agent (Product catalog → OpenSearch).
+#
+# Same single-leader StatefulSet shape as the Postgres agent. The
+# Neo4j cursor lives on the PVC; the Bolt CA cert is mounted from a
+# Secret so rustls trusts the TLS handshake.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ventstream-products
+  namespace: ventstream-agents
+  labels:
+    app.kubernetes.io/name: ventstream-products
+    app.kubernetes.io/component: cdc-agent
+spec:
+  serviceName: ventstream-products
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ventstream-products
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ventstream-products
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: engine
+          image: ghcr.io/bashiru98/ventstream:0.1.12
+          ports:
+            # Always-on health endpoint (VS_HEALTH_LISTEN, default :4043).
+            - name: health
+              containerPort: 4043
+          env:
+            - name: VS_ROLES
+              value: cdc
+            - name: VS_CDC_SOURCE
+              value: neo4j
+            # --- control plane ---
+            - name: VS_CONTROL_PLANE_URL
+              value: "http://ventstream-cp-api.ventstream-cp.svc:8080"
+            - name: VS_CONTROL_PLANE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: products-agent-secrets
+                  key: VS_CONTROL_PLANE_KEY
+            - name: VS_AGENT_NAME
+              value: products-cdc
+            - name: VS_CONTROL_PLANE_INTERVAL_SECS
+              value: "10"
+            # --- source ---
+            - name: VS_NEO4J_URI
+              value: "neo4j+s://neo4j.example.internal:7687"
+            - name: VS_NEO4J_USER
+              value: "neo4j"
+            - name: VS_NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: products-agent-secrets
+                  key: VS_NEO4J_PASSWORD
+            - name: VS_NEO4J_DATABASE
+              value: "neo4j"
+            - name: VS_NEO4J_NAMESPACE
+              value: "neo4j"
+            - name: VS_NEO4J_TRUST_CERT_FILE
+              value: "/etc/ventstream/certs/neo4j-ca.crt"
+            - name: VS_NEO4J_BOOTSTRAP_MODE
+              value: "snapshot"
+            - name: VS_NEO4J_BOOTSTRAP_BATCH_SIZE
+              value: "2000"
+            - name: VS_NEO4J_POLL_INTERVAL_MS
+              value: "500"
+            # Hot-endpoint detection threshold (shared lookup nodes).
+            - name: VS_NEO4J_HOT_NODE_THRESHOLD
+              value: "100"
+            # --- projection + state ---
+            - name: VS_NEO4J_DENORMALIZE_YAML
+              value: "/etc/ventstream/products.yaml"
+            - name: VS_NEO4J_STATE_DIR
+              value: "/var/lib/ventstream/state"
+            - name: VS_DLQ_PATH
+              value: "/var/lib/ventstream/dlq.jsonl"
+            # --- sink ---
+            - name: VS_OS_ENDPOINT
+              value: "http://opensearch.example.internal:9200"
+            - name: VS_INDEX_TEMPLATE
+              value: "${header:ventstream.cdc.relation}"
+            # --- throughput + ops ---
+            - name: VS_DISPATCH_PARALLEL_BULKS
+              value: "8"
+            - name: RUST_LOG
+              value: "info"
+            - name: VS_LOG_FORMAT
+              value: "json"
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/ventstream
+            - name: specs
+              mountPath: /etc/ventstream
+              readOnly: true
+            - name: certs
+              mountPath: /etc/ventstream/certs
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+      volumes:
+        - name: specs
+          configMap:
+            name: ventstream-specs
+        - name: certs
+          secret:
+            secretName: products-agent-secrets
+            items:
+              - key: neo4j-ca.crt
+                path: neo4j-ca.crt
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi

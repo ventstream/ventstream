@@ -1,0 +1,240 @@
+---
+title: "Fleet control plane on Kubernetes"
+description: "Provision PostgreSQL, secrets, PKI, email, and Helm values for a production Fleet control plane."
+---
+
+The `ventstream-fleet` umbrella chart installs the control API, control worker,
+agent gateway, and a one-shot pre-install/pre-upgrade migrator Job. It does not
+install PostgreSQL, an identity provider, SMTP, credentials, or production CA
+material.
+
+## Prerequisites
+
+- External PostgreSQL with encrypted connections, backups, and point-in-time
+  recovery
+- A schema-owning migrator role and a separate DDL-free runtime role
+- HTTPS ingress for the control API
+- Server TLS and client-identity CA material for the agent gateway
+- SMTP when built-in account verification is enabled
+- Immutable API, worker, gateway, and migrator image tags or digests
+
+## PostgreSQL roles
+
+Create two credentials through the database administration process:
+
+| Credential | Purpose | Kubernetes key |
+| --- | --- | --- |
+| Migrator URL | Owns Fleet schema and runs migrations only | `migrator-url` |
+| Runtime URL | Used by API, worker, and gateway; cannot run DDL or bypass RLS | `database-url` |
+
+The runtime database role must already exist and match
+`migration.database.runtimeRole` before the migration Job runs. Do not run the API
+with the migrator URL.
+
+## Required Secrets
+
+The production values file references existing Secrets. Names are configurable;
+the default key contracts are:
+
+| Secret purpose | Required keys | Consumers |
+| --- | --- | --- |
+| Runtime database | `database-url` | API, worker, gateway |
+| Migrator database | `migrator-url` | Migrator Job |
+| Enrollment grant signing | `hmac-key` | API, gateway |
+| Built-in JWT keyring | `keyring.json` | API |
+| Login throttling | `hmac-key` | API |
+| Email verification | `hmac-key` | API, worker |
+| Password reset | `hmac-key` | API, worker |
+| SMTP credentials (only when the relay authenticates) | `username`, `password` | Worker only |
+| Gateway server TLS | `tls.crt`, `tls.key` | Gateway |
+| Agent client CA | `ca.crt` | Gateway mTLS verifier |
+| Agent server trust | `ca.crt` | Returned to enrolling agents |
+| Agent issuing CA | `tls.crt`, `tls.key` | Gateway CA adapter |
+| API ingress TLS | Standard TLS Secret | Ingress controller |
+
+Create these Secret objects in the Helm release namespace
+(`ventstream-fleet` in the examples) through the cluster's secret-management
+workflow before installing the chart. The chart references existing Secrets; it
+does not generate production credentials or CA material.
+
+Generate the first-party signing keyring with the repository helper:
+
+```bash
+./infra/auth/generate-first-party-keyring.sh \
+  initial first-party-keyring.json 2026-07-v1
+```
+
+Enrollment, login-throttle, verification, and reset HMAC keys must each be stable
+independent 256-bit unpadded base64url values. Never reuse verification and reset
+key material. Generate each value independently through your secret manager; a
+local shell equivalent is:
+
+```bash
+openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'
+```
+
+Use `starttls` for authenticated SMTP on port 587 and `tls` for implicit TLS on
+port 465. A private-network or workload-identity relay can omit the username and
+password Secret. Built-in signup cannot complete without working verification
+delivery.
+
+## Prepare values
+
+Copy
+`infra/helm/ventstream-fleet/values-production.example.yaml` into a private
+deployment repository and replace every hostname, image, Secret name, platform
+administrator, and organization identifier.
+
+For built-in authentication, the worker email URL and ingress must describe the
+same public API origin. The example also uses that stable HTTPS identifier as the
+first-party token issuer:
+
+```yaml
+controlapi:
+  auth:
+    firstParty:
+      issuer: https://fleet.example.com
+
+controlworker:
+  email:
+    controlPlaneUrl: https://fleet.example.com
+
+ingress:
+  host: fleet.example.com
+```
+
+The worker is explicitly tenant-scoped. On a new installation, its initial
+non-nil placeholder organization performs no tenant maintenance but still allows
+platform verification mail to be delivered. After the platform administrator
+creates the first organization, replace the placeholder immediately with the full
+ID from `ventstreamctl orgs list --output json` and upgrade the release. Add every
+organization assigned to that worker, or deploy separately scoped workers.
+
+## Enterprise SSO
+
+Built-in accounts and enterprise OIDC can run together. Configure the customer's
+OIDC issuer when SSO, provider MFA, or federation is required:
+
+```yaml
+controlapi:
+  auth:
+    human:
+      issuer: https://idp.example.com/realms/acme
+      audience: ventstream-control-api
+      authorizedParties: [ventstream-cli]
+```
+
+The first `authorizedParties` entry is the public CLI client ID advertised to
+`ventstreamctl`; the provider must enable the OAuth device-authorization grant for
+that client. Set the provider's actual audience, allowed token `typ` values, and
+JWKS origin policy rather than copying placeholders. For a private-PKI issuer,
+set `auth.human.trustBundle.secretName` to an existing Secret containing the CA at
+`ca.crt`.
+
+For an OIDC-only deployment, disable both first-party and mail/reset paths:
+
+```yaml
+controlapi:
+  auth:
+    firstParty:
+      enabled: false
+      passwordReset: { enabled: false }
+controlworker:
+  email:
+    enabled: false
+    passwordReset: { enabled: false }
+```
+
+Then remove the first-party keyring, verification/reset HMAC, and SMTP Secret
+references. Keep at least one explicit platform-administrator principal or
+trusted role so organization provisioning cannot lock itself out.
+
+## Install
+
+VentStream Fleet is distributed separately from the open-core engine. Licensed
+operators receive the signed Fleet images, OCI chart, production values
+template, and version-matched `ventstreamctl` binary through the Fleet release
+channel.
+
+After obtaining a Fleet release, copy its production values template into a
+private deployment repository, create every referenced Secret, and install the
+immutable chart version:
+
+```bash
+helm show values \
+  oci://ghcr.io/bashiru98/charts/ventstream-fleet \
+  --version <fleet-version> >values.production.yaml
+# Edit values.production.yaml and create every referenced Secret first.
+helm template ventstream \
+  oci://ghcr.io/bashiru98/charts/ventstream-fleet \
+  --version <fleet-version> \
+  --namespace ventstream-fleet \
+  --values ./values.production.yaml >/dev/null
+
+helm upgrade --install ventstream \
+  oci://ghcr.io/bashiru98/charts/ventstream-fleet \
+  --version <fleet-version> \
+  --namespace ventstream-fleet \
+  --create-namespace \
+  --values ./values.production.yaml \
+  --atomic --timeout 10m
+```
+
+Verify every component, including the worker and migration result:
+
+```bash
+kubectl -n ventstream-fleet get deploy,pods,services,ingress,jobs
+kubectl -n ventstream-fleet rollout status deploy/ventstream-controlapi
+kubectl -n ventstream-fleet rollout status deploy/ventstream-controlworker
+kubectl -n ventstream-fleet rollout status deploy/ventstream-agentgateway
+helm status ventstream --namespace ventstream-fleet
+```
+
+The successful migrator hook is deleted automatically. A failed hook Job is
+retained long enough to inspect its logs and events.
+
+Expose the API only through HTTPS. Agents need network access to the gateway's
+server-TLS enrollment listener and mTLS control listener. PostgreSQL, the health
+listener, and CA private keys must remain private.
+
+## Bootstrap the first organization
+
+1. Install `ventstreamctl` and sign up with an address in
+   `controlapi.auth.firstParty.platformAdminEmails`.
+2. Verify the account through the configured SMTP delivery.
+3. Create the organization and initial environments with `orgs create`.
+4. Replace the worker's placeholder scope with the returned organization ID.
+5. Confirm `auth status`, `orgs list`, and `environments list` before enrolling
+   workloads.
+
+See [Authentication](/fleet/authentication) and
+[CLI administration](/fleet/cli) for exact commands.
+
+## Password-recovery upgrade
+
+Fresh installations may enable API reset routes and worker reset delivery in the
+initial values.
+
+When upgrading a release that predates credential generation, use two rollouts:
+
+1. Deploy the new API and worker versions with
+   `controlapi.auth.firstParty.passwordReset.enabled=false` and
+   `controlworker.email.passwordReset.enabled=false`. Wait until every old API and
+   worker pod has terminated.
+2. Provision the distinct reset HMAC Secret, set both flags to `true`, and deploy
+   again.
+
+Signup, login, refresh, and verification remain available during phase one. The
+two phases avoid serving password-reset requests while generation-unaware old pods
+still coexist in a Kubernetes rolling update.
+
+## Upgrade discipline
+
+- Back up PostgreSQL before every schema upgrade.
+- Review migration release notes and use expand/contract changes across rolling
+  compatibility windows.
+- Run Helm lint/template and OpenAPI compatibility checks before deployment.
+- Verify authentication, worker delivery, agent reconnection, and one waited
+  operation after rollout.
+- Keep the prior image digest and a database recovery plan; never attempt to undo
+  a schema migration by only rolling back pods.

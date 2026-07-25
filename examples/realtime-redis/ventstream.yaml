@@ -1,0 +1,26 @@
+schema_version: 1
+roles: [ws, graphql]
+
+runtime:
+  health_listen: 127.0.0.1:4043
+  tenant: acme
+  realtime:
+    provider: redis_streams
+    redis_streams:
+      url_ref: env:VS_REDIS_URL
+      key_prefix: ventstream
+      read_batch: 256
+      block_timeout_ms: 5000
+      broadcast_capacity: 2048
+      max_length: 1000000
+      connect_timeout_ms: 5000
+      response_timeout_ms: 5000
+  ws:
+    listen: 0.0.0.0:4040
+    mailbox: 256
+    ping_interval_ms: 10000
+    pong_timeout_ms: 30000
+  graphql:
+    listen: 0.0.0.0:4041
+    broadcast_capacity: 1024
+    playground: true

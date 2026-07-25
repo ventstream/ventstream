@@ -1,0 +1,413 @@
+/* ============================================================
+   VentStream documentation styles.
+   Clean, dark-by-default, system fonts. No build step.
+   ============================================================ */
+
+:root {
+  --bg:           #0d1117;
+  --bg-elevated:  #161b22;
+  --bg-code:      #1c2128;
+  --border:       #30363d;
+  --border-soft:  #21262d;
+  --text:         #e6edf3;
+  --text-muted:   #8d96a0;
+  --text-dim:     #6e7681;
+  --accent:       #58a6ff;
+  --accent-soft:  rgba(88, 166, 255, 0.1);
+  --success:      #3fb950;
+  --warning:      #d29922;
+  --danger:       #f85149;
+  --max-content:  860px;
+  --sidebar-w:    260px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg:           #ffffff;
+    --bg-elevated:  #f6f8fa;
+    --bg-code:      #f6f8fa;
+    --border:       #d0d7de;
+    --border-soft:  #d8dee4;
+    --text:         #1f2328;
+    --text-muted:   #59636e;
+    --text-dim:     #818b94;
+    --accent:       #0969da;
+    --accent-soft:  rgba(9, 105, 218, 0.08);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "SF Pro Text",
+               Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+/* ---------- Layout ---------- */
+
+.layout {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) 1fr;
+  min-height: 100vh;
+}
+
+@media (max-width: 800px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+  .sidebar {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+}
+
+.sidebar {
+  background: var(--bg-elevated);
+  border-right: 1px solid var(--border);
+  padding: 32px 24px;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+}
+
+@media (max-width: 800px) {
+  .sidebar { position: static; height: auto; }
+}
+
+.sidebar .logo {
+  font-weight: 700;
+  font-size: 20px;
+  letter-spacing: -0.02em;
+  margin-bottom: 4px;
+  display: block;
+  color: var(--text);
+}
+
+.sidebar .logo:hover { text-decoration: none; }
+
+.sidebar .tagline {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-bottom: 28px;
+  line-height: 1.4;
+}
+
+.sidebar .nav-section {
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin: 22px 0 8px;
+}
+
+.sidebar nav ul {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 18px;
+}
+
+.sidebar nav li {
+  margin: 0;
+}
+
+.sidebar nav a {
+  display: block;
+  padding: 6px 10px;
+  margin: 0 -10px;
+  border-radius: 5px;
+  color: var(--text-muted);
+  font-size: 14px;
+  font-weight: 400;
+  border: 1px solid transparent;
+}
+
+.sidebar nav a:hover {
+  background: var(--accent-soft);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.sidebar nav a.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 500;
+  border-color: var(--border-soft);
+}
+
+.sidebar .footer-note {
+  position: absolute;
+  bottom: 24px;
+  left: 24px;
+  right: 24px;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+
+/* ---------- Content ---------- */
+
+main {
+  padding: 56px 64px 96px;
+  max-width: calc(var(--max-content) + 128px);
+  margin: 0;
+}
+
+@media (max-width: 800px) {
+  main { padding: 32px 24px 64px; }
+}
+
+main > * {
+  max-width: var(--max-content);
+}
+
+main h1 {
+  font-size: 36px;
+  font-weight: 700;
+  margin: 0 0 8px;
+  letter-spacing: -0.025em;
+  line-height: 1.2;
+}
+
+main .subtitle {
+  color: var(--text-muted);
+  font-size: 18px;
+  margin: 0 0 40px;
+  line-height: 1.5;
+}
+
+main h2 {
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  margin: 48px 0 14px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+main h3 {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 28px 0 10px;
+}
+
+main h4 {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 20px 0 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+main p {
+  margin: 0 0 14px;
+}
+
+main ul, main ol {
+  padding-left: 22px;
+  margin: 0 0 14px;
+}
+
+main li {
+  margin: 4px 0;
+}
+
+main code, main pre {
+  font-family: ui-monospace, "SF Mono", Menlo, Monaco, Consolas,
+               "Liberation Mono", "Courier New", monospace;
+  font-size: 13px;
+}
+
+main p code, main li code, main td code {
+  background: var(--bg-code);
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border-soft);
+  font-size: 12.5px;
+}
+
+/* ---------- Code blocks with copy ---------- */
+
+.code-block {
+  position: relative;
+  margin: 14px 0 20px;
+}
+
+.code-block pre {
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 18px;
+  overflow-x: auto;
+  margin: 0;
+  line-height: 1.55;
+}
+
+.code-block pre code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.code-block .lang {
+  position: absolute;
+  top: 8px;
+  right: 56px;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  pointer-events: none;
+}
+
+.code-block button.copy {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 4px 10px;
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.code-block button.copy:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.code-block button.copy.copied {
+  color: var(--success);
+  border-color: var(--success);
+}
+
+/* ---------- Tables ---------- */
+
+main table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 14px 0 20px;
+  font-size: 14px;
+}
+
+main th, main td {
+  text-align: left;
+  padding: 8px 12px;
+  border: 1px solid var(--border-soft);
+  vertical-align: top;
+}
+
+main th {
+  background: var(--bg-elevated);
+  font-weight: 600;
+  color: var(--text);
+  font-size: 13px;
+}
+
+main td code {
+  white-space: nowrap;
+}
+
+/* ---------- Callouts ---------- */
+
+.callout {
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  padding: 12px 16px;
+  margin: 18px 0;
+  border-radius: 0 6px 6px 0;
+  font-size: 14.5px;
+}
+
+.callout.warn {
+  border-color: var(--warning);
+  background: rgba(210, 153, 34, 0.08);
+}
+
+.callout.gotcha {
+  border-color: var(--danger);
+  background: rgba(248, 81, 73, 0.08);
+}
+
+.callout strong {
+  font-weight: 600;
+}
+
+/* ---------- Misc ---------- */
+
+hr {
+  border: 0;
+  border-top: 1px solid var(--border-soft);
+  margin: 32px 0;
+}
+
+.pill {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  background: var(--bg-elevated);
+  vertical-align: middle;
+  margin-left: 6px;
+}
+
+.pill.shipped { color: var(--success); border-color: var(--success); }
+.pill.partial { color: var(--warning); border-color: var(--warning); }
+.pill.planned { color: var(--text-dim); }
+
+/* Footer at the bottom of each page */
+.page-footer {
+  margin-top: 64px;
+  padding-top: 24px;
+  border-top: 1px solid var(--border-soft);
+  color: var(--text-dim);
+  font-size: 13px;
+  display: flex;
+  justify-content: space-between;
+}
+
+/* Inline diagram blocks (ASCII art) */
+.diagram {
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 18px 22px;
+  margin: 16px 0;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12.5px;
+  line-height: 1.4;
+  white-space: pre;
+  overflow-x: auto;
+  color: var(--text);
+}

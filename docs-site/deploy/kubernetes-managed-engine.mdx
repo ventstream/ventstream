@@ -1,0 +1,225 @@
+---
+title: "Managed engine on Kubernetes"
+description: "Create, enroll, configure, start, and administer a Fleet-managed engine with ventstreamctl and Helm."
+---
+
+The `ventstream-managed-agent` chart runs the Fleet supervisor as PID 1 and the
+open-core engine as its child. The supervisor owns workload identity, desired
+state, operation receipts, and staged configuration. Connector secrets stay in the
+customer workload namespace.
+
+## Prerequisites
+
+- A reachable [Fleet control plane](/deploy/kubernetes-fleet)
+- `ventstreamctl` authenticated with organization and environment defaults
+- A managed image built from matching engine and control-plane revisions
+- The gateway enrollment server CA bundle
+- Workload-local connector Secrets
+
+The examples below use one Postgres CDC pipeline. CDC deployments must always use
+one replica.
+
+## 1. Create the Fleet resources
+
+```bash
+PIPELINE_ID=$(ventstreamctl pipelines create orders-cdc \
+  --description "Orders search projection" \
+  --workload-kind cdc \
+  --source-kind postgres \
+  --sink-kind opensearch \
+  --output json | jq -er '.data.id')
+
+DEPLOYMENT_ID=$(ventstreamctl agents create orders-primary \
+  --pipeline "$PIPELINE_ID" \
+  --output json | jq -er '.data.id')
+
+printf 'pipeline=%s\ndeployment=%s\n' "$PIPELINE_ID" "$DEPLOYMENT_ID"
+```
+
+Keep these IDs in the private deployment values for this workload.
+
+## 2. Create and select configuration
+
+Author `ventstream.yaml` using environment references for credentials:
+
+```yaml
+schema_version: 1
+roles: [cdc]
+source:
+  kind: postgres
+  postgres:
+    host_ref: env:VS_PG_HOST
+    port: 5432
+    user_ref: env:VS_PG_USER
+    password_ref: env:VS_PG_PASSWORD
+    database_ref: env:VS_PG_DATABASE
+    publication_ref: env:VS_PG_PUBLICATION
+    slot_ref: env:VS_PG_SLOT
+    bootstrap: { mode: snapshot, chunk_size: 10000 }
+    denormalize_mode: sql
+sink:
+  kind: opensearch
+  opensearch:
+    endpoint_ref: env:VS_OS_ENDPOINT
+    auth:
+      mode: api_key
+      api_key_ref: env:VS_OS_API_KEY
+    index_routing: { strategy: by_projection_target }
+specs:
+  joins: projections/orders.yaml
+runtime:
+  health_listen: 0.0.0.0:4043
+  dlq_path: /var/lib/ventstream/dlq.jsonl
+```
+
+Create, validate, and select the immutable revision. Selection leaves a new
+pipeline paused:
+
+```bash
+CONFIG_REVISION=$(ventstreamctl pipelines configurations create "$PIPELINE_ID" \
+  --engine-config ./ventstream.yaml \
+  --file projections/orders.yaml=./orders.yaml \
+  --output json | jq -er '.data.revision')
+
+ventstreamctl pipelines configurations validate \
+  "$PIPELINE_ID" "$CONFIG_REVISION" \
+  --reason "pre-deployment validation"
+
+ventstreamctl pipelines configurations select \
+  "$PIPELINE_ID" "$CONFIG_REVISION" \
+  --reason "initial deployment"
+```
+
+## 3. Prepare workload Secrets
+
+Create the namespace and connector Secret through the cluster's secret manager.
+The resulting Secret should expose only referenced environment values:
+
+```text
+orders-engine-secrets
+  VS_PG_HOST
+  VS_PG_USER
+  VS_PG_PASSWORD
+  VS_PG_DATABASE
+  VS_PG_PUBLICATION
+  VS_PG_SLOT
+  VS_OS_ENDPOINT
+  VS_OS_API_KEY
+```
+
+Create the gateway server trust Secret from the CA bundle supplied by the Fleet
+operator:
+
+```bash
+kubectl create namespace ventstream-workloads
+kubectl -n ventstream-workloads create secret generic fleet-gateway-server-ca \
+  --from-file=ca.crt=./gateway-server-ca.pem
+```
+
+Stream a new one-time enrollment grant directly into a Secret so it is not placed
+in a shell variable or command argument:
+
+```bash
+ventstreamctl agents enroll-token create "$DEPLOYMENT_ID" \
+  --pipeline "$PIPELINE_ID" | \
+kubectl -n ventstream-workloads create secret generic orders-enrollment \
+  --from-file=grant=/dev/stdin
+```
+
+The grant expires after ten minutes and is consumed by the first successful
+enrollment.
+
+## 4. Install the managed workload
+
+The managed-agent chart is maintained in the control-plane repository. Run Helm
+from a checkout whose revision matches the managed image:
+
+```bash
+cd ventstream-control-plane
+helm upgrade --install orders-cdc \
+  ./infra/helm/ventstream-managed-agent \
+  --namespace ventstream-workloads \
+  --set image.repository=ghcr.io/your-org/ventstream-managed-engine \
+  --set image.tag=VERSION \
+  --set workload.kind=cdc \
+  --set workload.roles=cdc \
+  --set workload.replicas=1 \
+  --set fleet.gatewayUrl=https://gateway.example.com:8445 \
+  --set fleet.pipelineId="$PIPELINE_ID" \
+  --set fleet.deploymentId="$DEPLOYMENT_ID" \
+  --set fleet.enrollment.enabled=true \
+  --set fleet.enrollment.url=https://gateway.example.com:8444 \
+  --set fleet.enrollment.tokenSecret=orders-enrollment \
+  --set fleet.enrollment.serverTrustSecret=fleet-gateway-server-ca \
+  --set engine.envFromSecret=orders-engine-secrets
+```
+
+The enrollment init container writes renewable identity state to the workload PVC.
+The main supervisor never mounts the enrollment token.
+
+<Warning>
+The current chart still references the consumed enrollment Secret on later pod
+starts while `fleet.enrollment.enabled=true`. Keep that Secret object present until
+a state-only bootstrap mode is released. The token is no longer redeemable, but
+deleting the Secret prevents Kubernetes from starting the init container.
+</Warning>
+
+## 5. Apply and start
+
+Wait for the agent to connect, then apply the selected revision and explicitly
+resume the pipeline:
+
+```bash
+ventstreamctl agents status \
+  --pipeline "$PIPELINE_ID" \
+  --deployment "$DEPLOYMENT_ID"
+
+ventstreamctl pipelines configurations apply \
+  "$PIPELINE_ID" "$CONFIG_REVISION" \
+  --reason "initial deployment" --wait
+
+ventstreamctl pipelines resume "$PIPELINE_ID" --wait
+```
+
+Verify both Kubernetes and Fleet views:
+
+```bash
+kubectl -n ventstream-workloads get pods,pvc,service
+kubectl -n ventstream-workloads logs statefulset/orders-cdc-ventstream-managed-agent --follow
+ventstreamctl agents status \
+  --pipeline "$PIPELINE_ID" \
+  --deployment "$DEPLOYMENT_ID"
+ventstreamctl operations list --pipeline "$PIPELINE_ID"
+```
+
+## Realtime workloads
+
+One enrollment grant is single-use. The current chart can automatically enroll a
+single realtime replica, but it cannot bootstrap several new StatefulSet replicas
+from one token Secret. Do not combine `fleet.enrollment.enabled=true` with
+`workload.replicas` greater than `1`.
+
+For replicated realtime today, either:
+
+- Run the standalone `ventstream-gateway` chart, or
+- Use `fleet.identitySecret` with a Fleet-compatible pre-provisioned deployment
+  identity from your PKI and leave enrollment disabled.
+
+The pre-provisioned Secret must contain `tls.crt`, `tls.key`, and `ca.crt`. Each
+pod still reports its immutable Pod UID as a distinct Fleet instance. Automatic
+multi-replica enrollment needs a per-replica identity bootstrap workflow and is
+not yet supported by this chart.
+
+## Routine administration
+
+```bash
+ventstreamctl pipelines pause "$PIPELINE_ID" \
+  --reason "maintenance" --wait
+ventstreamctl pipelines resume "$PIPELINE_ID" --wait
+ventstreamctl pipelines reconcile "$PIPELINE_ID" --wait
+ventstreamctl pipelines drain "$PIPELINE_ID" \
+  --reason "retire deployment" --wait
+```
+
+Do not delete the PVC during upgrades. It contains workload identity, cached
+desired state, applied configuration, and connector cursor/join state.

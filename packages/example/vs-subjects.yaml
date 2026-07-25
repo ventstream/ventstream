@@ -1,0 +1,18 @@
+# Subject manifest for the GraphQL gateway.
+# Returned by `query { availableSubjects { ... } }`.
+subjects:
+  - pattern: "orders.order.created.*"
+    description: "Fired when a new order is placed."
+    example_event_type: "orders.order.created"
+  - pattern: "orders.order.status_changed.*"
+    description: "Fired when an order's status transitions."
+    example_event_type: "orders.order.status_changed"
+  - pattern: "orders.order.refunded.*"
+    description: "Fired when an order is refunded."
+    example_event_type: "orders.order.refunded"
+  - pattern: "users.user.profile_updated.*"
+    description: "Fired when a user updates their profile fields."
+    example_event_type: "users.user.profile_updated"
+  - pattern: "billing.report.summary_generated.*"
+    description: "Nightly billing summary roll-up."
+    example_event_type: "billing.report.summary_generated"

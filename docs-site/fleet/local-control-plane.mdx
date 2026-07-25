@@ -1,0 +1,144 @@
+---
+title: "Run Fleet locally"
+description: "Start the complete VentStream control plane, verify a built-in account, and create the first organization."
+---
+
+The packaged Compose stack runs Fleet locally without Keycloak or another external
+identity provider.
+
+## Prerequisites
+
+- Docker Desktop or Docker Engine with Compose v2
+- Rust with the repository's pinned toolchain
+- The engine and control-plane repositories cloned next to one another when you
+  also intend to run the managed engine demo
+
+```text
+workspace/
+├── ventstream/
+└── ventstream-control-plane/
+```
+
+## Start Fleet
+
+```bash
+cd ventstream-control-plane
+cp .env.example .env
+docker compose up -d --build --wait
+```
+
+Compose starts PostgreSQL, a one-shot schema migrator, the control API, control
+worker, agent gateway, and a loopback-only Mailpit inbox. Built-in account
+verification and password-reset delivery are enabled for local development.
+
+| Service | Local address |
+| --- | --- |
+| Control API | `http://localhost:8080` |
+| Gateway health | `http://localhost:8081` |
+| Mailpit inbox | `http://localhost:8025` |
+
+The migrator should exit successfully after applying pending schema changes. It is
+not a long-running service. API, worker, and gateway processes use a separate
+DDL-free runtime database role.
+
+## Install the CLI
+
+```bash
+cargo install --locked --path crates/ventstreamctl
+ventstreamctl version
+```
+
+## Create and verify the local administrator
+
+The Compose defaults authorize `admin@ventstream.local` as a platform
+administrator. Read its password securely and create the pending account:
+
+```bash
+read -rsp "Local VentStream password: " VENTSTREAM_PASSWORD && echo
+printf '%s' "$VENTSTREAM_PASSWORD" | ventstreamctl auth signup \
+  --control-plane http://localhost:8080 \
+  --profile local \
+  --allow-insecure-localhost \
+  --email admin@ventstream.local \
+  --display-name "Local Admin" \
+  --password-stdin
+unset VENTSTREAM_PASSWORD
+```
+
+Open [Mailpit](http://localhost:8025), select the verification message, run the
+token-free command shown in the email, and paste the one-time token into the hidden
+prompt:
+
+```bash
+ventstreamctl auth verify-email --profile local
+ventstreamctl auth status --profile local
+```
+
+Verification creates the first authenticated session. Signup by itself does not.
+
+## Create an organization
+
+```bash
+ventstreamctl orgs create local-demo \
+  --profile local \
+  --display-name "Local Demo" \
+  --region local \
+  --environment development:Development
+
+ventstreamctl config show --profile local
+ventstreamctl pipelines list --profile local
+```
+
+Organization creation stores the organization and first environment as profile
+defaults. Normal commands no longer need to repeat their IDs or the local URL.
+
+The worker is deliberately tenant-scoped. If you are testing expiration and stale
+lease maintenance for this newly created organization, copy its full ID from
+`ventstreamctl orgs list --output json` into
+`FLEET_DEV_WORKER_ORGANIZATIONS` in `.env`, then recreate `control-worker`:
+
+```bash
+docker compose up -d --force-recreate control-worker
+```
+
+Immediate enrollment and lifecycle operations do not require waiting for the
+maintenance interval.
+
+## Inspect and recover
+
+```bash
+docker compose ps
+docker compose logs -f control-api control-worker agent-gateway
+```
+
+Mailpit also receives password-reset and password-changed messages:
+
+```bash
+ventstreamctl auth request-password-reset \
+  --profile local \
+  --email admin@ventstream.local
+ventstreamctl auth reset-password --profile local
+```
+
+Password reset does not log in automatically. Run `auth login` with the new
+password afterward.
+
+## Clean up
+
+Stop services while retaining the database and generated development CA:
+
+```bash
+docker compose down
+```
+
+Remove all local Fleet state only when you intend to start over:
+
+```bash
+docker compose down --volumes --remove-orphans
+```
+
+<Warning>
+The Compose passwords, HMAC keys, signing material, SMTP service, and generated CA
+are development fixtures. Do not expose this stack to a shared network or reuse
+its secrets in another environment.
+</Warning>

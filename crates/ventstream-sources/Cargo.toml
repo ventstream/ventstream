@@ -1,0 +1,50 @@
+[package]
+name = "ventstream-sources"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Source adapters for the VentStream engine."
+
+[dependencies]
+async-trait = { workspace = true }
+byteorder = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+parking_lot = { workspace = true }
+neo4rs = { workspace = true }
+mongodb = { workspace = true }
+mysql_async = { workspace = true }
+rdkafka = { workspace = true }
+pgwire-replication = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+tracing = { workspace = true }
+metrics = "0.24"
+ventstream-core = { workspace = true }
+ventstream-joins = { workspace = true }
+ventstream-telemetry = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "rt", "macros", "process"] }
+tokio-test = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[example]]
+name = "postgres_cdc_smoke"
+path = "examples/postgres_cdc_smoke.rs"
+
+[[example]]
+name = "postgres_cdc_edge"
+path = "examples/postgres_cdc_edge.rs"
+
+[lints]
+workspace = true

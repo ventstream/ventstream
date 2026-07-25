@@ -1,0 +1,66 @@
+---
+title: "Connectors"
+description: "The sources VentStream reads from and the sinks it writes to — and what's supported today."
+---
+
+A **connector** is how VentStream talks to a system. The engine is
+source / sink / transport-pluggable, so the set below is simply what's
+implemented and tested today — new connectors slot in without changing
+the engine or the spec model.
+
+- **Source connectors** read a system's native change stream and feed
+  it into the engine (the capture pipeline).
+- **Sink connectors** write the engine's output documents to a target
+  store.
+- The **real-time bus** carries published events for the delivery
+  pipeline.
+
+## Supported today
+
+| Kind | Connector | Notes |
+|------|-----------|-------|
+| **Source** | [PostgreSQL](/connectors/sources/postgres) | logical replication (`pgoutput`) |
+| **Source** | [Neo4j](/connectors/sources/neo4j) | CDC, 5.17+ Enterprise |
+| **Source** | [MongoDB](/connectors/sources/mongodb) | change streams from a replica set or sharded cluster |
+| **Source** | [MySQL / MariaDB](/connectors/sources/mysql) | row-based binlog replication |
+| **Source** | [Kafka / Redpanda](/connectors/sources/kafka) | Debezium envelopes or raw JSON topics |
+| **Sink** | [OpenSearch / Elasticsearch](/connectors/sinks/opensearch) | shared `_bulk` API |
+| **Real-time bus** | NATS (JetStream) | see [Real-time subscriptions](/concepts/real-time-subscriptions) |
+
+<Info>
+This matrix is the implemented surface for the current release. The architecture
+is pluggable, but a connector is supported only when it appears here and in the
+release test matrix.
+</Info>
+
+## Source connectors
+
+<CardGroup cols={2}>
+  <Card title="PostgreSQL" icon="elephant" href="/connectors/sources/postgres">
+    Logical replication → embed related rows into each document, with
+    field selection and 1:1 / 1:many joins.
+  </Card>
+  <Card title="Neo4j" icon="circle-nodes" href="/connectors/sources/neo4j">
+    CDC → fold a node's neighborhood into one document with multi-hop,
+    bounded fan-out.
+  </Card>
+  <Card title="MongoDB" icon="leaf" href="/connectors/sources/mongodb">
+    Change streams and resumable bootstrap for collections in replica sets or
+    sharded clusters.
+  </Card>
+  <Card title="MySQL / MariaDB" icon="database" href="/connectors/sources/mysql">
+    Row-binlog CDC with snapshot bootstrap and memory or SQL projection modes.
+  </Card>
+  <Card title="Kafka / Redpanda" icon="arrows-left-right" href="/connectors/sources/kafka">
+    Consume Debezium change envelopes or raw JSON with sink-gated offset commits.
+  </Card>
+</CardGroup>
+
+## Sink connectors
+
+<CardGroup cols={2}>
+  <Card title="OpenSearch / Elasticsearch" icon="magnifying-glass" href="/connectors/sinks/opensearch">
+    Bulk upserts with deterministic document IDs. The same engine handles
+    both (shared `_bulk` API).
+  </Card>
+</CardGroup>

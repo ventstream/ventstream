@@ -1,0 +1,283 @@
+{{- include "agent.validate" . -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "agent.fullname" . }}
+  labels:
+    {{- include "agent.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "agent.fullname" . }}
+  # Single-leader: a Postgres slot / Neo4j cursor is single-consumer.
+  # Never scale beyond 1 — run another release for another projection.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: cdc-agent
+  template:
+    metadata:
+      labels:
+        {{- include "agent.labels" . | nindent 8 }}
+    spec:
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: engine
+          image: {{ include "agent.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: health
+              containerPort: {{ .Values.healthPort }}
+          env:
+            - name: VS_ROLES
+              value: cdc
+            - name: VS_CDC_SOURCE
+              value: {{ .Values.source.type | quote }}
+            # --- control plane ---
+            - name: VS_CONTROL_PLANE_URL
+              value: {{ .Values.controlPlane.url | quote }}
+            - name: VS_CONTROL_PLANE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "agent.secretName" . }}
+                  key: VS_CONTROL_PLANE_KEY
+            - name: VS_AGENT_NAME
+              value: {{ .Values.agentName | quote }}
+            - name: VS_CONTROL_PLANE_INTERVAL_SECS
+              value: {{ .Values.controlPlane.intervalSecs | quote }}
+            {{- if eq .Values.source.type "postgres" }}
+            # --- Postgres source ---
+            - name: VS_PG_HOST
+              value: {{ required "pg.host is required" .Values.pg.host | quote }}
+            - name: VS_PG_PORT
+              value: {{ .Values.pg.port | quote }}
+            - name: VS_PG_USER
+              value: {{ .Values.pg.user | quote }}
+            - name: VS_PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "agent.secretName" . }}
+                  key: VS_PG_PASSWORD
+            - name: VS_PG_DATABASE
+              value: {{ required "pg.database is required" .Values.pg.database | quote }}
+            - name: VS_PG_PUBLICATION
+              value: {{ required "pg.publication is required" .Values.pg.publication | quote }}
+            - name: VS_PG_SLOT
+              value: {{ required "pg.slot is required" .Values.pg.slot | quote }}
+            - name: VS_PG_BOOTSTRAP_MODE
+              value: {{ .Values.pg.bootstrapMode | quote }}
+            {{- with .Values.pg.denormalizeMode }}
+            - name: VS_PG_DENORMALIZE_MODE
+              value: {{ . | quote }}
+            {{- end }}
+            - name: VS_PG_AUTO_RESYNC_ON_YAML_CHANGE
+              value: {{ .Values.pg.autoResyncOnYamlChange | quote }}
+            - name: VS_JOINS_YAML
+              value: /etc/ventstream/spec.yaml
+            - name: VS_JOINS_STATE_DIR
+              value: /var/lib/ventstream/state
+            {{- else if eq .Values.source.type "mongodb" }}
+            # --- MongoDB source (raw 1:1; change streams need a replica set) ---
+            - name: VS_MONGO_URI
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "agent.secretName" . }}
+                  key: VS_MONGO_URI
+            - name: VS_MONGO_DATABASE
+              value: {{ required "mongo.database is required" .Values.mongo.database | quote }}
+            - name: VS_MONGO_NAMESPACE
+              value: {{ .Values.mongo.namespace | quote }}
+            - name: VS_MONGO_COLLECTIONS
+              value: {{ .Values.mongo.collections | quote }}
+            - name: VS_MONGO_FULL_DOCUMENT
+              value: {{ .Values.mongo.fullDocument | quote }}
+            - name: VS_MONGO_BOOTSTRAP_MODE
+              value: {{ .Values.mongo.bootstrapMode | quote }}
+            - name: VS_MONGO_BOOTSTRAP_CHUNK_SIZE
+              value: {{ .Values.mongo.bootstrapChunkSize | quote }}
+            - name: VS_MONGO_TOKEN_FLUSH_MS
+              value: {{ .Values.mongo.tokenFlushMs | quote }}
+            - name: VS_MONGO_STATE_DIR
+              value: /var/lib/ventstream/state
+            {{- else if or (eq .Values.source.type "mysql") (eq .Values.source.type "mariadb") }}
+            # --- MySQL / MariaDB source (raw 1:1; row-based binlog tail) ---
+            - name: VS_MYSQL_HOST
+              value: {{ required "mysql.host is required" .Values.mysql.host | quote }}
+            - name: VS_MYSQL_PORT
+              value: {{ .Values.mysql.port | quote }}
+            - name: VS_MYSQL_USER
+              value: {{ .Values.mysql.user | quote }}
+            - name: VS_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "agent.secretName" . }}
+                  key: VS_MYSQL_PASSWORD
+            - name: VS_MYSQL_DATABASE
+              value: {{ required "mysql.database is required" .Values.mysql.database | quote }}
+            - name: VS_MYSQL_NAMESPACE
+              value: {{ .Values.mysql.namespace | quote }}
+            - name: VS_MYSQL_TABLES
+              value: {{ .Values.mysql.tables | quote }}
+            - name: VS_MYSQL_SERVER_ID
+              value: {{ .Values.mysql.serverId | quote }}
+            - name: VS_MYSQL_BOOTSTRAP_MODE
+              value: {{ .Values.mysql.bootstrapMode | quote }}
+            - name: VS_MYSQL_BOOTSTRAP_CHUNK_SIZE
+              value: {{ .Values.mysql.bootstrapChunkSize | quote }}
+            - name: VS_MYSQL_POS_FLUSH_MS
+              value: {{ .Values.mysql.posFlushMs | quote }}
+            - name: VS_MYSQL_STATE_DIR
+              value: /var/lib/ventstream/state
+            {{- else if or (eq .Values.source.type "kafka") (eq .Values.source.type "redpanda") }}
+            # --- Kafka / Redpanda source (raw 1:1; Debezium-unwrap) ---
+            - name: VS_KAFKA_BROKERS
+              value: {{ required "kafka.brokers is required" .Values.kafka.brokers | quote }}
+            - name: VS_KAFKA_TOPICS
+              value: {{ required "kafka.topics is required" .Values.kafka.topics | quote }}
+            - name: VS_KAFKA_GROUP_ID
+              value: {{ .Values.kafka.groupId | default .Values.agentName | quote }}
+            - name: VS_KAFKA_UNWRAP
+              value: {{ .Values.kafka.unwrap | quote }}
+            - name: VS_KAFKA_NAMESPACE
+              value: {{ .Values.kafka.namespace | quote }}
+            - name: VS_KAFKA_AUTO_OFFSET_RESET
+              value: {{ .Values.kafka.autoOffsetReset | quote }}
+            - name: VS_KAFKA_COMMIT_MS
+              value: {{ .Values.kafka.commitMs | quote }}
+            {{- with .Values.kafka.securityProtocol }}
+            - name: VS_KAFKA_SECURITY_PROTOCOL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.kafka.saslMechanism }}
+            - name: VS_KAFKA_SASL_MECHANISM
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.kafka.saslUsername }}
+            - name: VS_KAFKA_SASL_USERNAME
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.kafka.saslUsername }}
+            - name: VS_KAFKA_SASL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "agent.secretName" . }}
+                  key: VS_KAFKA_SASL_PASSWORD
+            {{- end }}
+            {{- with .Values.kafka.sslCaLocation }}
+            - name: VS_KAFKA_SSL_CA_LOCATION
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.kafka.rawKeyField }}
+            - name: VS_KAFKA_RAW_KEY_FIELD
+              value: {{ . | quote }}
+            {{- end }}
+            {{- else }}
+            # --- Neo4j source ---
+            - name: VS_NEO4J_URI
+              value: {{ required "neo4j.uri is required" .Values.neo4j.uri | quote }}
+            - name: VS_NEO4J_USER
+              value: {{ .Values.neo4j.user | quote }}
+            - name: VS_NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "agent.secretName" . }}
+                  key: VS_NEO4J_PASSWORD
+            - name: VS_NEO4J_DATABASE
+              value: {{ .Values.neo4j.database | quote }}
+            - name: VS_NEO4J_NAMESPACE
+              value: {{ .Values.neo4j.namespace | quote }}
+            - name: VS_NEO4J_BOOTSTRAP_MODE
+              value: {{ .Values.neo4j.bootstrapMode | quote }}
+            - name: VS_NEO4J_BOOTSTRAP_BATCH_SIZE
+              value: {{ .Values.neo4j.bootstrapBatchSize | quote }}
+            - name: VS_NEO4J_POLL_INTERVAL_MS
+              value: {{ .Values.neo4j.pollIntervalMs | quote }}
+            - name: VS_NEO4J_HOT_NODE_THRESHOLD
+              value: {{ .Values.neo4j.hotNodeThreshold | quote }}
+            - name: VS_NEO4J_RECOMPOSE_CHUNK
+              value: {{ .Values.neo4j.recomposeChunk | quote }}
+            - name: VS_NEO4J_RECOMPOSE_CONCURRENCY
+              value: {{ .Values.neo4j.recomposeConcurrency | quote }}
+            {{- if .Values.neo4j.trustCert.enabled }}
+            - name: VS_NEO4J_TRUST_CERT_FILE
+              value: /etc/ssl/neo4j/neo4j-ca.crt
+            {{- end }}
+            - name: VS_NEO4J_DENORMALIZE_YAML
+              value: /etc/ventstream/spec.yaml
+            - name: VS_NEO4J_STATE_DIR
+              value: /var/lib/ventstream/state
+            {{- end }}
+            # --- sink ---
+            - name: VS_OS_ENDPOINT
+              value: {{ .Values.sink.endpoint | quote }}
+            - name: VS_INDEX_TEMPLATE
+              value: {{ .Values.sink.indexTemplate | quote }}
+            - name: VS_DLQ_PATH
+              value: /var/lib/ventstream/dlq.jsonl
+            # --- ops ---
+            - name: RUST_LOG
+              value: {{ .Values.rustLog | quote }}
+            - name: VS_LOG_FORMAT
+              value: {{ .Values.logFormat | quote }}
+            - name: VS_HEALTH_LISTEN
+              value: "0.0.0.0:{{ .Values.healthPort }}"
+            {{- with .Values.extraEnv }}
+            # --- operator-supplied (OpenSearch auth, perf knobs, …) ---
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/ventstream
+            - name: spec
+              mountPath: /etc/ventstream
+              readOnly: true
+            {{- if and (eq .Values.source.type "neo4j") .Values.neo4j.trustCert.enabled }}
+            - name: certs
+              mountPath: /etc/ssl/neo4j
+              readOnly: true
+            {{- end }}
+          # Liveness: restart a wedged pod. Readiness shares the endpoint
+          # for now (a slot consumer has nothing load-balanced to it).
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: spec
+          configMap:
+            name: {{ include "agent.specConfigMap" . }}
+            items:
+              - key: {{ include "agent.specKey" . }}
+                path: spec.yaml
+        {{- if and (eq .Values.source.type "neo4j") .Values.neo4j.trustCert.enabled }}
+        - name: certs
+          secret:
+            secretName: {{ include "agent.secretName" . }}
+            items:
+              - key: neo4j-ca.crt
+                path: neo4j-ca.crt
+        {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.persistence.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.storage | quote }}

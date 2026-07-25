@@ -1,0 +1,33 @@
+{
+  "name": "@ventstream/sdk",
+  "version": "0.1.0",
+  "description": "VentStream publisher SDK — typed envelope construction for NATS and Redis Streams.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "nats": "^2.29.0",
+    "redis": "^5.12.1",
+    "ulid": "^2.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  },
+  "license": "Apache-2.0"
+}

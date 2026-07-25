@@ -1,0 +1,40 @@
+---
+title: "Fleet resource model"
+description: "How organizations, environments, pipelines, deployments, and instances relate."
+---
+
+```text
+Organization
+  Environment
+    Pipeline
+      Configuration revisions
+      Deployment
+        Agent instance(s)
+      Operations
+```
+
+| Resource | Meaning |
+| --- | --- |
+| Organization | Tenant, membership, authorization, billing, and audit boundary |
+| Environment | Named operational scope such as development, staging, or production |
+| Pipeline | Logical workload, explicitly `cdc` or `realtime`, with one desired state |
+| Deployment | Stable installation of a pipeline in a customer environment |
+| Instance | One running pod or process observed under a deployment |
+
+CDC deployments are singleton because a source cursor or replication slot has one
+active consumer. Realtime deployments can have multiple instances when the role
+and transport support replication.
+
+Operators normally target pipelines. The gateway fences concurrent CDC sessions
+for a deployment while allowing independently identified realtime instances.
+
+## Desired and observed state
+
+Desired state is a complete, monotonically revisioned snapshot containing the run
+state and selected configuration revision. Agents persist the last trusted desired
+state and report observed state independently. This makes convergence auditable
+and prevents an older gateway message from rolling an engine backward.
+
+Lifecycle and configuration changes create durable operations. API acceptance
+means the operation was queued, not that an engine has completed it. Inspect or
+wait for the operation to reach a terminal state.

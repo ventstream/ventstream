@@ -1,0 +1,56 @@
+[graph]
+# Audit every feature and target-specific dependency represented by the lockfile.
+all-features = true
+
+[advisories]
+# These are informational maintenance notices in current stable connector
+# dependencies. Vulnerability advisories are not exempted.
+ignore = [
+    { id = "RUSTSEC-2025-0012", reason = "backoff is transitive through stable neo4rs 0.8 and has no safe upgrade. Remove when neo4rs replaces it." },
+    { id = "RUSTSEC-2024-0384", reason = "instant is transitive through stable neo4rs 0.8 and has no safe upgrade. Remove when neo4rs replaces backoff." },
+    { id = "RUSTSEC-2024-0436", reason = "paste is transitive through stable neo4rs 0.8 and has no safe upgrade. Remove when neo4rs replaces it." },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is transitive through stable neo4rs and mysql_async releases. Remove when both upstreams use rustls-pki-types directly." },
+]
+
+[licenses]
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+ignore = false
+registries = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+allow-workspace = false
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

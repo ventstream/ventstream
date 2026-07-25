@@ -1,0 +1,23 @@
+# Keep the build context small + the dep-cache layer stable.
+target/
+**/target/
+.git/
+.github/
+**/.terraform/
+**/node_modules/
+**/.next/
+**/dist/
+*.md
+data/
+demo/
+docs/
+docs-site/
+examples/
+infra/
+packages/
+**/*.log
+.DS_Store
+# State / scratch that must never leak into an image.
+*.redb
+*.jsonl
+/tmp/

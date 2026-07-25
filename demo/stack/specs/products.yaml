@@ -1,0 +1,47 @@
+# Neo4j projection: one OpenSearch document per Product, enriched with
+# its category, supplier→region (2 hops), and tags.
+#
+# No temporal (fromDate) gating
+# every relationship here is unconditional, so a freshly-created edge
+# shows up in the document immediately.
+#
+# Scenarios this demonstrates:
+#   • update a Product node           → its one doc recomposes
+#   • rename a Category (HOT node,    → fan-out touches every product in
+#     ~500 products each)               that category; hot-endpoint
+#                                        detection keeps recomposes bounded
+#   • move a Supplier to a new Region → multi-hop cascade (2 hops) to
+#                                        every product of that supplier
+#   • delete a Product                → reconciliation removes its doc
+#
+# Pass via VS_NEO4J_DENORMALIZE_YAML=/specs/products.yaml.
+
+denormalize:
+  - primary_label: Product
+    output_table: products_denormalized
+    # 2 hops: Product → Supplier → Region is the deepest path.
+    fan_out_max_hops: 2
+    cypher: |
+      OPTIONAL MATCH (p)-[:IN_CATEGORY]->(cat:Category)
+
+      OPTIONAL MATCH (p)-[:SUPPLIED_BY]->(sup:Supplier)-[:LOCATED_IN]->(reg:Region)
+
+      OPTIONAL MATCH (p)-[:HAS_TAG]->(tag:Tag)
+      WITH p, cat, sup, reg, collect(DISTINCT tag.name) AS tags
+
+      RETURN elementId(p) AS primaryEid, {
+        id:        p.id,
+        elementId: elementId(p),
+        name:      p.name,
+        price:     p.price,
+        category:  CASE WHEN cat IS NOT NULL
+                       THEN {id: cat.id, name: cat.name}
+                       ELSE null END,
+        supplier:  CASE WHEN sup IS NOT NULL
+                       THEN {id: sup.id, name: sup.name,
+                             region: CASE WHEN reg IS NOT NULL
+                                          THEN {id: reg.id, name: reg.name}
+                                          ELSE null END}
+                       ELSE null END,
+        tags:      tags
+      } AS doc

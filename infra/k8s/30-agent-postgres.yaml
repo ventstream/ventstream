@@ -1,0 +1,136 @@
+# DEPRECATED MIGRATION REFERENCE. This manifest includes the retired API-key
+# telemetry integration. Use docs-site/deploy/kubernetes-standalone.mdx for a
+# current standalone StatefulSet or the Fleet managed-agent chart.
+#
+# Postgres CDC agent (shop.orders → OpenSearch).
+#
+# Why a StatefulSet with replicas:1 — a Postgres logical replication
+# slot is single-consumer. Two pods reading the same slot is undefined
+# behaviour. The agent is a SINGLE-LEADER process; HA is "fast restart
+# from persisted cursor + slot", not active-active. The PVC holds the
+# redb join state so a restart resumes instead of re-bootstrapping.
+#
+# To run N independent agents (different publications/indices), copy
+# this file with a new name + slot + PVC. Never point two at one slot.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ventstream-orders
+  namespace: ventstream-agents
+  labels:
+    app.kubernetes.io/name: ventstream-orders
+    app.kubernetes.io/component: cdc-agent
+spec:
+  serviceName: ventstream-orders
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ventstream-orders
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ventstream-orders
+    spec:
+      # Drain gracefully — let the engine flush its dispatcher + persist
+      # the cursor before SIGKILL.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: engine
+          image: ghcr.io/bashiru98/ventstream:0.1.12
+          ports:
+            # Always-on health endpoint (VS_HEALTH_LISTEN, default :4043).
+            - name: health
+              containerPort: 4043
+          env:
+            - name: VS_ROLES
+              value: cdc
+            - name: VS_CDC_SOURCE
+              value: postgres
+            # --- control plane ---
+            - name: VS_CONTROL_PLANE_URL
+              value: "http://ventstream-cp-api.ventstream-cp.svc:8080"
+            - name: VS_CONTROL_PLANE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: orders-agent-secrets
+                  key: VS_CONTROL_PLANE_KEY
+            - name: VS_AGENT_NAME
+              value: orders-cdc
+            - name: VS_CONTROL_PLANE_INTERVAL_SECS
+              value: "10"
+            # --- source ---
+            - name: VS_PG_HOST
+              value: "postgres.example.internal"
+            - name: VS_PG_PORT
+              value: "5432"
+            - name: VS_PG_USER
+              value: "ventstream"
+            - name: VS_PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: orders-agent-secrets
+                  key: VS_PG_PASSWORD
+            - name: VS_PG_DATABASE
+              value: "shop"
+            - name: VS_PG_PUBLICATION
+              value: "ventstream_shop"
+            - name: VS_PG_SLOT
+              value: "ventstream_orders_slot"
+            - name: VS_PG_BOOTSTRAP_MODE
+              value: "snapshot"
+            # --- projection + state ---
+            - name: VS_JOINS_YAML
+              value: "/etc/ventstream/orders.yaml"
+            - name: VS_JOINS_STATE_DIR
+              value: "/var/lib/ventstream/state"
+            - name: VS_DLQ_PATH
+              value: "/var/lib/ventstream/dlq.jsonl"
+            # Re-emit every row with the current YAML if the spec changed.
+            - name: VS_PG_AUTO_RESYNC_ON_YAML_CHANGE
+              value: "true"
+            # --- sink ---
+            - name: VS_OS_ENDPOINT
+              value: "http://opensearch.example.internal:9200"
+            - name: VS_INDEX_TEMPLATE
+              value: "${header:ventstream.cdc.relation}"
+            # --- ops ---
+            - name: RUST_LOG
+              value: "info"
+            - name: VS_LOG_FORMAT
+              value: "json"
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/ventstream
+            - name: specs
+              mountPath: /etc/ventstream
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        - name: specs
+          configMap:
+            name: ventstream-specs
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi

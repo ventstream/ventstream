@@ -1,0 +1,307 @@
+---
+title: "Engine environment variables"
+description: "Every variable the engine binary reads, grouped by purpose."
+---
+
+The engine still supports direct environment-variable configuration. Newer
+deployments can set `VS_ENGINE_CONFIG` to a canonical `ventstream.yaml` and keep
+deployment-specific values in env references such as `env:VS_OS_ENDPOINT`.
+Required values error clearly at startup if missing.
+
+## Common
+
+| Variable | Meaning |
+|---|---|
+| `VS_ENGINE_CONFIG` | Optional path to canonical `ventstream.yaml`. When set, roles, source kind, sink endpoint/auth references, sink index routing, spec file paths, and DLQ path are read from the file with legacy env fallback for connector details. |
+| `VS_ROLES` | `cdc` (and/or `ws`, `graphql`). The CDC role is the pipeline. |
+| `VS_CDC_SOURCE` | `postgres`, `neo4j`, `mongodb`, `mysql` (`mariadb` alias), or `kafka` (`redpanda` alias). |
+| `VS_CONTROL_PLANE_URL` | Legacy telemetry endpoint. This is not the Fleet gateway; new managed deployments use the supervisor's mTLS configuration. |
+| `VS_CONTROL_PLANE_KEY` | Legacy telemetry bearer/admin fallback. Not a Fleet enrollment token or workload identity. |
+| `VS_AGENT_NAME` | Legacy telemetry/source identifier fallback. Managed identity comes from the Fleet deployment certificate. |
+| `VS_CONTROL_PLANE_INTERVAL_SECS` | Legacy telemetry cadence (default 30). |
+| `VS_OS_ENDPOINT` | OpenSearch base URL. |
+| `VS_INDEX_TEMPLATE` | Per-event index name template, e.g. `${header:ventstream.cdc.relation}`. |
+| `VS_DLQ_PATH` | Dead-letter file path (on the PVC). |
+| `VS_HEALTH_LISTEN` | Always-on health server (default `0.0.0.0:4043`) serving `/healthz`, `/readyz`, and `/metrics`. `/healthz` reports process liveness. `/readyz` stays `503` until every enabled WS/GraphQL gateway has initialized its dependencies and bound its traffic listener, and also returns `503` at the WS capacity threshold. |
+| `RUST_LOG` | Log filter, e.g. `info`. |
+| `VS_LOG_FORMAT` | `pretty` or `json` (image defaults to `json`). |
+| `_RJEM_MALLOC_CONF` | jemalloc tuning (the engine uses jemalloc as its global allocator). The image bakes `background_thread:true,dirty_decay_ms:500,muzzy_decay_ms:1000` so freed pages return to the OS and RSS tracks the live working set (elastic after connection/working-set spikes). Note the `_RJEM_` prefix — tikv-jemalloc ignores the unprefixed `MALLOC_CONF`. Override per-deploy for different decay timing. Linux only. |
+
+## Canonical engine config
+
+`VS_ENGINE_CONFIG` points at a non-secret YAML file. The file can select the
+source kind, OpenSearch connection reference, index routing policy, and larger
+spec file paths while secrets remain in environment variables or mounted secret
+providers.
+
+```yaml
+schema_version: 1
+roles: [cdc]
+
+source:
+  kind: postgres
+
+sink:
+  kind: opensearch
+  opensearch:
+    endpoint_ref: env:VS_OS_ENDPOINT
+    auth:
+      mode: basic
+      username_ref: env:VS_OS_USERNAME
+      password_ref: env:VS_OS_PASSWORD
+    index_routing:
+      strategy: by_projection_target
+
+specs:
+  joins: ./joins.yaml
+
+runtime:
+  dlq_path: ./data/dlq.jsonl
+```
+
+OpenSearch routing strategies:
+
+| Strategy | Meaning |
+|---|---|
+| `by_output_relation` | Route by `${header:ventstream.cdc.relation}`. Good for raw table/collection sync and default projection routing. |
+| `by_projection_target` | Route PostgreSQL/MySQL joins by `${header:ventstream.target.index}`. Every projection must set `target.index`. |
+| `fixed` | Route every output document to one index: `name: orders`. |
+| `template` | Use the existing per-event template syntax: `template: "events-${header:ventstream.cdc.relation}"`. |
+
+## Fleet-managed configuration
+
+`VS_FLEET_APPLIED_CONFIG_PATH` is set by the Fleet supervisor in managed mode.
+When present, the engine reads the staged non-secret configuration envelope,
+verifies its SHA-256 content digest, rejects top-level `secrets`, and fails
+closed before starting data-path roles if the envelope is invalid.
+
+Schema version 1 supports these `document.specs` inline fields. They override
+the matching legacy file-path environment variables when supplied:
+
+| Field | Replaces |
+|---|---|
+| `joins_yaml` | `VS_JOINS_YAML` |
+| `neo4j_denormalize_yaml` | `VS_NEO4J_DENORMALIZE_YAML` |
+| `graphql_schema` | `VS_GRAPHQL_SCHEMA` |
+| `graphql_subscriptions_yaml` | `VS_GRAPHQL_SUBSCRIPTIONS` |
+| `graphql_manifest_yaml` | `VS_GRAPHQL_MANIFEST` |
+
+Fleet config is for topology, projection, and runtime-safe settings. Keep
+database passwords, OpenSearch credentials, NATS credentials, API keys, and
+certificates in Kubernetes Secrets or a local secret provider.
+
+## Postgres source
+
+| Variable | Meaning |
+|---|---|
+| `VS_PG_HOST` / `VS_PG_PORT` | Connection host/port. |
+| `VS_PG_USER` / `VS_PG_PASSWORD` | Credentials (role needs `REPLICATION`). |
+| `VS_PG_DATABASE` | Database name. |
+| `VS_PG_PUBLICATION` | Logical-replication publication to consume. |
+| `VS_PG_SLOT` | Replication slot name — **unique per agent**. |
+| `VS_PG_BOOTSTRAP_MODE` | `snapshot` (scan then tail) or `none`. |
+| `VS_PG_BOOTSTRAP_CHUNK_SIZE` | Rows per snapshot chunk (default 10000). |
+| `VS_JOINS_YAML` | Path to the join spec. |
+| `VS_PG_DENORMALIZE_MODE` | `memory` (default — in-memory join engine, lowest-latency tail, RSS scales with the working set) or `sql` (push the join into Postgres; bounded ~O(chunk) memory at any scale; needs indexes on the join/FK columns). Same `joins:` spec. See the [Postgres connector](/connectors/sources/postgres#denormalize-modes-in-memory-vs-sql). |
+| `VS_JOINS_STATE_DIR` | redb state directory on durable storage. **Required when a PostgreSQL or MySQL pipeline uses memory-mode joins**; the engine refuses to start without it. State commits occur only after the preceding sink boundary is durable, and the source checkpoint advances only after that state commit. Distinct from the spec's `state.backend`, which does not control redb persistence. (`sql` mode holds no join state.) |
+| `VS_PG_AUTO_RESYNC_ON_YAML_CHANGE` | `true` → re-bootstrap when the spec fingerprint changes. |
+| `VS_PG_FORCE_RESYNC` | `true` → re-bootstrap on this boot regardless. |
+| `VS_PG_LSN_FLUSH_MS` | How often the cursor watermark is flushed. |
+| `VS_PG_RELATED_FETCH_POOL_SIZE` | Maximum pooled connections for in-memory related-row fetches (default 4). One connection opens at startup; the remainder open lazily under concurrent demand. Canonical config: `source.postgres.related_fetch_pool_size`. |
+
+## Neo4j source
+
+| Variable | Meaning |
+|---|---|
+| `VS_NEO4J_URI` | `neo4j+s://host:7687` (use `+s` for TLS). |
+| `VS_NEO4J_USER` / `VS_NEO4J_PASSWORD` | Credentials. |
+| `VS_NEO4J_DATABASE` | Database (default `neo4j`). |
+| `VS_NEO4J_NAMESPACE` | Namespace prefix for emitted subjects. |
+| `VS_NEO4J_TRUST_CERT_FILE` | Bolt CA cert path (mounted from a Secret). |
+| `VS_NEO4J_DENORMALIZE_YAML` | Path to the denormalize spec. |
+| `VS_NEO4J_STATE_DIR` | Cursor-file directory (on the PVC). |
+| `VS_NEO4J_BOOTSTRAP_MODE` | `snapshot` or `none`. |
+| `VS_NEO4J_BOOTSTRAP_BATCH_SIZE` | Scan page size (default 2000). |
+| `VS_NEO4J_POLL_INTERVAL_MS` | CDC poll cadence (default 500). |
+| `VS_NEO4J_HOT_NODE_THRESHOLD` | Shared-lookup detection floor (default 100; `0` disables). |
+| `VS_NEO4J_RECOMPOSE_CHUNK` | Max affected primaries per live recompose query (default 128). Larger regresses sharply — a big element-id `IN`-list degrades the fan-out query plan. See [Performance](/concepts/performance). |
+| `VS_NEO4J_RECOMPOSE_CONCURRENCY` | How many recompose chunks run concurrently (default 8; bound ≤ bolt pool). Parallelizes large fan-outs. |
+
+## MongoDB source
+
+See the [MongoDB connector](/connectors/sources/mongodb). Change streams
+require a replica set or sharded cluster.
+
+| Variable | Meaning |
+|---|---|
+| `VS_MONGO_URI` | Connection string (`mongodb://` / `mongodb+srv://`) incl. replica-set / mongos host(s), auth, TLS. Carries credentials. |
+| `VS_MONGO_DATABASE` | Database to watch and namespace under. |
+| `VS_MONGO_NAMESPACE` | Namespace stamped on emitted subjects (default = database). |
+| `VS_MONGO_COLLECTIONS` | CSV of collections to watch; empty = all collections in the database. |
+| `VS_MONGO_FULL_DOCUMENT` | `updateLookup` (default — re-read post-image on updates) or `default` (deltas only). |
+| `VS_MONGO_BOOTSTRAP_MODE` | `snapshot` (scan then tail) or `none`. |
+| `VS_MONGO_BOOTSTRAP_CHUNK_SIZE` | Documents per snapshot `find` batch (default 1000). |
+| `VS_MONGO_TOKEN_FLUSH_MS` | Resume-token flush cadence (default 1000; batched, not per-event). |
+| `VS_MONGO_STATE_DIR` | Resume-token cursor-file directory (on the PVC). |
+
+## MySQL / MariaDB source
+
+See the [MySQL connector](/connectors/sources/mysql). Requires
+`binlog_format=ROW` and a `server_id` unique across the replication topology.
+
+| Variable | Meaning |
+|---|---|
+| `VS_MYSQL_HOST` | Server host. |
+| `VS_MYSQL_PORT` | Server port (default 3306). |
+| `VS_MYSQL_USER` | Login user (default `root`); needs `REPLICATION SLAVE` + `REPLICATION CLIENT`. |
+| `VS_MYSQL_PASSWORD` | Login password (carries credentials). |
+| `VS_MYSQL_DATABASE` | Database to watch and namespace under. |
+| `VS_MYSQL_NAMESPACE` | Namespace stamped on emitted subjects (default = database). |
+| `VS_MYSQL_TABLES` | CSV of tables to watch; empty = all tables in the database. |
+| `VS_MYSQL_SERVER_ID` | Replica `server_id` this agent registers as (default 4000000000); must be unique. |
+| `VS_MYSQL_BOOTSTRAP_MODE` | `snapshot` (scan then tail) or `none`. |
+| `VS_MYSQL_BOOTSTRAP_CHUNK_SIZE` | Rows per keyset-paginated snapshot batch (default 1000). |
+| `VS_MYSQL_POS_FLUSH_MS` | Binlog-position flush cadence (default 1000; batched, not per-event). |
+| `VS_MYSQL_STATE_DIR` | Binlog-position cursor-file directory (on the PVC). |
+| `VS_JOINS_YAML` | Optional denormalization join spec (same format as Postgres). When set, related tables are embedded into one document and `VS_JOINS_STATE_DIR` persists join state. See the [MySQL connector](/connectors/sources/mysql#denormalization-joins). |
+| `VS_MYSQL_DENORMALIZE_MODE` | `memory` (default — in-memory join engine, RSS scales with the working set) or `sql` (push the join into MySQL; bounded ~O(chunk) memory at any scale; needs indexes on the join/FK columns). Same `joins:` spec. See [Memory modes](/connectors/sources/mysql#memory-modes-in-memory-vs-sql). |
+| `VS_MYSQL_SINK_REVERSE_LOOKUP` | `true` (default) → SQL mode resolves 1:many child deletes to their parent via an OpenSearch reverse-lookup. |
+| `VS_MYSQL_RECOMPOSE_CHUNK` | Maximum primary keys in one SQL recomposition query (default 128). Canonical config: `source.mysql.recompose_chunk`. |
+| `VS_MYSQL_RECOMPOSE_CONCURRENCY` | Maximum concurrent SQL recomposition queries (default 6). Canonical config: `source.mysql.recompose_concurrency`. |
+
+## Kafka / Redpanda source
+
+See the [Kafka connector](/connectors/sources/kafka). Consumes Debezium change
+topics (or raw JSON topics). Resume is the consumer group's committed offsets,
+gated on sink durability — no state dir.
+
+| Variable | Meaning |
+|---|---|
+| `VS_KAFKA_BROKERS` | `bootstrap.servers` (CSV of host:port). |
+| `VS_KAFKA_TOPICS` | CSV of topics to consume; a single `^…` entry is a subscription regex. Required. |
+| `VS_KAFKA_GROUP_ID` | Consumer group id (offsets commit under it). Defaults to `VS_AGENT_NAME`. |
+| `VS_KAFKA_UNWRAP` | `debezium` (default — unwrap the change envelope) or `raw` (value is the document; null = delete). |
+| `VS_KAFKA_NAMESPACE` | Override the namespace stamped on subjects/headers (default = Debezium `source` schema/db, or the topic). |
+| `VS_KAFKA_AUTO_OFFSET_RESET` | `earliest` (default — replay history) or `latest` (live only), for a group with no committed offset. |
+| `VS_KAFKA_SECURITY_PROTOCOL` | e.g. `SASL_SSL`, `SSL`; unset = plaintext. |
+| `VS_KAFKA_SASL_MECHANISM` | e.g. `SCRAM-SHA-512`, `PLAIN`. |
+| `VS_KAFKA_SASL_USERNAME` / `VS_KAFKA_SASL_PASSWORD` | SASL credentials. |
+| `VS_KAFKA_SSL_CA_LOCATION` | PEM CA bundle path; unset = system trust store. |
+| `VS_KAFKA_RAW_KEY_FIELD` | Raw mode: value field to use as the doc id when the message has no key. |
+| `VS_KAFKA_COMMIT_MS` | Offset-commit cadence (default 1000; batched, gated on sink durability). |
+
+## Dispatcher / throughput
+
+| Variable | Meaning |
+|---|---|
+| `VS_DISPATCH_PARALLEL_BULKS` | Concurrent OpenSearch bulk requests (default 4). |
+| `VS_DISPATCH_MAX_EVENTS` | Max events per bulk batch. |
+| `VS_DISPATCH_MAX_BATCH_BYTES` | Max bulk body size. |
+| `VS_DISPATCH_FLUSH_MS` | Max time a batch waits before flushing. |
+| `VS_BUS_CAPACITY` | Internal event bus capacity. |
+
+## Adaptive memory
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `VS_MEMORY_CONTROLLER_ENABLED` | `true` | Enable byte-weighted CDC admission and cgroup pressure controls. On bare metal or macOS it remains inactive unless an explicit budget is supplied. |
+| `VS_MEMORY_BUDGET_BYTES` | 30% of a finite cgroup limit | Event-memory budget. Set explicitly to opt in outside a memory-limited Linux container. |
+| `VS_MEMORY_MAX_EVENT_BYTES` | `33554432` | Reject a single event whose conservative resident-memory estimate exceeds this value. Must be at most one quarter of an explicit budget. |
+| `VS_MEMORY_SAMPLE_MS` | `100` | Process and cgroup memory sampling interval. |
+| `VS_MEMORY_RECOVERY_MS` | `1000` | Continuous time below a recovery threshold before controls relax. |
+| `VS_MEMORY_TARGET_PERCENT` | `65` | Budget utilization where admission and request sizes begin shrinking. |
+| `VS_MEMORY_HIGH_PERCENT` | `75` | Budget utilization where high-pressure controls engage. |
+| `VS_MEMORY_CRITICAL_PERCENT` | `85` | Budget utilization where critical OOM protection engages. |
+| `VS_MEMORY_HYSTERESIS_PERCENT` | `5` | Percentage points below a threshold required before recovery begins. |
+
+<Warning>
+**Upgrade behavior for v0.1.11.** Existing memory-limited containers enable
+the controller automatically. Before upgrading, confirm the detected budget
+and the 32 MiB event ceiling against production payloads. Set an explicit
+budget for predictable behavior, or temporarily set
+`VS_MEMORY_CONTROLLER_ENABLED=false` while tuning. Checkpoint and join-state
+formats are unchanged. If a pre-v0.1.11 memory-join deployment has a valid
+source checkpoint but its local join database is missing or cannot be matched,
+the engine automatically rebuilds the complete join state from a source
+snapshot, retains the PostgreSQL slot or MySQL binlog cursor, and replays the
+retained change stream before declaring recovery complete. Keep the state
+volume and expect temporary snapshot load during this one-time reconstruction;
+do not delete the source checkpoint unless you intend a full drain/reset.
+
+To roll back to v0.1.10, remove `runtime.memory` from canonical YAML because
+that version rejects the unknown block; the new `VS_MEMORY_*` environment
+variables may also be removed.
+</Warning>
+
+## Optional listeners
+
+Bound only when set, as `host:port`:
+
+| Variable | Role |
+|---|---|
+| `VS_ADMIN_LISTEN` | On-demand admin/resync HTTP endpoint. |
+
+## Real-time gateways (`ws` / `graphql` roles)
+
+See [Real-time subscriptions](/concepts/real-time-subscriptions) for how
+these fit together and [Realtime brokers](/concepts/realtime-brokers) for the
+provider contract.
+
+Shared Redis settings apply to both realtime roles:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `VS_REALTIME_PROVIDER` | inferred | `nats_core`, `nats_jetstream`, or `redis_streams` |
+| `VS_REDIS_URL` | `redis://127.0.0.1:6379/` | Redis or TLS Redis (`rediss://`) connection URL; secret-bearing |
+| `VS_REDIS_KEY_PREFIX` | `ventstream` | prefix for `<prefix>:{<tenant>}:events` |
+| `VS_REDIS_READ_BATCH` | `256` | maximum entries read per Redis command |
+| `VS_REDIS_BLOCK_TIMEOUT_MS` | `5000` | finite blocking `XREAD` duration |
+| `VS_REDIS_BROADCAST_CAPACITY` | `2048` | per-tenant live fan-out capacity in each gateway process |
+| `VS_REDIS_MAX_TENANT_HUBS` | `1024` | maximum tenant stream tailers retained by one gateway process |
+| `VS_REDIS_MAX_LENGTH` | `1000000` | periodic gateway retention target per tenant stream; publishers should also use `MAXLEN` |
+| `VS_REDIS_CONNECT_TIMEOUT_MS` | `5000` | connection timeout |
+| `VS_REDIS_RESPONSE_TIMEOUT_MS` | `5000` | control/replay timeout and blocking-read response margin |
+
+Each suffix also has a role-specific form, `VS_WS_REDIS_<SUFFIX>` or
+`VS_GRAPHQL_REDIS_<SUFFIX>`. A role-specific value takes precedence over the
+shared value when the gateway roles run as separate processes.
+
+### Native WebSocket (`ws`)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `VS_WS_LISTEN` | `0.0.0.0:4040` | WebSocket listener (`/ws`) |
+| `VS_WS_PROVIDER` | inferred | role-specific provider override; must agree with `VS_REALTIME_PROVIDER` |
+| `VS_WS_NATS_URL` | `nats://127.0.0.1:4222` | NATS connection |
+| `VS_WS_SUBJECTS` | `vs.t.>` | subject filter consumed |
+| `VS_WS_MAILBOX` | `256` | per-connection outbound queue depth |
+| `VS_WS_PING_INTERVAL_MS` | `10000` | server ping cadence |
+| `VS_WS_PONG_TIMEOUT_MS` | `30000` | client pong deadline |
+| `VS_WS_MAX_CONNS` | `0` (unlimited) | per-pod connection cap (OOM backstop). A WS upgrade past this is rejected `503 + Retry-After` **before** the per-connection consumer/mailbox are allocated; reserved atomically at admission so it's a hard ceiling under concurrency. `/readyz` flips to `503` at 90% of it (LB diverts new connections first); `/healthz` stays `200`. Size to the memory limit: `~(limit − base) / 165 KiB-per-conn` (e.g. 1Gi → ~5000). |
+| `VS_WS_JETSTREAM` | unset | `1` enables durable per-connection mode |
+| `VS_WS_JS_STREAM` | `ventstream` | stream name (this role creates it) |
+| `VS_WS_JS_STORAGE` | `file` | `file` (durable) or `memory` (faster; cleared on NATS restart) |
+| `VS_WS_JS_MAX_AGE_SECS` | `600` | live-buffer window; oldest evicted past this (`discard: old`) |
+| `VS_WS_JS_MAX_BYTES` | `536870912` | stream size ceiling (512 MiB); a limit, not a reservation |
+| `VS_WS_JS_MAX_MSGS` | `-1` | message-count ceiling, `-1` = unbounded (age + bytes bound it) |
+| `VS_WS_JS_POD_ID` | ULID | pod id used in consumer naming |
+| `VS_WS_JS_INACTIVE_THRESHOLD_MS` | `300000` | server-side consumer auto-delete |
+| `VS_WS_JS_REAPER_INTERVAL_MS` | `60000` | orphan-consumer sweep interval |
+| `VS_WS_JS_REPLICAS` | `1` | stream replica count |
+
+### GraphQL subscriptions (`graphql`)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `VS_GRAPHQL_LISTEN` | `0.0.0.0:4041` | HTTP + `/graphql/ws` listener |
+| `VS_GRAPHQL_PROVIDER` | `nats_jetstream` | `nats_jetstream` or `redis_streams`; must agree with `VS_REALTIME_PROVIDER` |
+| `VS_GRAPHQL_NATS_URL` | `nats://127.0.0.1:4222` | NATS connection |
+| `VS_GRAPHQL_STREAM` | `ventstream` | stream to consume (must already exist) |
+| `VS_GRAPHQL_POD_ID` | ULID | pod id used in consumer naming |
+| `VS_GRAPHQL_INACTIVE_THRESHOLD_MS` | `300000` | server-side consumer auto-delete |
+| `VS_GRAPHQL_REAPER_INTERVAL_MS` | `60000` | orphan-consumer sweep interval (this role runs its own reaper) |
+| `VS_GRAPHQL_BROADCAST_CAP` | `1024` | bounded GraphQL event-source buffer depth. Live-only operations share the connection source; resumed operations use isolated sources. An operation that falls behind receives a terminal lag error and resumes from its last processed cursor. Raise for bursty/slow clients (more memory), lower to shed sooner. Min 1 |
+| `VS_GRAPHQL_MANIFEST` | unset | discoverable-subjects manifest path |
+| `VS_GRAPHQL_SCHEMA` | unset | typed-subscriptions **GraphQL SDL** file (`@vsSubscribe`/`@source`) — the recommended way; precedence over `VS_GRAPHQL_SUBSCRIPTIONS` |
+| `VS_GRAPHQL_SUBSCRIPTIONS` | unset | typed-subscriptions YAML manifest (legacy alternative to `VS_GRAPHQL_SCHEMA`) |
+| `VS_GRAPHQL_PLAYGROUND` | unset | `1` serves the in-browser GraphiQL playground at `/graphiql` (leave off in prod) |

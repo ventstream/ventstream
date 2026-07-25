@@ -1,0 +1,10 @@
+denormalize:
+  - primary_label: BenchmarkEvent
+    output_table: events
+    fan_out_max_hops: 0
+    cypher: |
+      RETURN elementId(p) AS primaryEid, {
+        id: p.id,
+        value: p.value,
+        payload: p.payload
+      } AS doc

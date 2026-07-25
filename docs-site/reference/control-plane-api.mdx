@@ -1,0 +1,61 @@
+---
+title: "Fleet API"
+description: "Versioned HTTP API conventions and contract for VentStream Fleet."
+---
+
+Fleet exposes a REST/JSON API under `/v1`. `ventstreamctl` and automation use this
+public API; neither receives privileged private endpoints.
+The versioned OpenAPI contract is distributed with each Fleet release and is
+available to operators through the Fleet release channel.
+
+## Contract rules
+
+- Human requests use short-lived OIDC or first-party bearer tokens.
+- Automation uses a configured OIDC workload provider and scoped service account.
+- Collection endpoints use opaque cursor pagination and bounded limits.
+- Retryable mutations require `Idempotency-Key`.
+- Concurrent mutations require the current strong `ETag` in `If-Match`.
+- Lifecycle and configuration actions return durable operations rather than
+  waiting synchronously for an agent.
+- Every response and audit event carries a request identifier.
+- Errors contain stable codes and safe messages, never database details or secrets.
+
+## Main resources
+
+| Resource | Scope | Purpose |
+| --- | --- | --- |
+| Organizations | platform | Tenant and membership boundary |
+| Environments | organization | Development, staging, production, or another operational boundary |
+| Pipelines | environment | Logical CDC or realtime workload and desired state |
+| Deployments | pipeline | Stable managed installation of a pipeline |
+| Instances | deployment | A currently or recently observed engine pod/process |
+| Configurations | pipeline | Immutable validated engine configuration revisions |
+| Operations | organization/environment | Durable lifecycle and configuration work |
+| Audit events | organization | Security and mutation history |
+
+## CLI and API coverage
+
+`ventstreamctl` covers account authentication, organizations, environments,
+pipelines, configuration revisions, deployments, enrollment, identities, and
+durable operations. The current CLI does not expose every V1 administration
+resource.
+
+Use the checked API contract for:
+
+- Organization invitations and invite acceptance
+- Role bindings and membership revocation
+- Service accounts
+- Organization settings and billing metadata
+- Organization audit-event queries
+
+These endpoints use the same bearer authentication, permission checks, tenant
+isolation, `If-Match`, idempotency, pagination, and safe error envelope described
+above. Do not build automation from undocumented database access.
+
+<Warning>
+Enrollment grants are returned once with `Cache-Control: no-store`. They are not
+generic API keys and must never be written to logs or an idempotency response
+ledger.
+</Warning>
+
+See [CLI administration](/fleet/cli) for the supported operator workflow.
