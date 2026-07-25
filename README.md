@@ -72,13 +72,13 @@ Choose a deployment mode in the
   plane and supervisor, then administer enrolled engines with `ventstreamctl`.
 
 Tagged releases publish the multi-architecture engine image at
-`ghcr.io/bashiru98/ventstream:<version>` and the standalone realtime
-chart at `oci://ghcr.io/bashiru98/charts/ventstream-gateway`. The
+`ghcr.io/ventstream/ventstream:<version>` and the standalone realtime
+chart at `oci://ghcr.io/ventstream/charts/ventstream-gateway`. The
 workflow does not publish a floating `latest` tag. Install a chart release with:
 
 ```bash
 helm upgrade --install realtime \
-  oci://ghcr.io/bashiru98/charts/ventstream-gateway \
+  oci://ghcr.io/ventstream/charts/ventstream-gateway \
   --version <version>
 ```
 

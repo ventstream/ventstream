@@ -162,17 +162,17 @@ immutable chart version:
 
 ```bash
 helm show values \
-  oci://ghcr.io/bashiru98/charts/ventstream-fleet \
+  oci://ghcr.io/ventstream/charts/ventstream-fleet \
   --version <fleet-version> >values.production.yaml
 # Edit values.production.yaml and create every referenced Secret first.
 helm template ventstream \
-  oci://ghcr.io/bashiru98/charts/ventstream-fleet \
+  oci://ghcr.io/ventstream/charts/ventstream-fleet \
   --version <fleet-version> \
   --namespace ventstream-fleet \
   --values ./values.production.yaml >/dev/null
 
 helm upgrade --install ventstream \
-  oci://ghcr.io/bashiru98/charts/ventstream-fleet \
+  oci://ghcr.io/ventstream/charts/ventstream-fleet \
   --version <fleet-version> \
   --namespace ventstream-fleet \
   --create-namespace \

@@ -52,7 +52,7 @@ jobs:
           helm lint infra/helm/ventstream-gateway
           helm template realtime infra/helm/ventstream-gateway \
             --set image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-            | grep -q 'ghcr.io/bashiru98/ventstream@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+            | grep -q 'ghcr.io/ventstream/ventstream@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
       - name: Validate release Dockerfile configuration
         run: docker buildx build --call=check --file infra/docker/engine.Dockerfile .
 

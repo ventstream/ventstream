@@ -18,7 +18,7 @@ only their own JetStream consumers.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `image.repository` / `image.tag` | `ghcr.io/bashiru98/ventstream` / appVersion | engine image |
+| `image.repository` / `image.tag` | `ghcr.io/ventstream/ventstream` / appVersion | engine image |
 | `image.digest` | empty | immutable image digest; takes precedence over the tag |
 | `roles` | `ws,graphql` | which gateway roles run (`ws`, `graphql`, or both) |
 | `replicas` | `2` | pod count (ignored when `autoscaling.enabled`) |

@@ -12,7 +12,7 @@ nameOverride: ""
 fullnameOverride: ""
 
 image:
-  repository: ghcr.io/bashiru98/ventstream
+  repository: ghcr.io/ventstream/ventstream
   tag: ""              # "" → Chart.appVersion
   digest: ""
   pullPolicy: IfNotPresent

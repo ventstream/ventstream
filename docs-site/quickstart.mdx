@@ -13,7 +13,7 @@ time.
 <Note>
 This covers the **capture** pipeline (source → synced documents). For the
 **real-time delivery** pipeline — live events over WebSocket / GraphQL —
-see the [real-time demo](https://github.com/bashiru98/ventstream/tree/main/demo/realtime)
+see the [real-time demo](https://github.com/ventstream/ventstream/tree/main/demo/realtime)
 and [Real-time subscriptions](/concepts/real-time-subscriptions).
 </Note>
 
@@ -32,7 +32,7 @@ follow, but the pipeline shape is identical to production:
 | Postgres `shop.orders` | OS index `orders` | order + embedded customer (1:1) + line items (1:many) |
 | Neo4j `Product` | OS index `products` | product + category + supplier→region (2 hops) + tags |
 
-Everything lives in [`demo/stack/`](https://github.com/bashiru98/ventstream/tree/main/demo/stack):
+Everything lives in [`demo/stack/`](https://github.com/ventstream/ventstream/tree/main/demo/stack):
 the `docker-compose.yml`, the seed data, and the two projection specs.
 
 ## Prerequisites

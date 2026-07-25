@@ -22,7 +22,7 @@ edition = "2021"
 rust-version = "1.94"
 authors = ["VentStream Authors"]
 license = "Apache-2.0"
-repository = "https://github.com/bashiru98/ventstream"
+repository = "https://github.com/ventstream/ventstream"
 readme = "README.md"
 
 # Centralized dependency versions. Crate-level Cargo.toml files reference

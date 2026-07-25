@@ -25,9 +25,9 @@ floating `latest` defaults, and an existing semantic-version image or chart tag.
 
 A tag such as `v0.1.12` publishes:
 
-- `ghcr.io/bashiru98/ventstream:0.1.12`
-- `ghcr.io/bashiru98/ventstream:sha-<40-character-commit>`
-- `oci://ghcr.io/bashiru98/charts/ventstream-gateway` version `0.1.12`
+- `ghcr.io/ventstream/ventstream:0.1.12`
+- `ghcr.io/ventstream/ventstream:sha-<40-character-commit>`
+- `oci://ghcr.io/ventstream/charts/ventstream-gateway` version `0.1.12`
 - `ventstream-0.1.12-{linux-amd64,linux-arm64,darwin-amd64,darwin-arm64}.tar.gz`
 - `ventstream-installer.sh`
 - a GitHub release containing those assets, the chart, image digest,
@@ -93,13 +93,13 @@ Use the immutable digest from `image-digests.txt` in the GitHub release:
 ```bash
 cosign verify \
   --certificate-identity-regexp \
-  '^https://github.com/bashiru98/ventstream/.github/workflows/release.yml@refs/tags/v[0-9]+[.][0-9]+[.][0-9]+$' \
+  '^https://github.com/ventstream/ventstream/.github/workflows/release.yml@refs/tags/v[0-9]+[.][0-9]+[.][0-9]+$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/bashiru98/ventstream@sha256:<digest>
+  ghcr.io/ventstream/ventstream@sha256:<digest>
 
 gh attestation verify \
-  oci://ghcr.io/bashiru98/ventstream@sha256:<digest> \
-  --repo bashiru98/ventstream
+  oci://ghcr.io/ventstream/ventstream@sha256:<digest> \
+  --repo ventstream/ventstream
 
 sha256sum --check SHA256SUMS
 ```
@@ -113,17 +113,17 @@ PLATFORM=linux-amd64
 ARCHIVE="ventstream-$VERSION-$PLATFORM.tar.gz"
 
 gh release download "v$VERSION" \
-  --repo bashiru98/ventstream \
+  --repo ventstream/ventstream \
   --pattern "$ARCHIVE" \
   --pattern SHA256SUMS
 grep "  ./$ARCHIVE\$" SHA256SUMS | sha256sum --check
 gh attestation verify "$ARCHIVE" \
-  --repo bashiru98/ventstream
+  --repo ventstream/ventstream
 gh release download "v$VERSION" \
-  --repo bashiru98/ventstream \
+  --repo ventstream/ventstream \
   --pattern ventstream-installer.sh
 gh attestation verify ventstream-installer.sh \
-  --repo bashiru98/ventstream
+  --repo ventstream/ventstream
 tar -xzf "$ARCHIVE"
 test "$(./ventstream --version)" = "ventstream $VERSION"
 ```
@@ -136,7 +136,7 @@ Install the chart by its immutable version and pin the image by digest:
 
 ```bash
 helm upgrade --install realtime \
-  oci://ghcr.io/bashiru98/charts/ventstream-gateway \
+  oci://ghcr.io/ventstream/charts/ventstream-gateway \
   --version 0.1.12 \
   --set image.digest=sha256:<digest>
 ```

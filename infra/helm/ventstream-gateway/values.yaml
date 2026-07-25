@@ -8,7 +8,7 @@ nameOverride: ""
 fullnameOverride: ""
 
 image:
-  repository: ghcr.io/bashiru98/ventstream
+  repository: ghcr.io/ventstream/ventstream
   tag: ""              # "" → Chart.appVersion
   # When set, renders repository@digest and takes precedence over tag.
   digest: ""
