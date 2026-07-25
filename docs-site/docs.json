@@ -114,7 +114,7 @@
     "links": [
       {
         "label": "GitHub",
-        "href": "https://github.com/bashiru98/ventstream"
+        "href": "https://github.com/ventstream/ventstream"
       }
     ],
     "primary": {
@@ -125,7 +125,7 @@
   },
   "footer": {
     "socials": {
-      "github": "https://github.com/bashiru98/ventstream"
+      "github": "https://github.com/ventstream/ventstream"
     }
   }
 }

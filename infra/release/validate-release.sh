@@ -40,7 +40,7 @@ for chart in infra/helm/ventstream-agent infra/helm/ventstream-gateway; do
   fi
 done
 
-if ! grep -q 'repository: ghcr.io/bashiru98/ventstream$' infra/helm/ventstream-gateway/values.yaml; then
+if ! grep -q 'repository: ghcr.io/ventstream/ventstream$' infra/helm/ventstream-gateway/values.yaml; then
   echo "the supported gateway chart must default to the release image repository" >&2
   exit 1
 fi

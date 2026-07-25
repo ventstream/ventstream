@@ -72,7 +72,7 @@ GraphiQL updates instantly:
 { "id": "order_1", "status": "confirmed", "changedAt": "2026-01-01T00:00:00Z" }
 ```
 
-The result field names differ from the payload because the SDL maps them with `@source`: `id ← $event.entityId`, `status ← $data.status`, `changedAt ← $event.occurredAt` (see [`subscriptions.graphql`](https://github.com/bashiru98/ventstream/blob/main/demo/realtime/subscriptions.graphql) and [Real-time subscriptions](/concepts/real-time-subscriptions)).
+The result field names differ from the payload because the SDL maps them with `@source`: `id ← $event.entityId`, `status ← $data.status`, `changedAt ← $event.occurredAt` (see [`subscriptions.graphql`](https://github.com/ventstream/ventstream/blob/main/demo/realtime/subscriptions.graphql) and [Real-time subscriptions](/concepts/real-time-subscriptions)).
 
 ## 4. Optional — stream continuous changing events
 

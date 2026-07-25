@@ -33,7 +33,7 @@ the binary version, and installs it under `~/.local/bin`.
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://github.com/bashiru98/ventstream/releases/latest/download/ventstream-installer.sh \
+  https://github.com/ventstream/ventstream/releases/latest/download/ventstream-installer.sh \
   | sh
 ```
 
@@ -45,7 +45,7 @@ Install a specific version or directory:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://github.com/bashiru98/ventstream/releases/latest/download/ventstream-installer.sh \
+  https://github.com/ventstream/ventstream/releases/latest/download/ventstream-installer.sh \
   | VENTSTREAM_VERSION=0.1.12 \
     VENTSTREAM_INSTALL_DIR="$HOME/bin" \
     sh
@@ -109,7 +109,7 @@ mkdir -p "$VENTSTREAM_HOME"
 cd "$VENTSTREAM_HOME"
 
 gh release download "v$VERSION" \
-  --repo bashiru98/ventstream \
+  --repo ventstream/ventstream \
   --pattern "$ARCHIVE" \
   --pattern SHA256SUMS
 
@@ -153,7 +153,7 @@ URLs:
 ```bash
 VERSION=0.1.12
 ARTIFACT="ventstream-$VERSION-linux-amd64.tar.gz"
-BASE="https://github.com/bashiru98/ventstream/releases/download/v$VERSION"
+BASE="https://github.com/ventstream/ventstream/releases/download/v$VERSION"
 curl --proto '=https' --tlsv1.2 -fLO "$BASE/$ARTIFACT"
 curl --proto '=https' --tlsv1.2 -fLO "$BASE/SHA256SUMS"
 grep "  ./$ARTIFACT\$" SHA256SUMS | sha256sum --check
@@ -171,10 +171,10 @@ piping it directly to the shell:
 
 ```bash
 gh release download v0.1.12 \
-  --repo bashiru98/ventstream \
+  --repo ventstream/ventstream \
   --pattern ventstream-installer.sh
 gh attestation verify ventstream-installer.sh \
-  --repo bashiru98/ventstream
+  --repo ventstream/ventstream
 ```
 
 While release assets are private, verify and extract the native archive through
@@ -186,7 +186,7 @@ Verify the archive against this repository before installation:
 
 ```bash
 gh attestation verify "ventstream-$VERSION-$PLATFORM.tar.gz" \
-  --repo bashiru98/ventstream
+  --repo ventstream/ventstream
 ```
 
 `SHA256SUMS` detects transfer corruption or substitution relative to the

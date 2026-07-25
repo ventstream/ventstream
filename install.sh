@@ -2,7 +2,7 @@
 
 set -eu
 
-REPOSITORY=${VENTSTREAM_REPOSITORY:-bashiru98/ventstream}
+REPOSITORY=${VENTSTREAM_REPOSITORY:-ventstream/ventstream}
 INSTALL_DIR=${VENTSTREAM_INSTALL_DIR:-${HOME:?HOME is required}/.local/bin}
 CONFIG_DIR=${VENTSTREAM_CONFIG_DIR:-${HOME}/.config/ventstream}
 VERSION=${VENTSTREAM_VERSION:-}

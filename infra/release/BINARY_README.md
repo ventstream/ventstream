@@ -18,7 +18,7 @@ Fleet control plane.
    ```
 
 The example is a PostgreSQL CDC pipeline targeting OpenSearch. Connector and
-realtime configurations are documented at https://github.com/bashiru98/ventstream/tree/main/docs-site.
+realtime configurations are documented at https://github.com/ventstream/ventstream/tree/main/docs-site.
 
 The standalone engine has no Fleet credentials or control-plane dependency.
 Centralized CLI administration requires a separately deployed Fleet-managed
