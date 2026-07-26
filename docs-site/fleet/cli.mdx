@@ -13,10 +13,8 @@ A standalone engine has no Fleet API and cannot be administered with
 
 ## Install
 
-`ventstreamctl` binaries are published in the public
+`ventstreamctl` binaries are published in the
 [VentStream releases repository](https://github.com/ventstream/ventstream-releases).
-Downloading and installing the CLI does not require a GitHub account, token, or
-access to the private Fleet source repository.
 
 | Operating system | Architectures |
 |---|---|
@@ -26,7 +24,7 @@ access to the private Fleet source repository.
 
 ### macOS and Linux
 
-Install the latest public release:
+Install the latest release:
 
 ```bash
 curl -fsSL \
@@ -72,22 +70,31 @@ extract `ventstreamctl.exe`, and place it in a directory on `PATH`.
 
 The installer performs checksum verification automatically. For manual
 checksum, immutable-release, attestation, and SBOM verification, follow the
-[public verification guide](https://github.com/ventstream/ventstream-releases/blob/main/docs/verification.md).
+[verification guide](https://github.com/ventstream/ventstream-releases/blob/main/docs/verification.md).
 
-The CLI executable is public, but it still requires a reachable Fleet control
-plane and an authorized user account to administer managed engines. A standalone
-engine does not require `ventstreamctl`.
+The CLI requires a reachable Fleet control plane and an authorized user account
+to administer managed engines. A standalone engine does not require
+`ventstreamctl`.
 
 ## Authenticate
 
-Create and verify a built-in account or use an operator-configured OIDC device
-flow. The complete account lifecycle, secure password input, recovery, refresh,
-and logout commands are covered in [Authentication](/fleet/authentication).
+Sign in through the browser. The CLI discovers the configured authentication
+method, stores the resulting session in a named profile, and prompts for an
+organization and environment when more than one is available:
 
 ```bash
+ventstreamctl auth login \
+  --control-plane https://fleet.example.com \
+  --profile production
+
 ventstreamctl auth status
 ventstreamctl auth whoami
 ```
+
+For a non-interactive terminal, add `--organization <uuid|short-id|slug>` and
+`--environment <uuid|short-id|slug>`. The complete browser, enterprise OIDC,
+account lifecycle, recovery, refresh, and logout behavior is covered in
+[Authentication](/fleet/authentication).
 
 ## Profiles and context
 
@@ -100,7 +107,8 @@ ventstreamctl config use-profile production
 ventstreamctl config show
 ```
 
-List the organizations visible to the authenticated principal and select one:
+Login normally selects the context. To change it later, list the organizations
+visible to the authenticated principal and select one:
 
 ```bash
 ventstreamctl orgs list
