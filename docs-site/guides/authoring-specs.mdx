@@ -89,8 +89,10 @@ A spec change means existing documents have the old shape. Options:
 - **Manual:** restart and let new changes use the new spec while old
   docs update lazily as their rows are touched.
 
-In Kubernetes the spec lives in a ConfigMap, so a change is a
-`kubectl apply` + rollout restart — no image rebuild.
+For a standalone Kubernetes deployment, update the ConfigMap and perform a
+controlled rollout. For a Cloud-managed pipeline, create and validate a new
+immutable configuration revision, then select it. Neither workflow requires an
+image rebuild.
 
 ## The scoping guarantee
 

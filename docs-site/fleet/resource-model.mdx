@@ -31,9 +31,9 @@ for a deployment while allowing independently identified realtime instances.
 ## Desired and observed state
 
 Desired state is a complete, monotonically revisioned snapshot containing the run
-state and selected configuration revision. Agents persist the last trusted desired
-state and report observed state independently. This makes convergence auditable
-and prevents an older gateway message from rolling an engine backward.
+state and activated configuration revision. Agents persist the last trusted
+desired state and report observed state independently. This makes convergence
+auditable and prevents an older gateway message from rolling an engine backward.
 
 Lifecycle and configuration changes create durable operations. API acceptance
 means the operation was queued, not that an engine has completed it. Inspect or

@@ -1,54 +1,67 @@
 ---
 title: "Authentication"
-description: "Authenticate ventstreamctl in the browser, select an organization and environment, and manage secure CLI sessions."
+description: "Authenticate ventstreamctl with VentStream Cloud and select the managed organization and environment you want to administer."
 ---
 
-`ventstreamctl` discovers the authentication method configured by the Fleet
-control plane. The normal flow opens the VentStream sign-in page in your browser,
-then stores a named CLI profile with the selected organization and environment.
+This guide is for VentStream Cloud users who administer managed CDC and
+realtime pipelines with `ventstreamctl`. Authentication gives the CLI the same
+organization-scoped access as the VentStream Cloud dashboard.
 
-## Browser login
+<Note>
+The standalone VentStream engine does not require a Cloud account or
+`ventstreamctl`. Run it directly with local configuration when centralized
+administration is not needed.
+</Note>
 
-Start login with the control-plane origin and a profile name:
+Create an account at [ventstream.dev/signup](https://ventstream.dev/signup), or
+accept an invitation from an existing organization, before starting CLI login.
+
+## Sign in from the CLI
+
+Use the control-plane URL supplied for your VentStream Cloud workspace:
 
 ```bash
 ventstreamctl auth login \
-  --control-plane https://fleet.example.com \
+  --control-plane <control-plane-url> \
   --profile production
 ```
 
-The CLI opens the authorization page in your system browser and waits for a
-loopback callback on `127.0.0.1`. Complete sign-in, account creation, MFA, or SSO
-on that page. The authorization exchange uses PKCE and a one-time state value;
-your password is never entered into the CLI.
+The CLI opens the VentStream authorization page in your system browser. Sign in
+with your existing account, complete any required MFA or SSO checks, and approve
+the CLI session.
 
-The command prints the authorization URL before opening it. Use `--no-browser`
-to suppress automatic launch and open that URL manually on the same workstation:
+The authorization flow uses PKCE, a one-time state value, and a loopback callback
+on `127.0.0.1`. Your password is entered only in the browser and is never exposed
+to the CLI.
+
+The command also prints the authorization URL. Use `--no-browser` to suppress
+automatic launch and open that URL manually on the same workstation:
 
 ```bash
 ventstreamctl auth login \
-  --control-plane https://fleet.example.com \
+  --control-plane <control-plane-url> \
   --profile production \
   --no-browser
 ```
 
 The browser callback expires after five minutes.
 
-## Select a context
+## Select an organization and environment
 
 After authentication, the CLI retrieves the organizations and environments that
-the account can access:
+your account can access:
 
 - A single organization or environment is selected automatically.
 - Multiple choices produce an interactive numbered prompt.
-- An account with no organization remains authenticated without a Fleet context.
+- An account with no organization remains authenticated until it accepts an
+  invitation or creates an organization in the dashboard.
 
 For a non-interactive terminal, or to select explicitly, pass a UUID, an
 unambiguous UUID prefix of at least eight characters, or a slug:
 
 ```bash
 ventstreamctl auth login \
-  --control-plane https://fleet.example.com \
+  --control-plane <control-plane-url> \
   --profile production \
   --organization acme \
   --environment production
@@ -64,26 +77,26 @@ ventstreamctl config set-env <environment-id> --profile production
 ventstreamctl config show --profile production
 ```
 
-## Enterprise OIDC
+## Enterprise SSO
 
-If the control plane advertises an external OIDC provider instead of the
-VentStream browser authorization page, the same `auth login` command starts the
-provider's device-code flow automatically. The CLI displays the verification URL
-and code while you complete SSO, MFA, and conditional-access checks.
+When enterprise OIDC is enabled for a workspace, the same `auth login` command
+uses the configured identity provider. Depending on the provider configuration,
+VentStream either completes authorization in the browser or displays a
+device-code URL and code.
 
-An OIDC provider using a private PKI can be trusted with:
+An identity provider using a private PKI can be trusted with:
 
 ```bash
 ventstreamctl auth login \
-  --control-plane https://fleet.example.com \
+  --control-plane <control-plane-url> \
   --profile enterprise \
   --oidc-trust-bundle <ca.pem>
 ```
 
-## Session status
+## Check the session
 
-Access tokens are short-lived. Profiles with a refresh session automatically
-refresh an expiring access token before authenticated commands.
+Access tokens are short-lived. The CLI automatically refreshes an expiring token
+when the profile has a valid refresh session.
 
 ```bash
 ventstreamctl auth status --profile production
@@ -102,118 +115,25 @@ ventstreamctl auth token --profile production --refresh
 shell-history expansions, or source-controlled files.
 </Warning>
 
-## Create an account from the CLI
+## Account recovery
 
-Browser account creation is preferred. When an operator needs the CLI-only
-account lifecycle, read the password from a hidden prompt rather than placing it
-in shell history or process arguments:
-
-```bash
-read -rsp "VentStream password: " VENTSTREAM_PASSWORD && echo
-printf '%s' "$VENTSTREAM_PASSWORD" | ventstreamctl auth signup \
-  --control-plane https://fleet.example.com \
-  --profile production \
-  --email operator@example.com \
-  --display-name "Fleet Operator" \
-  --password-stdin
-unset VENTSTREAM_PASSWORD
-```
-
-Signup creates an unverified account and a pending profile. The verification
-email contains a one-time token and a token-free command. Run the command, then
-paste the token into its hidden prompt:
-
-```bash
-ventstreamctl auth verify-email --profile production
-```
-
-For non-interactive verification, pass the name of a temporary environment
-variable rather than the token itself:
-
-```bash
-export VENTSTREAM_VERIFICATION_TOKEN='one-time-token'
-ventstreamctl auth verify-email \
-  --profile production \
-  --token-env VENTSTREAM_VERIFICATION_TOKEN
-unset VENTSTREAM_VERIFICATION_TOKEN
-```
-
-Request another message when the first token expires or is lost. The response
-does not reveal whether an account exists:
-
-```bash
-ventstreamctl auth resend-verification \
-  --profile production \
-  --email operator@example.com
-```
-
-## Recover a password
-
-Password-reset requests return a generic response regardless of account
-existence:
-
-```bash
-ventstreamctl auth request-password-reset \
-  --profile production \
-  --email operator@example.com
-```
-
-Run the command from the email. The CLI securely prompts for the one-time token,
-new password, and password confirmation:
-
-```bash
-ventstreamctl auth reset-password --profile production
-```
-
-A successful reset invalidates existing access tokens, revokes every first-party
-refresh session for the account, and clears matching credentials from the local
-profile. Log in again through the browser with the new password.
-
-## Legacy password login
-
-Direct password login is deprecated. Use it only with a control plane that does
-not yet provide browser authorization, and opt in explicitly:
-
-```bash
-read -rsp "VentStream password: " VENTSTREAM_PASSWORD && echo
-printf '%s' "$VENTSTREAM_PASSWORD" | ventstreamctl auth login \
-  --control-plane https://fleet.example.com \
-  --profile production \
-  --legacy-password-login \
-  --email operator@example.com \
-  --password-stdin
-unset VENTSTREAM_PASSWORD
-```
-
-Without `--legacy-password-login`, supplying `--email`, `--password-stdin`, or
-`--password-env` is rejected.
+Use [ventstream.dev/forgot-password](https://ventstream.dev/forgot-password) to
+request a one-time reset link. A successful password reset revokes existing
+Cloud sessions. Run `auth login` again after setting the new password.
 
 ## Log out
 
 ```bash
 ventstreamctl auth logout --profile production
-ventstreamctl auth logout --profile production --all-sessions
 ```
 
-The first command revokes the selected first-party refresh session and removes
-the profile. For an OIDC profile, it removes the local profile but does not end
-the identity-provider session. `--all-sessions` is available only for first-party
-profiles and revokes every refresh session for that account. Add
-`--keep-profile` to retain non-secret control-plane and context defaults.
+This revokes the selected first-party refresh session and removes the local
+profile. For an enterprise OIDC profile, it removes the local profile but does
+not end the identity-provider session.
 
-## Local development
-
-Plain HTTP is rejected except for an explicit loopback development profile:
-
-```bash
-ventstreamctl auth login \
-  --control-plane http://127.0.0.1:8080 \
-  --profile local \
-  --allow-insecure-localhost
-```
-
-The localhost allowance is retained in that profile and cannot be used for a
-non-loopback address.
+Use `--all-sessions` with a first-party profile to revoke every refresh session
+for the account. Add `--keep-profile` to retain non-secret control-plane and
+context defaults.
 
 ## Profile storage
 
@@ -223,5 +143,5 @@ Profiles are stored at
 files on Unix-like systems and rejects symlinked or overly permissive profile
 files. Set `VENTSTREAMCTL_CONFIG` to use an isolated profile file in automation.
 
-See [CLI administration](/fleet/cli) for Fleet operations and scripting
-guidance.
+See [CLI administration](/fleet/cli) for managed pipeline operations and
+scripting guidance.

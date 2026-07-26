@@ -4,10 +4,8 @@ description: "Stream a MongoDB replica set or sharded cluster into the sink via 
 ---
 
 The MongoDB source reads **change streams** and streams documents into the
-sink. In v1 each MongoDB document maps to **one** sink document (raw 1:1) —
-which fits MongoDB well, since documents are usually already denormalized.
-Cross-collection joins (embedding a referenced collection) are on the
-[roadmap](#limitations-v1).
+sink. The current connector maps each MongoDB document to one sink document
+(raw 1:1), which fits collections that are already denormalized.
 
 <Note>
 VentStream writes to a **target**. **OpenSearch and Elasticsearch** are the
@@ -114,12 +112,11 @@ explicit **index template** that maps such fields to `double` (or define the
 mapping up front).
 </Warning>
 
-## Limitations (v1)
+## Current limitations
 
 - **Raw 1:1 only.** One document → one sink document; there are no
   cross-collection joins yet, so a change to a *referenced* collection does
-  not recompose a parent document. (Phase 2: cross-collection joins via the
-  shared join engine.)
+  not recompose a parent document.
 - **Replica set / sharded cluster required** — change streams don't run on a
   standalone `mongod`.
 - **Oplog-bounded resume.** A resume reaches back only as far as the oplog

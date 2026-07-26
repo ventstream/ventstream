@@ -3,10 +3,8 @@ title: "Connectors"
 description: "The sources VentStream reads from and the sinks it writes to — and what's supported today."
 ---
 
-A **connector** is how VentStream talks to a system. The engine is
-source / sink / transport-pluggable, so the set below is simply what's
-implemented and tested today — new connectors slot in without changing
-the engine or the spec model.
+A **connector** is how VentStream talks to a system. The table below is the
+implemented connector surface for the current release.
 
 - **Source connectors** read a system's native change stream and feed
   it into the engine (the capture pipeline).
@@ -20,7 +18,7 @@ the engine or the spec model.
 | Kind | Connector | Notes |
 |------|-----------|-------|
 | **Source** | [PostgreSQL](/connectors/sources/postgres) | logical replication (`pgoutput`) |
-| **Source** | [Neo4j](/connectors/sources/neo4j) | CDC, 5.17+ Enterprise |
+| **Source** | [Neo4j](/connectors/sources/neo4j) | `db.cdc.*` on Enterprise or supported AuraDB tiers |
 | **Source** | [MongoDB](/connectors/sources/mongodb) | change streams from a replica set or sharded cluster |
 | **Source** | [MySQL / MariaDB](/connectors/sources/mysql) | row-based binlog replication |
 | **Source** | [Kafka / Redpanda](/connectors/sources/kafka) | Debezium envelopes or raw JSON topics |

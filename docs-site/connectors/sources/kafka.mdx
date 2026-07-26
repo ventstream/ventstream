@@ -5,10 +5,8 @@ description: "Consume Debezium change topics (or raw JSON topics) and stream the
 
 The Kafka source is a **consumer**: it reads change data that's already on a
 Kafka topic — typically produced by a **Debezium** source connector — and
-unwraps each message into a sink document. In v1 each message maps to **one**
-sink document (raw 1:1), keyed by the row's primary key. Cross-topic joins
-(denormalizing several Debezium topics into one document) are on the
-[roadmap](#limitations-v1).
+unwraps each message into a sink document. The current connector maps each
+message to one sink document (raw 1:1), keyed by the row's primary key.
 
 Works against Apache Kafka, **Redpanda**, **AWS MSK**, Confluent Cloud, and any
 Kafka-API broker. Set `VS_CDC_SOURCE=kafka` (or `redpanda`).
@@ -79,7 +77,9 @@ VS_KAFKA_SASL_PASSWORD=secret
 
 This covers **AWS MSK** with SASL/SCRAM, Confluent Cloud (`PLAIN`), and Redpanda
 Cloud. MSK **IAM** auth (and therefore MSK Serverless, which is IAM-only) is not
-supported in v1 — it needs an AWS SigV4 token provider (planned).
+supported in the current release because the connector does not provide an AWS
+SigV4 token provider. AWS documents the authentication requirement in
+[MSK Serverless](https://docs.aws.amazon.com/msk/latest/developerguide/serverless.html).
 
 ## Key environment variables
 
@@ -100,26 +100,25 @@ supported in v1 — it needs an AWS SigV4 token provider (planned).
 
 Full list in the [engine env reference](/reference/engine-env).
 
-## Limitations (v1)
+## Current limitations
 
-- **Raw 1:1 only.** One message → one sink document; no cross-topic joins yet,
+- **Raw 1:1 only.** One message → one sink document; there are no cross-topic joins,
   so a change on a *referenced* table's topic doesn't recompose a parent
-  document. (Phase 2: cross-topic joins via the shared join engine — this is
-  what makes the Kafka source worth more than a stock Kafka→ES sink connector.)
+  document.
 - **JSON values only.** Debezium JSON (with-schema and schemaless) and raw JSON.
   **Avro + Confluent Schema Registry** — the most common enterprise Debezium
-  setup — is not supported yet (v2).
+  setup — is not supported.
 - **Schema changes aren't tracked.** A Debezium DDL/schema-change event carries
   no row image and is skipped; the next data record reflects the new shape
-  (OpenSearch dynamic mapping permitting). Explicit schema-evolution handling is
-  planned for v2.
+  if the target mapping accepts it.
 - **Primary key required.** A message with no key (and no `VS_KAFKA_RAW_KEY_FIELD`
   match in raw mode) can't form a doc id and is logged + skipped.
-- **MSK IAM / MSK Serverless** need an AWS SigV4 token provider — not in v1.
+- **MSK IAM / MSK Serverless** require an AWS SigV4 token provider, which the
+  current connector does not include.
 - **Single consumer per agent.** No partition-parallel scaling / rebalance
   handling yet; run one agent per consumer group.
 - **Offsets commit on a single global prefix.** Offsets advance only through
   the contiguous sink-durable prefix across all partitions, so an event stalled
   on one partition holds back commits on the others until it's durable.
-  Conservative and safe (never commits past un-written data); just less
-  granular under a multi-partition stall.
+  This prevents committing past unwritten data but reduces commit granularity
+  during a multi-partition stall.

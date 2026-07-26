@@ -4,12 +4,12 @@ Publish an event to NATS and watch it arrive at a live subscriber in
 real time — over **both** transports VentStream speaks:
 
 - **Raw WebSocket** — the native JSON protocol on `ws://localhost:4040/ws`
-  (via `@ventstream/client`)
+  (via the repository-local `@ventstream/client` package)
 - **Apollo Client** — `graphql-transport-ws` on `ws://localhost:4041/graphql/ws`
   (the standard Apollo subscription link)
 
 ```
-publisher (@ventstream/sdk) ──► NATS (JetStream) ──► engine ┬─ ws role      ──► raw-WS client
+publisher (local SDK) ──► NATS (JetStream) ──► engine ┬─ ws role      ──► raw-WS client
    vs.t.acme.orders.order.status_changed.*         └─ graphql role ──► Apollo client
 ```
 
@@ -44,8 +44,9 @@ docker compose ps   # engine → "healthy"
 
 ## 2. One-time: build the SDK + client, install the example deps
 
-The publisher/subscriber SDKs are TypeScript; build them once (their
-`dist/` is gitignored), then install the example workspace:
+The publisher and raw client are repository-local TypeScript packages; they
+are not installed from npm. Build them once, then install the example
+workspace:
 
 ```bash
 # from the repo root
@@ -70,7 +71,7 @@ Expected:
 [publisher] sent id=… subject=vs.t.acme.orders.order.status_changed.order_1
 [client] event on vs.t.acme.orders.order.status_changed.order_1: {"id":…,"data":{"from":"pending","to":"confirmed",…}}
 …
-[demo] received 3 events end-to-end ✓
+[demo] received all 3 newly published events end-to-end ✓
 ```
 
 ## 4. Demo B — Apollo Client transport
@@ -90,12 +91,16 @@ Expected:
   • orders.order.status_changed.*  (Fired when an order's status transitions.)
   …
 — Subscribing to orders.order.status_changed.* —
-— Publishing 3 events via @ventstream/sdk —
+— Publishing 3 events via the local SDK —
   ← vs.t.acme.orders.order.status_changed.order_1
     entity=order_1  data={"from":"pending","to":"confirmed",…}
   …
-[demo] received 3 events via Apollo Client ✓
+[demo] received all 3 newly published events via Apollo Client ✓
 ```
+
+Other matching events may arrive while the demo is running. The script verifies
+the IDs of its three new events, so unrelated traffic does not produce a false
+pass.
 
 ## 4b. Demo C — GraphiQL playground (zero code)
 
@@ -157,8 +162,10 @@ docker compose -f demo/realtime/docker-compose.yml exec -T nats-box \
   '{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","event":"orderStatusChanged","tenant":"acme","entity_id":"ad_hoc","occurred_at":"2026-01-01T00:00:00Z","received_at":"2026-01-01T00:00:00Z","schema_version":2,"data":{"from":"pending","to":"paid"}}'
 ```
 
-(a subscriber from step 3/4 must be connected first — delivery is
-`New`, so there's no replay of past events)
+These examples start live because they do not supply a resume cursor, so connect
+the subscriber before publishing. Both gateways can replay retained JetStream
+events when the client reconnects with a cursor; persist the latest returned
+cursor when recovery matters.
 
 ## 7. Teardown
 
@@ -185,5 +192,7 @@ next `up` is clean.
 - **Subjects.** Events use `vs.t.<tenant>.<event>.<id>` (id last);
   clients subscribe with the tenant-relative pattern (the gateway anchors
   `vs.t.<tenant>.` for them). See the [real-time docs](/concepts/real-time-subscriptions).
-- **Auth is permissive in v1** — any non-empty token is accepted and the
-  tenant is trusted from the connection init. JWT validation is planned.
+- **Development authentication only.** This demo accepts any non-empty token
+  and trusts the tenant from `connection_init`. Do not expose it to untrusted
+  clients without an authenticating proxy that validates identity and fixes
+  the tenant.

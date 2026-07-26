@@ -1,11 +1,12 @@
 ---
 title: "Pre-production checklist"
-description: "Release gates for an engine-only or Fleet-managed VentStream deployment."
+description: "Production gates for standalone and VentStream Cloud-managed engine workloads."
 ---
 
-VentStream currently has an **internal-alpha** production assessment. The engine,
-Fleet control plane, managed supervisor, CLI, authentication, and Kubernetes
-packaging work end to end, but a local demo is not production evidence.
+Use this checklist before placing a standalone or Cloud-managed VentStream
+workload on a production data path. VentStream operates the Cloud management
+plane; customers remain responsible for connector access, workload sizing,
+secrets, persistence, and data-path validation in their infrastructure.
 
 <Warning>
 Do not expose the native WebSocket or GraphQL subscription listeners to untrusted
@@ -38,36 +39,33 @@ and subject authorization. Production realtime authorization remains a blocker.
 - Add a metrics scraper, alerts, log retention, resource limits, NetworkPolicy,
   and a PodDisruptionBudget for replicated realtime gateways.
 
-## Fleet checklist
+## Cloud-managed workload checklist
 
-- Follow [Fleet control plane on Kubernetes](/deploy/kubernetes-fleet), including
-  separate migrator/runtime database roles, SMTP or OIDC, signing/HMAC keys, and
-  gateway PKI.
-- Scope workers to real organization UUIDs after bootstrap; the production
-  placeholder performs no tenant maintenance.
-- Back up PostgreSQL before migration and use the documented two-phase password
-  recovery rollout for older deployments.
-- Keep managed engine, supervisor, API, worker, gateway, and migrator revisions
-  within the tested compatibility window.
-- Retain managed-agent PVCs and the consumed enrollment Secret object. Do not use
-  one enrollment grant to scale several replicas.
-- Prove cross-organization denial with at least two authenticated CLI profiles
-  and separate enrolled deployments.
+- Generate deployment values with `ventstreamctl agents manifest` so the chart,
+  managed image digest, gateway addresses, and identity references come from the
+  active Cloud installation profile.
+- Allow outbound access to the enrollment and control gateways without exposing
+  source databases, sinks, or engine health ports publicly.
+- Retain managed-agent PVCs across upgrades. Test recovery from process and node
+  restarts without deleting identity, cursor, or join state.
+- Keep connector credentials in the workload secret manager and managed engine
+  configuration non-secret.
+- Confirm the CLI profile is scoped to the intended organization and environment
+  before configuration or lifecycle changes.
+- Verify runtime status, operation history, metrics, alerts, DLQ behavior, and
+  rollback against representative data before production cutover.
 
 ## Already implemented
 
 - PostgreSQL, Neo4j, MongoDB, MySQL/MariaDB, and Kafka/Redpanda CDC sources.
 - OpenSearch/Elasticsearch sink, persisted cursor/join state, idempotent writes,
   DLQ handling, lifecycle operations, reconcile, and rebootstrap.
-- Native WebSocket and GraphQL subscriptions over NATS/JetStream.
+- Native WebSocket and GraphQL subscriptions over NATS/JetStream or Redis
+  Streams; native WebSocket also supports live-only NATS Core delivery.
 - Built-in verified accounts, rotating refresh sessions, recovery, signing-key
   rotation, optional enterprise OIDC, mTLS workload identity, and audited Fleet
   operations.
 - Canonical engine configuration, immutable Fleet revisions, validation, apply,
   and rollback.
-- Fleet, managed-agent, and standalone realtime Helm charts plus a current
-  standalone CDC StatefulSet baseline.
-
-The repository's `docs/pre-production-checklist.md` contains the release evidence
-record and mode-specific operator checks. Fleet's stricter gate is maintained in
-the control-plane repository at `docs/08-production-readiness.md`.
+- Managed-agent and standalone deployment paths for Kubernetes, plus native
+  engine binaries for supported platforms.

@@ -178,7 +178,7 @@ The join can run in two modes (same `joins:` spec):
 | | **In-memory** (default) | **SQL** (`VS_MYSQL_DENORMALIZE_MODE=sql`) |
 |---|---|---|
 | How | Holds related rows + reverse indexes in RAM; recompose is in-process | Pushes the join into MySQL (`JSON_OBJECT`/`JSON_ARRAYAGG`); recompose re-queries per change |
-| Memory | **Scales with the joined working set** (~1 KiB/row; can OOM at large scale) | **Bounded — O(chunk)**, independent of dataset (measured ~77 MiB for 100k orders / 200k items / 5k customers) |
+| Memory | Scales with the joined working set | Bounded by the configured chunk and in-flight work |
 | Latency | Lowest (no per-change DB round-trip) | Adds an indexed query per affected primary |
 | Best for | Small/medium datasets, lowest tail latency | Large datasets / strict pod memory limits |
 
@@ -197,7 +197,7 @@ reverse-lookup (on by default; `VS_MYSQL_SINK_REVERSE_LOOKUP=false` to disable),
 including **composite child PKs** — each PK column is matched and AND-ed, and
 any over-match is harmless since the parent is recomposed from current DB truth.
 
-## Limitations (v1)
+## Current limitations
 
 - **Joins are raw, not recursive.** One level of embedding per related entry
   (no nested joins-of-joins yet). Cross-source joins are not supported — all
@@ -206,16 +206,16 @@ any over-match is harmless since the parent is recomposed from current DB truth.
   table without one is **logged with a warning and skipped** at bootstrap, and
   its binlog events are skipped in the tail.
 - **`ROW` binlog format required** — statement/mixed formats carry no per-row
-  images. The source tails **positions, not GTIDs**, in v1: position resume is
+  images. The source tails **positions, not GTIDs**: position resume is
   robust on a single server, but a failover to a different primary is recovered
-  by re-bootstrap rather than seamless reposition. GTID resume is a v2
-  robustness play.
+  through the controlled reset and bootstrap path rather than GTID repositioning.
 - **Schema cache is not invalidated on DDL.** Per-table PK/column metadata is
   cached on first use. An `ALTER TABLE` that changes the primary key or columns
   mid-stream is not picked up until the agent restarts — restart after such a
   migration.
 - **Binlog-bounded resume.** A resume reaches back only as far as the binlog is
-  retained (`binlog_expire_logs_seconds`); past that the source re-bootstraps
-  automatically (see [How it works](#how-it-works)).
+  retained (`binlog_expire_logs_seconds`). If the saved position has been
+  purged, the source fails closed and requires explicit reconciliation or
+  drain/reset before bootstrap (see [How it works](#how-it-works)).
 - **MySQL 8.4+ compatible.** Uses `SHOW BINARY LOG STATUS` where available,
   falling back to the deprecated `SHOW MASTER STATUS` on older MySQL / MariaDB.

@@ -1,6 +1,6 @@
 ---
 title: "Standalone engine on Kubernetes"
-description: "Run the open-core engine without Fleet using canonical configuration, Kubernetes Secrets, and persistent state."
+description: "Run the open-source engine without VentStream Cloud using canonical configuration, Kubernetes Secrets, and persistent state."
 ---
 
 A standalone engine has no control-plane identity or management stream. Kubernetes
@@ -136,14 +136,14 @@ spec:
       terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
-        runAsUser: 999
-        runAsGroup: 999
-        fsGroup: 999
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: engine
-          image: ghcr.io/your-org/ventstream-engine@sha256:REPLACE_DIGEST
+          image: ghcr.io/ventstream/ventstream@sha256:REPLACE_WITH_RELEASE_DIGEST
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -187,7 +187,7 @@ spec:
           requests: { storage: 5Gi }
 ```
 
-The repository's engine image runs as numeric UID/GID `999`; the pod-level
+The published engine image runs as numeric UID/GID `10001`; the pod-level
 `fsGroup` makes a newly provisioned PVC writable without a root init container.
 If you replace the runtime stage or user in a custom image, change all three IDs
 to that image's fixed non-root UID/GID.
@@ -216,17 +216,23 @@ The engine repository's `ventstream-gateway` chart runs the horizontally scalabl
 
 ```bash
 cd ventstream
+IMAGE_DIGEST=$(curl --proto '=https' --tlsv1.2 -fsSL \
+  https://github.com/ventstream/ventstream/releases/latest/download/image-digests.txt \
+  | sed -n 's|^ghcr.io/ventstream/ventstream@||p')
+
 helm upgrade --install realtime ./infra/helm/ventstream-gateway \
   --namespace ventstream --create-namespace \
-  --set image.repository=ghcr.io/your-org/ventstream-engine \
-  --set image.tag=VERSION \
+  --set image.repository=ghcr.io/ventstream/ventstream \
+  --set-string image.digest="$IMAGE_DIGEST" \
   --set-string 'roles=ws\,graphql' \
   --set replicas=3 \
   --set nats.url=nats://nats.ventstream.svc:4222 \
   --set graphql.schema.existingConfigMap=ventstream-graphql-schema
 ```
 
-JetStream is required for GraphQL subscriptions and resumable WebSocket delivery.
-Use a Service or ingress appropriate for long-lived WebSocket connections, and
+This chart currently configures NATS; enable JetStream for GraphQL subscriptions
+and resumable native WebSocket delivery. The engine also supports Redis Streams
+through canonical configuration when you deploy it without this chart. Use a
+Service or ingress appropriate for long-lived WebSocket connections, and
 validate client authorization before exposing either listener outside a trusted
 network.

@@ -1,4 +1,4 @@
-// End-to-end demo using the published SDKs:
+// End-to-end demo using the repository-local SDK packages:
 //
 //   @ventstream/sdk     -> publishes events to NATS
 //   @ventstream/client  -> subscribes via WS gateway
@@ -24,8 +24,23 @@ await client.connect();
 console.log("[client] connected and ready");
 
 const received = [];
-const done = new Promise((resolve) => {
-  let n = 0;
+const receivedById = new Map();
+const publishedIds = new Set();
+let resolvePublished;
+const publishedDone = new Promise((resolve) => {
+  resolvePublished = resolve;
+});
+
+function checkPublishedEvents() {
+  if (
+    publishedIds.size === 3 &&
+    [...publishedIds].every((id) => receivedById.has(id))
+  ) {
+    resolvePublished();
+  }
+}
+
+{
   client.subscribe("orders.order.status_changed.*", (event, ctx) => {
     console.log(
       `[client] event on ${ctx.subject}:`,
@@ -36,10 +51,10 @@ const done = new Promise((resolve) => {
       }),
     );
     received.push(event);
-    n += 1;
-    if (n >= 3) resolve();
+    receivedById.set(event.id, event);
+    checkPublishedEvents();
   });
-});
+}
 
 // Give the subscribe ack a beat
 await new Promise((r) => setTimeout(r, 200));
@@ -61,11 +76,17 @@ for (let i = 1; i <= 3; i++) {
     actor: { kind: "user", id: "user_456" },
     data: { from: "pending", to: "confirmed", attempt: i },
   });
+  publishedIds.add(id);
   console.log(`[publisher] sent id=${id} subject=${subject}`);
+  checkPublishedEvents();
 }
 
-await done;
+await publishedDone;
 await vs.close();
 await client.close();
-console.log(`\n[demo] received ${received.length} events end-to-end ✓`);
+const unrelated = received.length - publishedIds.size;
+if (unrelated > 0) {
+  console.log(`\n[demo] observed ${unrelated} other matching event(s) while connected`);
+}
+console.log("[demo] received all 3 newly published events end-to-end ✓");
 process.exit(0);

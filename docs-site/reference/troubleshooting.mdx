@@ -1,43 +1,40 @@
 ---
 title: "Troubleshooting"
-description: "Diagnose engine, Fleet, authentication, enrollment, and local development failures."
+description: "Diagnose engine, VentStream Cloud, authentication, enrollment, and local development failures."
 ---
-
-Every row here is something that actually came up while building and
-deploying the stack.
 
 ## Agents
 
 | Symptom | Cause / fix |
 |---|---|
-| Agent stuck `STARTING`, flips to `erroring` | Source connect failed: check connector credentials, TLS/CA configuration, source CDC prerequisites, and network policy. Inspect engine logs and `ventstreamctl agents status`. |
+| Agent remains `starting`, then reports `degraded` or `failed` | Check connector credentials, TLS configuration, source CDC prerequisites, and network policy. Inspect engine logs and `ventstreamctl agents status`. |
 | Bootstrap skipped on restart | Retained source position means the connector resumes instead of re-scanning. Use Fleet rebootstrap for supported local state. PostgreSQL drops its slot; Neo4j, MongoDB, and MySQL remove their local cursor; Kafka consumer-group offsets must be reset through Kafka administration. |
-| Fleet reports an unhealthy or stale instance but no current engine error | The control stream or process stopped reporting. Inspect `agents status`, gateway logs, supervisor logs, and the pod restart count. |
+| Cloud reports an unhealthy or stale instance but the engine has no current error | The control stream or process stopped reporting. Inspect `agents status`, supervisor logs, and the pod restart count. |
 | Created edge "doesn't propagate" (Neo4j) | Temporal contract — the edge needs `fromDate` or the spec's `WHERE` filters it. The fan-out *did* fire (see `recomposed=N` in the log); the projection just returned nothing. |
 | Off-spec node change has no effect | Expected — only paths the spec declares, within `fan_out_max_hops`, propagate. |
 | One change recomputes the whole graph (Neo4j) | A hot (shared) endpoint isn't being filtered. Confirm `VS_NEO4J_HOT_NODE_THRESHOLD` (default 100) is above the shared node's cardinality. |
 | Two agents producing duplicate events | They share a source identity or state path. Give each workload a unique PostgreSQL slot, Neo4j/MongoDB/MySQL state path, MySQL server ID, or Kafka consumer group as appropriate. CDC remains single-active per pipeline. |
 
-## Control plane and CLI
+## VentStream Cloud and CLI
 
 | Symptom | Cause / fix |
 |---|---|
-| Signup succeeds but every authenticated command fails | Signup creates no session. Consume the verification email with `ventstreamctl auth verify-email`, then check `auth status`. |
-| Verification or reset email never arrives | Check `control-worker` logs, SMTP host/security/credentials, sender address, and the matching verification/reset HMAC Secret references. |
-| Password-reset endpoints return 404 | The API password-reset feature gate is disabled. This is expected during phase one of an upgrade; enable API and worker reset gates only after the documented rollout. |
+| `auth login` cannot complete | Confirm the control-plane URL, open the printed authorization URL on the same workstation, and allow the loopback callback on `127.0.0.1`. Start a new login if the five-minute callback window expired. |
 | `auth status` reports an expired access token | Normal commands refresh first-party sessions automatically. Use `auth token --refresh` to force rotation; log in again if the refresh family expired or was revoked. |
-| API starts but requests fail with missing relation/schema errors | The one-shot migrator did not complete. Inspect the Helm hook or Compose migrator and verify the schema-owning database URL. The API never runs migrations itself. |
-| Control worker fails at startup | `FLEET_WORKER_ORGANIZATIONS` is empty/invalid, its runtime database URL is wrong, or enabled email settings are incomplete. Every worker requires at least one non-nil organization scope. |
-| A new organization's old operations are never expired | Add its full organization ID to a worker's tenant scope and roll that worker. Worker organization discovery is not dynamic in the current release. |
-| Agent enrollment fails immediately | The grant expired, was already consumed/replaced, targets another deployment, or the enrollment server CA does not verify the gateway certificate. Mint a new grant and verify the trust bundle. |
-| Agent enrolled but cannot open the control stream | Check gateway control reachability, mTLS trust, certificate validity, deployment identity revocation, and the supervisor's persisted identity state. |
+| Commands target the wrong organization or environment | Run `ventstreamctl config show`, then use `config set-org` and `config set-env` with the intended context. |
+| A lifecycle command returns `queued` | The control plane accepted durable work but the agent has not completed it. Use `--wait` or inspect `ventstreamctl operations describe <operation-id> --attempts`. |
+| A selected revision is not running | Selection activates and delivers configuration, but it does not resume a paused pipeline. Check the apply operation, then run `ventstreamctl pipelines resume <pipeline> --wait`. |
+| Configuration delivery waits with no agent | Confirm the deployment is enrolled and connected with `ventstreamctl agents status`. The pending operation is delivered after a matching agent connects, subject to its expiry. |
+| Agent enrollment fails immediately | The grant expired, was already consumed or replaced, or targets another deployment. Create a new single-use grant. For private gateway trust, also verify the configured CA Secret; public Cloud gateways use WebPKI trust. |
+| Agent enrolled but cannot open the control stream | Check outbound gateway reachability, system time, certificate validity, deployment identity revocation, and the supervisor's persisted identity state. |
 
 ## Build / local
 
 | Symptom | Cause / fix |
 |---|---|
-| Compose service cannot bind a host port | Another process or Compose project owns the configured port. Override the corresponding `FLEET_DEV_*_PORT` or `VENTSTREAM_DEMO_*_PORT` value instead of stopping unrelated software. |
-| minikube runs old code after a rebuild | `minikube image load` with the same tag may not replace the cached image. Load under a fresh tag and `kubectl set image`. |
+| Compose service cannot bind a host port | Another process or Compose project owns the configured port. Override the corresponding `VENTSTREAM_DEMO_*_PORT` value instead of stopping unrelated software. |
+| `ventstream` is not found after installation | Add `~/.local/bin` to `PATH`, or set `VENTSTREAM_INSTALL_DIR` and add that directory. |
+| `--validate-config` reports a missing environment reference | Export the variable named by the `env:...` value. Validation resolves references but does not open source or sink connections. |
 | `pg_drop_replication_slot` errors on resync | The slot is still in use by a running agent. Stop the agent first, or let the engine's own drain path drop it. |
 
 ## Reading the recompose log

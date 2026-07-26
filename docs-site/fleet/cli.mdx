@@ -1,14 +1,20 @@
 ---
 title: "CLI administration"
-description: "Install ventstreamctl, select a Fleet context, and administer pipelines, agents, configuration, and operations."
+description: "Install ventstreamctl and administer VentStream Cloud pipelines, agents, configuration, and operations."
 ---
 
-`ventstreamctl` is an HTTPS client for the control-plane API. It never connects
-directly to an engine, source database, sink, or agent gateway.
+`ventstreamctl` is the command-line administration client for VentStream Cloud.
+Use it to manage organization-scoped environments, pipelines, configuration
+revisions, agent deployments, lifecycle operations, and runtime status.
+
+The CLI sends authenticated HTTPS requests to the managed control plane. It
+never connects directly to an engine, source database, sink, Kubernetes API, or
+agent gateway.
 
 <Note>
-A standalone engine has no Fleet API and cannot be administered with
-`ventstreamctl`. Use the CLI only for engines running under the Fleet supervisor.
+A standalone engine has no Cloud management connection and cannot be
+administered with `ventstreamctl`. Use the CLI for engines enrolled as managed
+agents in VentStream Cloud.
 </Note>
 
 ## Install
@@ -48,7 +54,7 @@ curl -fsSL \
   VENTSTREAMCTL_INSTALL_DIR="$HOME/bin" sh
 ```
 
-Rerun the installer to upgrade to the latest public release. For a reproducible
+Rerun the installer to upgrade to the latest release. For a reproducible
 installation, pin both the installer and binary version:
 
 ```bash
@@ -72,19 +78,19 @@ The installer performs checksum verification automatically. For manual
 checksum, immutable-release, attestation, and SBOM verification, follow the
 [verification guide](https://github.com/ventstream/ventstream-releases/blob/main/docs/verification.md).
 
-The CLI requires a reachable Fleet control plane and an authorized user account
-to administer managed engines. A standalone engine does not require
-`ventstreamctl`.
+The CLI requires a VentStream Cloud workspace, its control-plane URL, and an
+authorized user account.
 
 ## Authenticate
 
-Sign in through the browser. The CLI discovers the configured authentication
-method, stores the resulting session in a named profile, and prompts for an
-organization and environment when more than one is available:
+Create an account at [ventstream.dev/signup](https://ventstream.dev/signup), or
+accept an organization invitation. Then sign in through the browser. The CLI
+stores the resulting session in a named profile and prompts for an organization
+and environment when more than one is available:
 
 ```bash
 ventstreamctl auth login \
-  --control-plane https://fleet.example.com \
+  --control-plane <control-plane-url> \
   --profile production
 
 ventstreamctl auth status
@@ -136,31 +142,21 @@ Use `--profile <name>` for a one-command profile override. Use
 
 ## Organizations and environments
 
-Organization creation is a platform-administrator operation. It creates the
-organization, owner role binding, and optional initial environments atomically.
-The first environment becomes the profile default unless `--no-set-default` is
-supplied.
+Create organizations, accept invitations, and manage members from the
+[VentStream Cloud dashboard](https://ventstream.dev/dashboard). The CLI lists
+the organizations available to the authenticated account and stores one as its
+working context.
 
-```bash
-ventstreamctl orgs create acme \
-  --display-name "Acme" \
-  --region us-east \
-  --environment development:Development \
-  --environment production:Production
-```
-
-Create another environment inside the selected organization:
+Organization owners can create another environment from the CLI:
 
 ```bash
 ventstreamctl environments create staging \
   --display-name "Staging"
 ```
 
-Regular users can belong to multiple organizations. Once an administrator grants
-or invites the identity through the V1 API, it appears in `orgs list`. Invitation,
-role-binding, billing, settings, audit, and service-account administration are API
-operations in the current release; they do not yet have `ventstreamctl` command
-groups. See [Fleet API](/reference/control-plane-api).
+Users can belong to multiple organizations. Invitations, membership, roles,
+billing, and organization settings remain dashboard workflows; the CLI stays
+focused on pipeline and agent operations.
 
 ## Pipelines
 
@@ -220,21 +216,23 @@ ventstreamctl pipelines configurations create orders-cdc \
   --file graphql/schema.graphql=./schema.graphql
 ```
 
-Then validate, select, apply, and start it:
+Then validate and select it:
 
 ```bash
 ventstreamctl pipelines configurations list orders-cdc
 ventstreamctl pipelines configurations validate orders-cdc <revision> \
   --reason "pre-deployment validation"
 ventstreamctl pipelines configurations select orders-cdc <revision> \
-  --reason "release 2026-07"
-ventstreamctl pipelines configurations apply orders-cdc <revision> \
   --reason "release 2026-07" --wait
 ventstreamctl pipelines resume orders-cdc --wait
 ```
 
-Applying stages configuration but does not implicitly resume a new paused
-pipeline. Roll back by selecting and applying an earlier valid revision:
+Selecting a valid revision activates it and delivers it to connected
+deployments. It does not implicitly resume a paused pipeline. Use `apply` only
+when the active revision must be delivered again without creating or selecting a
+new revision.
+
+Roll back to an earlier valid revision:
 
 ```bash
 ventstreamctl pipelines configurations rollback orders-cdc <previous-revision> \
@@ -247,13 +245,31 @@ boundary.
 ## Deployments and enrollment
 
 The CLI calls engine installations *deployments* under the `agents` command
-group. Kubernetes or another scheduler creates the actual workload.
+group. VentStream Cloud stores desired state and identity, while Kubernetes,
+Docker Compose, or another scheduler creates the actual workload. The CLI does
+not deploy pods or connect to your cluster.
 
 ```bash
 ventstreamctl agents create orders-primary --pipeline orders-cdc
 ventstreamctl agents list --pipeline orders-cdc
 ventstreamctl agents describe <deployment-id> --pipeline orders-cdc
 ```
+
+Generate a non-secret, version-pinned deployment manifest from the Cloud
+installation profile:
+
+```bash
+ventstreamctl agents manifest orders-primary \
+  --pipeline orders-cdc \
+  --target helm \
+  --engine-secret orders-engine-secrets \
+  --enrollment-secret orders-enrollment \
+  --output orders-primary.values.yaml
+```
+
+Use `--target docker-compose` for a Docker Compose deployment. See
+[Managed agent on Kubernetes](/deploy/kubernetes-managed-engine) for the complete
+customer-side installation workflow.
 
 Generate one short-lived, single-use enrollment grant:
 
@@ -323,13 +339,5 @@ ventstreamctl operations cancel <operation-id> \
   the CLI creates one.
 - Waited commands exit non-zero for failed, canceled, expired, or timed-out
   operations.
-- One-time verification/reset secrets should use `--token-env`; passwords should
-  use `--password-env` or `--password-stdin`.
 
 Run `ventstreamctl <group> <command> --help` for every supported flag and default.
-
-<Note>
-For localhost development only, pass `--allow-insecure-localhost` during the first
-auth command. The allowance is retained in that profile and rejected for
-non-loopback hosts.
-</Note>

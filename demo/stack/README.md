@@ -6,8 +6,7 @@ Everything runs in Docker. No control plane, no cloud, no credentials to
 provision — copy the commands top to bottom.
 
 The data is a small **e-commerce** dataset (orders + product catalog) so
-the scenarios are easy to follow, but the pipeline shape is identical to
-what runs in production.
+the scenarios are easy to follow.
 
 ```
 Postgres  shop.orders + customers + order_items  ─┐
@@ -36,6 +35,28 @@ cd ventstream/demo/stack
 
 ---
 
+## Preflight
+
+Reset this demo's containers and volumes so the counts in this runbook are
+deterministic:
+
+```bash
+docker compose --profile dashboards down -v --remove-orphans
+```
+
+Port `9200` must also be unused before the demo starts:
+
+```bash
+docker ps --filter publish=9200 --format 'table {{.Names}}\t{{.Ports}}'
+lsof -nP -iTCP:9200 -sTCP:LISTEN
+```
+
+Both checks should return no listener. Docker Desktop can publish `9200` even
+when a local OpenSearch process already owns `localhost:9200`; in that case,
+the verification requests below reach the wrong cluster.
+
+---
+
 ## 1. Start the sources + target
 
 `--wait` blocks until all three pass their healthchecks (works the same
@@ -60,9 +81,9 @@ Postgres is already seeded. Neo4j needs two one-time commands — enable CDC
 on the database, then load the catalog graph:
 
 ```bash
-# Enable CDC (FULL enrichment) on the default database.
+# Enable CDC (DIFF enrichment) on the default database.
 docker compose exec -T neo4j cypher-shell -u neo4j -p ventstream \
-  "ALTER DATABASE neo4j SET OPTION txLogEnrichment 'FULL';"
+  "ALTER DATABASE neo4j SET OPTION txLogEnrichment 'DIFF';"
 
 # Load the product catalog (2,000 products, 4 categories, 20 suppliers, 3 regions).
 docker compose exec -T neo4j cypher-shell -u neo4j -p ventstream \
@@ -89,9 +110,8 @@ seconds.
 docker compose up -d --build engine-orders engine-products
 ```
 
-Watch them bootstrap and tail. The logs are intentionally verbose
-(`RUST_LOG=…=debug`, pretty format) and **never print credentials** —
-only host/db/slot identifiers, event counts, and document IDs:
+Watch them bootstrap and tail. The demo enables debug logging so source
+progress, projection work, and sink batches are visible:
 
 ```bash
 # Postgres → OpenSearch
@@ -182,7 +202,7 @@ curl -s 'http://localhost:9200/orders/_doc/shop.orders:%5B%22ord-0001%22%5D' \
 # → array now includes SKU-9999
 ```
 
-### 5d. Postgres — delete (reconciliation)
+### 5d. Postgres — delete an order
 
 ```bash
 # Delete the order's line items first (FK constraint), then the order.
@@ -236,7 +256,7 @@ curl -s 'http://localhost:9200/products/_search' -H 'content-type: application/j
 # (term on .keyword is exact; a `match` on "sup-1" would also hit sup-10, sup-11, …)
 ```
 
-### 5g. Neo4j — delete a product (reconciliation)
+### 5g. Neo4j — delete a product
 
 ```bash
 docker compose exec -T neo4j cypher-shell -u neo4j -p ventstream \
@@ -256,7 +276,7 @@ server-side with `pg_sleep`:
 ```bash
 # terminal 1 — one update roughly every 100 ms over a single connection
 while true; do
-  printf "UPDATE shop.orders SET status=(ARRAY['pending','paid','shipped','delivered'])[1+floor(random()*4)], total=round((random()*1000)::numeric,2) WHERE order_id='ord-0001';\nSELECT pg_sleep(0.1);\n"
+  printf "UPDATE shop.orders SET status=(ARRAY['pending','paid','shipped','delivered'])[1+floor(random()*4)], total=round((random()*1000)::numeric,2) WHERE order_id='ord-0002';\nSELECT pg_sleep(0.1);\n"
 done | docker compose exec -T postgres psql -U ventstream -d shop -q
 ```
 
@@ -269,15 +289,15 @@ Or watch the document change in lockstep:
 
 ```bash
 while true; do
-  curl -s 'http://localhost:9200/orders/_doc/shop.orders:%5B%22ord-0001%22%5D' \
+  curl -s 'http://localhost:9200/orders/_doc/shop.orders:%5B%22ord-0002%22%5D' \
     | jq -c '._source | {status, total}'
   sleep 0.2
 done
 ```
 
 Ctrl-C to stop. Tune the pace with `pg_sleep(0.1)` — `0.02` for ~20 ms,
-or drop it for max throughput. Each update still recomputes only that one
-document (`batch_size=1` in the logs); swap the `WHERE` to
+or drop it for max throughput. Each update recomputes only that one document;
+the dispatcher may combine nearby updates into one sink batch. Swap the `WHERE` to
 `order_id='ord-'||lpad((1+floor(random()*200))::int::text,4,'0')` to
 spread updates across all 200 orders.
 
@@ -329,9 +349,9 @@ curl -s localhost:9200/products/_count | jq .count
 docker compose exec -T postgres psql -U ventstream -d shop -c \
   "SELECT slot_name, active FROM pg_replication_slots;"
 
-# Any dead-lettered events?
-docker compose exec -T engine-orders   cat /var/lib/ventstream/dlq.jsonl 2>/dev/null | wc -l
-docker compose exec -T engine-products cat /var/lib/ventstream/dlq.jsonl 2>/dev/null | wc -l
+# Any dead-lettered events? This should print nothing.
+docker compose logs engine-orders engine-products \
+  | grep 'metric="dlq.write"' || true
 ```
 
 ---
@@ -356,10 +376,10 @@ docker compose --profile dashboards down -v --remove-orphans
 
 ## Notes
 
-- **No control plane here.** These engines stream standalone. To register
-  them with the VentStream control plane (metrics, pause/resume, fleet
-  view), set `VS_CONTROL_PLANE_URL` + `VS_CONTROL_PLANE_KEY` — see the
-  docs.
+- **No managed control plane here.** These engines run standalone. A
+  standalone process cannot be attached to VentStream Cloud in place; deploy
+  a managed agent when you need centralized configuration and lifecycle
+  operations.
 - **Security disabled for the demo.** OpenSearch runs with the security
   plugin off and Neo4j uses a trivial password. Never copy these settings
   to a real deployment.

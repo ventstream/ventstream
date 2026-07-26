@@ -11,7 +11,7 @@ real time over two transports — a **native WebSocket** protocol and
 
 ```mermaid
 flowchart LR
-    pub["Publisher<br/>(@ventstream/sdk)"] -- "publish vs.t.…" --> broker[("NATS or<br/>Redis Streams")]
+    pub["Publisher"] -- "publish vs.t.…" --> broker[("NATS or<br/>Redis Streams")]
     broker --> eng{{"engine"}}
     eng -- "role: ws<br/>:4040 /ws" --> raw["Raw WebSocket client"]
     eng -- "role: graphql<br/>:4041 /graphql/ws" --> apollo["Apollo Client"]
@@ -81,45 +81,24 @@ define; `actor`/`metadata` are optional):
 
 ## Publishing
 
-You don't hand-build the envelope above. Publishing takes a **minimal
-contract** — the `event` name and the instance `id`, plus optional opaque
-`data`:
+Publishers send the full envelope to an anchored broker subject. With the NATS
+CLI:
 
-```ts
-import { VentStream } from "@ventstream/sdk";
-
-const vs = new VentStream({ servers: "nats://localhost:4222", name: "orders-api" });
-await vs.connect();
-
-await vs.publish({
-  event: "orderStatusChanged",        // what happened (may be dotted)
-  id: "order_123",              // the instance id
-  data: { status: "active" }, // optional, opaque
-});
+```bash
+nats pub vs.t.acme.orderStatusChanged.order_123 \
+  '{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","event":"orderStatusChanged","tenant":"acme","entity_id":"order_123","occurred_at":"2026-01-01T00:00:00Z","received_at":"2026-01-01T00:00:00Z","schema_version":2,"data":{"status":"active"},"metadata":{}}'
 ```
 
-That's the whole publish surface. The SDK expands it into the full
-envelope and publishes to NATS. For Redis Streams, use `RedisVentStream`
-with the same publish arguments; see [Realtime brokers](/concepts/realtime-brokers#publishing-to-redis).
+The event name and entity ID form the final subject segments. The envelope must
+use the same tenant, event name, and entity ID as the subject. Generate a fresh
+ULID for every event and set `received_at` when publishing. Publisher services
+should derive the tenant from their authenticated workload context rather than
+accepting it from an end user.
 
-- `event` is the event name — no id baked in.
-- `id` becomes the **last** segment of the routing subject, so the event
-  lands on `vs.t.<tenant>.orderStatusChanged.`**`order_123`**. That's what makes
-  it individually targetable *and* wildcard-able (see
-  [Subscribing](#subscribing)) — and any number of clients can share it.
-- Everything else is derived or defaulted: `id`/ULID, `received_at`,
-  `schema_version`, `occurred_at` (now), `metadata` (empty); `actor` is
-  optional.
-- `tenant` is **not** in the payload — it comes from the publisher's
-  authenticated context, never caller input.
-
-(Reference implementation: `PublishInput` in `ventstream-protocol`;
-`into_event(tenant)` performs the expansion. The TS SDK mirrors it.)
-
-Any broker client works — the SDK is a convenience, not a requirement. NATS
-publishes the envelope on the anchored subject. Redis appends `subject` and
-`event` fields to the tenant stream defined in the
-[Redis wire contract](/concepts/realtime-brokers#redis-wire-contract).
+The repository contains `PublishInput` in `ventstream-protocol` as a reference
+for building the envelope. No VentStream npm publisher package is distributed
+in the current release. For Redis, append the same envelope to the tenant stream
+using the [Redis wire contract](/concepts/realtime-brokers#redis-wire-contract).
 
 ## Subscribing
 
@@ -176,8 +155,8 @@ publishes the envelope on the anchored subject. Redis appends `subject` and
       "matched": ["sub1"], "event": { /* envelope */ } }
     ```
 
-    The `@ventstream/client` package wraps this with auto-reconnect and
-    subscription replay. Endpoint: `ws://localhost:4040/ws`.
+    Production clients should implement reconnect, subscription replay, and
+    checkpoint persistence. Endpoint: `ws://localhost:4040/ws`.
   </Tab>
 </Tabs>
 
@@ -263,55 +242,34 @@ type OrderStatusChange {
 | What the subscription reads | Where it comes from | What the publisher does |
 |---|---|---|
 | `@vsSubscribe(subject: "…​{orderId}")` | routing subject | publish `event: "orderStatusChanged"`, `id` = the order id |
-| `$event.entityId` | envelope `entity_id` | (it's the `id` you publish — automatic) |
-| `$event.occurredAt` | envelope `occurred_at` | set automatically by the SDK |
+| `$event.entityId` | envelope `entity_id` | set it to the order ID |
+| `$event.occurredAt` | envelope `occurred_at` | set it to the business event time |
 | `$data.status` | the opaque `data` | **must include `status` in `data`** |
 
 So the **rule of thumb**: the `data` you must publish = the set of
 `$data.*` paths the subscription reads (here, just `status`). Everything
 else is envelope-supplied. Same contract, either transport:
 
-<Tabs>
-  <Tab title="SDK">
-    ```ts
-    await vs.publish({
-      event: "orderStatusChanged",
-      id: "order_1",                  // → entityId, and the subject's last segment
-      data: { status: "confirmed" },  // because a field maps $data.status
-    });
-    ```
+Any NATS client works. Build the full envelope and publish it to the composed
+subject:
 
-    The SDK is sugar — it mints the ULID `id`, stamps the timestamps +
-    `schema_version`, and composes the subject. You supply only
-    `event` + `id` + the `data` the subscription reads.
-  </Tab>
+```jsonc
+// subject: vs.t.acme.orderStatusChanged.order_1
+{
+  "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",   // a fresh 26-char ULID per event
+  "received_at": "2026-01-01T00:00:00Z",
+  "schema_version": 2,
+  "event": "orderStatusChanged",
+  "tenant": "acme",
+  "entity_id": "order_1",
+  "occurred_at": "2026-01-01T00:00:00Z",
+  "data": { "status": "confirmed" }
+}
+```
 
-  <Tab title="Raw NATS">
-    Any NATS client works — but you build the **full envelope** yourself
-    and publish it to the composed subject. The SDK normally fills the
-    boilerplate; raw, you provide it all:
-
-    ```jsonc
-    // subject: vs.t.acme.orderStatusChanged.order_1
-    {
-      // ── boilerplate the SDK normally generates for you ──
-      "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",   // a fresh 26-char ULID per event (mint one)
-      "received_at": "2026-01-01T00:00:00Z", // = now()
-      "schema_version": 2,                    // must equal the current version
-
-      // ── what you actually provide ──
-      "event": "orderStatusChanged",          // the event name
-      "tenant": "acme",                       // your tenant scope
-      "entity_id": "order_1",                 // the instance id  ($event.entityId)
-      "occurred_at": "2026-01-01T00:00:00Z",  // business time     ($event.occurredAt)
-      "data": { "status": "confirmed" }       // the fields subs read ($data.*)
-    }
-    ```
-
-    A bad `id`/`schema_version` or a subject that doesn't match the
-    envelope is **dropped** at decode.
-  </Tab>
-</Tabs>
+An invalid ULID or unsupported schema version is rejected during decoding.
+Routing follows the broker subject, so publishers must keep the subject and
+envelope fields consistent.
 
 The `orderEvents(orderId:) : Event!` variant reads nothing from `data`
 (it hands the whole envelope back), so its only requirement is the same
@@ -535,8 +493,8 @@ gracefully (not OOMKill) if scale-out hasn't caught up.** Validated on a
 Full list in the [engine env reference](/reference/engine-env).
 
 <Warning>
-**Auth is permissive in v1.** Any non-empty token is accepted and the
-tenant is trusted from the handshake / connection-init. JWT validation is
-planned — don't expose the gateways to untrusted clients without a proxy
-that enforces auth.
+The current gateway checks that the token and tenant are present but does not
+validate the token's issuer, signature, audience, or tenant claims. Do not
+expose it directly to untrusted clients. Put an authenticating proxy in front
+of the gateway and derive the allowed tenant from a verified identity.
 </Warning>

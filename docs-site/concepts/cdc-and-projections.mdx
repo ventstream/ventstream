@@ -31,10 +31,11 @@ give each agent a unique `VS_PG_SLOT`.
 
 ### Neo4j
 
-Neo4j 5.17+ Enterprise CDC via the `db.cdc.query` procedures. The
-engine polls the change feed on an interval and persists an opaque
-cursor string. Node and relationship creates/updates/deletes all
-arrive as change records.
+Neo4j CDC via the `db.cdc.query` procedures. The engine polls the change feed
+on an interval and persists an opaque cursor string. Use a Neo4j Enterprise
+release or AuraDB tier that provides `db.cdc.*`; the
+[Neo4j source guide](/connectors/sources/neo4j) covers the current deployment
+requirements.
 
 ```cypher
 ALTER DATABASE neo4j SET OPTION txLogEnrichment 'DIFF';

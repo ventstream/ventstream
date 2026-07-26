@@ -3,7 +3,8 @@ title: "Lifecycle state"
 description: "Revisioned desired state, independently reported observed state, and durable operation progress."
 ---
 
-Fleet separates what an operator requested from what an engine has observed.
+VentStream Cloud separates what an operator requested from what an engine has
+observed.
 
 ## Desired run state
 
@@ -21,7 +22,7 @@ ignores stale revisions, and treats redelivery of the same revision idempotently
 
 Agents report `starting`, `bootstrapping`, `running`, `paused`, `drained`,
 `degraded`, or `failed` together with the desired revision they are reconciling.
-Fleet does not infer successful pause or drain from heartbeat freshness.
+Cloud does not infer successful pause or drain from heartbeat freshness.
 
 ## Operation state
 
@@ -31,8 +32,8 @@ queued -> delivered -> acknowledged -> running -> succeeded
 ```
 
 Operations can also expire. Queued operations can be canceled; once execution has
-crossed a side-effect boundary, Fleet does not claim cancellation without an agent
-result. Agent receipts are persisted before acknowledgement so reconnect delivery
+crossed a side-effect boundary, Cloud does not claim cancellation without an
+agent result. Agent receipts are persisted before acknowledgement so reconnect delivery
 does not repeat a completed destructive action.
 
 Use `ventstreamctl ... --wait` when a script requires terminal success rather than

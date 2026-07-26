@@ -8,7 +8,7 @@ engine's primary capabilities.
 [`stack/`](./stack/) runs Postgres and Neo4j sources, two VentStream CDC
 agents, and OpenSearch. It bootstraps denormalized order and product indexes,
 then demonstrates row updates, relationship fan-out, multi-hop recomposition,
-and delete reconciliation.
+and deletes.
 
 Follow the tested [docs quickstart](../docs-site/quickstart.mdx) from top to
 bottom.

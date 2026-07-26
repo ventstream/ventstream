@@ -1,16 +1,16 @@
 ---
-title: "Fleet security model"
-description: "Identity, tenant isolation, certificate, and operational controls for Fleet."
+title: "Cloud security model"
+description: "Identity, tenant isolation, certificate, and operational controls for VentStream Cloud."
 ---
 
-Fleet can change production engine behavior, so every control path is authenticated,
-authorized, revision-protected, and auditable.
+VentStream Cloud can change production engine behavior, so every control path is
+authenticated, authorized, revision-protected, and auditable.
 
 ## Identities
 
 - Humans authenticate with short-lived built-in or enterprise OIDC tokens.
 - Automation uses explicitly configured OIDC workload providers and scoped service
-  accounts; V1 has no long-lived personal API keys.
+  accounts; the current Cloud API does not issue long-lived personal API keys.
 - Agents use deployment-bound X.509 identities over mTLS after one-time enrollment.
 - Agent private keys remain in the workload environment and are never returned to
   the control API.
@@ -32,10 +32,10 @@ migrations. A separate one-shot migrator uses a schema-owning role.
 - Enrollment tokens, access tokens, private keys, and connector secrets are
   redacted and excluded from generic replay storage.
 
-Production deployments must use HTTPS ingress, restricted gateway exposure,
-managed secrets, external database backups, immutable image digests, and monitored
-audit/operation streams. Compose defaults and generated certificates are strictly
-for local development.
+VentStream Cloud uses HTTPS, workload mTLS, managed secrets, immutable release
+artifacts, and monitored audit and operation streams. Customer workloads should
+keep connector credentials in their own secret manager, restrict inbound
+exposure, and use the image digest supplied by the Cloud installation profile.
 
 ## Built-in account controls
 
@@ -46,11 +46,6 @@ multi-key signing keyring with a documented rotation sequence. Password reset
 increments the account credential generation so previously issued access tokens
 are rejected immediately.
 
-Fleet does not implement first-party MFA in the current release. Organizations
-that require MFA, conditional access, or centralized employee lifecycle policy
-should configure enterprise OIDC and enforce those controls at their identity
-provider.
-
-When upgrading a pre-password-recovery control plane, use the documented
-two-phase API and worker rollout before enabling reset routes and delivery. Fresh
-installations can enable recovery in their first deployment.
+Organizations that require MFA, conditional access, or centralized employee
+lifecycle policy can configure enterprise OIDC and enforce those controls at
+their identity provider.

@@ -13,7 +13,8 @@
 //      prove HTTP queries work and the manifest is loaded.
 //   3. Starts a subscription on a pattern.
 //   4. Publishes three events via @ventstream/sdk.
-//   5. Verifies all three arrive at the Apollo subscription callback.
+//   5. Verifies those three event IDs arrive at the Apollo subscription
+//      callback, independently of any retained events replayed first.
 
 import { ApolloClient, InMemoryCache, HttpLink, gql, split } from "@apollo/client/core/index.js";
 import { GraphQLWsLink } from "@apollo/client/link/subscriptions/index.js";
@@ -84,8 +85,23 @@ for (const s of discovery.data.availableSubjects) {
 // 2. Subscription — proves WS transport + JetStream consumer path.
 console.log("\n— Subscribing to orders.order.status_changed.* —");
 const received = [];
-const done = new Promise((resolve) => {
-  let n = 0;
+const receivedById = new Map();
+const publishedIds = new Set();
+let resolvePublished;
+const publishedDone = new Promise((resolve) => {
+  resolvePublished = resolve;
+});
+
+function checkPublishedEvents() {
+  if (
+    publishedIds.size === 3 &&
+    [...publishedIds].every((id) => receivedById.has(id))
+  ) {
+    resolvePublished();
+  }
+}
+
+{
   const obs = apollo.subscribe({
     query: gql`
       subscription OnOrderStatus($pattern: String!) {
@@ -110,24 +126,24 @@ const done = new Promise((resolve) => {
       const ev = data?.events;
       if (!ev) return;
       received.push(ev);
+      receivedById.set(ev.id, ev);
       console.log(
         `  ← ${ev.subject}\n    entity_id=${ev.entityId}  data=${JSON.stringify(ev.data)}`,
       );
-      n += 1;
-      if (n >= 3) resolve();
+      checkPublishedEvents();
     },
     error(err) {
       console.error("subscription error:", err);
     },
   });
-});
+}
 
 // Give the subscription's WS upgrade + connection_init + consumer
 // create a beat before publishing.
 await new Promise((r) => setTimeout(r, 600));
 
 // 3. Publish three events through the standard SDK.
-console.log("\n— Publishing 3 events via @ventstream/sdk —");
+console.log("\n— Publishing 3 events via the local SDK —");
 const vs = new VentStream({ servers: NATS_URL, name: "apollo-demo" });
 await vs.connect();
 for (let i = 1; i <= 3; i++) {
@@ -139,11 +155,17 @@ for (let i = 1; i <= 3; i++) {
     actor: { kind: "user", id: "user_456" },
     data: { from: "pending", to: "confirmed", attempt: i },
   });
+  publishedIds.add(id);
   console.log(`  → id=${id} subject=${subject}`);
+  checkPublishedEvents();
 }
 
-await done;
+await publishedDone;
 await vs.close();
 await apollo.stop();
-console.log(`\n[demo] received ${received.length} events via Apollo Client ✓`);
+const otherMatching = received.length - publishedIds.size;
+if (otherMatching > 0) {
+  console.log(`\n[demo] observed ${otherMatching} other matching event(s) while connected`);
+}
+console.log("[demo] received all 3 newly published events via Apollo Client ✓");
 process.exit(0);

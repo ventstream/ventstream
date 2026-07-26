@@ -13,7 +13,8 @@ state, and the supervisor renews certificates before expiry.
 2. Request an enrollment grant for that deployment.
 3. Put the returned token in a short-lived Kubernetes Secret or equivalent secret
    injection mechanism.
-4. Start the managed-agent enrollment init container with the gateway server CA.
+4. Start the managed-agent enrollment init container using the trust mode in the
+   Cloud installation profile.
 5. The init container verifies server TLS, redeems the grant, and persists identity
    state. The main engine container never mounts the enrollment token.
 6. The supervisor opens an outbound mTLS control stream and reports its instance.
@@ -29,12 +30,10 @@ successful redemption. Do not place it in a configuration revision, shell histor
 log, image, or GitOps file.
 </Warning>
 
-The current managed-agent chart continues to reference the consumed enrollment
-Secret object during later pod starts. Keep that object present while
-`fleet.enrollment.enabled=true`; deleting it prevents the init container from
-starting even though identity state is already on the PVC. The retained token is
-no longer redeemable. State-only chart bootstrap without this Secret is not yet
-supported.
+Cloud gateways use public WebPKI trust by default. Private gateway deployments
+use a customer-provided CA Secret. After the first successful enrollment, the
+chart detects persisted identity before reading the bootstrap files, so the
+consumed grant Secret and optional private CA Secret can be removed.
 
 The agent persists its private key and management state on its own volume. If the
 pod restarts, it reconnects with the existing identity. If the workload identity is
@@ -46,5 +45,5 @@ that already has trusted running state.
 
 One enrollment grant bootstraps one credential state. Do not use one grant Secret
 to start multiple new replicas. Automatic chart enrollment currently supports one
-replica; replicated realtime requires a Fleet-compatible pre-provisioned identity
+replica; replicated realtime requires separately provisioned managed identities
 or the standalone realtime gateway chart.

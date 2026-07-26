@@ -18,16 +18,21 @@ with `VS_OS_ENDPOINT`.
 
 ## Source requirements
 
-Neo4j **5.17+ Enterprise** with CDC enabled per database. For VentStream's
-denormalized projections, **`DIFF` is the recommended enrichment mode** (see
-[below](#diff-vs-full-enrichment) for why):
+VentStream uses the `db.cdc.*` procedures, so use a release listed in the
+[Neo4j CDC documentation](https://neo4j.com/docs/cdc/current/). This includes
+supported Neo4j Enterprise releases and the AuraDB Business Critical and
+Virtual Dedicated Cloud tiers. Enable CDC for each database. For denormalized
+projections, `DIFF` is the recommended enrichment mode:
 
 ```cypher
 ALTER DATABASE neo4j SET OPTION txLogEnrichment 'DIFF';
 ```
 
-CDC is Enterprise-only (not Community, not Aura Free/Pro). Confirm the
-procedures exist:
+Aura administrators enable CDC from the instance settings rather than with the
+Cypher command above; see
+[CDC on Aura](https://neo4j.com/docs/cdc/current/get-started/aura/). CDC is not
+available on AuraDB Free or Professional. Whichever deployment you use, confirm
+that the procedures are available:
 
 ```cypher
 CALL db.cdc.current() YIELD id RETURN id;
@@ -35,38 +40,18 @@ CALL db.cdc.current() YIELD id RETURN id;
 
 ### `DIFF` vs `FULL` enrichment
 
-`txLogEnrichment` controls how much each change writes into the transaction
-log that CDC reads:
+`txLogEnrichment` controls how much each change records in the transaction log:
 
 - **`DIFF`** — records only what changed (changed properties; the full
-  before-state on deletes; labels and keys always present). About **+50%**
-  transaction-log write volume.
+  before-state on deletes; labels and keys remain available).
 - **`FULL`** — records a complete before+after copy of every changed entity.
-  About **+75%** tx-log write, and on update-heavy workloads with wide nodes
-  it's several× more than `DIFF` (we measured **~4× more** on the update
-  portion of a wide-node workload — `FULL` re-logs the whole node on every
-  update, `DIFF` only the changed field).
 
-**Use `DIFF`.** This connector builds denormalized documents by **re-running
-your projection Cypher against the live graph** on every change — the CDC
-event is only a *trigger* (which element changed), never the source of the
-document's data. So `DIFF`'s smaller payload loses nothing: deletes still
-carry the labels needed to tombstone, and every value is re-read from the
-graph. Validated end-to-end on a realistic shape across create / update /
-delete, multi-hop fan-out, temporal effective-dating (`fromDate`/`thruDate`),
-and multi-primary recompose — identical results to `FULL`.
+Use `DIFF` for projection mode. The connector re-runs the projection Cypher
+against the live graph after a change; the CDC record identifies what changed
+but is not used as the projected document. `FULL` therefore adds transaction-log
+volume without changing the projection result.
 
-Why `DIFF` is more efficient:
-
-- **Less tx-log written per commit.** `FULL` re-logs the entire node
-  (including untouched properties) on every update; `DIFF` logs only the
-  delta. That means lower write amplification on the commit path, less
-  transaction-log disk, and less data the CDC poll reads back.
-- **No memory difference.** Neo4j's resident memory is dominated by heap +
-  page cache; enrichment mode doesn't move it (measured ~equal). The saving
-  is purely disk and write I/O, not RAM.
-- **Bootstrap is unaffected.** The snapshot scan reads the graph directly
-  (not the tx log), so full-sync behaves identically under `DIFF` or `FULL`.
+Bootstrap is unaffected because the snapshot reads the graph directly.
 
 Choose `FULL` only if you consume the **raw CDC tail** (no projection spec)
 and a downstream consumer needs the complete entity state on every event —
@@ -81,9 +66,9 @@ production user usually isn't an admin, so split the setup:
 
 | Step | Who | Privilege needed |
 |------|-----|------------------|
-| Run Neo4j 5.17+ **Enterprise** | **operator** (infra) | — |
+| Run a Neo4j edition or AuraDB tier with CDC | **operator** (infra) | — |
 | `ALTER DATABASE … SET OPTION txLogEnrichment 'DIFF'` | **operator** (one-time) | `admin` / `ALTER DATABASE` |
-| Read the CDC stream (`db.cdc.current`, `db.cdc.query`) | **engine** | `EXECUTE PROCEDURE db.cdc.*` |
+| Read the CDC stream (`db.cdc.current`, `db.cdc.query`) | **engine** | execute and boosted execute on `db.cdc.*` |
 | Run the projection + snapshot Cypher | **engine** | `MATCH` (read) on the touched labels/rels |
 
 <Warning>
@@ -104,6 +89,7 @@ CREATE ROLE ventstream_reader;
 GRANT ACCESS ON DATABASE neo4j TO ventstream_reader;
 GRANT MATCH {*} ON GRAPH neo4j ELEMENTS * TO ventstream_reader;   -- read all labels/rels
 GRANT EXECUTE PROCEDURE db.cdc.* ON DBMS TO ventstream_reader;
+GRANT EXECUTE BOOSTED PROCEDURE db.cdc.query ON DBMS TO ventstream_reader;
 GRANT ROLE ventstream_reader TO ventstream;                       -- the engine's login
 ```
 
