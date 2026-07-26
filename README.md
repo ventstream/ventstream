@@ -70,6 +70,8 @@ Choose a deployment mode in the
   native WebSocket and GraphQL roles.
 - **Fleet-managed:** use the separately distributed VentStream Fleet control
   plane and supervisor, then administer enrolled engines with `ventstreamctl`.
+  The CLI executable is available without GitHub authentication from the
+  [public VentStream releases repository](https://github.com/ventstream/ventstream-releases).
 
 Tagged releases publish the multi-architecture engine image at
 `ghcr.io/ventstream/ventstream:<version>` and the standalone realtime
