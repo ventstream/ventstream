@@ -2,13 +2,23 @@
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
   "name": "VentStream",
-  "description": "Real-time change-data capture, denormalization, WebSocket, and GraphQL subscription engine for PostgreSQL, Neo4j, MongoDB, MySQL, and Kafka sources.",
+  "description": "Operational data streaming for change-data capture, joined projections, native WebSockets, GraphQL subscriptions, and managed engine fleets.",
   "colors": {
-    "primary": "#2563EB",
-    "light": "#60A5FA",
-    "dark": "#1E40AF"
+    "primary": "#2FCF88",
+    "light": "#50DCA0",
+    "dark": "#24B978"
+  },
+  "logo": {
+    "light": "/images/ventstream-logo-light.svg",
+    "dark": "/images/ventstream-logo-dark.svg",
+    "href": "https://ventstream.dev"
   },
   "favicon": "/images/favicon.svg",
+  "seo": {
+    "metatags": {
+      "canonical": "https://ventstream.dev/docs"
+    }
+  },
   "navigation": {
     "tabs": [
       {
@@ -112,6 +122,10 @@
   },
   "navbar": {
     "links": [
+      {
+        "label": "Website",
+        "href": "https://ventstream.dev"
+      },
       {
         "label": "GitHub",
         "href": "https://github.com/ventstream/ventstream"

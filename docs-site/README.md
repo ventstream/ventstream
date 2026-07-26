@@ -13,6 +13,9 @@ cd docs-site
 mint dev             # → http://localhost:3000 (or --port)
 ```
 
+The local server hosts documentation at `/`. Mintlify applies the `/docs` base
+path only to hosted preview and production deployments.
+
 ## Validate
 
 ```bash
@@ -31,11 +34,22 @@ mint broken-links    # documentation link scan
 Page groups: **Get started**, **Concepts**, **Connectors**, **Guides**,
 **Fleet management**, **Deploy**, **Reference**, **Operations**.
 
-## Deploy
+## Deploy at `ventstream.dev/docs`
 
-Not hosted yet — read it locally with `mint dev` (above). Mintlify is
-hosted-only (no static export / self-host); when we publish, it'll be by
-connecting this repo in the Mintlify dashboard. The site is the source of
-truth for public product docs. Files under `docs/` are engineering contracts,
-test guides, and release evidence; `docs/deployment.html` only redirects readers
-to the maintained deployment pages here.
+The site is rendered by Mintlify and reverse-proxied through the VentStream
+Vercel project so public URLs remain under `https://ventstream.dev/docs`.
+
+1. Connect the `ventstream/ventstream` repository in Mintlify.
+2. Enable the monorepo setting and use `/docs-site` as the documentation path.
+3. Enable **Host at `/docs`** in Mintlify domain settings and add
+   `ventstream.dev`.
+4. Set the resulting Mintlify project identifier as `MINTLIFY_SUBDOMAIN` in the
+   `ventstream-web` Vercel project. The Vercel rewrite targets
+   `https://<identifier>.mintlify.site/docs`.
+5. Deploy the website and verify `/docs`, `/docs/quickstart`,
+   `/docs/sitemap.xml`, and `/docs/llms.txt`.
+
+This directory is the source of truth for public product documentation. Files
+under `docs/` are engineering contracts, test guides, and release evidence;
+`docs/deployment.html` only redirects readers to the maintained deployment pages
+here.
