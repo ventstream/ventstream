@@ -13,18 +13,70 @@ A standalone engine has no Fleet API and cannot be administered with
 
 ## Install
 
-`ventstreamctl` is distributed with VentStream Fleet as a signed,
-platform-specific binary. It is not built from this open-core engine
-repository. Install the archive matching the Fleet release and verify its
-checksum and provenance using the release instructions supplied with that
-version:
+`ventstreamctl` binaries are published in the public
+[VentStream releases repository](https://github.com/ventstream/ventstream-releases).
+Downloading and installing the CLI does not require a GitHub account, token, or
+access to the private Fleet source repository.
+
+| Operating system | Architectures |
+|---|---|
+| macOS | Apple Silicon (`arm64`) and Intel (`amd64`) |
+| Linux | `arm64` and `amd64` |
+| Windows | `amd64` |
+
+### macOS and Linux
+
+Install the latest public release:
 
 ```bash
-ventstreamctl version
+curl -fsSL \
+  https://raw.githubusercontent.com/ventstream/ventstream-releases/main/install.sh |
+  sh
+
+export PATH="$HOME/.local/bin:$PATH"
+ventstreamctl --version
 ```
 
-Place the verified binary on `PATH`. A standalone engine does not require
-`ventstreamctl`.
+The installer detects the operating system and architecture, downloads the
+matching archive and `SHA256SUMS`, verifies the archive checksum and binary
+version, and stages the executable into `$HOME/.local/bin`. It does not use
+`sudo`, modify a shell profile, or send GitHub credentials.
+
+To use a different install directory:
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/ventstream/ventstream-releases/main/install.sh |
+  VENTSTREAMCTL_INSTALL_DIR="$HOME/bin" sh
+```
+
+Rerun the installer to upgrade to the latest public release. For a reproducible
+installation, pin both the installer and binary version:
+
+```bash
+VERSION=0.2.8
+curl -fsSL \
+  "https://raw.githubusercontent.com/ventstream/ventstream-releases/v${VERSION}/install.sh" |
+  VENTSTREAMCTL_VERSION="$VERSION" sh
+```
+
+Replace `0.2.8` with the release selected for your environment.
+
+### Windows
+
+Download `ventstreamctl-<version>-windows-amd64.zip` from
+[GitHub Releases](https://github.com/ventstream/ventstream-releases/releases/latest),
+extract `ventstreamctl.exe`, and place it in a directory on `PATH`.
+
+### Verify a release
+
+The installer performs checksum verification automatically. For manual
+checksum, immutable-release, attestation, and SBOM verification, follow the
+[public verification guide](https://github.com/ventstream/ventstream-releases/blob/main/docs/verification.md).
+
+The CLI executable is public, but it still requires a reachable Fleet control
+plane and an authorized user account to administer managed engines. A standalone
+engine does not require `ventstreamctl`.
 
 ## Authenticate
 
