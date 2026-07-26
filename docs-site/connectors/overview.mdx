@@ -25,7 +25,8 @@ the engine or the spec model.
 | **Source** | [MySQL / MariaDB](/connectors/sources/mysql) | row-based binlog replication |
 | **Source** | [Kafka / Redpanda](/connectors/sources/kafka) | Debezium envelopes or raw JSON topics |
 | **Sink** | [OpenSearch / Elasticsearch](/connectors/sinks/opensearch) | shared `_bulk` API |
-| **Real-time bus** | NATS (JetStream) | see [Real-time subscriptions](/concepts/real-time-subscriptions) |
+| **Real-time broker** | NATS Core / JetStream | live or replayable delivery |
+| **Real-time broker** | Redis Streams | replayable delivery with shared tenant tailers |
 
 <Info>
 This matrix is the implemented surface for the current release. The architecture
@@ -53,6 +54,19 @@ release test matrix.
   </Card>
   <Card title="Kafka / Redpanda" icon="arrows-left-right" href="/connectors/sources/kafka">
     Consume Debezium change envelopes or raw JSON with sink-gated offset commits.
+  </Card>
+</CardGroup>
+
+## Realtime brokers
+
+<CardGroup cols={2}>
+  <Card title="NATS" icon="tower-broadcast" href="/concepts/realtime-brokers">
+    Use NATS Core for live-only delivery or JetStream for acknowledged,
+    cursor-based replay.
+  </Card>
+  <Card title="Redis Streams" icon="database" href="/concepts/realtime-brokers">
+    Use Redis Streams for cursor-based replay when Redis is already part of the
+    operating environment.
   </Card>
 </CardGroup>
 

@@ -94,7 +94,7 @@
   <!-- Customer boundary -->
   <rect class="plane" x="24" y="320" width="1352" height="510" rx="8"/>
   <text class="eyebrow teal" x="44" y="346">CUSTOMER WORKLOAD ENVIRONMENT · DATA PLANE</text>
-  <text class="small" x="44" y="365">source records, destination documents, NATS events, client traffic, connector secrets, and private keys remain here</text>
+  <text class="small" x="44" y="365">source records, destination documents, broker events, client traffic, connector secrets, and private keys remain here</text>
 
   <!-- Managed supervisor and control stream -->
   <rect class="engine" x="492" y="382" width="416" height="102" rx="6"/>
@@ -153,8 +153,9 @@
   <text class="mono" x="131" y="768" text-anchor="middle">publish vs.t.&gt;</text>
 
   <rect class="realtime" x="270" y="703" width="156" height="76" rx="6"/>
-  <text class="label orange" x="348" y="731" text-anchor="middle">NATS JetStream</text>
-  <text class="small" x="348" y="752" text-anchor="middle">durable event bus</text>
+  <text class="label orange" x="348" y="727" text-anchor="middle">NATS / Redis</text>
+  <text class="small" x="348" y="747" text-anchor="middle">Core · JetStream · Streams</text>
+  <text class="small" x="348" y="763" text-anchor="middle">live or replayable delivery</text>
 
   <rect class="engine" x="492" y="684" width="416" height="114" rx="6"/>
   <text class="eyebrow" x="510" y="707">VENTSTREAM ENGINE CHILD · ROLE=ws,graphql</text>

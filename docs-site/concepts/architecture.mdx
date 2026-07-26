@@ -8,13 +8,13 @@ The separation is operational, security-sensitive, and deliberate.
 
 <img
   src="/images/architecture.svg"
-  alt="VentStream architecture showing the optional Fleet management plane above a customer-hosted data plane. Fleet administers managed agents over outbound mTLS while CDC records and realtime NATS events flow only through the VentStream engine inside the workload environment."
+  alt="VentStream architecture showing the optional Fleet management plane above a customer-hosted data plane. Fleet administers managed agents over outbound mTLS while CDC records and realtime broker events flow only through the VentStream engine inside the workload environment."
   className="rounded-lg"
 />
 
 The purple path is management traffic. Teal and green show the CDC path from
 source connectors through projection and sink acknowledgement. Orange shows the
-independent NATS-to-WebSocket/GraphQL delivery path. Neither data path enters
+independent broker-to-WebSocket/GraphQL delivery path. Neither data path enters
 Fleet. The same engine binary can also run standalone without a supervisor or
 control-plane dependency.
 
@@ -24,9 +24,10 @@ An engine process runs one or more explicit roles:
 
 - `cdc` reads a source cursor/change stream, transforms records and joins, and
   writes destinations such as OpenSearch.
-- `ws` and `graphql` consume NATS subjects and serve realtime clients.
+- `ws` and `graphql` consume NATS subjects or Redis Streams and serve realtime
+  clients.
 
-Connector credentials, source data, destination documents, NATS messages, and
+Connector credentials, source data, destination documents, broker messages, and
 client traffic remain in the workload environment. Cursor and join state are
 persisted locally or in the source system so restarts can resume correctly.
 

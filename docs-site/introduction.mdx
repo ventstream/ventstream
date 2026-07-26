@@ -30,7 +30,7 @@ these are the first implemented backends, and more are planned:
 - **Capture sources:** PostgreSQL logical replication, Neo4j CDC, MongoDB change
   streams, MySQL/MariaDB row binlog, and Kafka/Redpanda topics
 - **Target stores:** OpenSearch / Elasticsearch
-- **Real-time bus:** NATS (JetStream)
+- **Real-time brokers:** NATS Core, NATS JetStream, and Redis Streams
 
 The rest of these docs use those backends in examples, but the concepts
 are backend-agnostic.
@@ -55,8 +55,9 @@ means every team re-implements the same WebSocket delivery, subscription
 lifecycle, reconnect, and backpressure handling — usually subtly wrong.
 
 VentStream replaces both with one declarative model and a streaming
-engine: a change reaches its destination in **roughly a second**, and
-only the affected data is recomputed or delivered.
+engine. Only the affected data is recomputed or delivered, and latency is
+controlled by the source polling, projection, dispatch, broker, and sink
+settings selected for the workload.
 
 ## What makes it different
 

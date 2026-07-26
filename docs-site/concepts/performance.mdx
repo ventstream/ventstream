@@ -19,6 +19,42 @@ magnitude* and **measure on your own infrastructure** — the method is at
 the bottom of this page.
 </Warning>
 
+## Current sustainability matrix
+
+The July 2026 container matrix exercised the final adaptive-memory engine with
+two vCPUs per engine case. CDC workloads ran under a 512 MiB hard limit and
+realtime workloads under a 1 GiB hard limit. A case passed only when the
+expected sink documents or client deliveries were present; realtime cases also
+required zero gaps and zero duplicates.
+
+### Direct CDC
+
+| Source | Verified records | Throughput | RSS high-water mark |
+|---|---:|---:|---:|
+| PostgreSQL, SQL mode | 1,000,000 | 29,551/s | 256.5 MiB |
+| MySQL, SQL mode | 500,000 | 6,435/s | 28.2 MiB |
+| MongoDB | 1,000,000 | 56,815/s | 248.5 MiB |
+| Kafka / Redpanda | 2,000,000 | 62,950/s | 406.4 MiB |
+| Neo4j | 100,000 | 3,237/s | 59.8 MiB |
+
+### Realtime fan-out at 200 clients
+
+Each case published 20,000 events and verified 4,000,000 client deliveries.
+
+| Client protocol | Broker | Deliveries/s | RSS high-water mark | Gaps / duplicates |
+|---|---|---:|---:|---:|
+| Native WebSocket | NATS Core | 392,613 | 493.5 MiB | 0 / 0 |
+| Native WebSocket | NATS JetStream | 281,205 | 99.6 MiB | 0 / 0 |
+| GraphQL WebSocket | NATS JetStream | 199,698 | 119.6 MiB | 0 / 0 |
+| Native WebSocket | Redis Streams | 366,477 | 114.2 MiB | 0 / 0 |
+| GraphQL WebSocket | Redis Streams | 238,315 | 342.0 MiB | 0 / 0 |
+
+The complete direct, joined-projection, fan-out, CPU, cgroup, and memory results
+are in the
+[general sustainability report](https://github.com/ventstream/ventstream/blob/main/benchmarks/container-matrix/GENERAL-SUSTAINABILITY-RESULTS-2026-07-21.md).
+The public [performance page](https://ventstream.dev/performance) also includes
+the sustained fault-recovery validation.
+
 ## Why it's fast
 
 - **Bootstrap is one optimized query.** The snapshot projects the whole
@@ -33,11 +69,12 @@ the bottom of this page.
   into bulk requests and upserted by deterministic doc id, so retries
   and duplicate CDC deliveries are safe no-ops.
 
-## Indicative numbers
+## Projection microbenchmarks
 
-Final engine, local Docker, single node. PG projections embed N child
-tables; the Neo4j projection walks a 3-hop graph (`User → Membership
-→ Group`, and `User → Membership ← Grant ← admin User`).
+These focused local tests isolate projection shape and latency behavior. PG
+projections embed N child tables; the Neo4j projection walks a 3-hop graph
+(`User → Membership → Group`, and
+`User → Membership ← Grant ← admin User`).
 
 ### Bootstrap (one-shot scan)
 
