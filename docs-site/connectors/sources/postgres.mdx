@@ -52,9 +52,9 @@ GRANT USAGE ON SCHEMA shop TO ventstream;
 GRANT SELECT ON ALL TABLES IN SCHEMA shop TO ventstream;
 ```
 
-That's everything the operator does. The engine — logging in as
-`ventstream` — then creates the slot and starts streaming on its own; you
-run no commands for steps 4–5.
+The engine then connects as `ventstream`, creates its slot, and starts
+streaming. No additional operator commands are required for the final two
+steps.
 
 Every table the projection touches must be in the publication (step 2) —
 otherwise its changes never reach the engine.
@@ -131,18 +131,25 @@ if you want the one-shot snapshot of existing rows.
     **3. Create the publication** as the table owner (or `rds_superuser`).
 
     <Warning>
-    **Point the engine at the writer (cluster) endpoint** —
-    `…cluster-….rds.amazonaws.com`, not a reader. Replication slots live
-    only on the primary. Also note Aurora has historically **not**
-    carried logical slots across a **failover**; after one, the agent may
-    need to re-bootstrap. Verify slot-failover support for your Aurora
-    engine version before relying on it in prod.
+    Point the engine at the writer endpoint, not a read-only endpoint.
+    Logical-slot behavior during failover depends on the Aurora PostgreSQL
+    version and configuration. Rehearse a writer failover and verify that the
+    agent either resumes from its slot or performs the expected controlled
+    re-bootstrap before using the deployment in production.
     </Warning>
+
+    AWS documents the required parameter group, reboot, slot, and monitoring
+    steps in
+    [Setting up logical replication for Aurora PostgreSQL](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraPostgreSQL.Replication.Logical.Configure.html).
   </Accordion>
   <Accordion title="Cloud SQL for PostgreSQL" icon="google">
     - Set the `cloudsql.logical_decoding = on` flag, then restart.
     - `ALTER USER <engine_role> WITH REPLICATION;`
     - Grant `SELECT` on the published tables to the engine role.
+
+    Review Google's
+    [logical replication and decoding guide](https://cloud.google.com/sql/docs/postgres/replication/configure-logical-replication)
+    for version-specific restart, replica, and failover limitations.
   </Accordion>
 </AccordionGroup>
 
@@ -318,9 +325,8 @@ If the change was purely additive and the YAML didn't need editing, a
 `POST /admin/resync` re-scans the tables without a restart.
 
 <Note>
-Operator-selectable drift **responses** (route affected events to the DLQ,
-or halt loudly instead of warning) are planned. Today the engine detects
-and warns; recovery is the resync above.
+Schema-drift handling is currently warn-only. Review the emitted drift event,
+update the projection if needed, and use the resync procedure above.
 </Note>
 
 ## Child-row deletes

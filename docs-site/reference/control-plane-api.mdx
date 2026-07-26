@@ -1,12 +1,11 @@
 ---
-title: "Fleet API"
-description: "Versioned HTTP API conventions and contract for VentStream Fleet."
+title: "VentStream Cloud API"
+description: "Versioned API conventions for managed VentStream resources and operations."
 ---
 
-Fleet exposes a REST/JSON API under `/v1`. `ventstreamctl` and automation use this
-public API; neither receives privileged private endpoints.
-The versioned OpenAPI contract is distributed with each Fleet release and is
-available to operators through the Fleet release channel.
+VentStream Cloud exposes a REST/JSON API under `/v1`. `ventstreamctl`, the
+dashboard, and approved automation use the same organization-scoped resource and
+operation model.
 
 ## Contract rules
 
@@ -40,7 +39,7 @@ pipelines, configuration revisions, deployments, enrollment, identities, and
 durable operations. The current CLI does not expose every V1 administration
 resource.
 
-Use the checked API contract for:
+Use the dashboard or API for:
 
 - Organization invitations and invite acceptance
 - Role bindings and membership revocation

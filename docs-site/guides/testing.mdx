@@ -9,26 +9,28 @@ validate the engine — adapt it to your own projection.
 
 ## Automated integration suite
 
-The recipe below is also codified as an automated, environment-agnostic
-suite under `crates/ventstream/tests/`. Each test spins its own
-Postgres / OpenSearch / Neo4j via **testcontainers** and drives the real
-engine binary end-to-end — no pre-staged stack, just a Docker daemon.
-It covers bootstrap, child-row deletes (incl. composite-key reconcile),
-crash recovery, the Neo4j edge/node-delete path, and connection
-resilience — killing the source's replication connection mid-stream and
-asserting the engine reconnects in-process and keeps delivering.
+The repository includes Docker-backed integration suites under
+`crates/ventstream/tests/`. They start isolated source and OpenSearch
+containers and drive the engine end to end. Coverage includes bootstrap, live
+changes, deletes, cursor restart, join-state recovery, and source-specific
+failure handling.
 
 These tests are marked `#[ignore]` so the fast unit run skips them; run
-them explicitly:
+one source or the complete sequential matrix explicitly:
 
 ```bash
-# needs a running Docker daemon
-cargo test -p ventstream --test it_postgres -- --ignored --test-threads=1
-cargo test -p ventstream --test it_neo4j    -- --ignored --test-threads=1
+./scripts/test-sources.sh postgres
+./scripts/test-sources.sh neo4j
+./scripts/test-sources.sh mongodb
+./scripts/test-sources.sh mysql
+./scripts/test-sources.sh kafka
+
+# Run every source sequentially to bound local memory use.
+./scripts/test-sources.sh all
 ```
 
-CI runs them in a dedicated `integration` job (ubuntu, Docker-backed);
-the cross-platform `test` job skips them automatically.
+These are local qualification tests, not part of the default pull-request
+suite. Run the source relevant to your change before release.
 
 ## The matrix
 
@@ -53,16 +55,16 @@ right — it catches both failure modes:
 - **over-propagation** — the sibling wrongly changed (hot-endpoint bug)
 - **under-propagation** — the target didn't change (missed fan-out)
 
-Every hot-endpoint edge in the scale validation passed this: changing
-one primary's edge updated that primary and left its siblings alone.
+Run this check for every shared endpoint in the projection. A property change on
+a shared node is different: it should update every document that embeds that
+property.
 
 ## Latency expectations
 
-Steady-state propagation is **~1 second** end-to-end (source commit →
-CDC read → projection → bulk write). A change to a shared *node
-property* fans out to every embedding document, so its wall-clock
-scales with the fan-out size — e.g. renaming a shared node referenced by
-5,715 documents took ~13s for all of them.
+Measure source commit to target visibility under representative load. The result
+depends on source polling, dispatch flush settings, projection depth, fan-out,
+and target bulk latency. Record both steady-state latency and the time required
+to drain a bounded burst.
 
 ## Consistency check
 
@@ -92,8 +94,7 @@ updates + 250 deletes + 250 creates) in one transaction and watch:
 - **RSS** stays bounded (no per-event accumulation)
 - **count parity** holds afterward
 
-In validation a 1,000-op burst drained in seconds with each event
-recomputing exactly one document and RSS staying in the tens of MB.
+Record the drain time, peak RSS, retry count, and final source-to-target parity.
 
 ## Drain-resume + reconciliation
 
@@ -107,12 +108,8 @@ To verify delete reconciliation:
   <Step title="Assert">The deleted rows' docs are gone AND counts match.</Step>
 </Steps>
 
-Validated: 500 source deletes during a drain → exactly 500 index
-orphans removed, final counts equal.
-
 ## What won't propagate (and shouldn't)
 
 Updating a node/table the spec never traverses produces zero
-recomputations — verify this too. It confirms the spec is the true
-boundary: in testing, renaming an off-spec `Review` node produced 0
-recomposes and 0 index writes.
+recomputations. Verify this as a negative test so an unrelated source change
+cannot create unexpected target writes.

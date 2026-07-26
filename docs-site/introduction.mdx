@@ -3,19 +3,16 @@ title: "Introduction"
 description: "What VentStream is, the problems it solves, and when to reach for it."
 ---
 
-VentStream is a **data-streaming engine**. It moves data from where it
-changes to where it's needed — continuously, in real time — through two
-complementary pipelines that run on one binary:
+VentStream is an open-source data-streaming engine with two independent
+workloads in one binary:
 
 - **Capture & denormalize** — read a system's native change stream and
   keep a derived, denormalized view continuously in sync in a target
-  store. You declare the shape of the document you want; the engine
-  maintains it for every record, forever, reacting to each change as it
-  happens.
+  store. You declare the target document shape, and the engine updates
+  affected documents as source records change.
 - **Real-time data delivery** — publish domain events once and stream
   them to any number of subscribers (browsers, services) in real time
-  over WebSocket or GraphQL subscriptions, without each application
-  building its own socket plumbing.
+  over native WebSocket or GraphQL subscriptions.
 
 Both pipelines are the same idea — turn a stream of changes into the
 exact shape a consumer needs. The difference is how you consume it: a
@@ -38,9 +35,8 @@ are backend-agnostic.
 
 ## The problems it solves
 
-**Derived data drifts.** The moment you copy data into a search index,
-cache, or read model, it starts going stale. The usual fixes are each
-bad in their own way:
+**Derived data drifts.** The moment data is copied into a search index, cache,
+or read model, the copy can drift from its source:
 
 - **Periodic re-sync jobs** re-scan everything on a timer — minutes to
   hours behind, expensive, and they still miss anything that changed
@@ -50,9 +46,9 @@ bad in their own way:
 - **Hand-rolled triggers** become an unmaintainable web of per-table
   glue as the projection grows.
 
-**Real-time delivery is plumbing.** Pushing live updates to clients
-means every team re-implements the same WebSocket delivery, subscription
-lifecycle, reconnect, and backpressure handling — usually subtly wrong.
+**Real-time delivery repeats infrastructure work.** Teams need connection
+lifecycle, subscription routing, reconnect, replay, and slow-consumer handling
+before they can deliver an application event.
 
 VentStream replaces both with one declarative model and a streaming
 engine. Only the affected data is recomputed or delivered, and latency is
@@ -75,10 +71,9 @@ settings selected for the workload.
     records, select columns, walk multiple hops — declared in YAML, with
     bounded fan-out so a change recomputes only what depends on it.
   </Card>
-  <Card title="One job: move and reshape data" icon="bullseye">
+  <Card title="Focused data path" icon="bullseye">
     The engine streams and reshapes data — nothing else. It isn't an app
-    server, a broker, or a database. A focused, single-responsibility
-    component you can actually reason about and trust on the hot path.
+    server, a broker, or a database.
   </Card>
   <Card title="Single box or distributed — same model" icon="network-wired">
     Run one agent on one server or a fleet behind a router; the model
@@ -86,16 +81,14 @@ settings selected for the workload.
     (Apollo / Cosmo), so it drops into a distributed graph as cleanly as
     it runs standalone.
   </Card>
-  <Card title="Real-time WebSockets, done right" icon="tower-broadcast">
-    A fast, efficient WebSocket + GraphQL-subscription path for
-    server-to-server and server-to-client streaming — with subscription
-    lifecycle, reconnect, backpressure, and consumer cleanup handled, so
-    you don't re-implement socket plumbing per app.
+  <Card title="WebSocket and GraphQL delivery" icon="tower-broadcast">
+    Native WebSocket and GraphQL subscription gateways provide routing,
+    replay-capable broker cursors, backpressure, and consumer cleanup.
   </Card>
-  <Card title="Crash-safe by construction" icon="shield-check">
-    The source cursor only advances once the sink confirms the write, so
-    a restart resumes exactly where it left off — no silently dropped or
-    duplicated changes.
+  <Card title="Sink-gated checkpoints" icon="shield-check">
+    Durable source progress advances only after the sink handles the contiguous
+    output prefix. A restart can replay unconfirmed work using deterministic
+    document IDs.
   </Card>
 </CardGroup>
 
@@ -141,7 +134,7 @@ See [Architecture](/concepts/architecture) for the full picture.
     Fan live events out to clients over WebSocket or GraphQL.
   </Card>
   <Card title="Concepts" icon="book" href="/concepts/cdc-and-projections">
-    How capture, projections, and the fan-out engine actually work.
+    How capture, projections, and fan-out work.
   </Card>
   <Card title="Deploy" icon="server" href="/deploy/local">
     Run locally with Docker Compose, or ship the stack to Kubernetes.

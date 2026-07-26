@@ -1,50 +1,56 @@
 ---
-title: "Managed engine on Kubernetes"
-description: "Create, enroll, configure, start, and administer a Fleet-managed engine with ventstreamctl and Helm."
+title: "Managed agent on Kubernetes"
+description: "Deploy a VentStream Cloud-managed CDC or realtime agent into your Kubernetes cluster."
 ---
 
-The `ventstream-managed-agent` chart runs the Fleet supervisor as PID 1 and the
-open-core engine as its child. The supervisor owns workload identity, desired
-state, operation receipts, and staged configuration. Connector secrets stay in the
-customer workload namespace.
+A managed agent runs the VentStream data plane in your Kubernetes cluster while
+VentStream Cloud provides configuration, identity, lifecycle operations, and
+runtime visibility.
+
+VentStream Cloud does not create pods or receive source records. Your deployment
+automation installs the workload, and the agent makes outbound connections to
+the Cloud gateway.
 
 ## Prerequisites
 
-- A reachable [Fleet control plane](/deploy/kubernetes-fleet)
-- `ventstreamctl` authenticated with organization and environment defaults
-- A managed image built from matching engine and control-plane revisions
-- The gateway enrollment server CA bundle
-- Workload-local connector Secrets
+- A VentStream Cloud organization and environment
+- `ventstreamctl` authenticated to that environment
+- `kubectl` and Helm access to the target cluster
+- A storage class for durable engine and agent state
+- Connector credentials stored in your secret manager
+- Outbound network access to the Cloud enrollment and control gateways
 
-The examples below use one Postgres CDC pipeline. CDC deployments must always use
-one replica.
+CDC deployments use one active replica. Realtime workloads can use multiple
+deployments when each instance has its own managed identity.
 
-## 1. Create the Fleet resources
+## 1. Create the pipeline and deployment
+
+Create the logical pipeline, then create the deployment that represents this
+Kubernetes installation:
 
 ```bash
-PIPELINE_ID=$(ventstreamctl pipelines create orders-cdc \
+ventstreamctl pipelines create orders-cdc \
   --description "Orders search projection" \
   --workload-kind cdc \
   --source-kind postgres \
-  --sink-kind opensearch \
-  --output json | jq -er '.data.id')
+  --sink-kind opensearch
 
-DEPLOYMENT_ID=$(ventstreamctl agents create orders-primary \
-  --pipeline "$PIPELINE_ID" \
-  --output json | jq -er '.data.id')
-
-printf 'pipeline=%s\ndeployment=%s\n' "$PIPELINE_ID" "$DEPLOYMENT_ID"
+ventstreamctl agents create orders-primary \
+  --pipeline orders-cdc
 ```
 
-Keep these IDs in the private deployment values for this workload.
+Pipeline and deployment names can be used by later CLI commands, so routine
+workflows do not require UUIDs.
 
-## 2. Create and select configuration
+## 2. Create the managed configuration
 
-Author `ventstream.yaml` using environment references for credentials:
+Author a non-secret `ventstream.yaml`. Credential fields reference environment
+variables that will come from a Kubernetes Secret:
 
 ```yaml
 schema_version: 1
 roles: [cdc]
+
 source:
   kind: postgres
   postgres:
@@ -55,8 +61,11 @@ source:
     database_ref: env:VS_PG_DATABASE
     publication_ref: env:VS_PG_PUBLICATION
     slot_ref: env:VS_PG_SLOT
-    bootstrap: { mode: snapshot, chunk_size: 10000 }
+    bootstrap:
+      mode: snapshot
+      chunk_size: 10000
     denormalize_mode: sql
+
 sink:
   kind: opensearch
   opensearch:
@@ -64,162 +73,152 @@ sink:
     auth:
       mode: api_key
       api_key_ref: env:VS_OS_API_KEY
-    index_routing: { strategy: by_projection_target }
+    index_routing:
+      strategy: fixed
+      name: orders
+
 specs:
   joins: projections/orders.yaml
+
 runtime:
   health_listen: 0.0.0.0:4043
   dlq_path: /var/lib/ventstream/dlq.jsonl
 ```
 
-Create, validate, and select the immutable revision. Selection leaves a new
-pipeline paused:
+Create and validate an immutable revision:
 
 ```bash
-CONFIG_REVISION=$(ventstreamctl pipelines configurations create "$PIPELINE_ID" \
+ventstreamctl pipelines configurations create orders-cdc \
   --engine-config ./ventstream.yaml \
-  --file projections/orders.yaml=./orders.yaml \
-  --output json | jq -er '.data.revision')
+  --file projections/orders.yaml=./orders.yaml
 
-ventstreamctl pipelines configurations validate \
-  "$PIPELINE_ID" "$CONFIG_REVISION" \
-  --reason "pre-deployment validation"
+ventstreamctl pipelines configurations validate orders-cdc 1 \
+  --reason "initial deployment"
 
-ventstreamctl pipelines configurations select \
-  "$PIPELINE_ID" "$CONFIG_REVISION" \
+ventstreamctl pipelines configurations select orders-cdc 1 \
   --reason "initial deployment"
 ```
 
-## 3. Prepare workload Secrets
+The selected revision becomes the pipeline's active desired configuration. A new
+agent receives it when enrollment completes; no configuration file is baked into
+the container image.
 
-Create the namespace and connector Secret through the cluster's secret manager.
-The resulting Secret should expose only referenced environment values:
+## 3. Create connector and enrollment Secrets
 
-```text
-orders-engine-secrets
-  VS_PG_HOST
-  VS_PG_USER
-  VS_PG_PASSWORD
-  VS_PG_DATABASE
-  VS_PG_PUBLICATION
-  VS_PG_SLOT
-  VS_OS_ENDPOINT
-  VS_OS_API_KEY
-```
-
-Create the gateway server trust Secret from the CA bundle supplied by the Fleet
-operator:
+Create a namespace and a Secret containing only the environment variables
+referenced by the managed configuration:
 
 ```bash
 kubectl create namespace ventstream-workloads
-kubectl -n ventstream-workloads create secret generic fleet-gateway-server-ca \
-  --from-file=ca.crt=./gateway-server-ca.pem
+
+kubectl -n ventstream-workloads create secret generic orders-engine-secrets \
+  --from-env-file=./orders-engine.env
 ```
 
-Stream a new one-time enrollment grant directly into a Secret so it is not placed
-in a shell variable or command argument:
+Generate a short-lived, single-use enrollment grant directly into Kubernetes:
 
 ```bash
-ventstreamctl agents enroll-token create "$DEPLOYMENT_ID" \
-  --pipeline "$PIPELINE_ID" | \
+ventstreamctl agents enroll-token create orders-primary \
+  --pipeline orders-cdc | \
 kubectl -n ventstream-workloads create secret generic orders-enrollment \
   --from-file=grant=/dev/stdin
 ```
 
-The grant expires after ten minutes and is consumed by the first successful
-enrollment.
+Do not store the grant in source control, CI logs, or a Helm values file.
 
-## 4. Install the managed workload
+## 4. Generate the deployment values
 
-The managed-agent chart is maintained in the control-plane repository. Run Helm
-from a checkout whose revision matches the managed image:
+Ask VentStream Cloud for the approved chart, managed image digest, gateway
+addresses, trust mode, pipeline ID, and deployment ID:
 
 ```bash
-cd ventstream-control-plane
-helm upgrade --install orders-cdc \
-  ./infra/helm/ventstream-managed-agent \
+ventstreamctl agents manifest orders-primary \
+  --pipeline orders-cdc \
+  --target helm \
+  --engine-secret orders-engine-secrets \
+  --enrollment-secret orders-enrollment \
+  --output orders-primary.values.yaml
+```
+
+The generated file contains no credentials or enrollment grant. It pins the
+managed image by digest and names the existing Kubernetes Secrets. Its header
+contains the chart URL, chart version, and suggested Helm release name.
+
+Review the file in deployment automation, then install it using those header
+values:
+
+```bash
+helm upgrade --install orders-primary \
+  <chart-url-from-generated-header> \
+  --version <chart-version-from-generated-header> \
   --namespace ventstream-workloads \
-  --set image.repository=ghcr.io/your-org/ventstream-managed-engine \
-  --set image.tag=VERSION \
-  --set workload.kind=cdc \
-  --set workload.roles=cdc \
-  --set workload.replicas=1 \
-  --set fleet.gatewayUrl=https://gateway.example.com:8445 \
-  --set fleet.pipelineId="$PIPELINE_ID" \
-  --set fleet.deploymentId="$DEPLOYMENT_ID" \
-  --set fleet.enrollment.enabled=true \
-  --set fleet.enrollment.url=https://gateway.example.com:8444 \
-  --set fleet.enrollment.tokenSecret=orders-enrollment \
-  --set fleet.enrollment.serverTrustSecret=fleet-gateway-server-ca \
-  --set engine.envFromSecret=orders-engine-secrets
+  --create-namespace \
+  --values orders-primary.values.yaml
 ```
 
-The enrollment init container writes renewable identity state to the workload PVC.
-The main supervisor never mounts the enrollment token.
+Cloud gateways use public WebPKI trust by default, so customers do not need to
+exchange a CA file. If a workspace is intentionally configured with private
+gateway trust, `ventstreamctl agents manifest` requires the corresponding
+Kubernetes trust Secret explicitly.
 
-<Warning>
-The current chart still references the consumed enrollment Secret on later pod
-starts while `fleet.enrollment.enabled=true`. Keep that Secret object present until
-a state-only bootstrap mode is released. The token is no longer redeemable, but
-deleting the Secret prevents Kubernetes from starting the init container.
-</Warning>
+## 5. Verify and start
 
-## 5. Apply and start
-
-Wait for the agent to connect, then apply the selected revision and explicitly
-resume the pipeline:
+Wait for the pod to enroll and report its runtime state:
 
 ```bash
+kubectl -n ventstream-workloads get pods,pvc
+
 ventstreamctl agents status \
-  --pipeline "$PIPELINE_ID" \
-  --deployment "$DEPLOYMENT_ID"
+  --pipeline orders-cdc \
+  --deployment orders-primary
 
-ventstreamctl pipelines configurations apply \
-  "$PIPELINE_ID" "$CONFIG_REVISION" \
-  --reason "initial deployment" --wait
-
-ventstreamctl pipelines resume "$PIPELINE_ID" --wait
+ventstreamctl operations list --pipeline orders-cdc
 ```
 
-Verify both Kubernetes and Fleet views:
+New pipelines remain paused until an operator starts them:
 
 ```bash
-kubectl -n ventstream-workloads get pods,pvc,service
-kubectl -n ventstream-workloads logs statefulset/orders-cdc-ventstream-managed-agent --follow
-ventstreamctl agents status \
-  --pipeline "$PIPELINE_ID" \
-  --deployment "$DEPLOYMENT_ID"
-ventstreamctl operations list --pipeline "$PIPELINE_ID"
+ventstreamctl pipelines resume orders-cdc --wait
 ```
 
-## Realtime workloads
+Confirm the pipeline becomes running in both the dashboard and CLI before
+producing source changes.
 
-One enrollment grant is single-use. The current chart can automatically enroll a
-single realtime replica, but it cannot bootstrap several new StatefulSet replicas
-from one token Secret. Do not combine `fleet.enrollment.enabled=true` with
-`workload.replicas` greater than `1`.
+## Update configuration
 
-For replicated realtime today, either:
-
-- Run the standalone `ventstream-gateway` chart, or
-- Use `fleet.identitySecret` with a Fleet-compatible pre-provisioned deployment
-  identity from your PKI and leave enrollment disabled.
-
-The pre-provisioned Secret must contain `tls.crt`, `tls.key`, and `ca.crt`. Each
-pod still reports its immutable Pod UID as a distinct Fleet instance. Automatic
-multi-replica enrollment needs a per-replica identity bootstrap workflow and is
-not yet supported by this chart.
-
-## Routine administration
+Every edit creates another immutable revision:
 
 ```bash
-ventstreamctl pipelines pause "$PIPELINE_ID" \
-  --reason "maintenance" --wait
-ventstreamctl pipelines resume "$PIPELINE_ID" --wait
-ventstreamctl pipelines reconcile "$PIPELINE_ID" --wait
-ventstreamctl pipelines drain "$PIPELINE_ID" \
+ventstreamctl pipelines configurations create orders-cdc \
+  --engine-config ./ventstream.yaml \
+  --file projections/orders.yaml=./orders.yaml
+
+ventstreamctl pipelines configurations validate orders-cdc 2 \
+  --reason "add order status projection"
+
+ventstreamctl pipelines configurations select orders-cdc 2 \
+  --reason "add order status projection" \
+  --wait
+```
+
+Selection activates the valid revision and delivers it to connected deployments.
+Use configuration history to roll back to an earlier valid revision.
+
+## Routine operations
+
+```bash
+ventstreamctl pipelines pause orders-cdc \
+  --reason "source maintenance" --wait
+
+ventstreamctl pipelines resume orders-cdc --wait
+
+ventstreamctl pipelines reconcile orders-cdc \
+  --reason "verify sink parity" --wait
+
+ventstreamctl pipelines drain orders-cdc \
   --reason "retire deployment" --wait
 ```
 
-Do not delete the PVC during upgrades. It contains workload identity, cached
-desired state, applied configuration, and connector cursor/join state.
+Do not delete the workload PVC during routine upgrades. It contains managed
+identity, cached desired state, applied configuration, connector cursors, and
+join state.

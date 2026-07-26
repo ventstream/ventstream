@@ -1,31 +1,28 @@
 ---
 title: "Quickstart"
-description: "A fully self-contained demo — stream Postgres and Neo4j into OpenSearch in one `docker compose up`."
+description: "Run PostgreSQL and Neo4j CDC into OpenSearch with Docker Compose."
 ---
 
-This is the fastest way to *see* VentStream's **CDC / capture pipeline**
-work — source changes flowing into continuously-synced documents. It's a
-self-contained Docker stack with **pre-seeded data** in both source types
-— no control plane, no cloud, no source of your own to wire up. Copy the
-commands top to bottom and watch changes propagate to OpenSearch in real
-time.
+This walkthrough starts a self-contained CDC stack with pre-seeded PostgreSQL
+and Neo4j data. It bootstraps denormalized documents into OpenSearch, then
+shows inserts, updates, relationship changes, and deletes propagating from each
+source.
 
 <Note>
-This covers the **capture** pipeline (source → synced documents). For the
-**real-time delivery** pipeline — live events over WebSocket / GraphQL —
-see the [real-time demo](https://github.com/ventstream/ventstream/tree/main/demo/realtime)
+This guide covers the capture pipeline. For live events over WebSocket and
+GraphQL, use the
+[real-time demo](https://github.com/ventstream/ventstream/tree/main/demo/realtime)
 and [Real-time subscriptions](/concepts/real-time-subscriptions).
 </Note>
 
 <Note>
 The demo runs the engines **standalone**. A running standalone process cannot be
-attached to Fleet in place. To exercise CLI configuration and pause/resume, run a
-new supervised workload with the
-[Engine + Fleet local demo](/guides/local-engine-fleet-demo).
+attached to VentStream Cloud in place. To use centralized configuration,
+visibility, and lifecycle operations, create a managed pipeline and deploy a new
+[managed agent](/deploy/kubernetes-managed-engine).
 </Note>
 
-The dataset is a small **e-commerce** domain so the scenarios are easy to
-follow, but the pipeline shape is identical to production:
+The sample data uses an e-commerce domain:
 
 | Source | Target | What one document looks like |
 |--------|--------|------------------------------|
@@ -47,13 +44,16 @@ cd ventstream/demo/stack
 
 ### Preflight: clean up and check port 9200
 
-Remove containers from an earlier demo run before starting a new one. This
-keeps stale containers and networks from obscuring the results, but preserves
-the source and engine volumes:
+Start from a clean demo state so the seed counts and document IDs in this guide
+are deterministic:
 
 ```bash
-docker compose --profile dashboards down --remove-orphans
+docker compose --profile dashboards down -v --remove-orphans
 ```
+
+This removes only the containers, networks, and volumes created by this
+Compose project. If you are intentionally resuming an earlier run, omit `-v`;
+the exact counts below may then differ if you changed or deleted sample data.
 
 The demo must have exclusive access to host port `9200`. Check for another
 Docker container or local OpenSearch process before continuing:
@@ -64,6 +64,7 @@ lsof -nP -iTCP:9200 -sTCP:LISTEN   # macOS and most developer workstations
 ```
 
 <Warning>
+Both checks should return no listener before you start the demo.
 On Docker Desktop, the demo container can sometimes appear to start even when
 a host process already owns `localhost:9200`. In that state, the verification
 `curl` commands may reach the wrong OpenSearch cluster. Stop the process shown
@@ -117,10 +118,8 @@ start in seconds.
 docker compose up -d --build engine-orders engine-products
 ```
 
-Watch them bootstrap and switch to tailing. Logs are intentionally
-verbose (`RUST_LOG=…=debug`, pretty format) and **never print
-credentials** — only host/db/slot identifiers, event counts, and
-document IDs:
+Watch them bootstrap and switch to tailing. The demo enables debug logging so
+source progress, projection work, and sink batches are visible:
 
 <CodeGroup>
 ```bash Postgres → OpenSearch
@@ -205,7 +204,7 @@ appear in the log within ~1s and update OpenSearch.
       | jq '._source.items'
     ```
 
-    **Delete (reconciliation)** — items first (FK), then the order:
+    **Delete a primary row** — items first (FK), then the order:
     ```bash
     docker compose exec -T postgres psql -U ventstream -d shop -c \
       "DELETE FROM shop.order_items WHERE order_id='ord-0001';
@@ -249,7 +248,7 @@ appear in the log within ~1s and update OpenSearch.
       | jq '.hits.hits[0]._source.supplier'   # → region.name = "Asia Pacific"
     ```
 
-    **Delete a product (reconciliation)**
+    **Delete a product**
     ```bash
     docker compose exec -T neo4j cypher-shell -u neo4j -p ventstream \
       "MATCH (p:Product {id:'prod-1'}) DETACH DELETE p;"
@@ -269,7 +268,7 @@ server-side with `pg_sleep`:
 ```bash
 # terminal 1 — one update roughly every 100 ms over a single connection
 while true; do
-  printf "UPDATE shop.orders SET status=(ARRAY['pending','paid','shipped','delivered'])[1+floor(random()*4)], total=round((random()*1000)::numeric,2) WHERE order_id='ord-0001';\nSELECT pg_sleep(0.1);\n"
+  printf "UPDATE shop.orders SET status=(ARRAY['pending','paid','shipped','delivered'])[1+floor(random()*4)], total=round((random()*1000)::numeric,2) WHERE order_id='ord-0002';\nSELECT pg_sleep(0.1);\n"
 done | docker compose exec -T postgres psql -U ventstream -d shop -q
 ```
 
@@ -282,15 +281,15 @@ Or watch the document change in lockstep:
 
 ```bash
 while true; do
-  curl -s 'http://localhost:9200/orders/_doc/shop.orders:%5B%22ord-0001%22%5D' \
+  curl -s 'http://localhost:9200/orders/_doc/shop.orders:%5B%22ord-0002%22%5D' \
     | jq -c '._source | {status, total}'
   sleep 0.2
 done
 ```
 
 Ctrl-C to stop. Tune the pace with `pg_sleep(0.1)` — `0.02` for ~20 ms,
-or drop it entirely for max throughput. Each update still recomputes only
-that one document (`batch_size=1` in the logs). Swap the `WHERE` to
+or drop it entirely for max throughput. Each update recomputes only that one
+document; the dispatcher may combine nearby updates into one sink batch. Swap the `WHERE` to
 `order_id='ord-'||lpad((1+floor(random()*200))::int::text,4,'0')` to
 spread updates across all 200 orders.
 
@@ -333,9 +332,9 @@ curl -s localhost:9200/products/_count | jq .count
 docker compose exec -T postgres psql -U ventstream -d shop -c \
   "SELECT slot_name, active FROM pg_replication_slots;"
 
-# Any dead-lettered events? (should be 0)
-docker compose exec -T engine-orders   sh -c 'cat /var/lib/ventstream/dlq.jsonl 2>/dev/null | wc -l'
-docker compose exec -T engine-products sh -c 'cat /var/lib/ventstream/dlq.jsonl 2>/dev/null | wc -l'
+# Any dead-lettered events? This should print nothing.
+docker compose logs engine-orders engine-products \
+  | grep 'metric="dlq.write"' || true
 ```
 
 ## 8. Teardown
@@ -365,8 +364,8 @@ doesn't hit name/port clashes.
   <Card title="How fan-out works" icon="diagram-project" href="/concepts/fan-out">
     Why renaming a category updates 500 docs without exploding.
   </Card>
-  <Card title="Add the control plane" icon="gauge" href="/fleet/local-control-plane">
-    Enroll and administer an engine fleet with `ventstreamctl`.
+  <Card title="Use VentStream Cloud" icon="gauge" href="/fleet/overview">
+    Enroll managed agents and administer pipelines from the dashboard or CLI.
   </Card>
   <Card title="Deploy to Kubernetes" icon="server" href="/deploy/kubernetes">
     Ship the whole stack with the bundled manifests.

@@ -1,11 +1,12 @@
 ---
 title: "Managed configuration"
-description: "Validate, select, and apply immutable VentStream engine configuration revisions."
+description: "Create, validate, activate, and roll back immutable VentStream engine configuration revisions."
 ---
 
-Fleet stores non-secret engine configuration as immutable, content-addressed
-revisions. A revision must validate before it can be selected, and selection is
-separate from application.
+VentStream Cloud stores non-secret engine configuration as immutable,
+content-addressed revisions. A revision must pass validation before it can be
+selected. Selecting a valid revision makes it the activation target and queues
+delivery to enrolled deployments.
 
 ```bash
 ventstreamctl pipelines configurations create orders-cdc \
@@ -15,18 +16,28 @@ ventstreamctl pipelines configurations create orders-cdc \
 
 ventstreamctl pipelines configurations list orders-cdc
 ventstreamctl pipelines configurations validate orders-cdc <revision>
-ventstreamctl pipelines configurations select orders-cdc <revision>
-ventstreamctl pipelines configurations apply orders-cdc <revision> --wait
+ventstreamctl pipelines configurations select orders-cdc <revision> --wait
 ventstreamctl pipelines resume orders-cdc --wait
 ```
 
 The agent stages files atomically in a private configuration directory and starts
 the engine with `VS_ENGINE_CONFIG` pointing at the generated `ventstream.yaml`.
 For a new pipeline, the first selection creates its initial desired state as
-`paused`. Applying the revision stages and validates it without starting the
-engine; an explicit `resume` performs the first start. Later selections preserve
-the pipeline's current run state. Rollback selects and applies a previously valid
-immutable revision.
+`paused`; an explicit `resume` performs the first start. Later selections
+preserve the pipeline's current run state.
+
+Use `apply` only to deliver the selected revision again, for example after
+replacing a deployment:
+
+```bash
+ventstreamctl pipelines configurations apply orders-cdc <revision> --wait
+```
+
+Roll back by activating a previously valid immutable revision:
+
+```bash
+ventstreamctl pipelines configurations rollback orders-cdc <revision> --wait
+```
 
 ## Secret boundary
 

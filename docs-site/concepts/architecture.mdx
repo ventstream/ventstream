@@ -3,7 +3,7 @@ title: "Architecture"
 description: "How VentStream separates engine data paths from optional Fleet management."
 ---
 
-VentStream has an open-core data plane and an optional Fleet management plane.
+VentStream has an open-source data plane and an optional Cloud management plane.
 The separation is operational, security-sensitive, and deliberate.
 
 <img
@@ -31,6 +31,35 @@ Connector credentials, source data, destination documents, broker messages, and
 client traffic remain in the workload environment. Cursor and join state are
 persisted locally or in the source system so restarts can resume correctly.
 
+## Deterministic document IDs
+
+CDC documents use IDs derived from the source relation and primary key. A
+bootstrap record, live update, retry, and replay therefore target the same sink
+document. Source deletes use the same ID for a sink tombstone.
+
+Examples:
+
+- PostgreSQL and MySQL: `shop.orders:["order-42"]`
+- MongoDB: `shop.orders:["64f0..."]`
+- Neo4j projection: `products_denormalized:<element-id>`
+
+This makes repeated delivery idempotent at the document boundary. It does not
+make arbitrary downstream side effects idempotent; consumers of realtime events
+should use the event ID for that purpose.
+
+## Crash safety: the cursor watermark
+
+For durable CDC sources, VentStream does not confirm source progress beyond the
+contiguous prefix that the sink has handled. A crash before confirmation replays
+from the previous checkpoint. Deterministic document IDs make those repeated
+writes converge on the same result.
+
+Checkpoint storage differs by source: PostgreSQL uses its replication slot,
+Kafka uses committed consumer-group offsets, and Neo4j, MongoDB, and MySQL keep
+cursor state on durable local storage. Retention still sets the recovery limit:
+WAL, binlogs, oplogs, transaction logs, and Kafka topics must retain changes long
+enough for the engine to catch up.
+
 ## Management plane
 
 Fleet stores tenant inventory, authorization, desired state, immutable
@@ -42,7 +71,7 @@ databases and never proxies engine traffic.
 
 The Fleet supervisor is PID 1 in the managed image. It owns workload identity,
 the control stream, cached desired state, operation receipts, and configuration
-staging. It supervises the unmodified open-core engine as a child process.
+staging. It supervises the unmodified open-source engine as a child process.
 
 The child receives connector settings and a local configuration path, but no Fleet
 private key or protocol implementation. Pause stops the child while retaining

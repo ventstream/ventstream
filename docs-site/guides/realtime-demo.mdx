@@ -1,12 +1,11 @@
 ---
 title: "Real-time demo (GraphiQL)"
-description: "Stream typed GraphQL subscriptions over NATS — live, in the browser, zero code."
+description: "Stream typed GraphQL subscriptions over NATS in a browser."
 ---
 
-VentStream's real-time gateways turn NATS events into **typed GraphQL
-subscriptions**. This demo brings up NATS + the engine (in `ws,graphql`
-mode) and lets you watch events arrive live in the in-browser **GraphiQL**
-playground — nothing to install, no client code to write.
+VentStream's real-time gateways turn NATS events into typed GraphQL
+subscriptions. This demo starts NATS and the engine in `ws,graphql` mode,
+then displays the subscription stream in GraphiQL.
 
 <Note>
 The typed subscription fields come from an SDL file
@@ -69,7 +68,7 @@ docker compose exec -T nats-box nats pub vs.t.acme.orderStatusChanged.order_1 \
 GraphiQL updates instantly:
 
 ```json
-{ "id": "order_1", "status": "confirmed", "changedAt": "2026-01-01T00:00:00Z" }
+{ "id": "order_1", "status": "confirmed", "changedAt": "2026-01-01T00:00:00+00:00" }
 ```
 
 The result field names differ from the payload because the SDL maps them with `@source`: `id ← $event.entityId`, `status ← $data.status`, `changedAt ← $event.occurredAt` (see [`subscriptions.graphql`](https://github.com/ventstream/ventstream/blob/main/demo/realtime/subscriptions.graphql) and [Real-time subscriptions](/concepts/real-time-subscriptions)).
@@ -93,9 +92,9 @@ while true; do
 done
 ```
 
-GraphiQL ticks once per second — `status` flipping `paid` → `shipped`,
-`changedAt` advancing. That's your live subscription stream. (`st`, not
-`status` — `status` is a read-only variable in zsh.)
+GraphiQL receives one result per second, with `status` alternating between
+`paid` and `shipped` and `changedAt` advancing. The shell example uses `st`
+because `status` is read-only in zsh.
 
 <Note>
 Every event needs a fresh, valid **ULID** for `id` and `schema_version: 2`.

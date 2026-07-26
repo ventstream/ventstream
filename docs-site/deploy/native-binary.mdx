@@ -19,14 +19,6 @@ the Fleet control plane or an enrollment token.
 
 ## Install with curl
 
-<Note>
-The direct `curl` installer is the intended public download experience. The
-repository and its release assets are currently private, so use the
-[authenticated portable install](#authenticated-portable-install) below today.
-The same `curl | sh` command will work without GitHub credentials when the
-open-core release assets are public.
-</Note>
-
 The installer detects the operating system and CPU architecture, downloads the
 matching release archive, verifies it against the release `SHA256SUMS`, checks
 the binary version, and installs it under `~/.local/bin`.
@@ -91,64 +83,9 @@ Use the source guides for [PostgreSQL](/connectors/sources/postgres),
 use the same binary and are covered by the
 [real-time guide](/concepts/real-time-subscriptions).
 
-## Authenticated portable install
+## Download an archive manually
 
-While releases are private, use the GitHub CLI to download the archive into one
-readable workload directory. The binary can stay beside its configuration; it
-does not need to be installed globally.
-
-```bash
-gh auth login
-
-VERSION=0.1.12
-PLATFORM=darwin-arm64 # Apple silicon; use darwin-amd64 for an Intel Mac
-VENTSTREAM_HOME="$HOME/ventstream"
-ARCHIVE="ventstream-$VERSION-$PLATFORM.tar.gz"
-
-mkdir -p "$VENTSTREAM_HOME"
-cd "$VENTSTREAM_HOME"
-
-gh release download "v$VERSION" \
-  --repo ventstream/ventstream \
-  --pattern "$ARCHIVE" \
-  --pattern SHA256SUMS
-
-grep "  ./$ARCHIVE\$" SHA256SUMS | shasum -a 256 --check
-tar -xzf "$ARCHIVE"
-test -e ventstream.yaml || cp ventstream.example.yaml ventstream.yaml
-```
-
-The resulting directory is self-contained and easy to inspect:
-
-```text
-~/ventstream/
-├── ventstream
-├── ventstream.yaml
-├── ventstream.example.yaml
-├── README.md
-├── SHA256SUMS
-└── ventstream-0.1.12-darwin-arm64.tar.gz
-```
-
-Set the environment variables referenced by `ventstream.yaml`, then validate and
-run from that directory:
-
-```bash
-cd "$HOME/ventstream"
-export VS_ENGINE_CONFIG="$PWD/ventstream.yaml"
-
-./ventstream --version
-./ventstream --validate-config
-./ventstream
-```
-
-Add `$HOME/ventstream` to `PATH` only if you want to invoke the binary from other
-directories.
-
-## Download public assets manually
-
-When release assets are public, the equivalent downloads are ordinary HTTPS
-URLs:
+Release archives are also available as ordinary HTTPS downloads:
 
 ```bash
 VERSION=0.1.12
@@ -176,10 +113,6 @@ gh release download v0.1.12 \
 gh attestation verify ventstream-installer.sh \
   --repo ventstream/ventstream
 ```
-
-While release assets are private, verify and extract the native archive through
-the authenticated portable flow above. Running the installer itself still
-requires access to its archive and checksum download URLs.
 
 Every native archive also has GitHub build-provenance and SBOM attestations.
 Verify the archive against this repository before installation:

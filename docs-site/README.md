@@ -1,7 +1,6 @@
 # VentStream docs site
 
-Mintlify documentation site for VentStream. Same platform as the
-Wundergraph Cosmo docs.
+Source for the VentStream documentation site, built with Mintlify.
 
 ## Local preview
 
@@ -32,7 +31,7 @@ mint broken-links    # documentation link scan
 - `images/` — favicon + any assets.
 
 Page groups: **Get started**, **Concepts**, **Connectors**, **Guides**,
-**Fleet management**, **Deploy**, **Reference**, **Operations**.
+**VentStream Cloud**, **Deploy**, **Reference**, **Operations**.
 
 ## Deploy at `ventstream.dev/docs`
 

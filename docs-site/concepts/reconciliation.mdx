@@ -51,25 +51,14 @@ Because documents use [deterministic IDs](/concepts/architecture#deterministic-d
 the diff is a clean set-membership test: extract the key from each
 doc ID, check it against the source set.
 
-## Validated at scale
-
-Deleting **500 rows** from a source during a drain window, then
-resuming: reconciliation removed **exactly 500** orphans and the final
-`source == index` counts matched. The scan cost is `O(index size)`
-(independent of how many orphans there are); the delete cost is
-`O(orphans / 1000)` bulk requests.
-
 ## Cost characteristics
 
-| Index size | Scan time (approx) | Notes |
-|---|---|---|
-| 100k docs | a few seconds | ~77 scroll round-trips |
-| 1M docs | ~1 minute | scan dominates; tune scroll batch |
-| 10M docs | ~10 minutes | consider scoping or off-peak |
-
-The valid-key set is held in memory during the pass. For very large
-tables (tens of millions of keys) that set itself becomes the memory
-constraint — at typical scale (≤100k keys) it's a few MB.
+The scan cost is proportional to the number of documents in the target index,
+not the number of orphans. Deletes are issued in batches of 1,000. The
+source-key set is held in memory for the duration of the pass, so measure both
+runtime and peak memory with production-like data before scheduling
+reconciliation for a large index. Run it during a lower-traffic window when the
+scan would compete with search traffic.
 
 ## Composite keys
 
@@ -84,10 +73,8 @@ regardless of key arity:
 - a **composite** key serializes every key column, in declared order, as
   a JSON array (`shop.cart_items:["cart-42","prod-9"]`).
 
-Both sides — the source-side live set (`pg_table_pk_keys` projects all PK
-columns `::text`) and the doc-ID parser — share one encoder (`pk_key`), so
-they can't drift, and a single pass deletes orphans for single- and
-composite-key tables alike.
+The source-side live set and the document-ID parser use the same canonical key
+encoder, so a single pass handles single- and composite-key tables.
 
 <Tip>
 The deterministic doc-ID format differs per source — a JSON array for

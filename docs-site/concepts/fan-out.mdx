@@ -30,12 +30,9 @@ A node whose label the spec never traverses produces **zero**
 recomputations — the change event is read and discarded. This is what
 keeps a single change from rippling across the whole graph.
 
-Measured on a 100k-node validation graph: renaming a shared lookup node
-(3 hops from the primary, embedded in the document) correctly recomputed
-the **5,715** documents that reference it — in **13 seconds** — and
-nothing else. Deleting that node cascaded the removal to the same 5,715
-in 23s. That's real, correct cascade work: the embedded value changed, so
-every document embedding it must update.
+Changing a shared lookup node must recompute every primary document that embeds
+that value. This can be expensive, but it is required for the target documents
+to converge.
 
 ## The hot-endpoint problem
 
@@ -53,7 +50,7 @@ recompute** in testing. A 1,000-operation burst queued ~5,800 such
 cascades — hours of wasted work for changes that should each touch one
 document.
 
-## The fix: hot-endpoint detection
+## Hot-endpoint detection
 
 At startup, the engine probes each projection path's leaf cardinality.
 Any endpoint label below a threshold (default **100**, via
@@ -70,9 +67,8 @@ shared-node edge change
   hot-filtered:    [edge, primary-eid]                    → 1 recompute
 ```
 
-After the fix, the same 1,000-op burst drained in **seconds** with
-every event recomputing exactly **1** document, and engine memory
-stayed at 14–82 MB.
+With hot-endpoint detection, the relationship event keeps only the
+primary-side anchor and recomputes the document whose edge changed.
 
 ## What is *not* filtered
 
@@ -92,9 +88,9 @@ changing).
 
 ## Cost
 
-- **Startup:** one count query per projection path. Milliseconds.
-- **Memory:** tens of element-ID strings per spec. Kilobytes.
-- **Per event:** one `HashSet` membership check. Sub-microsecond.
+- **Startup:** one count query for each analysable projection-path prefix.
+- **Memory:** a set of detected endpoint IDs, keyed by relationship type.
+- **Per event:** relationship-type and endpoint membership lookups.
 
 Set `VS_NEO4J_HOT_NODE_THRESHOLD=0` to disable detection entirely (the
 old behavior). Raise it if a genuine fan-out target sits just above the

@@ -72,13 +72,12 @@
             "pages": [
               "guides/realtime-demo",
               "guides/reliable-apollo-subscriptions",
-              "guides/local-engine-fleet-demo",
               "guides/authoring-specs",
               "guides/testing"
             ]
           },
           {
-            "group": "Fleet management",
+            "group": "VentStream Cloud",
             "pages": [
               "fleet/overview",
               "fleet/resource-model",
@@ -94,11 +93,8 @@
             "pages": [
               "deploy/native-binary",
               "deploy/local",
-              "fleet/local-control-plane",
-              "deploy/build-images",
               "deploy/kubernetes",
               "deploy/kubernetes-standalone",
-              "deploy/kubernetes-fleet",
               "deploy/kubernetes-managed-engine"
             ]
           },

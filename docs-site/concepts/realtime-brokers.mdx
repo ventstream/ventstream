@@ -87,40 +87,56 @@ it never silently falls back to live-only delivery.
 
 ## Publishing to Redis
 
-The TypeScript SDK builds the same envelope used by the NATS publisher:
+Publish the canonical event envelope with any Redis client. This Node.js example
+uses the official `redis` package:
 
 ```ts
-import { RedisVentStream } from "@ventstream/sdk";
+import { createClient } from "redis";
 
-const publisher = new RedisVentStream({
-  url: process.env.VS_REDIS_URL!,
-  maxLength: 1_000_000,
-});
+const redis = createClient({ url: process.env.VS_REDIS_URL });
+await redis.connect();
 
-await publisher.connect();
-const result = await publisher.publish({
-  tenant: "acme",
-  domain: "orders",
-  action: "updated",
-  entity: { kind: "order", id: "order_1" },
+const tenant = "acme";
+const subject = "vs.t.acme.orderStatusChanged.order_1";
+const event = JSON.stringify({
+  id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  event: "orderStatusChanged",
+  tenant,
+  entity_id: "order_1",
+  occurred_at: "2026-01-01T00:00:00Z",
+  received_at: new Date().toISOString(),
+  schema_version: 2,
   data: { status: "ready" },
+  metadata: {},
 });
 
-console.log(result.cursor); // rs:1712345678901-0
+const streamId = await redis.sendCommand([
+  "XADD",
+  `ventstream:{${tenant}}:events`,
+  "MAXLEN",
+  "~",
+  "1000000",
+  "*",
+  "subject",
+  subject,
+  "event",
+  event,
+]);
+console.log(`rs:${streamId}`);
 ```
 
-Any Redis client can publish without the SDK:
+The equivalent Redis command is:
 
-```text
+```bash
 XADD ventstream:{acme}:events MAXLEN ~ 1000000 * \
   subject vs.t.acme.orders.order.updated.order_1 \
   event '{"id":"01...","event":"orders.order.updated",...}'
 ```
 
-`maxLength` on the SDK bounds growth atomically with `XADD`. The gateway also
-applies the configured `max_length` periodically as a retention backstop for
-publishers that omit `MAXLEN`. Managed publishers should still set `MAXLEN` so
-retention remains bounded while gateways are offline.
+`MAXLEN` bounds growth atomically with `XADD`. The gateway also applies the
+configured `max_length` periodically as a retention backstop for publishers
+that omit it. Publishers should still set `MAXLEN` so retention remains bounded
+while gateways are offline.
 
 ## Scaling model
 

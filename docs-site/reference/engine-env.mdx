@@ -1,12 +1,12 @@
 ---
 title: "Engine environment variables"
-description: "Every variable the engine binary reads, grouped by purpose."
+description: "Operator-facing environment variables for standalone and managed VentStream engine workloads."
 ---
 
-The engine still supports direct environment-variable configuration. Newer
-deployments can set `VS_ENGINE_CONFIG` to a canonical `ventstream.yaml` and keep
-deployment-specific values in env references such as `env:VS_OS_ENDPOINT`.
-Required values error clearly at startup if missing.
+The engine supports direct environment-variable configuration. For new
+deployments, use `VS_ENGINE_CONFIG` with a canonical `ventstream.yaml` and keep
+deployment-specific values in references such as `env:VS_OS_ENDPOINT`.
+Validation fails when a required reference is missing.
 
 ## Common
 
@@ -15,10 +15,9 @@ Required values error clearly at startup if missing.
 | `VS_ENGINE_CONFIG` | Optional path to canonical `ventstream.yaml`. When set, roles, source kind, sink endpoint/auth references, sink index routing, spec file paths, and DLQ path are read from the file with legacy env fallback for connector details. |
 | `VS_ROLES` | `cdc` (and/or `ws`, `graphql`). The CDC role is the pipeline. |
 | `VS_CDC_SOURCE` | `postgres`, `neo4j`, `mongodb`, `mysql` (`mariadb` alias), or `kafka` (`redpanda` alias). |
-| `VS_CONTROL_PLANE_URL` | Legacy telemetry endpoint. This is not the Fleet gateway; new managed deployments use the supervisor's mTLS configuration. |
-| `VS_CONTROL_PLANE_KEY` | Legacy telemetry bearer/admin fallback. Not a Fleet enrollment token or workload identity. |
-| `VS_AGENT_NAME` | Legacy telemetry/source identifier fallback. Managed identity comes from the Fleet deployment certificate. |
-| `VS_CONTROL_PLANE_INTERVAL_SECS` | Legacy telemetry cadence (default 30). |
+| `VS_SINK` | Sink kind. The current supported value and default is `opensearch`. |
+| `VS_AGENT_NAME` | Standalone process identifier and default Kafka consumer-group ID. Managed identity comes from the Cloud deployment certificate. |
+| `VS_TENANT` | Server-authorized tenant for `ws` and `graphql`. Set it outside local development so clients cannot select another tenant during the handshake. |
 | `VS_OS_ENDPOINT` | OpenSearch base URL. |
 | `VS_INDEX_TEMPLATE` | Per-event index name template, e.g. `${header:ventstream.cdc.relation}`. |
 | `VS_DLQ_PATH` | Dead-letter file path (on the PVC). |
@@ -26,6 +25,17 @@ Required values error clearly at startup if missing.
 | `RUST_LOG` | Log filter, e.g. `info`. |
 | `VS_LOG_FORMAT` | `pretty` or `json` (image defaults to `json`). |
 | `_RJEM_MALLOC_CONF` | jemalloc tuning (the engine uses jemalloc as its global allocator). The image bakes `background_thread:true,dirty_decay_ms:500,muzzy_decay_ms:1000` so freed pages return to the OS and RSS tracks the live working set (elastic after connection/working-set spikes). Note the `_RJEM_` prefix — tikv-jemalloc ignores the unprefixed `MALLOC_CONF`. Override per-deploy for different decay timing. Linux only. |
+
+## OpenSearch / Elasticsearch sink
+
+| Variable | Meaning |
+|---|---|
+| `VS_OS_ENDPOINT` | Required base URL when canonical configuration does not provide `sink.opensearch.endpoint_ref`. |
+| `VS_OS_USERNAME` / `VS_OS_PASSWORD` | HTTP basic-auth credentials. Set both. |
+| `VS_OS_API_KEY` | API-key credential. Takes precedence over basic auth when both are present. |
+| `VS_INDEX_TEMPLATE` | Required legacy routing template when canonical `index_routing` is not configured. |
+| `VS_OS_RECONCILE_ALLOW_FULL_PURGE` | Allow reconciliation to remove every document when the source key set is empty. Default `false`; leave disabled unless an empty source is known to be authoritative. |
+| `VS_INSECURE_TLS` | Disable sink certificate verification. Default `false`; use only for isolated local testing. |
 
 ## Canonical engine config
 
@@ -50,7 +60,8 @@ sink:
       username_ref: env:VS_OS_USERNAME
       password_ref: env:VS_OS_PASSWORD
     index_routing:
-      strategy: by_projection_target
+      strategy: fixed
+      name: orders
 
 specs:
   joins: ./joins.yaml
@@ -106,8 +117,11 @@ certificates in Kubernetes Secrets or a local secret provider.
 | `VS_JOINS_STATE_DIR` | redb state directory on durable storage. **Required when a PostgreSQL or MySQL pipeline uses memory-mode joins**; the engine refuses to start without it. State commits occur only after the preceding sink boundary is durable, and the source checkpoint advances only after that state commit. Distinct from the spec's `state.backend`, which does not control redb persistence. (`sql` mode holds no join state.) |
 | `VS_PG_AUTO_RESYNC_ON_YAML_CHANGE` | `true` → re-bootstrap when the spec fingerprint changes. |
 | `VS_PG_FORCE_RESYNC` | `true` → re-bootstrap on this boot regardless. |
-| `VS_PG_LSN_FLUSH_MS` | How often the cursor watermark is flushed. |
+| `VS_LSN_FLUSH_MS` | Sink-gated source checkpoint flush cadence in milliseconds (default 200). Used by PostgreSQL and MySQL join pipelines. |
 | `VS_PG_RELATED_FETCH_POOL_SIZE` | Maximum pooled connections for in-memory related-row fetches (default 4). One connection opens at startup; the remainder open lazily under concurrent demand. Canonical config: `source.postgres.related_fetch_pool_size`. |
+| `VS_PG_SINK_REVERSE_LOOKUP` | `true` (default) lets SQL mode resolve 1:many child deletes to their parent through an OpenSearch reverse lookup. |
+| `VS_PERSIST_BATCH_OPS` | Maximum join-state mutations in one persistent redb transaction (default 5000). Canonical config: `runtime.joins.persist_batch_ops`. |
+| `VS_JOIN_IDLE_FLUSH_MS` | Maximum time before pending join-state mutations are flushed while idle (default 1000). Canonical config: `runtime.joins.idle_flush_ms`. |
 
 ## Neo4j source
 
@@ -126,6 +140,10 @@ certificates in Kubernetes Secrets or a local secret provider.
 | `VS_NEO4J_HOT_NODE_THRESHOLD` | Shared-lookup detection floor (default 100; `0` disables). |
 | `VS_NEO4J_RECOMPOSE_CHUNK` | Max affected primaries per live recompose query (default 128). Larger regresses sharply — a big element-id `IN`-list degrades the fan-out query plan. See [Performance](/concepts/performance). |
 | `VS_NEO4J_RECOMPOSE_CONCURRENCY` | How many recompose chunks run concurrently (default 8; bound ≤ bolt pool). Parallelizes large fan-outs. |
+| `VS_NEO4J_PROJECTION_FAN_OUT` | Enable projection-derived fan-out queries (default `true`). Disable only when deliberately using the legacy variable-length path. |
+| `VS_NEO4J_LABEL_TABLES` / `VS_NEO4J_RELTYPE_TABLES` | Raw CDC output mappings in `SourceName:output_relation` CSV form. Canonical config: `source.neo4j.label_tables` and `reltype_tables`. |
+| `VS_NEO4J_LABEL_FILTER` / `VS_NEO4J_RELTYPE_FILTER` | Optional CSV allowlists for raw Neo4j CDC. |
+| `VS_NEO4J_LABEL_PRIORITY` | CSV label precedence used when a raw node has several labels. |
 
 ## MongoDB source
 
@@ -168,6 +186,7 @@ See the [MySQL connector](/connectors/sources/mysql). Requires
 | `VS_MYSQL_SINK_REVERSE_LOOKUP` | `true` (default) → SQL mode resolves 1:many child deletes to their parent via an OpenSearch reverse-lookup. |
 | `VS_MYSQL_RECOMPOSE_CHUNK` | Maximum primary keys in one SQL recomposition query (default 128). Canonical config: `source.mysql.recompose_chunk`. |
 | `VS_MYSQL_RECOMPOSE_CONCURRENCY` | Maximum concurrent SQL recomposition queries (default 6). Canonical config: `source.mysql.recompose_concurrency`. |
+| `VS_LSN_FLUSH_MS` | Sink-gated source checkpoint flush cadence in milliseconds (default 200). Shared with PostgreSQL join pipelines. |
 
 ## Kafka / Redpanda source
 
@@ -214,24 +233,9 @@ gated on sink durability — no state dir.
 | `VS_MEMORY_CRITICAL_PERCENT` | `85` | Budget utilization where critical OOM protection engages. |
 | `VS_MEMORY_HYSTERESIS_PERCENT` | `5` | Percentage points below a threshold required before recovery begins. |
 
-<Warning>
-**Upgrade behavior for v0.1.11.** Existing memory-limited containers enable
-the controller automatically. Before upgrading, confirm the detected budget
-and the 32 MiB event ceiling against production payloads. Set an explicit
-budget for predictable behavior, or temporarily set
-`VS_MEMORY_CONTROLLER_ENABLED=false` while tuning. Checkpoint and join-state
-formats are unchanged. If a pre-v0.1.11 memory-join deployment has a valid
-source checkpoint but its local join database is missing or cannot be matched,
-the engine automatically rebuilds the complete join state from a source
-snapshot, retains the PostgreSQL slot or MySQL binlog cursor, and replays the
-retained change stream before declaring recovery complete. Keep the state
-volume and expect temporary snapshot load during this one-time reconstruction;
-do not delete the source checkpoint unless you intend a full drain/reset.
-
-To roll back to v0.1.10, remove `runtime.memory` from canonical YAML because
-that version rejects the unknown block; the new `VS_MEMORY_*` environment
-variables may also be removed.
-</Warning>
+Set an explicit memory budget when capacity must be predictable. Before changing
+the default event ceiling, measure the largest serialized source event and its
+projection expansion under the workload's actual memory limit.
 
 ## Optional listeners
 
@@ -240,6 +244,7 @@ Bound only when set, as `host:port`:
 | Variable | Role |
 |---|---|
 | `VS_ADMIN_LISTEN` | On-demand admin/resync HTTP endpoint. |
+| `VS_ADMIN_TOKEN` | Bearer token for the admin endpoint. Required for a non-loopback bind and recommended even on loopback. |
 
 ## Real-time gateways (`ws` / `graphql` roles)
 

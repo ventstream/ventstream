@@ -1,51 +1,64 @@
 ---
-title: "Fleet overview"
-description: "Administer many VentStream engine deployments without putting the control plane in the data path."
+title: "VentStream Cloud"
+description: "Operate managed VentStream pipelines without putting the control plane in the data path."
 ---
 
-VentStream Fleet is the management plane for CDC and realtime engine workloads.
-It inventories deployments, enrolls agents, distributes desired state and
-configuration, records durable operations, and exposes organization-scoped audit
-history.
+VentStream Cloud is the managed control plane for CDC and realtime engine
+workloads. It inventories deployments, enrolls agents, distributes desired state
+and configuration, records durable operations, and provides organization-scoped
+visibility.
 
-Fleet never proxies source records, OpenSearch documents, NATS messages,
-GraphQL events, or WebSocket traffic. An already-running engine continues its
-cached state during a temporary control-plane outage.
+The management plane is hosted by VentStream. Managed agents run in your
+infrastructure and connect outbound to Cloud. Source records, sink writes, broker
+events, GraphQL subscriptions, and WebSocket traffic stay in the engine data
+path; they are not proxied through the control plane.
 
 ```mermaid
 flowchart LR
-  O[Operator] -->|ventstreamctl / HTTPS| API[Control API]
+  O[Operator] -->|Dashboard / HTTPS| API[VentStream Cloud]
   CLI[ventstreamctl] -->|HTTPS| API
-  API --> DB[(Fleet PostgreSQL)]
   API --> OP[Desired state and operations]
-  A[Managed agent] -->|outbound mTLS| G[Agent gateway]
-  G --> DB
+  subgraph Customer environment
+    A[Managed agent]
+    E[VentStream engine]
+    D[Sources, brokers, and sinks]
+  end
+  A -->|outbound mTLS| G[Cloud agent gateway]
   G -->|desired state and operations| A
-  A --> E[VentStream engine]
-  E -->|CDC / realtime data| D[Customer destinations]
+  A --> E
+  E -->|CDC / realtime data| D
 ```
 
 ## Administration surfaces
 
-- `ventstreamctl` is the complete operational surface for environments,
-  pipelines, deployments, enrollment, configuration, and operations.
-- `ventstreamctl` also handles account onboarding, organization creation and
-  selection, environments, and operational workflows through the public V1 API.
-- Invitations, role bindings, service accounts, billing, settings, and audit
-  queries are available through the V1 API but do not yet have CLI command groups.
-- Helm or the customer's scheduler creates workloads. Fleet administers them
-  after enrollment; it is not a general-purpose Kubernetes provisioner.
+- The dashboard provides onboarding, organization membership, pipeline creation,
+  configuration editing, deployment guidance, observability, billing, and
+  settings.
+- `ventstreamctl` provides repeatable pipeline, deployment, configuration,
+  lifecycle, identity, status, and operation workflows.
+- Kubernetes, Docker Compose, or your scheduler creates the managed-agent
+  workload in your infrastructure. Cloud administers it after enrollment; it
+  does not deploy directly into your cluster.
 
-## Deployment choices
+## Managed and standalone modes
 
-Open-core engines can run standalone from local configuration with no Fleet
+The VentStream engine can run standalone from local configuration with no Cloud
 dependency. Managed deployments run the Fleet supervisor as PID 1, which starts
 and stops the engine child according to persisted desired state.
 
 Standalone engines are operated through their process manager, Kubernetes, or
 another scheduler. They cannot be paused, resumed, configured, or inspected with
-`ventstreamctl` because they are not enrolled in Fleet.
+`ventstreamctl` because they are not enrolled in VentStream Cloud.
 
-Fleet itself may be hosted by VentStream or self-hosted. In both cases, engines
-initiate outbound connections to the agent gateway; Fleet does not require inbound
-access to source databases or engine data ports.
+Choose VentStream Cloud when you need centralized inventory, configuration
+history, runtime visibility, controlled pause/resume/drain operations, agent
+identity, or administration across organizations and environments.
+
+<CardGroup cols={2}>
+  <Card title="Create a Cloud account" icon="cloud" href="https://ventstream.dev/signup">
+    Start an organization or accept an invitation.
+  </Card>
+  <Card title="Administer with the CLI" icon="terminal" href="/fleet/cli">
+    Install `ventstreamctl` and manage enrolled pipelines.
+  </Card>
+</CardGroup>

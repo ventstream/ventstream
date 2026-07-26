@@ -15,8 +15,7 @@ your local services.
 
 ## Install or build the engine
 
-Install the release binary without a Rust toolchain once the open-core release
-assets are public:
+Install the release binary without a Rust toolchain:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
@@ -24,14 +23,6 @@ curl --proto '=https' --tlsv1.2 -fsSL \
   | sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
-
-<Note>
-The repository and its release assets are currently private. For a working
-installation today, use the [authenticated portable
-install](/deploy/native-binary#authenticated-portable-install). It places
-`ventstream`, `ventstream.yaml`, and the example configuration together under
-`~/ventstream` and requires no Rust toolchain.
-</Note>
 
 See [Install the engine binary](/deploy/native-binary) for specific versions,
 manual downloads, checksums, and build-provenance verification.
@@ -48,10 +39,8 @@ cargo build --release -p ventstream   # → ./target/release/ventstream
 The commands below use `ventstream`. When building from source, replace it with
 `./target/release/ventstream`.
 
-A standalone engine needs **no control plane**. Do not set the legacy
-`VS_CONTROL_PLANE_URL` or `VS_CONTROL_PLANE_KEY` telemetry variables. Lifecycle
-is restart-based: stop the process to pause, and it resumes from its retained
-cursor on restart.
+A standalone engine needs no control plane. Lifecycle is restart-based: stop
+the process to pause it, then start it again to resume from retained state.
 
 Pick a mode:
 
