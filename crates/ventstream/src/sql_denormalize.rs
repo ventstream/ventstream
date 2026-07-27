@@ -29,7 +29,8 @@ use ventstream_core::{
     ContentType, Event, EventReceiver, EventSender, Headers, Payload, ShutdownToken, SourceUri,
     Subject,
 };
-use ventstream_joins::{Cardinality, JoinDefinition, RelatedDefinition};
+use ventstream_joins::config::{BackfillConfig, StateConfig, TargetConfig};
+use ventstream_joins::{Cardinality, JoinDefinition, PkSpec, PrimaryRef, RelatedDefinition};
 use ventstream_sinks::opensearch::{index_template, OpenSearchConfig, OsReverseLookup};
 
 /// Greedy-drain ceiling for the tail loop. `recv_batch` returns one event
@@ -199,9 +200,16 @@ pub struct SqlDenormalizer {
 
 impl SqlDenormalizer {
     /// Connect and prepare the definitions (fetches PK types).
+    ///
+    /// When no explicit join definitions are supplied, every primary-keyed
+    /// table in the publication becomes a direct projection. This keeps SQL
+    /// mode useful for plain table replication while retaining the same
+    /// bounded-memory bootstrap and full-row recomposition semantics used by
+    /// joined projections.
     pub async fn connect(
         conn_string: &str,
-        joins: Vec<JoinDefinition>,
+        publication: &str,
+        mut joins: Vec<JoinDefinition>,
         chunk_size: i64,
     ) -> Result<Self> {
         let (client, connection) = tokio_postgres::connect(conn_string, NoTls)
@@ -212,6 +220,20 @@ impl SqlDenormalizer {
                 warn!(error = %err, "sql-denormalize connection ended");
             }
         });
+
+        if joins.is_empty() {
+            joins = discover_direct_projections(&client, publication).await?;
+            if joins.is_empty() {
+                anyhow::bail!(
+                    "publication '{publication}' has no primary-keyed tables to materialize"
+                );
+            }
+            info!(
+                publication,
+                projections = joins.len(),
+                "sql-denormalize: discovered direct publication projections"
+            );
+        }
 
         let mut defs = Vec::with_capacity(joins.len());
         for def in joins {
@@ -882,6 +904,80 @@ impl SqlDenormalizer {
     }
 }
 
+/// Build one no-join projection for a publication table. The sink routing
+/// policy still owns the destination index: fixed routing sends every
+/// projection to one index, while by-output-relation uses the table name.
+fn direct_projection(namespace: &str, name: &str, primary_key: Vec<String>) -> JoinDefinition {
+    let table = format!("{namespace}.{name}");
+    JoinDefinition {
+        name: Some(table.clone()),
+        primary: PrimaryRef {
+            table,
+            pk: PkSpec(primary_key),
+        },
+        related: Vec::new(),
+        target: TargetConfig::default(),
+        state: StateConfig::default(),
+        backfill: BackfillConfig::default(),
+    }
+}
+
+/// Discover primary-keyed tables from the configured publication. Tables
+/// without a primary key cannot support deterministic upserts/deletes, so they
+/// are skipped with an operator-visible warning.
+async fn discover_direct_projections(
+    client: &Client,
+    publication: &str,
+) -> Result<Vec<JoinDefinition>> {
+    let rows = client
+        .query(
+            "SELECT schemaname, tablename \
+             FROM pg_publication_tables \
+             WHERE pubname = $1 \
+             ORDER BY schemaname, tablename",
+            &[&publication],
+        )
+        .await
+        .with_context(|| format!("listing tables in publication {publication}"))?;
+
+    let mut projections = Vec::with_capacity(rows.len());
+    for row in rows {
+        let namespace: String = row.get(0);
+        let name: String = row.get(1);
+        let pk_rows = client
+            .query(
+                "SELECT kcu.column_name \
+                 FROM information_schema.table_constraints tc \
+                 JOIN information_schema.key_column_usage kcu \
+                   ON kcu.constraint_schema = tc.constraint_schema \
+                  AND kcu.constraint_name = tc.constraint_name \
+                  AND kcu.table_schema = tc.table_schema \
+                  AND kcu.table_name = tc.table_name \
+                 WHERE tc.constraint_type = 'PRIMARY KEY' \
+                   AND tc.table_schema = $1 \
+                   AND tc.table_name = $2 \
+                 ORDER BY kcu.ordinal_position",
+                &[&namespace, &name],
+            )
+            .await
+            .with_context(|| format!("listing primary key for {namespace}.{name}"))?;
+        let primary_key = pk_rows
+            .into_iter()
+            .map(|pk_row| pk_row.get(0))
+            .collect::<Vec<String>>();
+        if primary_key.is_empty() {
+            warn!(
+                table = %format!("{namespace}.{name}"),
+                publication,
+                "sql-denormalize: skipping publication table without a primary key"
+            );
+            continue;
+        }
+        projections.push(direct_projection(&namespace, &name, primary_key));
+    }
+    Ok(projections)
+}
+
 /// Highest `ventstream.cdc.lsn` across a batch, returned as the original
 /// header string (LSNs are decimal `u64` strings, parsed numerically to
 /// compare). `None` if no event in the batch carries an LSN (e.g. a pure
@@ -1078,6 +1174,25 @@ mod tests {
         assert_eq!(quote_qualified("noschema"), "\"noschema\"");
         assert_eq!(relation_of("shop.orders"), "orders");
         assert_eq!(namespace_of("shop.orders"), "shop");
+    }
+
+    #[test]
+    fn direct_projection_materializes_the_complete_primary_row() {
+        let def = direct_projection(
+            "public",
+            "orders",
+            vec!["tenant_id".to_owned(), "id".to_owned()],
+        );
+
+        assert_eq!(def.effective_name(), "public.orders");
+        assert_eq!(def.primary.table, "public.orders");
+        assert_eq!(
+            def.primary.pk.columns(),
+            &["tenant_id".to_owned(), "id".to_owned()]
+        );
+        assert!(def.related.is_empty());
+        assert_eq!(doc_expr(&def), "to_jsonb(p)");
+        assert_eq!(def.target_index(), None);
     }
 
     #[test]

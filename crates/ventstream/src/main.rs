@@ -1730,9 +1730,10 @@ async fn build_and_run_pg_sql_denormalize_engine(
         "VS_PG_BOOTSTRAP_CHUNK_SIZE",
         5_000,
     )? as i64;
-    let mut denorm = sql_denormalize::SqlDenormalizer::connect(&conn, joins, chunk)
-        .await
-        .context("building SQL denormalizer")?;
+    let mut denorm =
+        sql_denormalize::SqlDenormalizer::connect(&conn, &pg.publication, joins, chunk)
+            .await
+            .context("building SQL denormalizer")?;
     // Sink-as-reverse-index fallback for 1:many child deletes under Postgres
     // `REPLICA IDENTITY DEFAULT` (the WAL pre-image lacks the parent FK). The
     // denormalizer queries the same OS index the dispatcher writes to recover
