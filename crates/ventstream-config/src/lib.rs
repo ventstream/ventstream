@@ -9,6 +9,48 @@ use thiserror::Error;
 /// Engine configuration schema version supported by this crate.
 pub const SUPPORTED_SCHEMA_VERSION: u64 = 1;
 
+/// TLS policy shared by database sources and HTTPS sinks.
+///
+/// The block is optional for backward compatibility. When present, strict
+/// certificate and hostname verification is the default.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// Transport policy. Omit to use strict verification.
+    #[serde(default)]
+    pub mode: TlsMode,
+    /// Optional PEM CA bundle for private certificate authorities.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+}
+
+impl TlsConfig {
+    fn validate(&self, field: &'static str) -> Result<(), ConfigError> {
+        if self.mode == TlsMode::Disabled && self.ca_file.is_some() {
+            return Err(ConfigError::InvalidField(match field {
+                "source.postgres.tls" => "source.postgres.tls.ca_file requires mode=verify_full",
+                "source.mysql.tls" => "source.mysql.tls.ca_file requires mode=verify_full",
+                "source.mongodb.tls" => "source.mongodb.tls.ca_file requires mode=verify_full",
+                "source.neo4j.tls" => "source.neo4j.tls.ca_file requires mode=verify_full",
+                "sink.opensearch.tls" => "sink.opensearch.tls.ca_file requires mode=verify_full",
+                _ => "tls.ca_file requires mode=verify_full",
+            }));
+        }
+        Ok(())
+    }
+}
+
+/// Supported database transport-security policies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsMode {
+    /// Require TLS and verify both the certificate chain and server hostname.
+    #[default]
+    VerifyFull,
+    /// Disable TLS. Intended only for isolated local development.
+    Disabled,
+}
+
 /// Parsed canonical engine configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -256,6 +298,9 @@ pub struct PostgresSourceConfig {
     /// Maximum pooled connections for in-memory related-row fetches.
     #[serde(default)]
     pub related_fetch_pool_size: Option<usize>,
+    /// TLS transport policy.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
 }
 
 impl PostgresSourceConfig {
@@ -294,6 +339,9 @@ impl PostgresSourceConfig {
             return Err(ConfigError::InvalidField(
                 "source.postgres.related_fetch_pool_size must be positive",
             ));
+        }
+        if let Some(tls) = &self.tls {
+            tls.validate("source.postgres.tls")?;
         }
         Ok(())
     }
@@ -369,6 +417,9 @@ pub struct Neo4jSourceConfig {
     /// Optional PEM trust bundle path.
     #[serde(default)]
     pub trust_cert_file: Option<PathBuf>,
+    /// TLS transport policy. Prefer this over `trust_cert_file`.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
 }
 
 impl Neo4jSourceConfig {
@@ -403,6 +454,14 @@ impl Neo4jSourceConfig {
             return Err(ConfigError::InvalidField(
                 "source.neo4j recompose values must be positive",
             ));
+        }
+        if let Some(tls) = &self.tls {
+            tls.validate("source.neo4j.tls")?;
+            if tls.ca_file.is_some() && self.trust_cert_file.is_some() {
+                return Err(ConfigError::InvalidField(
+                    "source.neo4j.tls.ca_file and source.neo4j.trust_cert_file are mutually exclusive",
+                ));
+            }
         }
         Ok(())
     }
@@ -439,6 +498,9 @@ pub struct MongodbSourceConfig {
     /// Resume-token flush cadence in milliseconds.
     #[serde(default)]
     pub token_flush_ms: Option<u64>,
+    /// TLS transport policy.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
 }
 
 impl MongodbSourceConfig {
@@ -462,6 +524,9 @@ impl MongodbSourceConfig {
             ));
         }
         validate_nonempty_list("source.mongodb.collections", &self.collections)?;
+        if let Some(tls) = &self.tls {
+            tls.validate("source.mongodb.tls")?;
+        }
         Ok(())
     }
 }
@@ -534,6 +599,9 @@ pub struct MysqlSourceConfig {
     /// Maximum concurrent SQL recomposition queries.
     #[serde(default)]
     pub recompose_concurrency: Option<usize>,
+    /// TLS transport policy.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
 }
 
 impl MysqlSourceConfig {
@@ -569,6 +637,9 @@ impl MysqlSourceConfig {
             ));
         }
         validate_nonempty_list("source.mysql.tables", &self.tables)?;
+        if let Some(tls) = &self.tls {
+            tls.validate("source.mysql.tls")?;
+        }
         Ok(())
     }
 }
@@ -773,12 +844,23 @@ pub struct OpenSearchSinkConfig {
     /// Disable TLS certificate verification. Development only.
     #[serde(default)]
     pub insecure_tls: Option<bool>,
+    /// TLS transport policy. Prefer this over `insecure_tls`.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
 }
 
 impl OpenSearchSinkConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         if let Some(auth) = &self.auth {
             auth.validate()?;
+        }
+        if let Some(tls) = &self.tls {
+            tls.validate("sink.opensearch.tls")?;
+            if self.insecure_tls == Some(true) {
+                return Err(ConfigError::InvalidField(
+                    "sink.opensearch.tls and sink.opensearch.insecure_tls=true are mutually exclusive",
+                ));
+            }
         }
         self.index_routing.validate()
     }
@@ -1628,6 +1710,7 @@ fn validate_env_name(name: &str) -> Result<(), ConfigError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -2286,5 +2369,50 @@ runtime:
         );
         assert!(invalid_headroom.is_err());
         Ok(())
+    }
+
+    #[test]
+    fn tls_blocks_default_to_strict_verification() {
+        let tls: TlsConfig = serde_yaml::from_str("{}").expect("parse TLS defaults");
+        assert_eq!(tls.mode, TlsMode::VerifyFull);
+
+        let tls: TlsConfig =
+            serde_yaml::from_str("mode: verify_full\nca_file: /run/secrets/database-ca.pem\n")
+                .expect("parse strict TLS");
+        assert_eq!(tls.mode, TlsMode::VerifyFull);
+        assert_eq!(
+            tls.ca_file.as_deref(),
+            Some(std::path::Path::new("/run/secrets/database-ca.pem"))
+        );
+    }
+
+    #[test]
+    fn rejects_weak_or_contradictory_tls_settings() {
+        assert!(serde_yaml::from_str::<TlsConfig>("mode: require\n").is_err());
+
+        let disabled_with_ca: TlsConfig =
+            serde_yaml::from_str("mode: disabled\nca_file: /tmp/ca.pem\n")
+                .expect("deserialize before semantic validation");
+        assert!(disabled_with_ca.validate("source.postgres.tls").is_err());
+
+        let config = EngineConfig::from_yaml_str(
+            r#"
+schema_version: 1
+roles: [cdc]
+source:
+  kind: mongodb
+  mongodb:
+    uri_ref: env:VS_MONGO_URI
+    database: app
+    tls: {}
+sink:
+  kind: opensearch
+  opensearch:
+    endpoint_ref: env:VS_OS_ENDPOINT
+    insecure_tls: true
+    tls: {}
+"#,
+        );
+        assert!(config.is_err());
     }
 }

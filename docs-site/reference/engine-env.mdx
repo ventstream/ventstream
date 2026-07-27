@@ -35,6 +35,8 @@ Validation fails when a required reference is missing.
 | `VS_OS_API_KEY` | API-key credential. Takes precedence over basic auth when both are present. |
 | `VS_INDEX_TEMPLATE` | Required legacy routing template when canonical `index_routing` is not configured. |
 | `VS_OS_RECONCILE_ALLOW_FULL_PURGE` | Allow reconciliation to remove every document when the source key set is empty. Default `false`; leave disabled unless an empty source is known to be authoritative. |
+| `VS_OS_TLS_MODE` | `verify_full` requires HTTPS and validates the certificate chain and hostname. `disabled` requires an `http://` endpoint. |
+| `VS_OS_TLS_CA_FILE` | Optional PEM CA bundle for a privately issued OpenSearch certificate. |
 | `VS_INSECURE_TLS` | Disable sink certificate verification. Default `false`; use only for isolated local testing. |
 
 ## Canonical engine config
@@ -69,6 +71,20 @@ specs:
 runtime:
   dlq_path: ./data/dlq.jsonl
 ```
+
+PostgreSQL, MySQL, MongoDB, Neo4j, and OpenSearch accept the same optional
+transport block beneath their connector settings:
+
+```yaml
+tls:
+  mode: verify_full
+  ca_file: /run/secrets/database-ca.pem
+```
+
+`verify_full` checks both the certificate chain and hostname. Omit `ca_file`
+when the certificate uses a public root. Existing configurations keep their
+current URI or connector behavior when `tls` is omitted. `disabled` is the only
+other mode; weak modes that encrypt without hostname verification are rejected.
 
 OpenSearch routing strategies:
 
@@ -108,6 +124,8 @@ certificates in Kubernetes Secrets or a local secret provider.
 | `VS_PG_HOST` / `VS_PG_PORT` | Connection host/port. |
 | `VS_PG_USER` / `VS_PG_PASSWORD` | Credentials (role needs `REPLICATION`). |
 | `VS_PG_DATABASE` | Database name. |
+| `VS_PG_TLS_MODE` | `verify_full` validates the certificate chain and hostname; `disabled` uses an unencrypted connection. |
+| `VS_PG_TLS_CA_FILE` | Optional PEM CA bundle for a private CA, including cloud database CA bundles. |
 | `VS_PG_PUBLICATION` | Logical-replication publication to consume. |
 | `VS_PG_SLOT` | Replication slot name — **unique per agent**. |
 | `VS_PG_BOOTSTRAP_MODE` | `snapshot` (scan then tail) or `none`. |
@@ -131,6 +149,8 @@ certificates in Kubernetes Secrets or a local secret provider.
 | `VS_NEO4J_USER` / `VS_NEO4J_PASSWORD` | Credentials. |
 | `VS_NEO4J_DATABASE` | Database (default `neo4j`). |
 | `VS_NEO4J_NAMESPACE` | Namespace prefix for emitted subjects. |
+| `VS_NEO4J_TLS_MODE` | `verify_full` selects `neo4j+s://`/`bolt+s://`; `disabled` selects an unencrypted URI. |
+| `VS_NEO4J_TLS_CA_FILE` | Optional PEM CA bundle for a privately issued Bolt certificate. |
 | `VS_NEO4J_TRUST_CERT_FILE` | Bolt CA cert path (mounted from a Secret). |
 | `VS_NEO4J_DENORMALIZE_YAML` | Path to the denormalize spec. |
 | `VS_NEO4J_STATE_DIR` | Cursor-file directory (on the PVC). |
@@ -154,6 +174,8 @@ require a replica set or sharded cluster.
 |---|---|
 | `VS_MONGO_URI` | Connection string (`mongodb://` / `mongodb+srv://`) incl. replica-set / mongos host(s), auth, TLS. Carries credentials. |
 | `VS_MONGO_DATABASE` | Database to watch and namespace under. |
+| `VS_MONGO_TLS_MODE` | `verify_full` enables TLS and certificate validation; `disabled` turns TLS off. Explicit policy overrides TLS flags in the URI. |
+| `VS_MONGO_TLS_CA_FILE` | Optional PEM CA bundle for a private CA. Atlas normally uses public roots and does not need this. |
 | `VS_MONGO_NAMESPACE` | Namespace stamped on emitted subjects (default = database). |
 | `VS_MONGO_COLLECTIONS` | CSV of collections to watch; empty = all collections in the database. |
 | `VS_MONGO_FULL_DOCUMENT` | `updateLookup` (default — re-read post-image on updates) or `default` (deltas only). |
@@ -174,6 +196,8 @@ See the [MySQL connector](/connectors/sources/mysql). Requires
 | `VS_MYSQL_USER` | Login user (default `root`); needs `REPLICATION SLAVE` + `REPLICATION CLIENT`. |
 | `VS_MYSQL_PASSWORD` | Login password (carries credentials). |
 | `VS_MYSQL_DATABASE` | Database to watch and namespace under. |
+| `VS_MYSQL_TLS_MODE` | `verify_full` validates the certificate chain and hostname; `disabled` uses an unencrypted connection. |
+| `VS_MYSQL_TLS_CA_FILE` | Optional PEM CA bundle for a private CA or managed-database CA. |
 | `VS_MYSQL_NAMESPACE` | Namespace stamped on emitted subjects (default = database). |
 | `VS_MYSQL_TABLES` | CSV of tables to watch; empty = all tables in the database. |
 | `VS_MYSQL_SERVER_ID` | Replica `server_id` this agent registers as (default 4000000000); must be unique. |

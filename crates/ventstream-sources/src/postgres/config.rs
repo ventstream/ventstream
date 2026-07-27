@@ -6,6 +6,8 @@
 
 use std::time::Duration;
 
+use crate::tls::DatabaseTlsConfig;
+
 /// Configuration for a [`super::PostgresCdcSource`].
 #[derive(Debug, Clone)]
 pub struct PostgresCdcConfig {
@@ -54,6 +56,9 @@ pub struct PostgresCdcConfig {
     /// When `None`, the slot must already exist or the operator
     /// accepts that the engine starts with empty state.
     pub bootstrap: Option<SnapshotBootstrap>,
+
+    /// Optional TLS policy. `None` preserves the legacy plaintext default.
+    pub tls: Option<DatabaseTlsConfig>,
 }
 
 /// Tables to scan in a one-time snapshot bootstrap.
@@ -131,6 +136,7 @@ impl PostgresCdcConfig {
             slot_name: slot_name.into(),
             status_interval: Duration::from_secs(10),
             bootstrap: None,
+            tls: None,
         }
     }
 
@@ -153,6 +159,13 @@ impl PostgresCdcConfig {
     #[must_use]
     pub fn with_status_interval(mut self, interval: Duration) -> Self {
         self.status_interval = interval;
+        self
+    }
+
+    /// Apply one TLS policy to replication and every auxiliary connection.
+    #[must_use]
+    pub fn with_tls(mut self, tls: DatabaseTlsConfig) -> Self {
+        self.tls = Some(tls);
         self
     }
 }

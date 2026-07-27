@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use tracing::{debug, info, warn};
 use ventstream_core::{
     ContentType, Event, EventReceiver, EventSender, Headers, Payload, ShutdownToken, SourceUri,
@@ -32,6 +32,7 @@ use ventstream_core::{
 use ventstream_joins::config::{BackfillConfig, StateConfig, TargetConfig};
 use ventstream_joins::{Cardinality, JoinDefinition, PkSpec, PrimaryRef, RelatedDefinition};
 use ventstream_sinks::opensearch::{index_template, OpenSearchConfig, OsReverseLookup};
+use ventstream_sources::postgres::{connect_client, PostgresCdcConfig};
 
 /// Greedy-drain ceiling for the tail loop. `recv_batch` returns one event
 /// immediately when idle (low latency) and opportunistically drains up to this
@@ -207,19 +208,14 @@ impl SqlDenormalizer {
     /// bounded-memory bootstrap and full-row recomposition semantics used by
     /// joined projections.
     pub async fn connect(
-        conn_string: &str,
+        source: &PostgresCdcConfig,
         publication: &str,
         mut joins: Vec<JoinDefinition>,
         chunk_size: i64,
     ) -> Result<Self> {
-        let (client, connection) = tokio_postgres::connect(conn_string, NoTls)
+        let client = connect_client(source, "sql-denormalize connect")
             .await
             .context("sql-denormalize connect")?;
-        tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                warn!(error = %err, "sql-denormalize connection ended");
-            }
-        });
 
         if joins.is_empty() {
             joins = discover_direct_projections(&client, publication).await?;

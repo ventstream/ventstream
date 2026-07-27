@@ -123,20 +123,18 @@ directly, and CDC carries every change after enrichment is on.
 
 ## TLS / Bolt cert
 
-For `neo4j+s://` connections the engine validates the server cert via
-the OS trust store. Supply the Bolt CA cert and point the engine at it:
+Set `VS_NEO4J_TLS_MODE=verify_full` to require encrypted Bolt and validate both
+the certificate chain and hostname. The engine selects the strict
+`neo4j+s://` or `bolt+s://` scheme automatically.
 
 ```bash
-# extract from a local container, or get it from your Neo4j admin
-docker exec vs-neo4j cat /ssl/bolt/public.crt > /etc/ventstream/neo4j-ca.crt
+VS_NEO4J_TLS_MODE=verify_full
+# Only for a private CA:
+VS_NEO4J_TLS_CA_FILE=/run/secrets/neo4j-ca.pem
 ```
 
-```bash
-VS_NEO4J_TRUST_CERT_FILE=/etc/ventstream/neo4j-ca.crt
-```
-
-In Kubernetes this cert is mounted from a Secret — see
-[Kubernetes](/deploy/kubernetes).
+Aura certificates use public roots, so no CA file is normally needed. Mount a
+private CA from a Secret when operating a self-managed encrypted Bolt endpoint.
 
 ## The projection
 

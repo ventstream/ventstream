@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::tls::DatabaseTlsConfig;
+
 /// Configuration for a [`super::Neo4jCdcSource`].
 #[derive(Debug, Clone)]
 pub struct Neo4jCdcConfig {
@@ -72,6 +74,9 @@ pub struct Neo4jCdcConfig {
     /// trust store. Leave `None` and `bolt+s://` / `neo4j+s://` URIs
     /// will validate automatically.
     pub trust_cert_file: Option<PathBuf>,
+
+    /// Optional TLS policy. `None` leaves encryption selection to the URI.
+    pub tls: Option<DatabaseTlsConfig>,
 
     /// How long to wait between polls of `db.cdc.query`. Smaller =
     /// lower live-tail latency at the cost of more idle Bolt traffic.
@@ -164,6 +169,7 @@ impl Neo4jCdcConfig {
             label_priority: Vec::new(),
             state_dir,
             trust_cert_file: None,
+            tls: None,
             poll_interval: Duration::from_millis(500),
             idle_advance_after_polls: 20,
             recompose_chunk: 128,

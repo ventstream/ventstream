@@ -17,6 +17,7 @@ use tracing::debug;
 
 use super::config::Neo4jCdcConfig;
 use crate::error::Neo4jCdcError;
+use crate::tls::ensure_crypto_provider;
 
 type Result<T> = std::result::Result<T, Neo4jCdcError>;
 
@@ -26,6 +27,7 @@ type Result<T> = std::result::Result<T, Neo4jCdcError>;
 /// `connect` lives on a private impl and changing that ripples into
 /// the source's invariants.
 async fn connect(config: &Neo4jCdcConfig) -> Result<Graph> {
+    ensure_crypto_provider();
     let mut builder = ConfigBuilder::default()
         .uri(config.uri.as_str())
         .user(config.user.as_str())

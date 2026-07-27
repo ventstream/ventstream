@@ -99,6 +99,19 @@ VS_INDEX_TEMPLATE='${header:ventstream.cdc.relation}' \
 database. The index template renders one index per table (`orders`,
 `order_items`, …).
 
+## TLS
+
+Use strict TLS for a managed or remote database:
+
+```bash
+VS_MYSQL_TLS_MODE=verify_full
+VS_MYSQL_TLS_CA_FILE=/run/secrets/mysql-ca.pem
+```
+
+The CA file is optional when the server certificate chains to a public root.
+Strict mode validates both the certificate chain and hostname for binlog,
+snapshot, join-fetch, and SQL recomposition connections.
+
 ## Key environment variables
 
 | Variable | Default | Purpose |
@@ -108,6 +121,8 @@ database. The index template renders one index per table (`orders`,
 | `VS_MYSQL_USER` | `root` | Login user; needs `REPLICATION SLAVE` + `REPLICATION CLIENT` + `SELECT`. |
 | `VS_MYSQL_PASSWORD` | empty | Login password. Carries credentials — source it from a Secret in Kubernetes. |
 | `VS_MYSQL_DATABASE` | — (required) | Database to watch and namespace rows under. |
+| `VS_MYSQL_TLS_MODE` | unset | `verify_full` or `disabled`. |
+| `VS_MYSQL_TLS_CA_FILE` | unset | PEM CA bundle for a private CA. |
 | `VS_MYSQL_NAMESPACE` | = database | Logical namespace stamped on subjects/headers. |
 | `VS_MYSQL_TABLES` | unset (all) | CSV of tables to watch; empty = every table in the database. |
 | `VS_MYSQL_SERVER_ID` | `4000000000` | Replica `server_id` the agent registers as; must be unique in the topology. |

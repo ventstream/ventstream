@@ -246,6 +246,19 @@ VS_INDEX_TEMPLATE='${header:ventstream.cdc.relation}' \
 ./target/release/ventstream
 ```
 
+## TLS
+
+Use strict TLS for a managed or remote database:
+
+```bash
+VS_PG_TLS_MODE=verify_full
+VS_PG_TLS_CA_FILE=/run/secrets/postgres-ca.pem
+```
+
+The CA file is optional when the certificate chains to a public root. Strict
+mode applies to logical replication, snapshots, related-row fetching, SQL
+recomposition, reconciliation, and replication-slot management.
+
 ## Connection resilience
 
 If the replication connection drops mid-stream — a transient network

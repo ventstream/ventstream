@@ -1,5 +1,6 @@
 //! Configuration for the OpenSearch / Elasticsearch sink.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Top-level sink configuration.
@@ -37,6 +38,9 @@ pub struct OpenSearchConfig {
     /// disable in production.
     pub verify_tls: bool,
 
+    /// Optional PEM CA bundle for a private certificate authority.
+    pub ca_file: Option<PathBuf>,
+
     /// Override the reconcile mass-deletion guardrails. When false (the
     /// default), [`super::reconcile_orphans`] refuses to run if the source
     /// returned **zero** valid PKs, or if more than
@@ -63,6 +67,7 @@ impl OpenSearchConfig {
             retry: RetryConfig::default(),
             request_timeout: Duration::from_secs(30),
             verify_tls: true,
+            ca_file: None,
             reconcile_allow_full_purge: false,
         }
     }
@@ -99,6 +104,13 @@ impl OpenSearchConfig {
     #[must_use]
     pub const fn with_insecure_tls(mut self) -> Self {
         self.verify_tls = false;
+        self
+    }
+
+    /// Add a private CA bundle while retaining full certificate verification.
+    #[must_use]
+    pub fn with_ca_file(mut self, path: PathBuf) -> Self {
+        self.ca_file = Some(path);
         self
     }
 

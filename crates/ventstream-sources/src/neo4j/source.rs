@@ -78,6 +78,7 @@ use super::denormalize;
 use super::event_mapper::{self, LiveEventOutcome};
 use super::retry;
 use crate::error::Neo4jCdcError;
+use crate::tls::ensure_crypto_provider;
 
 /// Shared counters between the tail loop and the heartbeat task.
 ///
@@ -172,6 +173,7 @@ impl Neo4jCdcSource {
     }
 
     async fn connect(&self) -> Result<Graph, Neo4jCdcError> {
+        ensure_crypto_provider();
         let mut builder = ConfigBuilder::default()
             .uri(self.config.uri.as_str())
             .user(self.config.user.as_str())
@@ -836,6 +838,74 @@ async fn poll_once(graph: &Graph, cursor: &str) -> Result<Vec<CdcRow>, Neo4jCdcE
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+
+    fn live_neo4j_source() -> Neo4jCdcSource {
+        let uri = std::env::var("VENTSTREAM_TEST_NEO4J_URI").expect("VENTSTREAM_TEST_NEO4J_URI");
+        let user = std::env::var("VENTSTREAM_TEST_NEO4J_USER").expect("VENTSTREAM_TEST_NEO4J_USER");
+        let password = std::env::var("VENTSTREAM_TEST_NEO4J_PASSWORD")
+            .expect("VENTSTREAM_TEST_NEO4J_PASSWORD");
+        let database =
+            std::env::var("VENTSTREAM_TEST_NEO4J_DATABASE").unwrap_or_else(|_| "neo4j".to_owned());
+        let mut config = Neo4jCdcConfig::new(
+            "neo4j-tls-test",
+            uri,
+            user,
+            password,
+            database,
+            tmp_state_dir(),
+        );
+        if let Ok(path) = std::env::var("VENTSTREAM_TEST_NEO4J_CA_FILE") {
+            config.trust_cert_file = Some(path.into());
+        }
+        Neo4jCdcSource::new(config)
+    }
+
+    async fn probe_neo4j(source: &Neo4jCdcSource) -> Result<(), Neo4jCdcError> {
+        let graph = tokio::time::timeout(std::time::Duration::from_secs(30), source.connect())
+            .await
+            .map_err(|_| Neo4jCdcError::Connection("Neo4j TLS connection timed out".into()))??;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            graph.run(query("RETURN 1 AS ok")),
+        )
+        .await
+        .map_err(|_| Neo4jCdcError::Connection("Neo4j TLS probe timed out".into()))?;
+        result.map_err(|err| Neo4jCdcError::Connection(err.to_string()))
+    }
+
+    #[tokio::test]
+    #[ignore = "requires VENTSTREAM_TEST_NEO4J_URI, user, password, and optional database/CA"]
+    async fn strict_tls_connects_to_a_trusted_neo4j_server() {
+        let source = live_neo4j_source();
+        assert!(
+            source.config.uri.starts_with("neo4j+s://")
+                || source.config.uri.starts_with("bolt+s://"),
+            "live TLS test requires a strict +s URI"
+        );
+        probe_neo4j(&source)
+            .await
+            .expect("strict Neo4j TLS connection");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a wrong VENTSTREAM_TEST_NEO4J_CA_FILE"]
+    async fn strict_tls_rejects_an_untrusted_neo4j_ca() {
+        let source = live_neo4j_source();
+        assert!(
+            probe_neo4j(&source).await.is_err(),
+            "an unrelated CA must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a hostname-mismatched VENTSTREAM_TEST_NEO4J_URI"]
+    async fn strict_tls_rejects_a_neo4j_hostname_mismatch() {
+        let source = live_neo4j_source();
+        assert!(
+            probe_neo4j(&source).await.is_err(),
+            "a hostname mismatch must be rejected"
+        );
+    }
 
     #[test]
     fn invalid_cursor_classification() {

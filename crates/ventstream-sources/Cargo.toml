@@ -20,12 +20,16 @@ mongodb = { workspace = true }
 mysql_async = { workspace = true }
 rdkafka = { workspace = true }
 pgwire-replication = { workspace = true }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
+tokio-postgres-rustls = { workspace = true }
 tracing = { workspace = true }
 metrics = "0.24"
 ventstream-core = { workspace = true }

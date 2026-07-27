@@ -40,11 +40,12 @@ use std::time::Instant;
 
 use chrono::Utc;
 use serde_json::Value;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::Client;
 use tracing::{info, warn};
 use ventstream_core::{ContentType, Event, Headers, Payload, SourceContext, SourceUri, Subject};
 
 use super::config::{PostgresCdcConfig, SnapshotBootstrap, SnapshotTable};
+use super::connection::connect_client;
 use crate::error::PostgresCdcError;
 
 /// Re-snapshot a specific set of tables on demand. Skips the
@@ -59,14 +60,7 @@ pub async fn resync_tables(
     chunk_size: usize,
     ctx: &SourceContext,
 ) -> Result<ResyncStats, PostgresCdcError> {
-    let (client, connection) = tokio_postgres::connect(&connection_string(config), NoTls)
-        .await
-        .map_err(|err| PostgresCdcError::Connection(format!("resync connect: {err}")))?;
-    tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            warn!(error = %err, "resync connection task ended");
-        }
-    });
+    let client = connect_client(config, "resync connect").await?;
 
     info!(tables = tables.len(), chunk_size, "resync starting");
     let start = Instant::now();
@@ -103,18 +97,7 @@ pub(crate) async fn maybe_bootstrap(
         return Ok(());
     };
 
-    let (client, connection) = tokio_postgres::connect(&connection_string(config), NoTls)
-        .await
-        .map_err(|err| {
-            PostgresCdcError::Connection(format!("snapshot bootstrap connect: {err}"))
-        })?;
-    // The connection driver needs its own task; if it dies we surface
-    // that via the next client call.
-    tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            warn!(error = %err, "snapshot bootstrap connection task ended");
-        }
-    });
+    let client = connect_client(config, "snapshot bootstrap connect").await?;
 
     let existing_slot = slot_exists(&client, &config.slot_name).await?;
     if existing_slot && !bootstrap_existing_slot {
@@ -663,12 +646,6 @@ fn sanitize_segment(input: &str) -> String {
         out.push('_');
     }
     out
-}
-
-/// Build the connection string passed to the standalone bootstrap
-/// connection. Delegates to the shared, properly-escaped builder (M9).
-fn connection_string(cfg: &PostgresCdcConfig) -> String {
-    cfg.connection_string()
 }
 
 #[cfg(test)]

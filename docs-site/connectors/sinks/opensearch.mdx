@@ -14,11 +14,17 @@ The sink writes the engine's output documents to **OpenSearch** or
 | `VS_OS_ENDPOINT` | — | base URL, e.g. `http://localhost:9200` (required) |
 | `VS_OS_USERNAME` / `VS_OS_PASSWORD` | — | HTTP basic auth |
 | `VS_OS_API_KEY` | — | `ApiKey`-header auth (alternative to basic) |
+| `VS_OS_TLS_MODE` | unset | `verify_full` requires HTTPS and validates the certificate and hostname; `disabled` requires HTTP |
+| `VS_OS_TLS_CA_FILE` | — | PEM CA bundle for a private CA |
 | `VS_INDEX_TEMPLATE` | — | how each document's target index name is built |
 
 Bulk batching, parallelism, and the dead-letter path are tuned with the
 shared dispatcher knobs (`VS_DISPATCH_*`) — see the
 [engine env reference](/reference/engine-env).
+
+For a private CA, mount its PEM bundle and set
+`VS_OS_TLS_MODE=verify_full` with `VS_OS_TLS_CA_FILE`. Publicly issued
+certificates need strict mode but no CA file.
 
 ## Index naming
 
