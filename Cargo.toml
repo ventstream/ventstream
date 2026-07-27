@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 rust-version = "1.94"
 authors = ["VentStream Authors"]
@@ -160,18 +160,18 @@ proptest = "1.5"
 hex = "0.4"
 
 # Internal crates referenced as workspace deps
-ventstream-core = { version = "0.1.12", path = "crates/ventstream-core" }
-ventstream-sources = { version = "0.1.12", path = "crates/ventstream-sources" }
-ventstream-sinks = { version = "0.1.12", path = "crates/ventstream-sinks" }
-ventstream-graphql = { version = "0.1.12", path = "crates/ventstream-graphql" }
-ventstream-jetstream = { version = "0.1.12", path = "crates/ventstream-jetstream" }
-ventstream-joins = { version = "0.1.12", path = "crates/ventstream-joins" }
-ventstream-protocol = { version = "0.1.12", path = "crates/ventstream-protocol" }
-ventstream-realtime = { version = "0.1.12", path = "crates/ventstream-realtime" }
-ventstream-redis = { version = "0.1.12", path = "crates/ventstream-redis" }
-ventstream-ws = { version = "0.1.12", path = "crates/ventstream-ws" }
-ventstream-config = { version = "0.1.12", path = "crates/ventstream-config" }
-ventstream-telemetry = { version = "0.1.12", path = "crates/ventstream-telemetry" }
+ventstream-core = { version = "0.1.13", path = "crates/ventstream-core" }
+ventstream-sources = { version = "0.1.13", path = "crates/ventstream-sources" }
+ventstream-sinks = { version = "0.1.13", path = "crates/ventstream-sinks" }
+ventstream-graphql = { version = "0.1.13", path = "crates/ventstream-graphql" }
+ventstream-jetstream = { version = "0.1.13", path = "crates/ventstream-jetstream" }
+ventstream-joins = { version = "0.1.13", path = "crates/ventstream-joins" }
+ventstream-protocol = { version = "0.1.13", path = "crates/ventstream-protocol" }
+ventstream-realtime = { version = "0.1.13", path = "crates/ventstream-realtime" }
+ventstream-redis = { version = "0.1.13", path = "crates/ventstream-redis" }
+ventstream-ws = { version = "0.1.13", path = "crates/ventstream-ws" }
+ventstream-config = { version = "0.1.13", path = "crates/ventstream-config" }
+ventstream-telemetry = { version = "0.1.13", path = "crates/ventstream-telemetry" }
 
 # YAML config parsing (will land alongside the join engine)
 serde_yaml = "0.9"
