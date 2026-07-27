@@ -314,6 +314,13 @@ impl BulkResponseAction {
             Self::Index(e) | Self::Create(e) | Self::Update(e) | Self::Delete(e) => e,
         }
     }
+
+    /// Whether a delete reached the desired state because the document was
+    /// already absent. Replayed deletes must remain idempotent across source
+    /// and sink restarts.
+    pub fn is_idempotent_delete_not_found(&self) -> bool {
+        matches!(self, Self::Delete(entry) if entry.status == 404)
+    }
 }
 
 /// One item's outcome — the inner object under `index` / `create` /

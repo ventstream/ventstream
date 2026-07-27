@@ -529,6 +529,13 @@ fn partition_bulk_items(parsed: &BulkResponse) -> SendOutcome {
         if entry.is_success() {
             continue;
         }
+        if item.action.is_idempotent_delete_not_found() {
+            debug!(
+                offset,
+                "bulk delete target was already absent; treating replay as applied"
+            );
+            continue;
+        }
         // A 409 external-version conflict is not a failure: a newer
         // (>=) write already won, so this stale op is correctly dropped
         // (H18). Treat it as applied — never retry it (the retry would
@@ -1139,6 +1146,67 @@ mod tests {
         sink.write(batch)
             .await
             .expect("version conflict must not fail the batch");
+    }
+
+    #[test]
+    fn partition_treats_only_delete_not_found_as_success() {
+        let json = serde_json::json!({
+            "took": 1,
+            "errors": true,
+            "items": [
+                { "delete": { "_id": "already-absent", "status": 404,
+                    "error": { "type": "document_missing_exception" } } },
+                { "index": { "_id": "bad-index", "status": 404,
+                    "error": { "type": "index_not_found_exception" } } }
+            ]
+        });
+        let parsed: BulkResponse = serde_json::from_value(json).unwrap();
+        match partition_bulk_items(&parsed) {
+            SendOutcome::PerItem {
+                transient,
+                permanent,
+            } => {
+                assert!(transient.is_empty());
+                assert_eq!(permanent.len(), 1);
+                assert_eq!(permanent[0].offset, 1);
+                assert!(permanent[0].error.contains("index_not_found_exception"));
+            }
+            other => panic!("expected the non-delete 404 to remain permanent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn replayed_delete_not_found_does_not_fail_the_write() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "took": 1,
+            "errors": true,
+            "items": [
+                { "delete": { "_id": "orders:missing", "status": 404,
+                    "error": { "type": "document_missing_exception" } } }
+            ]
+        });
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let source = SourceUri::new("test://x").expect("uri");
+        let subject = Subject::new("postgres.app.orders.delete").expect("subject");
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("ventstream.doc.id".to_owned(), "orders:missing".to_owned());
+        let event = Event::builder(source, subject)
+            .payload(Payload::from_vec(br#"{"id":"missing"}"#.to_vec()))
+            .content_type(ContentType::Json)
+            .headers(Headers::from_map(headers))
+            .build();
+
+        let sink = sink_against(&server.uri());
+        sink.write(SinkBatch::new(vec![event]))
+            .await
+            .expect("an already-absent delete target is applied");
     }
 
     #[test]
