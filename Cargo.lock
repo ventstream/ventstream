@@ -5352,7 +5352,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "ventstream"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5389,7 +5389,7 @@ dependencies = [
 
 [[package]]
 name = "ventstream-config"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "serde",
  "serde_yaml",
@@ -5398,7 +5398,7 @@ dependencies = [
 
 [[package]]
 name = "ventstream-core"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5418,7 +5418,7 @@ dependencies = [
 
 [[package]]
 name = "ventstream-graphql"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
@@ -5448,7 +5448,7 @@ dependencies = [
 
 [[package]]
 name = "ventstream-jetstream"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -5465,7 +5465,7 @@ dependencies = [
 
 [[package]]
 name = "ventstream-joins"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5483,7 +5483,7 @@ dependencies = [
 
 [[package]]
 name = "ventstream-protocol"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "chrono",
  "serde",
@@ -5494,7 +5494,7 @@ dependencies = [
 
 [[package]]
 name = "ventstream-realtime"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5504,7 +5504,7 @@ dependencies = [
 
 [[package]]
 name = "ventstream-redis"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5520,7 +5520,7 @@ dependencies = [
 
 [[package]]
 name = "ventstream-sinks"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5540,7 +5540,7 @@ dependencies = [
 
 [[package]]
 name = "ventstream-sources"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -5575,7 +5575,7 @@ dependencies = [
 
 [[package]]
 name = "ventstream-telemetry"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5595,7 +5595,7 @@ dependencies = [
 
 [[package]]
 name = "ventstream-ws"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-nats",
  "async-trait",
