@@ -121,6 +121,101 @@ async fn sql_mode_discovers_numeric_pk_type_before_first_insert() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "local integration: requires Docker; run with scripts/test-sources.sh postgres"]
+async fn sql_mode_without_joins_materializes_publication_tables() {
+    const INDEX: &str = "it_pg_direct_sql_orders";
+    const SPEC: &str = "joins: []\n";
+    let stack = common::start_pg_os().await;
+    let pg = common::pg_client(stack.pg_port).await;
+    pg.batch_execute(
+        "CREATE SCHEMA direct;
+         CREATE TABLE direct.orders(
+           id text PRIMARY KEY,
+           status text NOT NULL,
+           total bigint NOT NULL
+         );
+         INSERT INTO direct.orders VALUES
+           ('ord-1', 'created', 100),
+           ('ord-2', 'paid', 200);
+         CREATE PUBLICATION ventstream_direct FOR TABLE direct.orders;",
+    )
+    .await
+    .expect("seed direct table");
+
+    let dir = common::state_dir("direct-sql", stack.pg_port);
+    let spec = common::write_spec(&dir, SPEC);
+    let opts = common::PgEngine {
+        pg_port: stack.pg_port,
+        os_port: stack.os_port,
+        slot: "direct_sql_slot",
+        publication: "ventstream_direct",
+        spec_path: &spec,
+        state_dir: &dir,
+        index_template: INDEX,
+        denormalize_mode: "sql",
+    };
+    let mut engine = common::spawn_pg_engine(&opts);
+
+    common::wait_until(Duration::from_secs(60), "direct SQL bootstrap", || async {
+        common::os_count(stack.os_port, INDEX).await == 2
+    })
+    .await;
+    let id1 = r#"direct.orders:["ord-1"]"#;
+    let id2 = r#"direct.orders:["ord-2"]"#;
+    let id3 = r#"direct.orders:["ord-3"]"#;
+    let doc = common::os_doc(stack.os_port, INDEX, id1)
+        .await
+        .expect("stable bootstrap document");
+    assert_eq!(doc["status"], "created");
+    assert!(doc.get("new").is_none(), "sink document must be a flat row");
+
+    pg.batch_execute("UPDATE direct.orders SET status='shipped', total=150 WHERE id='ord-1';")
+        .await
+        .expect("update direct row");
+    common::wait_until(Duration::from_secs(30), "direct SQL update", || async {
+        common::os_doc(stack.os_port, INDEX, id1)
+            .await
+            .is_some_and(|doc| doc["status"] == "shipped" && doc["total"] == 150)
+            && common::os_count(stack.os_port, INDEX).await == 2
+    })
+    .await;
+
+    pg.batch_execute("INSERT INTO direct.orders VALUES ('ord-3', 'created', 300);")
+        .await
+        .expect("insert direct row");
+    common::wait_until(Duration::from_secs(30), "direct SQL insert", || async {
+        common::os_doc(stack.os_port, INDEX, id3).await.is_some()
+            && common::os_count(stack.os_port, INDEX).await == 3
+    })
+    .await;
+
+    pg.batch_execute("DELETE FROM direct.orders WHERE id='ord-2';")
+        .await
+        .expect("delete direct row");
+    common::wait_until(Duration::from_secs(30), "direct SQL delete", || async {
+        common::os_doc(stack.os_port, INDEX, id2).await.is_none()
+            && common::os_count(stack.os_port, INDEX).await == 2
+    })
+    .await;
+
+    engine.terminate();
+    let _restarted = common::spawn_pg_engine(&opts);
+    common::wait_until(
+        Duration::from_secs(60),
+        "restart preserves stable direct projection",
+        || async {
+            common::os_count(stack.os_port, INDEX).await == 2
+                && common::os_doc(stack.os_port, INDEX, id1)
+                    .await
+                    .is_some_and(|doc| doc["status"] == "shipped")
+                && common::os_doc(stack.os_port, INDEX, id2).await.is_none()
+                && common::os_doc(stack.os_port, INDEX, id3).await.is_some()
+        },
+    )
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "local benchmark: requires Docker; run with scripts/test-sources.sh postgres"]
 async fn related_fetcher_batches_real_postgres_lookups() {
