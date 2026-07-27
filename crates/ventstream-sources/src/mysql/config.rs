@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use mysql_async::{Opts, OptsBuilder};
+use mysql_async::{Opts, OptsBuilder, SslOpts};
+
+use crate::tls::{ensure_crypto_provider, DatabaseTlsConfig, DatabaseTlsMode};
 
 /// One MySQL/MariaDB CDC source.
 #[derive(Debug, Clone)]
@@ -34,6 +36,8 @@ pub struct MySqlCdcConfig {
     pub bootstrap_chunk_size: usize,
     /// Batched binlog-position flush cadence.
     pub pos_flush_interval: Duration,
+    /// Optional TLS policy shared by binlog, snapshot, and query connections.
+    pub tls: Option<DatabaseTlsConfig>,
 }
 
 impl MySqlCdcConfig {
@@ -61,6 +65,7 @@ impl MySqlCdcConfig {
             bootstrap: true,
             bootstrap_chunk_size: 1000,
             pos_flush_interval: Duration::from_millis(1000),
+            tls: None,
         }
     }
 
@@ -71,14 +76,28 @@ impl MySqlCdcConfig {
     /// Connection options shared by the binlog source, the join fetcher, and
     /// the SQL-denormalize path.
     pub fn opts(&self) -> Opts {
-        Opts::from(
-            OptsBuilder::default()
-                .ip_or_hostname(self.host.clone())
-                .tcp_port(self.port)
-                .user(Some(self.user.clone()))
-                .pass(Some(self.password.clone()))
-                .db_name(Some(self.database.clone())),
-        )
+        let mut builder = OptsBuilder::default()
+            .ip_or_hostname(self.host.clone())
+            .tcp_port(self.port)
+            .user(Some(self.user.clone()))
+            .pass(Some(self.password.clone()))
+            .db_name(Some(self.database.clone()));
+        if let Some(tls) = &self.tls {
+            match tls.mode {
+                DatabaseTlsMode::VerifyFull => {
+                    ensure_crypto_provider();
+                    let mut ssl = SslOpts::default();
+                    if let Some(path) = &tls.ca_file {
+                        ssl = ssl.with_root_certs(vec![path.clone().into()]);
+                    }
+                    builder = builder.ssl_opts(Some(ssl));
+                }
+                DatabaseTlsMode::Disabled => {
+                    builder = builder.ssl_opts(None::<SslOpts>);
+                }
+            }
+        }
+        Opts::from(builder)
     }
 }
 
@@ -95,5 +114,29 @@ mod tests {
         assert!(c.table_allowed("orders"));
         assert!(!c.table_allowed("customers"));
         assert_eq!(c.namespace, "shop");
+    }
+
+    #[test]
+    fn strict_tls_enables_ca_and_hostname_verification() {
+        let mut c = MySqlCdcConfig::new("m", "db.example.com", "u", "p", "shop", "/tmp/x");
+        c.tls = Some(DatabaseTlsConfig {
+            mode: DatabaseTlsMode::VerifyFull,
+            ca_file: Some(PathBuf::from("/run/secrets/mysql-ca.pem")),
+        });
+        let opts = c.opts();
+        let ssl = opts.ssl_opts().expect("TLS options");
+        assert_eq!(ssl.root_certs().len(), 1);
+        assert!(!ssl.accept_invalid_certs());
+        assert!(!ssl.skip_domain_validation());
+    }
+
+    #[test]
+    fn disabled_tls_leaves_mysql_ssl_options_off() {
+        let mut c = MySqlCdcConfig::new("m", "localhost", "u", "p", "shop", "/tmp/x");
+        c.tls = Some(DatabaseTlsConfig {
+            mode: DatabaseTlsMode::Disabled,
+            ca_file: None,
+        });
+        assert!(c.opts().ssl_opts().is_none());
     }
 }

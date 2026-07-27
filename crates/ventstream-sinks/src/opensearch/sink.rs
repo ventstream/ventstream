@@ -149,6 +149,11 @@ impl OpenSearchSink {
     /// Construct a sink. Builds the HTTP client eagerly so connection
     /// pooling kicks in on the first call to [`write`](Self::write).
     pub fn new(config: OpenSearchConfig) -> Result<Self, OpenSearchSinkError> {
+        if !config.verify_tls && config.ca_file.is_some() {
+            return Err(OpenSearchSinkError::Internal(
+                "a custom CA cannot be combined with disabled TLS verification".into(),
+            ));
+        }
         let mut builder = reqwest::Client::builder()
             .timeout(config.request_timeout)
             .connect_timeout(Duration::from_secs(10))
@@ -163,6 +168,29 @@ impl OpenSearchSink {
             .user_agent(concat!("ventstream/", env!("CARGO_PKG_VERSION")));
         if !config.verify_tls {
             builder = builder.danger_accept_invalid_certs(true);
+        }
+        if let Some(path) = &config.ca_file {
+            let pem = std::fs::read(path).map_err(|err| {
+                OpenSearchSinkError::Internal(format!(
+                    "read TLS CA bundle {}: {err}",
+                    path.display()
+                ))
+            })?;
+            let certificates = reqwest::Certificate::from_pem_bundle(&pem).map_err(|err| {
+                OpenSearchSinkError::Internal(format!(
+                    "parse TLS CA bundle {}: {err}",
+                    path.display()
+                ))
+            })?;
+            if certificates.is_empty() {
+                return Err(OpenSearchSinkError::Internal(format!(
+                    "TLS CA bundle {} contains no certificates",
+                    path.display()
+                )));
+            }
+            for certificate in certificates {
+                builder = builder.add_root_certificate(certificate);
+            }
         }
         let client = builder
             .build()
@@ -785,6 +813,14 @@ mod tests {
         assert_eq!(adaptive.desired(2), 2);
     }
 
+    #[test]
+    fn rejects_a_custom_ca_with_verification_disabled() {
+        let config = OpenSearchConfig::new("test", "https://localhost:9200", "events")
+            .with_ca_file("/run/secrets/ca.pem".into())
+            .with_insecure_tls();
+        assert!(OpenSearchSink::new(config).is_err());
+    }
+
     fn make_event(subject: &str, payload: &str) -> Event {
         let source = SourceUri::new("test://x").expect("uri");
         let subject = Subject::new(subject).expect("subject");
@@ -806,6 +842,73 @@ mod tests {
         };
         cfg.request_timeout = Duration::from_secs(2);
         OpenSearchSink::new(cfg).expect("sink builds")
+    }
+
+    fn live_tls_sink(ca_file: Option<std::path::PathBuf>) -> OpenSearchSink {
+        let endpoint = std::env::var("VENTSTREAM_TEST_OPENSEARCH_ENDPOINT")
+            .expect("VENTSTREAM_TEST_OPENSEARCH_ENDPOINT is required");
+        let mut cfg = OpenSearchConfig::new("tls-test", endpoint, "ventstream-tls-test");
+        cfg.retry = super::super::config::RetryConfig {
+            max_attempts: 1,
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+            backoff_factor: 1.0,
+        };
+        cfg.request_timeout = Duration::from_secs(10);
+        if let Some(path) = ca_file {
+            cfg = cfg.with_ca_file(path);
+        }
+        OpenSearchSink::new(cfg).expect("sink builds")
+    }
+
+    async fn probe_tls(sink: &OpenSearchSink) -> Result<(), ventstream_core::SinkError> {
+        sink.write(SinkBatch::new(vec![make_event(
+            "tls.probe",
+            r#"{"probe":true}"#,
+        )]))
+        .await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires VENTSTREAM_TEST_OPENSEARCH_ENDPOINT and VENTSTREAM_TEST_OPENSEARCH_CA_FILE"]
+    async fn strict_tls_reaches_a_trusted_opensearch_endpoint() {
+        let ca = std::path::PathBuf::from(
+            std::env::var("VENTSTREAM_TEST_OPENSEARCH_CA_FILE")
+                .expect("VENTSTREAM_TEST_OPENSEARCH_CA_FILE is required"),
+        );
+        let result = probe_tls(&live_tls_sink(Some(ca))).await;
+        assert!(
+            !matches!(result, Err(ventstream_core::SinkError::Connection(_))),
+            "trusted TLS must complete before any HTTP-level rejection: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires VENTSTREAM_TEST_OPENSEARCH_ENDPOINT and VENTSTREAM_TEST_WRONG_CA_FILE"]
+    async fn strict_tls_rejects_an_untrusted_opensearch_ca() {
+        let wrong_ca = std::path::PathBuf::from(
+            std::env::var("VENTSTREAM_TEST_WRONG_CA_FILE")
+                .expect("VENTSTREAM_TEST_WRONG_CA_FILE is required"),
+        );
+        let result = probe_tls(&live_tls_sink(Some(wrong_ca))).await;
+        assert!(
+            matches!(result, Err(ventstream_core::SinkError::Connection(_))),
+            "an unrelated CA must fail at the transport layer: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a hostname-mismatched VENTSTREAM_TEST_OPENSEARCH_ENDPOINT and VENTSTREAM_TEST_OPENSEARCH_CA_FILE"]
+    async fn strict_tls_rejects_an_opensearch_hostname_mismatch() {
+        let ca = std::path::PathBuf::from(
+            std::env::var("VENTSTREAM_TEST_OPENSEARCH_CA_FILE")
+                .expect("VENTSTREAM_TEST_OPENSEARCH_CA_FILE is required"),
+        );
+        let result = probe_tls(&live_tls_sink(Some(ca))).await;
+        assert!(
+            matches!(result, Err(ventstream_core::SinkError::Connection(_))),
+            "a hostname mismatch must fail at the transport layer: {result:?}"
+        );
     }
 
     #[tokio::test]

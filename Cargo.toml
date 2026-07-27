@@ -78,6 +78,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # own. We pin the same version neo4rs and reqwest pull in and call
 # `install_default()` from main() before the tokio runtime starts.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
 
 # HTTP mocking for sink integration tests (used as a dev-dependency).
 wiremock = "0.6"

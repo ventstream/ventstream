@@ -23,6 +23,7 @@ pub mod mongodb;
 pub mod mysql;
 pub mod neo4j;
 pub mod postgres;
+pub mod tls;
 
 pub use error::{KafkaCdcError, MongoCdcError, MySqlCdcError, Neo4jCdcError, PostgresCdcError};
 pub use kafka::{KafkaCdcConfig, KafkaCdcSource, UnwrapMode};
@@ -30,3 +31,4 @@ pub use mongodb::{FullDocument, MongoCdcConfig, MongoCdcSource};
 pub use mysql::{MySqlCdcConfig, MySqlCdcSource};
 pub use neo4j::{Neo4jBootstrap, Neo4jCdcConfig, Neo4jCdcSource};
 pub use postgres::{PostgresCdcConfig, PostgresCdcSource};
+pub use tls::{DatabaseTlsConfig, DatabaseTlsMode};

@@ -6,6 +6,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::tls::DatabaseTlsConfig;
+
 /// How much of the document the source asks MongoDB for on **update**
 /// events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +65,8 @@ pub struct MongoCdcConfig {
     /// crash only re-tails at most this window's worth of already-applied
     /// (and thus harmlessly re-upserted) events.
     pub token_flush_interval: Duration,
+    /// Optional TLS policy. `None` leaves TLS behavior to the MongoDB URI.
+    pub tls: Option<DatabaseTlsConfig>,
 }
 
 impl MongoCdcConfig {
@@ -85,6 +89,7 @@ impl MongoCdcConfig {
             bootstrap: true,
             bootstrap_chunk_size: 1000,
             token_flush_interval: Duration::from_millis(1000),
+            tls: None,
         }
     }
 

@@ -193,6 +193,7 @@ below show Postgres and Neo4j.
 
 **Postgres** (`VS_CDC_SOURCE=postgres`)
 - `VS_PG_HOST`, `VS_PG_PORT` (5432), `VS_PG_USER`, `VS_PG_PASSWORD`, `VS_PG_DATABASE` — connection.
+- `VS_PG_TLS_MODE=verify_full`, with optional `VS_PG_TLS_CA_FILE`, enforces certificate and hostname verification on every Postgres connection.
 - `VS_PG_PUBLICATION`, `VS_PG_SLOT` — logical-replication publication + slot to consume.
 - `VS_PG_BOOTSTRAP_MODE` — `snapshot` to seed state from existing rows on cold start.
 - `VS_PG_BOOTSTRAP_CHUNK_SIZE` (10000) — rows per keyset-paginated chunk during bootstrap.
@@ -200,12 +201,14 @@ below show Postgres and Neo4j.
 
 **Neo4j** (`VS_CDC_SOURCE=neo4j`)
 - `VS_NEO4J_URI` (e.g. `neo4j+s://host:7687`), `VS_NEO4J_USER`, `VS_NEO4J_PASSWORD`, `VS_NEO4J_DATABASE` (`neo4j`).
+- `VS_NEO4J_TLS_MODE=verify_full`, with optional `VS_NEO4J_TLS_CA_FILE`, selects strict encrypted Bolt.
 - `VS_NEO4J_DENORMALIZE_YAML` — denormalize spec; `VS_NEO4J_STATE_DIR` — cursor directory.
 - `VS_NEO4J_BOOTSTRAP_BATCH_SIZE` (2000), `VS_NEO4J_POLL_INTERVAL_MS` (500), `VS_NEO4J_HOT_NODE_THRESHOLD` (100).
 - `VS_NEO4J_RECOMPOSE_CHUNK` (128), `VS_NEO4J_RECOMPOSE_CONCURRENCY` (8) — live multi-hop recompose tuning.
 
 ### Sink
 - `VS_OS_ENDPOINT` — OpenSearch URL.
+- `VS_OS_TLS_MODE=verify_full`, with optional `VS_OS_TLS_CA_FILE`, enforces HTTPS certificate and hostname verification.
 - `VS_INDEX_TEMPLATE` — destination index pattern; supports `${header:…}` and `%Y/%m/%d`.
 
 ### Joins

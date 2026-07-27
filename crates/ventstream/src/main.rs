@@ -60,7 +60,7 @@ use ventstream_config::{
     JetStreamStorage as ConfigJetStreamStorage, KafkaUnwrapMode as ConfigKafkaUnwrapMode,
     LogFormat as ConfigLogFormat, MongodbFullDocumentMode as ConfigMongodbFullDocumentMode,
     OpenSearchAuthConfig, OpenSearchIndexRouting, RealtimeBrokerProvider, Role as ConfigRole,
-    SourceKind, SqlDenormalizeMode, ValueRef,
+    SourceKind, SqlDenormalizeMode, TlsConfig as FileTlsConfig, TlsMode as FileTlsMode, ValueRef,
 };
 use ventstream_core::{MemoryAdmission, ReadinessSignal, ShutdownToken};
 use ventstream_graphql::GraphQlConfig;
@@ -78,6 +78,7 @@ use ventstream_sources::neo4j::{
 use ventstream_sources::postgres::{
     PostgresCdcConfig, PostgresCdcSource, PostgresFetcher, SnapshotBootstrap, SnapshotTable,
 };
+use ventstream_sources::{DatabaseTlsConfig, DatabaseTlsMode};
 use ventstream_ws::{JetStreamConfig, RedisStreamsConfig, WsConfig};
 
 use crate::dispatcher::DispatcherConfig;
@@ -1206,15 +1207,9 @@ async fn reconcile_orphan_docs_pg(
     if joins.is_empty() {
         return Ok(0);
     }
-    let conn_str = build_pg_connection_string(pg);
-    let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+    let client = ventstream_sources::postgres::connect_client(pg, "reconciliation")
         .await
         .context("connecting to postgres for reconciliation")?;
-    let conn_handle = tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            warn!(error = %err, "reconciliation pg connection ended with error");
-        }
-    });
 
     let mut total = 0usize;
     for join in joins {
@@ -1251,7 +1246,6 @@ async fn reconcile_orphan_docs_pg(
     }
 
     drop(client);
-    let _ = conn_handle.await;
     info!(
         orphans_deleted = total,
         "reconciliation pass complete (all tables)"
@@ -1431,7 +1425,6 @@ async fn build_and_run_pg_engine(
     let join_engine = if joins.is_empty() {
         None
     } else {
-        let fetcher_conn_string = build_pg_connection_string(&pg);
         let fetcher_pool_size = config_usize_or_env(
             runtime
                 .engine_file_config
@@ -1442,10 +1435,9 @@ async fn build_and_run_pg_engine(
             "VS_PG_RELATED_FETCH_POOL_SIZE",
             4,
         )?;
-        let fetcher =
-            PostgresFetcher::connect_with_pool_size(fetcher_conn_string, fetcher_pool_size)
-                .await
-                .context("opening sync-on-miss fetcher connection")?;
+        let fetcher = PostgresFetcher::connect_config_with_pool_size(pg.clone(), fetcher_pool_size)
+            .await
+            .context("opening sync-on-miss fetcher connection")?;
 
         // Memory-mode joins require durable local state because the source
         // checkpoint advances only after the corresponding state transaction.
@@ -1678,13 +1670,10 @@ fn pg_sql_denormalize_enabled(engine_config: Option<&EngineFileConfig>) -> bool 
 /// never creates the slot), but the tail still needs it — and creating it
 /// *before* the SQL-join bootstrap means WAL retains any change made
 /// during the bootstrap window for the tail to replay.
-async fn ensure_replication_slot(conn: &str, slot: &str) -> Result<()> {
-    let (client, connection) = tokio_postgres::connect(conn, tokio_postgres::NoTls)
+async fn ensure_replication_slot(pg: &PostgresCdcConfig, slot: &str) -> Result<()> {
+    let client = ventstream_sources::postgres::connect_client(pg, "create replication slot")
         .await
         .context("connect to create replication slot")?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
     let exists: bool = client
         .query_one(
             "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
@@ -1722,18 +1711,16 @@ async fn build_and_run_pg_sql_denormalize_engine(
     use std::sync::Arc;
     use ventstream_core::{EventBus, Source, SourceContext};
 
-    let conn = build_pg_connection_string(&pg);
-    ensure_replication_slot(&conn, &pg.slot_name).await?;
+    ensure_replication_slot(&pg, &pg.slot_name).await?;
 
     let chunk = postgres_bootstrap_chunk_size(
         runtime.engine_file_config.as_ref(),
         "VS_PG_BOOTSTRAP_CHUNK_SIZE",
         5_000,
     )? as i64;
-    let mut denorm =
-        sql_denormalize::SqlDenormalizer::connect(&conn, &pg.publication, joins, chunk)
-            .await
-            .context("building SQL denormalizer")?;
+    let mut denorm = sql_denormalize::SqlDenormalizer::connect(&pg, &pg.publication, joins, chunk)
+        .await
+        .context("building SQL denormalizer")?;
     // Sink-as-reverse-index fallback for 1:many child deletes under Postgres
     // `REPLICA IDENTITY DEFAULT` (the WAL pre-image lacks the parent FK). The
     // denormalizer queries the same OS index the dispatcher writes to recover
@@ -2503,16 +2490,6 @@ async fn build_and_run_kafka_engine(
     }
 }
 
-/// Build a libpq-style connection string for the standalone fetcher
-/// connection from the same fields the replication source uses.
-fn build_pg_connection_string(pg: &PostgresCdcConfig) -> String {
-    // Keyword/value form (no URL-encoding of the password), with every value
-    // properly single-quoted + escaped by the shared builder so a value with a
-    // space/quote can't break parsing or inject connection params (M9). The
-    // prior `format!` here did NOT actually quote despite its comment.
-    pg.connection_string()
-}
-
 /// Everything the CDC role needs, loaded together so that
 /// presence/absence is decided once at startup.
 struct CdcBundle {
@@ -3050,7 +3027,39 @@ fn load_opensearch_config(engine_config: Option<&EngineFileConfig>) -> Result<Op
             "VS_OS_RECONCILE_ALLOW_FULL_PURGE",
             false,
         ));
-    if config_bool_or_env(opensearch.insecure_tls, "VS_INSECURE_TLS", false) {
+    let tls = database_tls_or_env(
+        opensearch.tls.as_ref(),
+        "VS_OS_TLS_MODE",
+        "VS_OS_TLS_CA_FILE",
+    )?;
+    let insecure_tls = config_bool_or_env(opensearch.insecure_tls, "VS_INSECURE_TLS", false);
+    if tls.is_some() && insecure_tls {
+        return Err(anyhow!(
+            "strict OpenSearch TLS and VS_INSECURE_TLS=true are mutually exclusive"
+        ));
+    }
+    if let Some(tls) = tls {
+        match tls.mode {
+            DatabaseTlsMode::VerifyFull => {
+                if !os.endpoint.starts_with("https://") {
+                    return Err(anyhow!(
+                        "sink.opensearch.tls.mode=verify_full requires an https:// endpoint"
+                    ));
+                }
+                if let Some(path) = tls.ca_file {
+                    os = os.with_ca_file(path);
+                }
+            }
+            DatabaseTlsMode::Disabled => {
+                if !os.endpoint.starts_with("http://") {
+                    return Err(anyhow!(
+                        "sink.opensearch.tls.mode=disabled requires an http:// endpoint"
+                    ));
+                }
+            }
+        }
+    }
+    if insecure_tls {
         os = os.with_insecure_tls();
     }
     Ok(os)
@@ -3071,7 +3080,35 @@ fn load_opensearch_config_from_env() -> Result<OpenSearchConfig> {
     let mut os = OpenSearchConfig::new("opensearch", os_endpoint, index_template)
         .with_auth(os_auth)
         .with_reconcile_allow_full_purge(bool_env("VS_OS_RECONCILE_ALLOW_FULL_PURGE", false));
-    if bool_env("VS_INSECURE_TLS", false) {
+    let tls = database_tls_or_env(None, "VS_OS_TLS_MODE", "VS_OS_TLS_CA_FILE")?;
+    let insecure_tls = bool_env("VS_INSECURE_TLS", false);
+    if tls.is_some() && insecure_tls {
+        return Err(anyhow!(
+            "VS_OS_TLS_MODE and VS_INSECURE_TLS=true are mutually exclusive"
+        ));
+    }
+    if let Some(tls) = tls {
+        match tls.mode {
+            DatabaseTlsMode::VerifyFull => {
+                if !os.endpoint.starts_with("https://") {
+                    return Err(anyhow!(
+                        "VS_OS_TLS_MODE=verify_full requires an https:// endpoint"
+                    ));
+                }
+                if let Some(path) = tls.ca_file {
+                    os = os.with_ca_file(path);
+                }
+            }
+            DatabaseTlsMode::Disabled => {
+                if !os.endpoint.starts_with("http://") {
+                    return Err(anyhow!(
+                        "VS_OS_TLS_MODE=disabled requires an http:// endpoint"
+                    ));
+                }
+            }
+        }
+    }
+    if insecure_tls {
         os = os.with_insecure_tls();
     }
     Ok(os)
@@ -3081,6 +3118,77 @@ fn resolve_value_ref(reference: &ValueRef) -> Result<String> {
     match reference {
         ValueRef::Env(name) => req(name),
     }
+}
+
+fn database_tls_or_env(
+    config: Option<&FileTlsConfig>,
+    mode_env: &str,
+    ca_file_env: &str,
+) -> Result<Option<DatabaseTlsConfig>> {
+    let env_mode = if config.is_none() {
+        opt(mode_env)?
+    } else {
+        None
+    };
+    let env_ca = if config.is_none() {
+        opt(ca_file_env)?.filter(|value| !value.trim().is_empty())
+    } else {
+        None
+    };
+    if config.is_none() && env_mode.is_none() && env_ca.is_none() {
+        return Ok(None);
+    }
+
+    let mode = match config.map(|tls| tls.mode) {
+        Some(FileTlsMode::VerifyFull) => DatabaseTlsMode::VerifyFull,
+        Some(FileTlsMode::Disabled) => DatabaseTlsMode::Disabled,
+        None => match env_mode
+            .as_deref()
+            .unwrap_or("verify_full")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "verify_full" | "verify-full" | "strict" => DatabaseTlsMode::VerifyFull,
+            "disabled" | "disable" | "off" => DatabaseTlsMode::Disabled,
+            other => {
+                return Err(anyhow!(
+                    "{mode_env} must be 'verify_full' or 'disabled', got '{other}'"
+                ))
+            }
+        },
+    };
+    let ca_file = config
+        .and_then(|tls| tls.ca_file.clone())
+        .or_else(|| env_ca.map(PathBuf::from));
+    if mode == DatabaseTlsMode::Disabled && ca_file.is_some() {
+        return Err(anyhow!("{ca_file_env} requires {mode_env}=verify_full"));
+    }
+    Ok(Some(DatabaseTlsConfig { mode, ca_file }))
+}
+
+fn apply_neo4j_tls_mode(uri: &str, tls: Option<&DatabaseTlsConfig>) -> Result<String> {
+    let Some(tls) = tls else {
+        return Ok(uri.to_owned());
+    };
+    let (scheme, rest) = uri
+        .split_once("://")
+        .ok_or_else(|| anyhow!("Neo4j URI must include a supported scheme"))?;
+    let scheme = match (tls.mode, scheme) {
+        (DatabaseTlsMode::VerifyFull, "bolt") => "bolt+s",
+        (DatabaseTlsMode::VerifyFull, "neo4j") => "neo4j+s",
+        (DatabaseTlsMode::VerifyFull, "bolt+s" | "neo4j+s") => scheme,
+        (DatabaseTlsMode::VerifyFull, "bolt+ssc" | "neo4j+ssc") => {
+            return Err(anyhow!(
+                "Neo4j +ssc URI schemes are not accepted with tls.mode=verify_full"
+            ))
+        }
+        (DatabaseTlsMode::Disabled, "bolt" | "neo4j") => scheme,
+        (DatabaseTlsMode::Disabled, "bolt+s" | "bolt+ssc") => "bolt",
+        (DatabaseTlsMode::Disabled, "neo4j+s" | "neo4j+ssc") => "neo4j",
+        (_, other) => return Err(anyhow!("unsupported Neo4j URI scheme '{other}'")),
+    };
+    Ok(format!("{scheme}://{rest}"))
 }
 
 fn config_value_or_env(
@@ -3461,6 +3569,11 @@ fn load_cdc_bundle_mongodb(engine_config: Option<&EngineFileConfig>) -> Result<C
         "VS_MONGO_TOKEN_FLUSH_MS",
         Duration::from_millis(1000),
     )?;
+    config.tls = database_tls_or_env(
+        source_config.and_then(|config| config.tls.as_ref()),
+        "VS_MONGO_TLS_MODE",
+        "VS_MONGO_TLS_CA_FILE",
+    )?;
 
     // Sink + DLQ — same OpenSearch config the other sources load.
     let os = load_opensearch_config(engine_config)?;
@@ -3557,6 +3670,11 @@ fn load_cdc_bundle_mysql(
         source_config.and_then(|config| config.pos_flush_ms),
         "VS_MYSQL_POS_FLUSH_MS",
         Duration::from_millis(1000),
+    )?;
+    config.tls = database_tls_or_env(
+        source_config.and_then(|config| config.tls.as_ref()),
+        "VS_MYSQL_TLS_MODE",
+        "VS_MYSQL_TLS_CA_FILE",
     )?;
 
     // Optional denormalization joins (shared spec + engine with Postgres).
@@ -3841,6 +3959,20 @@ fn load_cdc_bundle_neo4j(
     )? {
         neo.trust_cert_file = Some(path);
     }
+    neo.tls = database_tls_or_env(
+        source_config.and_then(|config| config.tls.as_ref()),
+        "VS_NEO4J_TLS_MODE",
+        "VS_NEO4J_TLS_CA_FILE",
+    )?;
+    neo.uri = apply_neo4j_tls_mode(&neo.uri, neo.tls.as_ref())?;
+    if let Some(path) = neo.tls.as_ref().and_then(|tls| tls.ca_file.clone()) {
+        if neo.trust_cert_file.is_some() {
+            return Err(anyhow!(
+                "configure only one of VS_NEO4J_TLS_CA_FILE and VS_NEO4J_TRUST_CERT_FILE"
+            ));
+        }
+        neo.trust_cert_file = Some(path);
+    }
 
     // Optional denormalize mode. Driven by a YAML file describing one
     // or more primary projections — see
@@ -3986,7 +4118,7 @@ fn load_cdc_bundle_postgres(
     let dlq_path = load_dlq_path(engine_config)?;
     let engine_runtime = load_engine_runtime_config(engine_config, dlq_path)?;
 
-    let pg = PostgresCdcConfig::new(
+    let mut pg = PostgresCdcConfig::new(
         "postgres-cdc",
         pg_host,
         pg_user,
@@ -3996,6 +4128,11 @@ fn load_cdc_bundle_postgres(
         pg_slot,
     )
     .with_port(pg_port);
+    pg.tls = database_tls_or_env(
+        source_config.and_then(|config| config.tls.as_ref()),
+        "VS_PG_TLS_MODE",
+        "VS_PG_TLS_CA_FILE",
+    )?;
 
     let (joins, joins_yaml_text) = load_joins_yaml(fleet_config, engine_config)?;
     validate_projection_target_indexes(engine_config, &joins)?;
@@ -4429,18 +4566,11 @@ fn bool_env(key: &str, default: bool) -> bool {
 ///
 /// `WHERE EXISTS` makes this a no-op when the slot is absent — useful
 /// because operators may have already dropped it by hand. We connect
-/// over plain TLS-less Postgres (the same shape the rest of the engine
-/// uses) and tear the connection down once the statement finishes.
+/// using the same transport policy as the replication connection.
 async fn replication_slot_exists(pg: &PostgresCdcConfig, slot: &str) -> Result<bool> {
-    let conn_str = pg.connection_string();
-    let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+    let client = ventstream_sources::postgres::connect_client(pg, "inspect replication slot")
         .await
         .with_context(|| format!("connecting to {} to inspect slot {slot}", pg.host))?;
-    let handle = tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            warn!(error = %err, "slot-inspection connection ended with error");
-        }
-    });
     let exists = client
         .query_one(
             "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
@@ -4450,7 +4580,6 @@ async fn replication_slot_exists(pg: &PostgresCdcConfig, slot: &str) -> Result<b
         .with_context(|| format!("inspecting replication slot {slot}"))?
         .get::<_, bool>(0);
     drop(client);
-    let _ = handle.await;
     Ok(exists)
 }
 
@@ -4458,15 +4587,9 @@ async fn drop_replication_slot(pg: &PostgresCdcConfig, slot: &str) -> Result<()>
     // Shared, properly-escaped builder — the single source for every PG
     // connection the engine opens (M9). The prior hand-built `format!` here
     // was the exact slot-drop/resync hazard M9 closes.
-    let conn_str = pg.connection_string();
-    let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+    let client = ventstream_sources::postgres::connect_client(pg, "drop replication slot")
         .await
         .with_context(|| format!("connecting to {} to drop slot {slot}", pg.host))?;
-    let handle = tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            warn!(error = %err, "slot-drop connection ended with error");
-        }
-    });
     let res = client
         .execute(
             "SELECT pg_drop_replication_slot(slot_name) \
@@ -4476,7 +4599,6 @@ async fn drop_replication_slot(pg: &PostgresCdcConfig, slot: &str) -> Result<()>
         .await
         .with_context(|| format!("dropping replication slot {slot}"));
     drop(client);
-    let _ = handle.await;
     match res {
         Ok(0) => {
             info!(slot = %slot, "no existing replication slot to drop");
@@ -4788,5 +4910,24 @@ joins:
             expected,
             true
         ));
+    }
+
+    #[test]
+    fn neo4j_tls_policy_controls_the_uri_scheme() {
+        let strict = DatabaseTlsConfig::default();
+        assert_eq!(
+            apply_neo4j_tls_mode("bolt://db.example.com:7687", Some(&strict)).unwrap(),
+            "bolt+s://db.example.com:7687"
+        );
+        assert!(apply_neo4j_tls_mode("neo4j+ssc://db.example.com", Some(&strict)).is_err());
+
+        let disabled = DatabaseTlsConfig {
+            mode: DatabaseTlsMode::Disabled,
+            ca_file: None,
+        };
+        assert_eq!(
+            apply_neo4j_tls_mode("neo4j+s://db.example.com", Some(&disabled)).unwrap(),
+            "neo4j://db.example.com"
+        );
     }
 }

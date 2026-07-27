@@ -93,6 +93,7 @@ use super::pgoutput::{self, LogicalMessage};
 use super::schema::RelationCache;
 use super::snapshot;
 use crate::error::PostgresCdcError;
+use crate::tls::DatabaseTlsMode;
 
 /// Source adapter for a Postgres logical replication slot.
 pub struct PostgresCdcSource {
@@ -271,13 +272,25 @@ impl PostgresCdcSource {
 
     /// Build the `pgwire-replication` config from our own.
     fn build_replication_config(&self) -> ReplicationConfig {
+        let tls = match self.config.tls.as_ref() {
+            None
+            | Some(crate::tls::DatabaseTlsConfig {
+                mode: DatabaseTlsMode::Disabled,
+                ..
+            }) => TlsConfig::disabled(),
+            Some(config) => TlsConfig {
+                mode: pgwire_replication::config::SslMode::VerifyFull,
+                ca_pem_path: config.ca_file.clone(),
+                ..TlsConfig::default()
+            },
+        };
         ReplicationConfig {
             host: self.config.host.clone(),
             port: self.config.port,
             user: self.config.user.clone(),
             password: self.config.password.clone(),
             database: self.config.database.clone(),
-            tls: TlsConfig::default(),
+            tls,
             slot: self.config.slot_name.clone(),
             publication: self.config.publication.clone(),
             start_lsn: PgwLsn::ZERO,
@@ -731,6 +744,24 @@ mod tests {
             "test_pub",
             "test_slot",
         ))
+    }
+
+    #[test]
+    fn replication_uses_the_configured_tls_policy() {
+        let mut source = make_source();
+        source.config.tls = Some(crate::tls::DatabaseTlsConfig {
+            mode: crate::tls::DatabaseTlsMode::VerifyFull,
+            ca_file: Some(std::path::PathBuf::from("/run/secrets/postgres-ca.pem")),
+        });
+        let config = source.build_replication_config();
+        assert_eq!(
+            config.tls.mode,
+            pgwire_replication::config::SslMode::VerifyFull
+        );
+        assert_eq!(
+            config.tls.ca_pem_path.as_deref(),
+            Some(std::path::Path::new("/run/secrets/postgres-ca.pem"))
+        );
     }
 
     fn cache_users_relation(source: &PostgresCdcSource) {

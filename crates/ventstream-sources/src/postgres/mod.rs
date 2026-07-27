@@ -23,6 +23,7 @@
 //!   Phase 0b alongside ACK-gated LSN advance.
 
 pub mod config;
+pub mod connection;
 pub mod event_mapper;
 pub mod fetcher;
 pub mod pgoutput;
@@ -31,6 +32,7 @@ pub mod snapshot;
 pub mod source;
 
 pub use config::{PostgresCdcConfig, SnapshotBootstrap, SnapshotTable};
+pub use connection::connect_client;
 pub use fetcher::PostgresFetcher;
 pub use snapshot::{resync_tables, ResyncStats};
 pub use source::PostgresCdcSource;

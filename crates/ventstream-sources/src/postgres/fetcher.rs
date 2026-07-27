@@ -35,6 +35,9 @@ use tokio_postgres::{Client, NoTls};
 use tracing::{debug, error, info, warn};
 use ventstream_joins::{FetchError, PkValue, RelatedFetcher};
 
+use super::config::PostgresCdcConfig;
+use super::connection::connect_client;
+
 /// Postgres-backed [`RelatedFetcher`].
 ///
 /// Owns a small reconnecting client pool. Concurrent relation batches are
@@ -47,9 +50,7 @@ const DEFAULT_POOL_SIZE: usize = 4;
 const BATCH_KEY_CHUNK: usize = 256;
 
 struct Inner {
-    /// Original connection string — kept so we can reconnect if the
-    /// existing client returns a fatal error on a future request.
-    connection_string: String,
+    connection: FetcherConnection,
     clients: Vec<RwLock<Option<Arc<Client>>>>,
     next_client: AtomicUsize,
     /// Server-rendered SQL types keyed by configured table and column. Values
@@ -59,6 +60,12 @@ struct Inner {
     /// Last time we logged the connection state. Used only to throttle
     /// the noisy reconnect-attempt log lines.
     last_log: Mutex<std::time::Instant>,
+}
+
+#[derive(Clone)]
+enum FetcherConnection {
+    Legacy(String),
+    Source(Box<PostgresCdcConfig>),
 }
 
 impl PostgresFetcher {
@@ -76,11 +83,24 @@ impl PostgresFetcher {
         connection_string: String,
         pool_size: usize,
     ) -> Result<Self, FetchError> {
+        Self::connect_inner(FetcherConnection::Legacy(connection_string), pool_size).await
+    }
+
+    /// Construct a fetcher that inherits the source's TLS policy.
+    pub async fn connect_config_with_pool_size(
+        source: PostgresCdcConfig,
+        pool_size: usize,
+    ) -> Result<Self, FetchError> {
+        Self::connect_inner(FetcherConnection::Source(Box::new(source)), pool_size).await
+    }
+
+    async fn connect_inner(
+        connection: FetcherConnection,
+        pool_size: usize,
+    ) -> Result<Self, FetchError> {
         let pool_size = pool_size.max(1);
         let mut clients = Vec::with_capacity(pool_size);
-        clients.push(RwLock::new(Some(Arc::new(
-            open_client(&connection_string).await?,
-        ))));
+        clients.push(RwLock::new(Some(Arc::new(open_client(&connection).await?))));
         for _ in 1..pool_size {
             clients.push(RwLock::new(None));
         }
@@ -91,7 +111,7 @@ impl PostgresFetcher {
         );
         Ok(Self {
             inner: Arc::new(Inner {
-                connection_string,
+                connection,
                 clients,
                 next_client: AtomicUsize::new(0),
                 column_types: AsyncMutex::new(HashMap::new()),
@@ -122,7 +142,7 @@ impl PostgresFetcher {
                     *last = now;
                 }
             }
-            let fresh = open_client(&self.inner.connection_string).await?;
+            let fresh = open_client(&self.inner.connection).await?;
             *slot_guard = Some(Arc::new(fresh));
         }
         slot_guard
@@ -148,20 +168,23 @@ impl PostgresFetcher {
     }
 }
 
-async fn open_client(connection_string: &str) -> Result<Client, FetchError> {
-    let (client, connection) = tokio_postgres::connect(connection_string, NoTls)
-        .await
-        .map_err(|err| FetchError::Unreachable(err.to_string()))?;
-    // The Connection future drives the underlying I/O loop. We spawn
-    // it onto the tokio runtime and let it run for the lifetime of
-    // the process. If the connection dies the next query will return
-    // an error which we use to trigger a reconnect.
-    tokio::spawn(async move {
-        if let Err(err) = connection.await {
-            error!(error = %err, "postgres fetcher connection task ended");
+async fn open_client(connection: &FetcherConnection) -> Result<Client, FetchError> {
+    match connection {
+        FetcherConnection::Source(source) => connect_client(source, "related-row fetcher")
+            .await
+            .map_err(|err| FetchError::Unreachable(err.to_string())),
+        FetcherConnection::Legacy(connection_string) => {
+            let (client, connection) = tokio_postgres::connect(connection_string, NoTls)
+                .await
+                .map_err(|err| FetchError::Unreachable(err.to_string()))?;
+            tokio::spawn(async move {
+                if let Err(err) = connection.await {
+                    error!(error = %err, "postgres fetcher connection task ended");
+                }
+            });
+            Ok(client)
         }
-    });
-    Ok(client)
+    }
 }
 
 #[async_trait]

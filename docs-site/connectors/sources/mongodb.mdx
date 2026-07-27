@@ -82,12 +82,28 @@ VS_INDEX_TEMPLATE='${header:ventstream.cdc.relation}' \
 the database. The index template renders one index per collection
 (`orders`, `customers`, …).
 
+## TLS
+
+Atlas enables TLS through its connection string and uses publicly trusted
+certificates. To enforce the same policy independently of URI options, set:
+
+```bash
+VS_MONGO_TLS_MODE=verify_full
+# Only for a private CA:
+VS_MONGO_TLS_CA_FILE=/run/secrets/mongodb-ca.pem
+```
+
+An explicit TLS mode overrides `tls` settings in the URI. Strict mode validates
+the server certificate and hostname.
+
 ## Key environment variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `VS_MONGO_URI` | — (required) | Connection string (`mongodb://` / `mongodb+srv://`), incl. replica-set / mongos host(s), auth, TLS. Carries credentials — source it from a Secret in Kubernetes. |
 | `VS_MONGO_DATABASE` | — (required) | Database to watch and namespace documents under. |
+| `VS_MONGO_TLS_MODE` | unset | `verify_full` or `disabled`. |
+| `VS_MONGO_TLS_CA_FILE` | unset | PEM CA bundle for a private CA. |
 | `VS_MONGO_NAMESPACE` | = database | Logical namespace stamped on subjects/headers. |
 | `VS_MONGO_COLLECTIONS` | unset (all) | CSV of collections to watch; empty = every collection in the database. |
 | `VS_MONGO_FULL_DOCUMENT` | `updateLookup` | `updateLookup` re-reads the post-image on updates (always-current; one extra read). `default` sends deltas only — not usable for raw 1:1. |

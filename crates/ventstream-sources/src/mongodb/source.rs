@@ -37,7 +37,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use mongodb::bson::{doc, Document};
 use mongodb::change_stream::event::{ChangeStreamEvent, OperationType, ResumeToken};
-use mongodb::options::FullDocumentType;
+use mongodb::options::{ClientOptions, FullDocumentType, Tls, TlsOptions};
 use mongodb::{Client, Database};
 use serde_json::Value;
 use tracing::{info, warn};
@@ -48,6 +48,7 @@ use super::config::{FullDocument, MongoCdcConfig};
 use super::cursor::CursorFile;
 use super::event_mapper::{self, Op};
 use crate::error::MongoCdcError;
+use crate::tls::DatabaseTlsMode;
 
 /// MongoDB CDC source.
 pub struct MongoCdcSource {
@@ -61,9 +62,33 @@ impl MongoCdcSource {
     }
 
     async fn connect(&self) -> Result<Client, MongoCdcError> {
-        Client::with_uri_str(&self.config.uri)
-            .await
+        let options = self.client_options().await?;
+        Client::with_options(options)
             .map_err(|e| MongoCdcError::Connection(format!("connecting to mongodb: {e}")))
+    }
+
+    async fn client_options(&self) -> Result<ClientOptions, MongoCdcError> {
+        let mut options = ClientOptions::parse(&self.config.uri)
+            .await
+            .map_err(|e| MongoCdcError::Connection(format!("parse mongodb URI: {e}")))?;
+        if let Some(tls) = &self.config.tls {
+            options.tls = Some(match tls.mode {
+                DatabaseTlsMode::VerifyFull => {
+                    let options = match &tls.ca_file {
+                        Some(path) => TlsOptions::builder()
+                            .allow_invalid_certificates(false)
+                            .ca_file_path(path.clone())
+                            .build(),
+                        None => TlsOptions::builder()
+                            .allow_invalid_certificates(false)
+                            .build(),
+                    };
+                    Tls::Enabled(options)
+                }
+                DatabaseTlsMode::Disabled => Tls::Disabled,
+            });
+        }
+        Ok(options)
     }
 
     async fn run_inner(&self, ctx: SourceContext) -> Result<(), MongoCdcError> {
@@ -369,4 +394,103 @@ fn looks_like_resume_failure(e: &mongodb::error::Error) -> bool {
         || msg.contains("changestreamhistorylost")
         || msg.contains("history lost")
         || msg.contains("oplog")
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::tls::{DatabaseTlsConfig, DatabaseTlsMode};
+    use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn strict_policy_overrides_unsafe_uri_tls_options() {
+        let mut config = MongoCdcConfig::new(
+            "mongo",
+            "mongodb://localhost:27017/?tls=false",
+            "app",
+            "/tmp/mongo",
+        );
+        config.tls = Some(DatabaseTlsConfig {
+            mode: DatabaseTlsMode::VerifyFull,
+            ca_file: Some(PathBuf::from("/run/secrets/mongo-ca.pem")),
+        });
+        let source = MongoCdcSource::new(config);
+        let options = source.client_options().await.expect("parse options");
+        let tls = match options.tls.as_ref() {
+            Some(Tls::Enabled(tls)) => Some(tls),
+            _ => None,
+        };
+        assert!(tls.is_some(), "strict policy must enable TLS");
+        if let Some(tls) = tls {
+            assert_eq!(
+                tls.ca_file_path.as_deref(),
+                Some(std::path::Path::new("/run/secrets/mongo-ca.pem"))
+            );
+            assert_eq!(tls.allow_invalid_certificates, Some(false));
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_policy_overrides_tls_uri() {
+        let mut config = MongoCdcConfig::new(
+            "mongo",
+            "mongodb://localhost:27017/?tls=true",
+            "app",
+            "/tmp/mongo",
+        );
+        config.tls = Some(DatabaseTlsConfig {
+            mode: DatabaseTlsMode::Disabled,
+            ca_file: None,
+        });
+        let source = MongoCdcSource::new(config);
+        let options = source.client_options().await.expect("parse options");
+        assert_eq!(options.tls, Some(Tls::Disabled));
+    }
+
+    fn live_config(ca_file: Option<PathBuf>) -> MongoCdcConfig {
+        let uri = std::env::var("VENTSTREAM_TEST_MONGODB_URI")
+            .expect("VENTSTREAM_TEST_MONGODB_URI is required");
+        let database = std::env::var("VENTSTREAM_TEST_MONGODB_DATABASE")
+            .unwrap_or_else(|_| "admin".to_owned());
+        let mut config = MongoCdcConfig::new("mongo-tls-test", uri, database, "/tmp/mongo-tls");
+        config.tls = Some(DatabaseTlsConfig {
+            mode: DatabaseTlsMode::VerifyFull,
+            ca_file,
+        });
+        config
+    }
+
+    #[tokio::test]
+    #[ignore = "requires VENTSTREAM_TEST_MONGODB_URI"]
+    async fn strict_tls_connects_to_a_trusted_mongodb_server() {
+        let source = MongoCdcSource::new(live_config(None));
+        let client = source.connect().await.expect("build MongoDB client");
+        client
+            .database(&source.config.database)
+            .run_command(doc! { "ping": 1 })
+            .await
+            .expect("strict MongoDB TLS connection");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires VENTSTREAM_TEST_MONGODB_URI and VENTSTREAM_TEST_WRONG_CA_FILE"]
+    async fn strict_tls_rejects_an_untrusted_mongodb_ca() {
+        let wrong_ca = PathBuf::from(
+            std::env::var("VENTSTREAM_TEST_WRONG_CA_FILE")
+                .expect("VENTSTREAM_TEST_WRONG_CA_FILE is required"),
+        );
+        let source = MongoCdcSource::new(live_config(Some(wrong_ca)));
+        let mut options = source
+            .client_options()
+            .await
+            .expect("parse MongoDB options");
+        options.server_selection_timeout = Some(std::time::Duration::from_secs(5));
+        let client = Client::with_options(options).expect("build MongoDB client");
+        let result = client
+            .database(&source.config.database)
+            .run_command(doc! { "ping": 1 })
+            .await;
+        assert!(result.is_err(), "an unrelated CA must be rejected");
+    }
 }
