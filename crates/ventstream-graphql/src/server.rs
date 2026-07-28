@@ -14,6 +14,7 @@
 //! supported via the `GraphQLProtocol` axum extractor that
 //! async-graphql provides.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_graphql::http::ALL_WEBSOCKET_PROTOCOLS;
@@ -38,6 +39,45 @@ use crate::error::GraphQlError;
 use crate::manifest::Manifest as SubscriptionsManifest;
 use crate::schema::{build_schema, AppSchema, GraphContext};
 
+static ACTIVE_GRAPHQL_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+
+struct GraphQlConnectionGuard;
+
+impl GraphQlConnectionGuard {
+    fn new() -> Self {
+        let active = ACTIVE_GRAPHQL_CONNECTIONS
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        metrics::gauge!(
+            "vs_realtime_connections_active",
+            "transport" => "graphql"
+        )
+        .set(active as f64);
+        metrics::counter!(
+            "vs_realtime_connections_total",
+            "transport" => "graphql"
+        )
+        .increment(1);
+        Self
+    }
+}
+
+impl Drop for GraphQlConnectionGuard {
+    fn drop(&mut self) {
+        let active = ACTIVE_GRAPHQL_CONNECTIONS
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            })
+            .unwrap_or(0)
+            .saturating_sub(1);
+        metrics::gauge!(
+            "vs_realtime_connections_active",
+            "transport" => "graphql"
+        )
+        .set(active as f64);
+    }
+}
+
 /// Run the GraphQL gateway until shutdown fires.
 pub async fn run(config: GraphQlConfig, shutdown: ShutdownToken) -> Result<(), GraphQlError> {
     run_inner(config, shutdown, None).await
@@ -61,6 +101,11 @@ async fn run_inner(
     shutdown: ShutdownToken,
     readiness: Option<ReadinessSignal>,
 ) -> Result<(), GraphQlError> {
+    metrics::gauge!(
+        "vs_realtime_connections_active",
+        "transport" => "graphql"
+    )
+    .set(ACTIVE_GRAPHQL_CONNECTIONS.load(Ordering::Relaxed) as f64);
     let readiness = readiness.as_ref().map(ReadinessSignal::guard);
     let manifest = if let Some(path) = &config.manifest_path {
         let text = std::fs::read_to_string(path).map_err(|err| {
@@ -451,6 +496,7 @@ async fn graphql_ws_handler(
     websocket
         .protocols(ALL_WEBSOCKET_PROTOCOLS)
         .on_upgrade(move |socket| async move {
+            let _connection = GraphQlConnectionGuard::new();
             GraphQLWebSocket::new(socket, schema, protocol)
                 .on_connection_init(move |value| async move {
                     match auth::extract(value, expected.as_deref()) {
@@ -512,6 +558,7 @@ async fn graphql_ws_handler_dynamic(
     websocket
         .protocols(ALL_WEBSOCKET_PROTOCOLS)
         .on_upgrade(move |socket| async move {
+            let _connection = GraphQlConnectionGuard::new();
             GraphQLWebSocket::new(socket, schema, protocol)
                 .on_connection_init(move |value| async move {
                     match auth::extract(value, expected.as_deref()) {
