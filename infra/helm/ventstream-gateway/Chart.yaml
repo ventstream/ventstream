@@ -2,8 +2,8 @@ apiVersion: v2
 name: ventstream-gateway
 description: VentStream real-time gateway — the stateless WebSocket (ws) and/or GraphQL (graphql) fan-out roles. Horizontally scalable; one Deployment, not per-tenant.
 type: application
-version: 0.1.15
-appVersion: "0.1.15"
+version: 0.1.16
+appVersion: "0.1.16"
 keywords:
   - ventstream
   - websocket
