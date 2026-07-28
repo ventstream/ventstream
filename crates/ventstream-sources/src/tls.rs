@@ -138,6 +138,7 @@ pub(crate) fn ensure_crypto_provider() {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::io::BufReader;
 
