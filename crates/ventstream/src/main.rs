@@ -60,7 +60,8 @@ use ventstream_config::{
     JetStreamStorage as ConfigJetStreamStorage, KafkaUnwrapMode as ConfigKafkaUnwrapMode,
     LogFormat as ConfigLogFormat, MongodbFullDocumentMode as ConfigMongodbFullDocumentMode,
     OpenSearchAuthConfig, OpenSearchIndexRouting, RealtimeBrokerProvider, Role as ConfigRole,
-    SourceKind, SqlDenormalizeMode, TlsConfig as FileTlsConfig, TlsMode as FileTlsMode, ValueRef,
+    SourceKind, SqlDenormalizeMode, TlsConfig as FileTlsConfig, TlsMode as FileTlsMode,
+    TlsTrustProvider as FileTlsTrustProvider, ValueRef,
 };
 use ventstream_core::{MemoryAdmission, ReadinessSignal, ShutdownToken};
 use ventstream_graphql::GraphQlConfig;
@@ -78,7 +79,9 @@ use ventstream_sources::neo4j::{
 use ventstream_sources::postgres::{
     PostgresCdcConfig, PostgresCdcSource, PostgresFetcher, SnapshotBootstrap, SnapshotTable,
 };
-use ventstream_sources::{DatabaseTlsConfig, DatabaseTlsMode};
+use ventstream_sources::{
+    materialize_provider_ca_bundle, DatabaseTlsConfig, DatabaseTlsMode, DatabaseTlsTrustProvider,
+};
 use ventstream_ws::{JetStreamConfig, RedisStreamsConfig, WsConfig};
 
 use crate::dispatcher::DispatcherConfig;
@@ -3031,6 +3034,7 @@ fn load_opensearch_config(engine_config: Option<&EngineFileConfig>) -> Result<Op
         opensearch.tls.as_ref(),
         "VS_OS_TLS_MODE",
         "VS_OS_TLS_CA_FILE",
+        None,
     )?;
     let insecure_tls = config_bool_or_env(opensearch.insecure_tls, "VS_INSECURE_TLS", false);
     if tls.is_some() && insecure_tls {
@@ -3080,7 +3084,7 @@ fn load_opensearch_config_from_env() -> Result<OpenSearchConfig> {
     let mut os = OpenSearchConfig::new("opensearch", os_endpoint, index_template)
         .with_auth(os_auth)
         .with_reconcile_allow_full_purge(bool_env("VS_OS_RECONCILE_ALLOW_FULL_PURGE", false));
-    let tls = database_tls_or_env(None, "VS_OS_TLS_MODE", "VS_OS_TLS_CA_FILE")?;
+    let tls = database_tls_or_env(None, "VS_OS_TLS_MODE", "VS_OS_TLS_CA_FILE", None)?;
     let insecure_tls = bool_env("VS_INSECURE_TLS", false);
     if tls.is_some() && insecure_tls {
         return Err(anyhow!(
@@ -3124,6 +3128,7 @@ fn database_tls_or_env(
     config: Option<&FileTlsConfig>,
     mode_env: &str,
     ca_file_env: &str,
+    trust_provider_env: Option<&str>,
 ) -> Result<Option<DatabaseTlsConfig>> {
     let env_mode = if config.is_none() {
         opt(mode_env)?
@@ -3135,7 +3140,16 @@ fn database_tls_or_env(
     } else {
         None
     };
-    if config.is_none() && env_mode.is_none() && env_ca.is_none() {
+    let env_trust_provider = if config.is_none() {
+        trust_provider_env
+            .map(opt)
+            .transpose()?
+            .flatten()
+            .filter(|value| !value.trim().is_empty())
+    } else {
+        None
+    };
+    if config.is_none() && env_mode.is_none() && env_ca.is_none() && env_trust_provider.is_none() {
         return Ok(None);
     }
 
@@ -3158,11 +3172,40 @@ fn database_tls_or_env(
             }
         },
     };
-    let ca_file = config
+    let mut ca_file = config
         .and_then(|tls| tls.ca_file.clone())
         .or_else(|| env_ca.map(PathBuf::from));
-    if mode == DatabaseTlsMode::Disabled && ca_file.is_some() {
-        return Err(anyhow!("{ca_file_env} requires {mode_env}=verify_full"));
+    let trust_provider = match config.and_then(|tls| tls.trust.as_ref()) {
+        Some(trust) => Some(match trust.provider {
+            FileTlsTrustProvider::AwsRds => DatabaseTlsTrustProvider::AwsRds,
+        }),
+        None => env_trust_provider
+            .as_deref()
+            .map(
+                |provider| match provider.trim().to_ascii_lowercase().as_str() {
+                    "aws_rds" | "aws-rds" => Ok(DatabaseTlsTrustProvider::AwsRds),
+                    other => Err(anyhow!(
+                        "{} must be 'aws_rds', got '{other}'",
+                        trust_provider_env.unwrap_or("TLS trust provider")
+                    )),
+                },
+            )
+            .transpose()?,
+    };
+    if mode == DatabaseTlsMode::Disabled && (ca_file.is_some() || trust_provider.is_some()) {
+        return Err(anyhow!("TLS trust settings require {mode_env}=verify_full"));
+    }
+    if ca_file.is_some() && trust_provider.is_some() {
+        return Err(anyhow!(
+            "{ca_file_env} and {} are mutually exclusive",
+            trust_provider_env.unwrap_or("the configured TLS trust provider")
+        ));
+    }
+    if let Some(provider) = trust_provider {
+        ca_file = Some(
+            materialize_provider_ca_bundle(provider)
+                .map_err(|err| anyhow!("prepare provider TLS trust bundle: {err}"))?,
+        );
     }
     Ok(Some(DatabaseTlsConfig { mode, ca_file }))
 }
@@ -3573,6 +3616,7 @@ fn load_cdc_bundle_mongodb(engine_config: Option<&EngineFileConfig>) -> Result<C
         source_config.and_then(|config| config.tls.as_ref()),
         "VS_MONGO_TLS_MODE",
         "VS_MONGO_TLS_CA_FILE",
+        None,
     )?;
 
     // Sink + DLQ — same OpenSearch config the other sources load.
@@ -3675,6 +3719,7 @@ fn load_cdc_bundle_mysql(
         source_config.and_then(|config| config.tls.as_ref()),
         "VS_MYSQL_TLS_MODE",
         "VS_MYSQL_TLS_CA_FILE",
+        Some("VS_MYSQL_TLS_TRUST_PROVIDER"),
     )?;
 
     // Optional denormalization joins (shared spec + engine with Postgres).
@@ -3963,6 +4008,7 @@ fn load_cdc_bundle_neo4j(
         source_config.and_then(|config| config.tls.as_ref()),
         "VS_NEO4J_TLS_MODE",
         "VS_NEO4J_TLS_CA_FILE",
+        None,
     )?;
     neo.uri = apply_neo4j_tls_mode(&neo.uri, neo.tls.as_ref())?;
     if let Some(path) = neo.tls.as_ref().and_then(|tls| tls.ca_file.clone()) {
@@ -4132,6 +4178,7 @@ fn load_cdc_bundle_postgres(
         source_config.and_then(|config| config.tls.as_ref()),
         "VS_PG_TLS_MODE",
         "VS_PG_TLS_CA_FILE",
+        Some("VS_PG_TLS_TRUST_PROVIDER"),
     )?;
 
     let (joins, joins_yaml_text) = load_joins_yaml(fleet_config, engine_config)?;
@@ -4929,5 +4976,24 @@ joins:
             apply_neo4j_tls_mode("neo4j+s://db.example.com", Some(&disabled)).unwrap(),
             "neo4j://db.example.com"
         );
+    }
+
+    #[test]
+    fn aws_rds_trust_resolves_to_the_packaged_bundle() {
+        let tls: FileTlsConfig =
+            serde_yaml::from_str("mode: verify_full\ntrust:\n  provider: aws_rds\n")
+                .expect("parse AWS RDS trust configuration");
+        let resolved = database_tls_or_env(
+            Some(&tls),
+            "UNUSED_TLS_MODE",
+            "UNUSED_TLS_CA_FILE",
+            Some("UNUSED_TLS_TRUST_PROVIDER"),
+        )
+        .expect("resolve AWS RDS trust configuration")
+        .expect("TLS configuration");
+        let path = resolved.ca_file.expect("materialized provider bundle");
+        let bundle = std::fs::read_to_string(path).expect("read materialized provider bundle");
+        assert!(bundle.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert_eq!(bundle.matches("-----BEGIN CERTIFICATE-----").count(), 108);
     }
 }

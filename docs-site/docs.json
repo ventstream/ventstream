@@ -70,6 +70,7 @@
           {
             "group": "Guides",
             "pages": [
+              "guides/database-tls",
               "guides/realtime-demo",
               "guides/reliable-apollo-subscriptions",
               "guides/authoring-specs",

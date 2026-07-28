@@ -31,4 +31,6 @@ pub use mongodb::{FullDocument, MongoCdcConfig, MongoCdcSource};
 pub use mysql::{MySqlCdcConfig, MySqlCdcSource};
 pub use neo4j::{Neo4jBootstrap, Neo4jCdcConfig, Neo4jCdcSource};
 pub use postgres::{PostgresCdcConfig, PostgresCdcSource};
-pub use tls::{DatabaseTlsConfig, DatabaseTlsMode};
+pub use tls::{
+    materialize_provider_ca_bundle, DatabaseTlsConfig, DatabaseTlsMode, DatabaseTlsTrustProvider,
+};

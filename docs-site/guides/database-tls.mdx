@@ -1,0 +1,157 @@
+---
+title: "Database TLS and trust"
+description: "Choose system trust, an automatic provider bundle, or a custom CA without weakening server verification."
+---
+
+VentStream uses strict TLS when a connector has `tls.mode: verify_full`. The
+engine verifies the certificate chain and checks that the certificate matches
+the configured database hostname.
+
+## Choose a trust source
+
+| Database certificate | Configuration |
+|---|---|
+| Signed by a CA in the operating system trust store | Set `mode: verify_full`. No CA file is needed. |
+| Amazon RDS for PostgreSQL or MySQL | Set `trust.provider: aws_rds`. VentStream supplies the AWS global RDS CA bundle. |
+| Signed by a private or self-managed CA | Set `ca_file` to a mounted PEM bundle. |
+| Unencrypted local development database | Set `mode: disabled`. Do not use this for remote or production traffic. |
+
+## What developers provide
+
+| Deployment | Developer action |
+|---|---|
+| Amazon RDS PostgreSQL or MySQL | Supply the database endpoint and credentials through environment variables or Secrets. Select `trust.provider: aws_rds` in the engine configuration. |
+| Managed database with a publicly trusted certificate | Supply the endpoint and credentials. Set `mode: verify_full`; no CA file is required. |
+| Database using a private CA | Supply the endpoint and credentials, mount the CA bundle into the engine, and set `ca_file` to that in-container path. |
+| Local database without TLS | Set `mode: disabled` explicitly. Do not attach a trust provider or CA file. |
+
+Passwords and connection URLs do not belong in the YAML configuration. Use
+`env:` references and inject their values at deployment time.
+
+### System trust
+
+Use the default trust store when the provider issues certificates from a
+standard public CA:
+
+```yaml
+tls:
+  mode: verify_full
+```
+
+This is normally sufficient for MongoDB Atlas and HTTPS OpenSearch or
+Elasticsearch endpoints with publicly trusted certificates.
+
+### Amazon RDS
+
+VentStream packages the AWS global RDS CA bundle. You do not need to download,
+mount, or distribute an RDS certificate:
+
+```yaml
+source:
+  kind: postgres
+  postgres:
+    host_ref: env:VS_PG_HOST
+    user_ref: env:VS_PG_USER
+    password_ref: env:VS_PG_PASSWORD
+    database_ref: env:VS_PG_DATABASE
+    publication: ventstream_app
+    slot: ventstream_app_slot
+    tls:
+      mode: verify_full
+      trust:
+        provider: aws_rds
+```
+
+The same trust provider works for an Amazon RDS MySQL source:
+
+```yaml
+source:
+  kind: mysql
+  mysql:
+    host_ref: env:VS_MYSQL_HOST
+    user_ref: env:VS_MYSQL_USER
+    password_ref: env:VS_MYSQL_PASSWORD
+    database_ref: env:VS_MYSQL_DATABASE
+    tls:
+      mode: verify_full
+      trust:
+        provider: aws_rds
+```
+
+For environment-variable configuration, use:
+
+```bash
+VS_PG_TLS_MODE=verify_full
+VS_PG_TLS_TRUST_PROVIDER=aws_rds
+
+# MySQL equivalent
+VS_MYSQL_TLS_MODE=verify_full
+VS_MYSQL_TLS_TRUST_PROVIDER=aws_rds
+```
+
+The provider bundle applies to every connection used by the source, including
+snapshot, replication, join fetching, SQL recomposition, reconciliation, and
+checkpoint management.
+
+Each engine release pins a reviewed copy of the AWS bundle. Upgrade the engine
+when a VentStream release notes an RDS trust-bundle update. AWS's current bundle
+and rotation guidance are available in the
+[Amazon RDS TLS documentation](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html).
+
+### Private certificate authority
+
+Use `ca_file` when the server certificate chains to your own CA:
+
+```yaml
+tls:
+  mode: verify_full
+  ca_file: /run/secrets/database-ca.pem
+```
+
+Mount that PEM file into the standalone container or agent workload. A CA
+certificate is public trust material, but its integrity still matters. Deliver
+it through a read-only Kubernetes Secret, ConfigMap, container image, or managed
+configuration file. Keep client private keys in a secret manager.
+
+## Managed and standalone engines
+
+The configuration is identical in both modes:
+
+- VentStream Cloud delivers `trust.provider: aws_rds` as part of the selected
+  configuration revision. The managed engine already contains the provider
+  bundle.
+- A standalone Docker or native engine also contains the provider bundle. No
+  additional file is required for `aws_rds`.
+- A custom `ca_file` must exist at the configured path in either mode.
+
+`ca_file` and `trust` are mutually exclusive. VentStream rejects configurations
+that specify both, use provider trust with `mode: disabled`, or select
+`aws_rds` for an unsupported connector.
+
+## Local databases without TLS
+
+VentStream still supports databases that do not offer TLS:
+
+```yaml
+tls:
+  mode: disabled
+```
+
+Use this only on an isolated development network. Production and other remote
+database connections should use `verify_full`.
+
+## Connection failures
+
+Strict TLS fails closed. Check these first when a source cannot connect:
+
+1. Use the provider's DNS hostname, not an IP address, so hostname verification
+   can succeed.
+2. Confirm the system clock is accurate.
+3. For RDS PostgreSQL or MySQL, select `trust.provider: aws_rds`.
+4. For a private CA, confirm `ca_file` exists inside the engine process and
+   contains the complete PEM chain.
+5. Do not switch to `mode: disabled` to work around a certificate error on a
+   remote database.
+
+See the [PostgreSQL source](/connectors/sources/postgres) and
+[MySQL source](/connectors/sources/mysql) guides for connector prerequisites.

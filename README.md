@@ -116,8 +116,9 @@ fallbacks:
 - `graphql_subscriptions_yaml` replaces `VS_GRAPHQL_SUBSCRIPTIONS`.
 - `graphql_manifest_yaml` replaces `VS_GRAPHQL_MANIFEST`.
 
-Connection strings, passwords, API keys, and certificates remain local env/Secret
-configuration. Fleet config stores topology and spec content, not secret values.
+Connection strings, passwords, API keys, client certificates, and private keys
+remain local environment or Secret configuration. Public provider trust bundles
+can be selected in the engine config, including `trust.provider: aws_rds`.
 
 The numbered CDC manifests under `infra/k8s/` and the deprecated
 `ventstream-agent` chart document the retired telemetry integration and are kept
@@ -193,7 +194,7 @@ below show Postgres and Neo4j.
 
 **Postgres** (`VS_CDC_SOURCE=postgres`)
 - `VS_PG_HOST`, `VS_PG_PORT` (5432), `VS_PG_USER`, `VS_PG_PASSWORD`, `VS_PG_DATABASE` — connection.
-- `VS_PG_TLS_MODE=verify_full`, with optional `VS_PG_TLS_CA_FILE`, enforces certificate and hostname verification on every Postgres connection.
+- `VS_PG_TLS_MODE=verify_full` enforces certificate and hostname verification. Set `VS_PG_TLS_TRUST_PROVIDER=aws_rds` for Amazon RDS, or use `VS_PG_TLS_CA_FILE` for a private CA.
 - `VS_PG_PUBLICATION`, `VS_PG_SLOT` — logical-replication publication + slot to consume.
 - `VS_PG_BOOTSTRAP_MODE` — `snapshot` to seed state from existing rows on cold start.
 - `VS_PG_BOOTSTRAP_CHUNK_SIZE` (10000) — rows per keyset-paginated chunk during bootstrap.

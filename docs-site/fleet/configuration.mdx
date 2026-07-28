@@ -42,10 +42,24 @@ ventstreamctl pipelines configurations rollback orders-cdc <revision> --wait
 ## Secret boundary
 
 Configuration documents contain references such as `env:VS_OS_ENDPOINT`, not
-credential values. Inject database passwords, API keys, TLS private keys, and other
-secrets through Kubernetes Secrets or the customer's secret manager. Fleet should
-be able to validate and distribute configuration without becoming a credential
-vault or data-plane dependency.
+credential values. Inject database passwords, API keys, client certificates,
+TLS private keys, and other secrets through Kubernetes Secrets or the
+customer's secret manager. Fleet validates and distributes configuration
+without becoming a credential vault or data-plane dependency.
+
+Public CA certificates are trust material rather than credentials. For Amazon
+RDS PostgreSQL and MySQL, select the bundle already packaged with the engine:
+
+```yaml
+tls:
+  mode: verify_full
+  trust:
+    provider: aws_rds
+```
+
+No CA file needs to be uploaded or mounted for that provider. Use `ca_file`
+only for a private or self-managed CA. See
+[Database TLS and trust](/guides/database-tls).
 
 Validation occurs at multiple boundaries: control-plane schema and policy checks,
 agent bundle integrity checks, and engine-native semantic parsing before startup.
