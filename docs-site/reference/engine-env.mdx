@@ -72,19 +72,31 @@ runtime:
   dlq_path: ./data/dlq.jsonl
 ```
 
-PostgreSQL, MySQL, MongoDB, Neo4j, and OpenSearch accept the same optional
-transport block beneath their connector settings:
+PostgreSQL, MySQL, MongoDB, Neo4j, and OpenSearch accept an optional transport
+block beneath their connector settings. Publicly trusted certificates need no
+additional file:
 
 ```yaml
 tls:
   mode: verify_full
-  ca_file: /run/secrets/database-ca.pem
 ```
 
-`verify_full` checks both the certificate chain and hostname. Omit `ca_file`
-when the certificate uses a public root. Existing configurations keep their
-current URI or connector behavior when `tls` is omitted. `disabled` is the only
-other mode; weak modes that encrypt without hostname verification are rejected.
+Amazon RDS PostgreSQL and MySQL can use the provider bundle packaged with the
+engine:
+
+```yaml
+tls:
+  mode: verify_full
+  trust:
+    provider: aws_rds
+```
+
+Use `ca_file: /run/secrets/database-ca.pem` instead for a private CA.
+`verify_full` checks both the certificate chain and hostname. Existing
+configurations keep their current URI or connector behavior when `tls` is
+omitted. `disabled` is the only other mode; weak modes that encrypt without
+hostname verification are rejected. See
+[Database TLS and trust](/guides/database-tls) for the complete decision guide.
 
 OpenSearch routing strategies:
 
@@ -125,7 +137,8 @@ certificates in Kubernetes Secrets or a local secret provider.
 | `VS_PG_USER` / `VS_PG_PASSWORD` | Credentials (role needs `REPLICATION`). |
 | `VS_PG_DATABASE` | Database name. |
 | `VS_PG_TLS_MODE` | `verify_full` validates the certificate chain and hostname; `disabled` uses an unencrypted connection. |
-| `VS_PG_TLS_CA_FILE` | Optional PEM CA bundle for a private CA, including cloud database CA bundles. |
+| `VS_PG_TLS_TRUST_PROVIDER` | Set to `aws_rds` for Amazon RDS. VentStream supplies the global RDS CA bundle. |
+| `VS_PG_TLS_CA_FILE` | Optional PEM CA bundle for a private or self-managed CA. Mutually exclusive with `VS_PG_TLS_TRUST_PROVIDER`. |
 | `VS_PG_PUBLICATION` | Logical-replication publication to consume. |
 | `VS_PG_SLOT` | Replication slot name — **unique per agent**. |
 | `VS_PG_BOOTSTRAP_MODE` | `snapshot` (scan then tail) or `none`. |
@@ -197,7 +210,8 @@ See the [MySQL connector](/connectors/sources/mysql). Requires
 | `VS_MYSQL_PASSWORD` | Login password (carries credentials). |
 | `VS_MYSQL_DATABASE` | Database to watch and namespace under. |
 | `VS_MYSQL_TLS_MODE` | `verify_full` validates the certificate chain and hostname; `disabled` uses an unencrypted connection. |
-| `VS_MYSQL_TLS_CA_FILE` | Optional PEM CA bundle for a private CA or managed-database CA. |
+| `VS_MYSQL_TLS_TRUST_PROVIDER` | Set to `aws_rds` for Amazon RDS. VentStream supplies the global RDS CA bundle. |
+| `VS_MYSQL_TLS_CA_FILE` | Optional PEM CA bundle for a private or self-managed CA. Mutually exclusive with `VS_MYSQL_TLS_TRUST_PROVIDER`. |
 | `VS_MYSQL_NAMESPACE` | Namespace stamped on emitted subjects (default = database). |
 | `VS_MYSQL_TABLES` | CSV of tables to watch; empty = all tables in the database. |
 | `VS_MYSQL_SERVER_ID` | Replica `server_id` this agent registers as (default 4000000000); must be unique. |

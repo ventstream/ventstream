@@ -7,7 +7,7 @@ description: "Diagnose engine, VentStream Cloud, authentication, enrollment, and
 
 | Symptom | Cause / fix |
 |---|---|
-| Agent remains `starting`, then reports `degraded` or `failed` | Check connector credentials, TLS configuration, source CDC prerequisites, and network policy. Inspect engine logs and `ventstreamctl agents status`. |
+| Agent remains `starting`, then reports `degraded` or `failed` | Check connector credentials, [database trust configuration](/guides/database-tls), source CDC prerequisites, and network policy. Amazon RDS PostgreSQL and MySQL should use `trust.provider: aws_rds`; private CAs require a mounted `ca_file`. Inspect engine logs and `ventstreamctl agents status`. |
 | Bootstrap skipped on restart | Retained source position means the connector resumes instead of re-scanning. Use Fleet rebootstrap for supported local state. PostgreSQL drops its slot; Neo4j, MongoDB, and MySQL remove their local cursor; Kafka consumer-group offsets must be reset through Kafka administration. |
 | Cloud reports an unhealthy or stale instance but the engine has no current error | The control stream or process stopped reporting. Inspect `agents status`, supervisor logs, and the pod restart count. |
 | Created edge "doesn't propagate" (Neo4j) | Temporal contract — the edge needs `fromDate` or the spec's `WHERE` filters it. The fan-out *did* fire (see `recomposed=N` in the log); the projection just returned nothing. |

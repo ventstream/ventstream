@@ -101,16 +101,27 @@ database. The index template renders one index per table (`orders`,
 
 ## TLS
 
-Use strict TLS for a managed or remote database:
+Use strict TLS for a remote database. Amazon RDS needs no downloaded CA file:
 
 ```bash
 VS_MYSQL_TLS_MODE=verify_full
-VS_MYSQL_TLS_CA_FILE=/run/secrets/mysql-ca.pem
+VS_MYSQL_TLS_TRUST_PROVIDER=aws_rds
 ```
 
-The CA file is optional when the server certificate chains to a public root.
-Strict mode validates both the certificate chain and hostname for binlog,
-snapshot, join-fetch, and SQL recomposition connections.
+The canonical configuration is:
+
+```yaml
+tls:
+  mode: verify_full
+  trust:
+    provider: aws_rds
+```
+
+For a publicly trusted database, omit the trust provider. For a private CA, use
+`ca_file` instead. Strict mode validates both the certificate chain and
+hostname for binlog, snapshot, join-fetch, and SQL recomposition connections.
+See [Database TLS and trust](/guides/database-tls) for the complete decision
+guide.
 
 ## Key environment variables
 
@@ -122,7 +133,8 @@ snapshot, join-fetch, and SQL recomposition connections.
 | `VS_MYSQL_PASSWORD` | empty | Login password. Carries credentials — source it from a Secret in Kubernetes. |
 | `VS_MYSQL_DATABASE` | — (required) | Database to watch and namespace rows under. |
 | `VS_MYSQL_TLS_MODE` | unset | `verify_full` or `disabled`. |
-| `VS_MYSQL_TLS_CA_FILE` | unset | PEM CA bundle for a private CA. |
+| `VS_MYSQL_TLS_TRUST_PROVIDER` | unset | Set to `aws_rds` for Amazon RDS. |
+| `VS_MYSQL_TLS_CA_FILE` | unset | PEM CA bundle for a private CA. Mutually exclusive with the trust provider. |
 | `VS_MYSQL_NAMESPACE` | = database | Logical namespace stamped on subjects/headers. |
 | `VS_MYSQL_TABLES` | unset (all) | CSV of tables to watch; empty = every table in the database. |
 | `VS_MYSQL_SERVER_ID` | `4000000000` | Replica `server_id` the agent registers as; must be unique in the topology. |

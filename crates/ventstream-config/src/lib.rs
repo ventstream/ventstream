@@ -22,22 +22,79 @@ pub struct TlsConfig {
     /// Optional PEM CA bundle for private certificate authorities.
     #[serde(default)]
     pub ca_file: Option<PathBuf>,
+    /// Optional maintained trust bundle for a known database provider.
+    #[serde(default)]
+    pub trust: Option<TlsTrustConfig>,
 }
 
 impl TlsConfig {
     fn validate(&self, field: &'static str) -> Result<(), ConfigError> {
-        if self.mode == TlsMode::Disabled && self.ca_file.is_some() {
+        if self.mode == TlsMode::Disabled && (self.ca_file.is_some() || self.trust.is_some()) {
             return Err(ConfigError::InvalidField(match field {
-                "source.postgres.tls" => "source.postgres.tls.ca_file requires mode=verify_full",
-                "source.mysql.tls" => "source.mysql.tls.ca_file requires mode=verify_full",
-                "source.mongodb.tls" => "source.mongodb.tls.ca_file requires mode=verify_full",
-                "source.neo4j.tls" => "source.neo4j.tls.ca_file requires mode=verify_full",
-                "sink.opensearch.tls" => "sink.opensearch.tls.ca_file requires mode=verify_full",
-                _ => "tls.ca_file requires mode=verify_full",
+                "source.postgres.tls" => {
+                    "source.postgres.tls trust settings require mode=verify_full"
+                }
+                "source.mysql.tls" => "source.mysql.tls trust settings require mode=verify_full",
+                "source.mongodb.tls" => {
+                    "source.mongodb.tls trust settings require mode=verify_full"
+                }
+                "source.neo4j.tls" => "source.neo4j.tls trust settings require mode=verify_full",
+                "sink.opensearch.tls" => {
+                    "sink.opensearch.tls trust settings require mode=verify_full"
+                }
+                _ => "TLS trust settings require mode=verify_full",
+            }));
+        }
+        if self.ca_file.is_some() && self.trust.is_some() {
+            return Err(ConfigError::InvalidField(match field {
+                "source.postgres.tls" => {
+                    "source.postgres.tls.ca_file and source.postgres.tls.trust are mutually exclusive"
+                }
+                "source.mysql.tls" => {
+                    "source.mysql.tls.ca_file and source.mysql.tls.trust are mutually exclusive"
+                }
+                "source.mongodb.tls" => {
+                    "source.mongodb.tls.ca_file and source.mongodb.tls.trust are mutually exclusive"
+                }
+                "source.neo4j.tls" => {
+                    "source.neo4j.tls.ca_file and source.neo4j.tls.trust are mutually exclusive"
+                }
+                "sink.opensearch.tls" => {
+                    "sink.opensearch.tls.ca_file and sink.opensearch.tls.trust are mutually exclusive"
+                }
+                _ => "tls.ca_file and tls.trust are mutually exclusive",
+            }));
+        }
+        if self.trust.is_some() && !matches!(field, "source.postgres.tls" | "source.mysql.tls") {
+            return Err(ConfigError::InvalidField(match field {
+                "source.mongodb.tls" => {
+                    "source.mongodb.tls.trust.provider=aws_rds is not supported"
+                }
+                "source.neo4j.tls" => "source.neo4j.tls.trust.provider=aws_rds is not supported",
+                "sink.opensearch.tls" => {
+                    "sink.opensearch.tls.trust.provider=aws_rds is not supported"
+                }
+                _ => "tls.trust.provider=aws_rds is not supported by this connector",
             }));
         }
         Ok(())
     }
+}
+
+/// Maintained trust material for a known database provider.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsTrustConfig {
+    /// Provider whose CA bundle VentStream should supply.
+    pub provider: TlsTrustProvider,
+}
+
+/// Provider trust bundles packaged with the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsTrustProvider {
+    /// Amazon RDS global CA bundle for PostgreSQL and MySQL.
+    AwsRds,
 }
 
 /// Supported database transport-security policies.
@@ -2375,6 +2432,7 @@ runtime:
     fn tls_blocks_default_to_strict_verification() {
         let tls: TlsConfig = serde_yaml::from_str("{}").expect("parse TLS defaults");
         assert_eq!(tls.mode, TlsMode::VerifyFull);
+        assert!(tls.trust.is_none());
 
         let tls: TlsConfig =
             serde_yaml::from_str("mode: verify_full\nca_file: /run/secrets/database-ca.pem\n")
@@ -2383,6 +2441,14 @@ runtime:
         assert_eq!(
             tls.ca_file.as_deref(),
             Some(std::path::Path::new("/run/secrets/database-ca.pem"))
+        );
+
+        let tls: TlsConfig =
+            serde_yaml::from_str("mode: verify_full\ntrust:\n  provider: aws_rds\n")
+                .expect("parse provider trust");
+        assert_eq!(
+            tls.trust.as_ref().map(|trust| trust.provider),
+            Some(TlsTrustProvider::AwsRds)
         );
     }
 
@@ -2394,6 +2460,17 @@ runtime:
             serde_yaml::from_str("mode: disabled\nca_file: /tmp/ca.pem\n")
                 .expect("deserialize before semantic validation");
         assert!(disabled_with_ca.validate("source.postgres.tls").is_err());
+
+        let conflicting_trust: TlsConfig = serde_yaml::from_str(
+            "mode: verify_full\nca_file: /tmp/ca.pem\ntrust:\n  provider: aws_rds\n",
+        )
+        .expect("deserialize before semantic validation");
+        assert!(conflicting_trust.validate("source.postgres.tls").is_err());
+
+        let unsupported_provider: TlsConfig =
+            serde_yaml::from_str("mode: verify_full\ntrust:\n  provider: aws_rds\n")
+                .expect("deserialize before semantic validation");
+        assert!(unsupported_provider.validate("source.mongodb.tls").is_err());
 
         let config = EngineConfig::from_yaml_str(
             r#"
@@ -2414,5 +2491,55 @@ sink:
 "#,
         );
         assert!(config.is_err());
+    }
+
+    #[test]
+    fn aws_rds_trust_is_accepted_for_postgres_and_mysql() {
+        for yaml in [
+            r#"
+schema_version: 1
+roles: [cdc]
+source:
+  kind: postgres
+  postgres:
+    host_ref: env:VS_PG_HOST
+    database_ref: env:VS_PG_DATABASE
+    publication: app_publication
+    slot: app_slot
+    tls:
+      mode: verify_full
+      trust:
+        provider: aws_rds
+sink:
+  kind: opensearch
+  opensearch:
+    endpoint_ref: env:VS_OS_ENDPOINT
+    index_routing:
+      strategy: fixed
+      name: app
+"#,
+            r#"
+schema_version: 1
+roles: [cdc]
+source:
+  kind: mysql
+  mysql:
+    host_ref: env:VS_MYSQL_HOST
+    database_ref: env:VS_MYSQL_DATABASE
+    tls:
+      mode: verify_full
+      trust:
+        provider: aws_rds
+sink:
+  kind: opensearch
+  opensearch:
+    endpoint_ref: env:VS_OS_ENDPOINT
+    index_routing:
+      strategy: fixed
+      name: app
+"#,
+        ] {
+            EngineConfig::from_yaml_str(yaml).expect("accept AWS RDS provider trust");
+        }
     }
 }
