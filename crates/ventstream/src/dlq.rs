@@ -1,7 +1,7 @@
 //! Local-disk dead-letter queue.
 //!
-//! Poison events — those a sink rejects with `is_poison()` semantics —
-//! are appended here as JSON Lines so an operator can inspect and
+//! Poison events — those a sink identifies with exact per-item failure
+//! offsets — are appended here as JSON Lines so an operator can inspect and
 //! replay them later. The DLQ is intentionally simple: one file per
 //! pipeline, append-only, line-buffered through a tokio `BufWriter`,
 //! `fsync()` on close (and on every N writes once the engine gets a

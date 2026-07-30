@@ -21,7 +21,7 @@ Validation fails when a required reference is missing.
 | `VS_OS_ENDPOINT` | OpenSearch base URL. |
 | `VS_INDEX_TEMPLATE` | Per-event index name template, e.g. `${header:ventstream.cdc.relation}`. |
 | `VS_DLQ_PATH` | Dead-letter file path (on the PVC). |
-| `VS_HEALTH_LISTEN` | Always-on health server (default `0.0.0.0:4043`) serving `/healthz`, `/readyz`, and `/metrics`. `/healthz` reports process liveness. `/readyz` stays `503` until every enabled WS/GraphQL gateway has initialized its dependencies and bound its traffic listener, and also returns `503` at the WS capacity threshold. |
+| `VS_HEALTH_LISTEN` | Always-on health server (default `0.0.0.0:4043`) serving `/healthz`, `/readyz`, and `/metrics`. `/healthz` reports process liveness. `/readyz` covers WS/GraphQL startup, WS capacity, sustained CDC sink outages, and immediate sink authentication/configuration blockers. |
 | `RUST_LOG` | Log filter, e.g. `info`. |
 | `VS_LOG_FORMAT` | `pretty` or `json` (image defaults to `json`). |
 | `_RJEM_MALLOC_CONF` | jemalloc tuning (the engine uses jemalloc as its global allocator). The image bakes `background_thread:true,dirty_decay_ms:500,muzzy_decay_ms:1000` so freed pages return to the OS and RSS tracks the live working set (elastic after connection/working-set spikes). Note the `_RJEM_` prefix — tikv-jemalloc ignores the unprefixed `MALLOC_CONF`. Override per-deploy for different decay timing. Linux only. |

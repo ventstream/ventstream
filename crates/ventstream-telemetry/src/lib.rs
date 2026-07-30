@@ -61,7 +61,7 @@ pub struct TelemetryCounters {
     pub events_received: AtomicU64,
     /// Total events acknowledged by the sink.
     pub events_delivered: AtomicU64,
-    /// Total events rejected by the sink or failed as part of a whole batch.
+    /// Total exact permanent item failures reported by the sink.
     pub events_failed: AtomicU64,
     /// Total event delivery retries attempted by a sink.
     pub sink_retries: AtomicU64,
@@ -90,6 +90,8 @@ pub struct TelemetryCounters {
     pub last_input_at_ms: AtomicU64,
     /// Unix millis for the newest successful sink acknowledgement.
     pub last_output_at_ms: AtomicU64,
+    /// Unix millis when the current sink outage began; zero while available.
+    pub sink_unavailable_since_ms: AtomicU64,
     /// Current lifecycle phase as a [`LifecyclePhase`] discriminant.
     /// Source code calls [`set_phase`] when state transitions occur
     /// (snapshot start, snapshot complete, tail mode, fatal error).
@@ -685,6 +687,13 @@ pub fn render_prometheus(handle: &PrometheusHandle) -> String {
             .set(c.last_input_at_ms.load(Ordering::Relaxed) as f64);
         metrics::gauge!("vs_last_output_at_unixtime_ms")
             .set(c.last_output_at_ms.load(Ordering::Relaxed) as f64);
+        let unavailable_since = c.sink_unavailable_since_ms.load(Ordering::Relaxed);
+        metrics::gauge!("vs_sink_available").set(if unavailable_since == 0 { 1.0 } else { 0.0 });
+        metrics::gauge!("vs_sink_outage_seconds").set(if unavailable_since == 0 {
+            0.0
+        } else {
+            now_unix_millis().saturating_sub(unavailable_since) as f64 / 1_000.0
+        });
         metrics::gauge!("vs_bulk_write_p50_ms").set(c.bulk_p50_ms.load(Ordering::Relaxed) as f64);
         metrics::gauge!("vs_bulk_write_p95_ms").set(c.bulk_p95_ms.load(Ordering::Relaxed) as f64);
         metrics::gauge!("vs_lifecycle_phase").set(c.current_phase.load(Ordering::Relaxed) as f64);
@@ -734,6 +743,28 @@ pub fn bump_events_failed(n: u64) {
 pub fn bump_sink_retries(n: u64) {
     with_global(|c| {
         c.sink_retries.fetch_add(n, Ordering::Relaxed);
+    });
+}
+
+/// Mark the downstream sink unavailable without resetting the original outage
+/// start time on every retry.
+#[inline]
+pub fn mark_sink_unavailable() {
+    with_global(|c| {
+        let _ = c.sink_unavailable_since_ms.compare_exchange(
+            0,
+            now_unix_millis(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    });
+}
+
+/// Mark the downstream sink recovered.
+#[inline]
+pub fn mark_sink_available() {
+    with_global(|c| {
+        c.sink_unavailable_since_ms.store(0, Ordering::Relaxed);
     });
 }
 

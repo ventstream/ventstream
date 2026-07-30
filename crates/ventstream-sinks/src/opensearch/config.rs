@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use ventstream_core::SinkHealth;
+
 /// Top-level sink configuration.
 #[derive(Debug, Clone)]
 pub struct OpenSearchConfig {
@@ -49,6 +51,10 @@ pub struct OpenSearchConfig {
     /// query, and deleting on them wipes a live index. Set true only when a
     /// genuine full purge is intended (e.g. a table truly emptied).
     pub reconcile_allow_full_purge: bool,
+
+    /// Process-local availability state shared with the health server.
+    #[doc(hidden)]
+    pub delivery_health: Option<SinkHealth>,
 }
 
 impl OpenSearchConfig {
@@ -69,6 +75,7 @@ impl OpenSearchConfig {
             verify_tls: true,
             ca_file: None,
             reconcile_allow_full_purge: false,
+            delivery_health: None,
         }
     }
 
@@ -122,6 +129,13 @@ impl OpenSearchConfig {
         self.reconcile_allow_full_purge = allow;
         self
     }
+
+    /// Attach the sink availability state observed by process readiness.
+    #[must_use]
+    pub fn with_delivery_health(mut self, health: SinkHealth) -> Self {
+        self.delivery_health = Some(health);
+        self
+    }
 }
 
 /// Authentication mode for the sink.
@@ -168,7 +182,12 @@ impl Default for BulkConfig {
 /// Retry policy for transient sink failures.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryConfig {
-    /// Maximum total attempts (initial + retries). Default 5.
+    /// Maximum total attempts (initial + retries).
+    ///
+    /// `0` means retry transient failures for the lifetime of the process. This
+    /// is the production default: a temporary sink outage must apply
+    /// backpressure rather than turn source records into permanent DLQ entries.
+    /// A finite value is intended only for bounded diagnostics and tests.
     pub max_attempts: u32,
     /// Backoff before the first retry. Default 100ms.
     pub initial_backoff: Duration,
@@ -181,7 +200,7 @@ pub struct RetryConfig {
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_attempts: 5,
+            max_attempts: 0,
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(30),
             backoff_factor: 2.0,

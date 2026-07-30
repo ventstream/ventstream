@@ -76,11 +76,53 @@ many times a record is re-emitted. A source delete becomes a document
 ## Reliability
 
 - **Bulk upserts** are batched and flushed with bounded parallelism.
-- **Rejects** (mapping conflicts, etc.) go to the dead-letter queue
-  (`VS_DLQ_PATH`) for inspection/replay rather than blocking the stream.
+- Transport failures, HTTP `408`, `429`, and `5xx` responses retry with
+  exponential backoff, jitter, and a 30-second delay ceiling. A
+  `Retry-After` delta supplied by the server is honored up to that ceiling.
+- Retryable sink outages apply backpressure for the lifetime of the process.
+  They do not create DLQ records.
+- A permanent bulk-item failure with an exact item offset, such as a document
+  mapping conflict, goes to the dead-letter queue (`VS_DLQ_PATH`). Whole-request
+  authentication, configuration, protocol, and unknown item failures stop
+  delivery without advancing the source cursor.
 - The source cursor only advances once the sink **confirms** the write —
   so a crash resumes from the last durably-written position. See
   [Architecture](/concepts/architecture#crash-safety-the-cursor-watermark).
+- `/readyz` returns `503` when a retryable sink outage lasts at least 30
+  seconds, and immediately for an authentication or configuration blocker.
+  `/healthz` remains a process-liveness check.
+
+The Prometheus endpoint exposes `vs_sink_available` and
+`vs_sink_outage_seconds`. Alert on sustained unavailability, sink retry growth,
+source cursor age, and source-retention headroom.
+
+<Warning>
+Fail-closed retry prevents the engine from discarding records, but it cannot
+extend the source system's retention. Size PostgreSQL WAL, MySQL binlogs,
+MongoDB's oplog, Neo4j CDC retention, or Kafka topic retention for the longest
+sink outage you intend to recover without a new snapshot.
+</Warning>
+
+## Production topology
+
+Run the destination as a replicated service across failure domains. A
+single-node OpenSearch or Elasticsearch cluster is suitable for local
+development, not a production CDC sink.
+
+For Amazon OpenSearch Service, use **Multi-AZ with Standby** across three
+Availability Zones, three dedicated cluster-manager nodes, and three data nodes
+or a multiple of three. Each index needs at least two replicas so all three
+zones hold a copy. Enable Auto-Tune and software updates, then alarm on:
+
+- `ClusterStatus.red` and sustained `ClusterStatus.yellow`
+- `ClusterIndexWritesBlocked`
+- low `FreeStorageSpace`
+- `JVMMemoryPressure` and `OldGenJVMMemoryPressure`
+- missing nodes, high CPU, and snapshot failures
+
+The `infra/aws` example accepts `opensearch_topology = "ha"` to exercise this
+topology. Size its node types, storage, shard count, and alarm actions from
+measured indexing and query load before using it for customer traffic.
 
 <Warning>
 The local demo disables the OpenSearch security plugin for convenience.

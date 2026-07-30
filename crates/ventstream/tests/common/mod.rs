@@ -647,8 +647,11 @@ pub struct MySqlOsStack {
 }
 
 pub async fn start_mysql_os() -> MySqlOsStack {
+    // Docker may assign a different ephemeral host port when a stopped
+    // container is restarted. Pin one test-local port so the running engine
+    // can reconnect to the same address during outage drills.
+    let mysql_port = reserve_local_port();
     let mysql = GenericImage::new("mysql", "8.4")
-        .with_exposed_port(3306.tcp())
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", MYSQL_PASSWORD)
         .with_env_var("MYSQL_ROOT_HOST", "%")
@@ -660,13 +663,10 @@ pub async fn start_mysql_os() -> MySqlOsStack {
             "--binlog-format=ROW",
             "--binlog-row-image=FULL",
         ])
+        .with_mapped_port(mysql_port, 3306.tcp())
         .start()
         .await
         .expect("start mysql container");
-    let mysql_port = mysql
-        .get_host_port_ipv4(3306.tcp())
-        .await
-        .expect("mysql host port");
     wait_mysql_ready(mysql_port).await;
     let (os, os_port) = start_os().await;
     MySqlOsStack {
@@ -677,7 +677,7 @@ pub async fn start_mysql_os() -> MySqlOsStack {
     }
 }
 
-async fn wait_mysql_ready(port: u16) {
+pub async fn wait_mysql_ready(port: u16) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match mysql_root_conn(port).await {

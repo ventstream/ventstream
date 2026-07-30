@@ -180,15 +180,14 @@ fn build_bulk_request_inner(
             // A delete MUST target the stable logical doc id. Falling back to
             // the per-event ULID would address a doc that never existed → OS
             // returns 404 (swallowed by the bulk response) and the doc that
-            // should be removed lives forever. Poison the batch instead of
-            // silently emitting an unmatchable delete (H9) — a delete without
+            // should be removed lives forever. Block delivery instead of
+            // silently emitting an unmatchable delete (H9); a delete without
             // this header means a misconfigured / raw passthrough path.
             let Some(doc_id) = stable_id else {
                 return Err(OpenSearchSinkError::Internal(format!(
                     "delete event {} (subject '{}') has no `ventstream.doc.id`; \
-                     cannot identify the doc to remove — refusing to emit an \
-                     unmatchable delete (routing to DLQ). The source / denormalize \
-                     mode must stamp a stable doc id on deletes.",
+                     cannot identify the doc to remove. Delivery is blocked until \
+                     the source or denormalization mode stamps a stable doc id.",
                     event.id, event.subject
                 )));
             };
@@ -317,9 +316,16 @@ impl BulkResponseAction {
 
     /// Whether a delete reached the desired state because the document was
     /// already absent. Replayed deletes must remain idempotent across source
-    /// and sink restarts.
-    pub fn is_idempotent_delete_not_found(&self) -> bool {
-        matches!(self, Self::Delete(entry) if entry.status == 404)
+    /// and sink restarts. An `index_not_found_exception` is a deployment
+    /// failure, not an idempotent delete result, and must block delivery.
+    pub fn is_delete_not_found(&self) -> bool {
+        matches!(
+            self,
+            Self::Delete(entry)
+                if entry.status == 404
+                    && (entry.error.is_none()
+                        || entry.error_type() == Some("document_missing_exception"))
+        )
     }
 }
 
@@ -348,9 +354,19 @@ impl BulkResponseEntry {
         self.status == 429
     }
 
-    /// Whether the failure is permanent (4xx other than 429).
+    /// Whether the item carries an HTTP client-error status other than the
+    /// separately classified rate limit. This does not imply the failure is a
+    /// permanent document error.
     pub fn is_client_error(&self) -> bool {
         (400..500).contains(&self.status) && self.status != 429
+    }
+
+    /// OpenSearch/Elasticsearch error type, when the response supplied one.
+    pub fn error_type(&self) -> Option<&str> {
+        self.error
+            .as_ref()
+            .and_then(|error| error.get("type"))
+            .and_then(serde_json::Value::as_str)
     }
 
     /// Whether the item failed with an OpenSearch external-version
@@ -367,12 +383,7 @@ impl BulkResponseEntry {
         if self.status != 409 {
             return false;
         }
-        match self
-            .error
-            .as_ref()
-            .and_then(|e| e.get("type"))
-            .and_then(serde_json::Value::as_str)
-        {
+        match self.error_type() {
             Some(t) => t.contains("version_conflict"),
             // No typed error body — a bare 409 from bulk is a version
             // conflict by construction (we only ever send versioned ops).
@@ -536,14 +547,14 @@ mod tests {
     }
 
     #[test]
-    fn delete_without_doc_id_is_poisoned() {
+    fn delete_without_doc_id_blocks_delivery() {
         // H9: a delete with no stable doc id can't target the doc to remove;
-        // refuse (→ DLQ) rather than emit an unmatchable delete that 404s and
+        // block delivery rather than emit an unmatchable delete that 404s and
         // leaves the doc indexed forever.
         let event = make_event_with_doc_id("a.b.delete", None);
         let err = match build_bulk_request(&[event], "idx", now()) {
             Err(e) => e,
-            Ok(_) => panic!("delete without doc.id must be poisoned, not emitted"),
+            Ok(_) => panic!("delete without doc.id must block, not be emitted"),
         };
         assert!(
             err.to_string().contains("ventstream.doc.id"),
@@ -709,5 +720,29 @@ mod tests {
             error: Some(serde_json::json!({ "type": "mapper_parsing_exception" })),
         };
         assert!(!mapper.is_version_conflict());
+    }
+
+    #[test]
+    fn delete_not_found_requires_delete_action_without_error() {
+        let already_absent = BulkResponseAction::Delete(BulkResponseEntry {
+            id: Some("gone".into()),
+            status: 404,
+            error: None,
+        });
+        assert!(already_absent.is_delete_not_found());
+
+        let missing_index = BulkResponseAction::Delete(BulkResponseEntry {
+            id: Some("gone".into()),
+            status: 404,
+            error: Some(serde_json::json!({ "type": "index_not_found_exception" })),
+        });
+        assert!(!missing_index.is_delete_not_found());
+
+        let missing_indexed_document = BulkResponseAction::Index(BulkResponseEntry {
+            id: Some("gone".into()),
+            status: 404,
+            error: None,
+        });
+        assert!(!missing_indexed_document.is_delete_not_found());
     }
 }

@@ -106,12 +106,6 @@
               "reference/control-plane-api",
               "reference/troubleshooting"
             ]
-          },
-          {
-            "group": "Operations",
-            "pages": [
-              "operations/pre-production"
-            ]
           }
         ]
       }

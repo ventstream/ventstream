@@ -10,9 +10,9 @@ use super::config::RetryConfig;
 
 /// Iterator-style schedule over backoff delays.
 ///
-/// Yields the delay to wait *before* the next attempt. `next()` returns
-/// `None` once `max_attempts` has been reached (i.e. the caller should
-/// give up).
+/// Yields the delay to wait *before* the next attempt. A configured
+/// `max_attempts` of `0` is unbounded; otherwise `next()` returns `None` once
+/// the finite diagnostic budget has been reached.
 pub struct BackoffSchedule {
     config: RetryConfig,
     attempt: u32,
@@ -41,9 +41,10 @@ impl Iterator for BackoffSchedule {
     type Item = Duration;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // `max_attempts` includes the initial attempt, so a value of 5
-        // permits 4 retries (4 delays from this iterator).
-        if self.attempt + 1 >= self.config.max_attempts {
+        // `max_attempts` includes the initial attempt, so a value of 5 permits
+        // 4 retries. Zero is the fail-closed production mode and never
+        // exhausts while the process is running.
+        if self.config.max_attempts != 0 && self.attempt + 1 >= self.config.max_attempts {
             return None;
         }
         let delay = self.next_delay;
@@ -123,6 +124,22 @@ mod tests {
     fn schedule_with_one_max_attempt_yields_no_delays() {
         let mut s = BackoffSchedule::new(cfg(1));
         assert_eq!(s.next(), None);
+    }
+
+    #[test]
+    fn zero_max_attempts_retries_forever_at_the_cap() {
+        let mut s = BackoffSchedule::new(RetryConfig {
+            max_attempts: 0,
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_millis(400),
+            backoff_factor: 2.0,
+        });
+        assert_eq!(s.next(), Some(Duration::from_millis(100)));
+        assert_eq!(s.next(), Some(Duration::from_millis(200)));
+        assert_eq!(s.next(), Some(Duration::from_millis(400)));
+        for _ in 0..10_000 {
+            assert_eq!(s.next(), Some(Duration::from_millis(400)));
+        }
     }
 
     #[test]

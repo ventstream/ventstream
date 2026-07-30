@@ -129,6 +129,12 @@ pub enum SinkError {
         millis: u64,
     },
 
+    /// The sink cannot accept any event until an operator fixes deployment
+    /// configuration, credentials, or protocol compatibility. This is not an
+    /// event-level rejection and must never be routed to the DLQ.
+    #[error("sink blocked: {0}")]
+    Blocked(String),
+
     /// A non-recoverable internal error.
     #[error("sink internal error: {0}")]
     Internal(String),

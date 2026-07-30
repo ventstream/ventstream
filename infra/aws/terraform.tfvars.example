@@ -7,5 +7,10 @@ region = "eu-central-1"
 # node_instance_type        = "m5.large"
 # node_desired_size         = 3
 
+# Durable OpenSearch validation topology (three AZs, three dedicated
+# cluster-manager nodes, Multi-AZ with Standby):
+# opensearch_topology = "ha"
+# opensearch_alarm_actions = ["arn:aws:sns:eu-central-1:123456789012:platform-alerts"]
+
 # Per-pod WS connection cap (size to node/pod memory; PR #7).
 # ws_max_conns = 5000

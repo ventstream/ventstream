@@ -56,6 +56,46 @@ variable "opensearch_instance_count" {
   default = 1
 }
 
+variable "opensearch_topology" {
+  description = "acceptance keeps the disposable single-node domain; ha provisions a three-AZ, standby-enabled production topology."
+  type        = string
+  default     = "acceptance"
+
+  validation {
+    condition     = contains(["acceptance", "ha"], var.opensearch_topology)
+    error_message = "opensearch_topology must be acceptance or ha."
+  }
+}
+
+variable "opensearch_ha_instance_type" {
+  description = "Data node type used by the HA topology."
+  type        = string
+  default     = "r6g.large.search"
+}
+
+variable "opensearch_ha_instance_count" {
+  description = "Data nodes used by the HA topology. Multi-AZ with Standby requires a multiple of three."
+  type        = number
+  default     = 3
+
+  validation {
+    condition     = var.opensearch_ha_instance_count >= 3 && var.opensearch_ha_instance_count % 3 == 0
+    error_message = "opensearch_ha_instance_count must be at least 3 and divisible by 3."
+  }
+}
+
+variable "opensearch_ha_master_instance_type" {
+  description = "Dedicated cluster-manager node type used by the HA topology."
+  type        = string
+  default     = "m6g.large.search"
+}
+
+variable "opensearch_alarm_actions" {
+  description = "SNS topic ARNs notified by OpenSearch availability/capacity alarms."
+  type        = list(string)
+  default     = []
+}
+
 variable "opensearch_master_user" {
   description = "FGAC master user (basic auth). The engine sink uses this — SigV4/IAM is not yet supported by the sink."
   type        = string

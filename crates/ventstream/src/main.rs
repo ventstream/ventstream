@@ -434,7 +434,7 @@ async fn run(
     engine_config: Option<EngineFileConfig>,
 ) -> Result<()> {
     let fleet_config = fleet_config::load_from_env()?;
-    let cfg = PipelineEnv::load(fleet_config.as_ref(), engine_config.as_ref())?;
+    let mut cfg = PipelineEnv::load(fleet_config.as_ref(), engine_config.as_ref())?;
     info!(roles = ?cfg.roles, "pipeline roles configured");
 
     let shutdown = ShutdownToken::new();
@@ -467,6 +467,11 @@ async fn run(
     let graphql_role_readiness = ReadinessSignal::new();
     let ws_enabled = cfg.ws.is_some();
     let graphql_enabled = cfg.graphql.is_some();
+    let cdc_sink_health = cfg.cdc.as_mut().map(|cdc| {
+        let health = ventstream_core::SinkHealth::new();
+        cdc.runtime.os.delivery_health = Some(health.clone());
+        health
+    });
 
     // Shared established-connection counter for the WS gateway. The gateway
     // mutates it; the health server reads it for capacity readiness.
@@ -490,6 +495,7 @@ async fn run(
         ws_enabled.then(|| ws_role_readiness.clone()),
         graphql_enabled.then(|| graphql_role_readiness.clone()),
         ws_capacity,
+        cdc_sink_health,
     );
 
     // Single, always-on health server shared by every role — one

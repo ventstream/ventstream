@@ -20,6 +20,7 @@ mongodb = { workspace = true }
 mysql_async = { workspace = true }
 rdkafka = { workspace = true }
 pgwire-replication = { workspace = true }
+rand = "0.8"
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 rustls-pemfile = { workspace = true }
