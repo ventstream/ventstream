@@ -29,6 +29,27 @@ demo).
 - **CDC runs single-active** (the legacy CDC release is a one-replica StatefulSet because the PostgreSQL replication slot is exclusive).
 - **WS gateway** ships the PR #7 connection cap + memory HPA; `ws_max_conns` is wired from Terraform.
 
+## OpenSearch topology
+
+The default `acceptance` topology is one small data node to keep short-lived
+validation inexpensive. It is not resilient to a node or Availability Zone
+failure.
+
+Set the following for a durable three-zone validation:
+
+```hcl
+opensearch_topology = "ha"
+opensearch_alarm_actions = [
+  "arn:aws:sns:eu-central-1:123456789012:platform-alerts"
+]
+```
+
+The `ha` profile enables Multi-AZ with Standby, three dedicated
+cluster-manager nodes, three data nodes by default, Auto-Tune, automatic
+software updates, and baseline CloudWatch alarms. Configure every destination
+index with at least two replicas and size nodes, storage, and shard counts from
+measured load before using the topology for customer traffic.
+
 ## Prerequisites
 - Valid AWS creds for the target account (`aws sts get-caller-identity` must succeed). Refresh in-session with `! aws sso login` / `! aws configure` if expired.
 - Region: `eu-central-1` (override with `-var region=`).

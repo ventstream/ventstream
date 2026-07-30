@@ -21,18 +21,20 @@
 //!   (serving its existing connections), so liveness must stay 200 or
 //!   k8s would needlessly restart it and drop those connections.
 //! - `GET /readyz`  — readiness. Returns 503 until every enabled traffic
-//!   gateway has initialized its dependencies and bound its listener, and
-//!   also while the WS gateway is at its connection-capacity threshold.
+//!   gateway has initialized its dependencies and bound its listener, while
+//!   the WS gateway is at its connection-capacity threshold, or after a CDC
+//!   sink has remained unavailable for the delivery grace period.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::http::StatusCode;
 use axum::{response::IntoResponse, routing::get, Router};
 use tokio::net::TcpListener;
 use tracing::info;
-use ventstream_core::{ReadinessSignal, ShutdownToken};
+use ventstream_core::{ReadinessSignal, ShutdownToken, SinkHealth, SinkHealthSnapshot};
 use ventstream_telemetry::PrometheusHandle;
 
 /// Aggregate readiness for the enabled traffic gateways and WS capacity.
@@ -41,18 +43,25 @@ pub(crate) struct ReadinessGate {
     ws: Option<ReadinessSignal>,
     graphql: Option<ReadinessSignal>,
     ws_capacity: Option<WsCapacityGate>,
+    sink_health: Option<SinkHealth>,
+    sink_failure_grace: Duration,
 }
 
 impl ReadinessGate {
+    const DEFAULT_SINK_FAILURE_GRACE: Duration = Duration::from_secs(30);
+
     pub(crate) fn new(
         ws: Option<ReadinessSignal>,
         graphql: Option<ReadinessSignal>,
         ws_capacity: Option<(Arc<AtomicUsize>, usize)>,
+        sink_health: Option<SinkHealth>,
     ) -> Self {
         Self {
             ws,
             graphql,
             ws_capacity: ws_capacity.map(|(active, max)| WsCapacityGate { active, max }),
+            sink_health,
+            sink_failure_grace: Self::DEFAULT_SINK_FAILURE_GRACE,
         }
     }
 
@@ -70,6 +79,27 @@ impl ReadinessGate {
         }
         if !waiting_for.is_empty() {
             return ReadinessStatus::Starting(waiting_for);
+        }
+        if let Some(health) = &self.sink_health {
+            match health.snapshot() {
+                SinkHealthSnapshot::Blocked { duration, reason } => {
+                    return ReadinessStatus::SinkUnavailable {
+                        state: "blocked",
+                        duration,
+                        reason,
+                    };
+                }
+                SinkHealthSnapshot::Degraded { duration, reason }
+                    if duration >= self.sink_failure_grace =>
+                {
+                    return ReadinessStatus::SinkUnavailable {
+                        state: "unavailable",
+                        duration,
+                        reason,
+                    };
+                }
+                SinkHealthSnapshot::Healthy | SinkHealthSnapshot::Degraded { .. } => {}
+            }
         }
         if self
             .ws_capacity
@@ -97,6 +127,11 @@ impl WsCapacityGate {
 #[derive(Debug, PartialEq, Eq)]
 enum ReadinessStatus {
     Starting(Vec<&'static str>),
+    SinkUnavailable {
+        state: &'static str,
+        duration: Duration,
+        reason: String,
+    },
     AtCapacity,
     Ready,
 }
@@ -169,6 +204,21 @@ fn readyz(gate: &ReadinessGate) -> axum::response::Response {
             axum::Json(serde_json::json!({ "status": "at_capacity" })),
         )
             .into_response(),
+        ReadinessStatus::SinkUnavailable {
+            state,
+            duration,
+            reason,
+        } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "status": "not_ready",
+                "dependency": "sink",
+                "state": state,
+                "failing_for_ms": u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                "reason": reason,
+            })),
+        )
+            .into_response(),
         ReadinessStatus::Ready => (
             StatusCode::OK,
             axum::Json(serde_json::json!({ "status": "ready" })),
@@ -185,7 +235,7 @@ mod tests {
     fn waits_for_every_enabled_gateway() {
         let ws = ReadinessSignal::new();
         let graphql = ReadinessSignal::new();
-        let gate = ReadinessGate::new(Some(ws.clone()), Some(graphql.clone()), None);
+        let gate = ReadinessGate::new(Some(ws.clone()), Some(graphql.clone()), None, None);
 
         assert_eq!(
             gate.status(),
@@ -204,7 +254,7 @@ mod tests {
     fn applies_capacity_only_after_gateway_startup() {
         let ws = ReadinessSignal::new();
         let active = Arc::new(AtomicUsize::new(9));
-        let gate = ReadinessGate::new(Some(ws.clone()), None, Some((Arc::clone(&active), 9)));
+        let gate = ReadinessGate::new(Some(ws.clone()), None, Some((Arc::clone(&active), 9)), None);
 
         assert_eq!(gate.status(), ReadinessStatus::Starting(vec!["ws"]));
         ws.mark_ready();
@@ -215,7 +265,41 @@ mod tests {
 
     #[test]
     fn cdc_only_process_has_no_gateway_startup_gate() {
-        let gate = ReadinessGate::new(None, None, None);
+        let gate = ReadinessGate::new(None, None, None, Some(SinkHealth::new()));
         assert_eq!(gate.status(), ReadinessStatus::Ready);
+    }
+
+    #[test]
+    fn brief_sink_failure_stays_ready_but_sustained_failure_does_not() {
+        let health = SinkHealth::new();
+        let _failure = health.begin_transient_failure("HTTP 503");
+        let mut gate = ReadinessGate::new(None, None, None, Some(health));
+
+        assert_eq!(gate.status(), ReadinessStatus::Ready);
+        gate.sink_failure_grace = Duration::ZERO;
+        assert!(matches!(
+            gate.status(),
+            ReadinessStatus::SinkUnavailable {
+                state: "unavailable",
+                ref reason,
+                ..
+            } if reason == "HTTP 503"
+        ));
+    }
+
+    #[test]
+    fn blocked_sink_is_immediately_not_ready() {
+        let health = SinkHealth::new();
+        health.mark_blocked("authentication failed");
+        let gate = ReadinessGate::new(None, None, None, Some(health));
+
+        assert!(matches!(
+            gate.status(),
+            ReadinessStatus::SinkUnavailable {
+                state: "blocked",
+                ref reason,
+                ..
+            } if reason == "authentication failed"
+        ));
     }
 }

@@ -2,8 +2,8 @@
 //!
 //! A sink receives batches of events from the dispatcher and writes them
 //! to its target (OpenSearch, S3, an HTTP webhook, etc.). The engine
-//! drives batching and retry policy; the sink is responsible for the
-//! protocol-specific call.
+//! drives batching and ordered progress; the sink is responsible for the
+//! protocol-specific call and its transient retry policy.
 
 use async_trait::async_trait;
 
@@ -57,8 +57,9 @@ impl SinkBatch {
 ///   on failure. Sinks should use [`Event::id`](crate::Event::id) as the
 ///   idempotency key with the downstream (for example, OpenSearch
 ///   `_id` or an HTTP `Idempotency-Key` header).
-/// - Should never `unwrap` or `panic`; return [`SinkError`] instead so
-///   the engine can route the batch to the dead-letter queue.
+/// - Should never `unwrap` or `panic`; return [`SinkError`] instead. The
+///   engine fails closed for whole-request errors and only routes explicitly
+///   identified permanent item failures to the dead-letter queue.
 #[async_trait]
 pub trait Sink: Send + Sync + 'static {
     /// Stable identifier (matches the `id` field in `pipeline.yaml`).

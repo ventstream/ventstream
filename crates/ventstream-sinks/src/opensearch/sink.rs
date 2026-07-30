@@ -16,33 +16,37 @@
 //!   policy treats it identically to 5xx for simplicity).
 //! - HTTP 401 / 403 → [`OpenSearchSinkError::Auth`] → not retried; the
 //!   engine should surface this to the operator immediately.
-//! - HTTP 4xx other → [`OpenSearchSinkError::Client`] → not retried;
-//!   batch is poison.
+//! - HTTP 4xx other → [`OpenSearchSinkError::Client`] → not retried; the
+//!   whole request is blocked without advancing source progress.
 //! - Bulk response with `errors: true` → per-item split: transient items
 //!   (429 / 5xx) are retried as a shrinking subset (already-acked items are
-//!   never re-sent); only permanent items (4xx ≠ 429) — plus any transient
-//!   items whose retries are exhausted — surface as
+//!   never re-sent); only known permanent document errors surface as
 //!   [`OpenSearchSinkError::PartialFailure`] carrying their original-batch
-//!   offsets so the engine can DLQ them.
+//!   offsets so the engine can DLQ them. Unknown item failures and transient
+//!   exhaustion in an explicitly bounded diagnostic policy fail the batch
+//!   closed.
 //!
 //! ### What the sink does NOT do
 //!
 //! - Throughput batching: the engine's dispatcher builds the [`SinkBatch`].
 //!   The sink only bisects a batch when its exact NDJSON body exceeds the
 //!   configured protocol limit.
-//! - DLQ writes: the engine handles DLQ on poison or partial-failure.
+//! - DLQ writes: the engine handles exact permanent item failures reported by
+//!   the sink.
 
 use std::collections::VecDeque;
-use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
+use rand::Rng;
 use reqwest::{header, StatusCode};
 use tracing::{debug, warn};
-use ventstream_core::{Sink, SinkBatch, SinkError};
+use ventstream_core::{
+    Sink, SinkBatch, SinkError, SinkFailureGuard, SinkHealth, SinkHealthSnapshot,
+};
 
 use super::bulk::{self, BulkResponse};
 use super::config::{AuthMode, OpenSearchConfig};
@@ -55,6 +59,7 @@ pub struct OpenSearchSink {
     client: reqwest::Client,
     bulk_url: String,
     adaptive: AdaptiveConcurrency,
+    delivery_health: SinkHealth,
 }
 
 struct AdaptiveConcurrency {
@@ -198,11 +203,13 @@ impl OpenSearchSink {
 
         let bulk_url = format!("{}/_bulk", config.endpoint.trim_end_matches('/'));
         let adaptive = AdaptiveConcurrency::new(config.request_timeout);
+        let delivery_health = config.delivery_health.clone().unwrap_or_default();
         Ok(Self {
             config,
             client,
             bulk_url,
             adaptive,
+            delivery_health,
         })
     }
 
@@ -220,8 +227,6 @@ impl OpenSearchSink {
         let mut ranges = VecDeque::new();
         ranges.push_back(0..events.len());
         let mut permanent: Vec<ventstream_core::FailedItem> = Vec::new();
-        let mut split = false;
-
         while let Some(range) = ranges.pop_front() {
             let Some(attempt) = events.get(range.clone()) else {
                 return Err(OpenSearchSinkError::Internal(
@@ -231,7 +236,6 @@ impl OpenSearchSink {
             match self.send_slice_with_retry(attempt).await {
                 Ok(()) => {}
                 Err(OpenSearchSinkError::RequestTooLarge { .. }) if range.len() > 1 => {
-                    split = true;
                     let midpoint = range.start + range.len() / 2;
                     // Process the left half first while retaining the right half
                     // at the front. This preserves source order at concurrency=1.
@@ -254,20 +258,13 @@ impl OpenSearchSink {
                         }
                     }
                 }
-                Err(err) if !split && permanent.is_empty() && ranges.is_empty() => {
-                    // Preserve the previous whole-batch error classification
-                    // when no size split has already produced partial success.
-                    return Err(err);
-                }
                 Err(err) => {
-                    // Some chunks may already be durable. Mark only this chunk
-                    // and the not-yet-attempted ranges as failed; re-DLQing a
-                    // successful prefix would be misleading and wasteful.
-                    let message = err.to_string();
-                    append_failed_range(&mut permanent, range, &message);
-                    while let Some(remaining) = ranges.pop_front() {
-                        append_failed_range(&mut permanent, remaining, &message);
-                    }
+                    // A whole-request failure after one or more split chunks
+                    // succeeded is still not evidence that the remaining
+                    // events are poison. Fail the enclosing dispatcher batch
+                    // closed; stable document IDs and external versions make
+                    // replay of the successful prefix safe.
+                    return Err(err);
                 }
             }
         }
@@ -312,6 +309,7 @@ impl OpenSearchSink {
         let mut use_subset = false;
         let rendered_at = Utc::now();
         let mut encoded: Option<Bytes> = None;
+        let mut transient_failure: Option<SinkFailureGuard> = None;
 
         loop {
             let attempt: &[ventstream_core::Event] = if use_subset {
@@ -328,19 +326,36 @@ impl OpenSearchSink {
                 ));
             };
             let request_started = Instant::now();
-            match self.send_once(body).await {
+            match self.send_once(body, attempt.len()).await {
                 Ok(SendOutcome::AllOk) => {
                     self.adaptive.on_success(request_started.elapsed());
+                    self.finish_transient_failure(&mut transient_failure);
                     break;
                 }
                 Ok(SendOutcome::PerItem {
                     transient,
                     permanent: perm,
+                    blocked,
                 }) => {
+                    if !blocked.is_empty() {
+                        let sample_error = blocked
+                            .first()
+                            .map(|item| item.error.clone())
+                            .unwrap_or_else(|| "unknown blocked bulk item".to_owned());
+                        return Err(OpenSearchSinkError::BlockedItems {
+                            failed_count: blocked.len(),
+                            sample_error,
+                        });
+                    }
                     if transient.is_empty() {
                         self.adaptive.on_success(request_started.elapsed());
+                        self.finish_transient_failure(&mut transient_failure);
                     } else {
                         self.adaptive.on_pressure("bulk_item_rejection");
+                        self.begin_transient_failure(
+                            &mut transient_failure,
+                            "OpenSearch rejected bulk items with a transient status",
+                        );
                     }
                     // Map attempt-relative offsets back to original-batch
                     // offsets so the DLQ targets the right events.
@@ -377,7 +392,7 @@ impl OpenSearchSink {
                             ?delay,
                             "partial bulk failure; retrying transient subset after backoff"
                         );
-                        tokio::time::sleep(delay).await;
+                        tokio::time::sleep(jittered_delay(delay)).await;
                         subset = next_offsets
                             .iter()
                             .filter_map(|&i| events.get(i).cloned())
@@ -395,19 +410,30 @@ impl OpenSearchSink {
                         encoded = None;
                         continue;
                     }
+                    let sample_error = next_failed
+                        .first()
+                        .map(|item| item.error.clone())
+                        .unwrap_or_else(|| "unknown transient item failure".to_owned());
                     warn!(
                         sink_id = %self.config.id,
                         retry_items = next_offsets.len(),
-                        "partial bulk transient retries exhausted; routing to DLQ"
+                        "partial bulk transient retry budget exhausted; failing closed"
                     );
-                    permanent.extend(next_failed);
-                    break;
+                    return Err(OpenSearchSinkError::TransientItems {
+                        failed_count: next_offsets.len(),
+                        sample_error,
+                    });
                 }
                 Err(err) if err.is_retryable() => {
                     self.adaptive.on_pressure(pressure_reason(&err));
+                    self.begin_transient_failure(&mut transient_failure, err.to_string());
                     // Whole-attempt transient (transport / 5xx / 429 at the
                     // HTTP layer) — retry the same attempt (full or subset).
-                    if let Some(delay) = schedule.next() {
+                    if let Some(base_delay) = schedule.next() {
+                        let delay = err
+                            .retry_after()
+                            .unwrap_or_else(|| jittered_delay(base_delay))
+                            .min(self.config.retry.max_backoff);
                         ventstream_telemetry::bump_sink_retries(
                             u64::try_from(attempt.len()).unwrap_or(u64::MAX),
                         );
@@ -426,24 +452,13 @@ impl OpenSearchSink {
                         error = %err,
                         "bulk request retries exhausted"
                     );
-                    if use_subset {
-                        fold_pending_into_permanent(&pending, &err, &mut permanent);
-                        break;
-                    }
                     return Err(err);
                 }
                 Err(err) => {
-                    // Non-retryable (poison, auth, malformed response).
-                    if use_subset {
-                        // Already partitioned at least once — this hard failure
-                        // implicates only the items still in flight (the
-                        // subset), not the whole original batch. Fold them into
-                        // `permanent` so attempt-1 successes aren't re-DLQ'd,
-                        // and surface a scoped PartialFailure instead of a
-                        // whole-batch Rejected.
-                        fold_pending_into_permanent(&pending, &err, &mut permanent);
-                        break;
-                    }
+                    // Whole-request authentication, configuration, and
+                    // protocol failures are deployment-level blockers, not
+                    // event-level poison. Fail closed even when an earlier
+                    // attempt already partitioned this batch.
                     return Err(err);
                 }
             }
@@ -465,6 +480,29 @@ impl OpenSearchSink {
         })
     }
 
+    fn begin_transient_failure(
+        &self,
+        current: &mut Option<SinkFailureGuard>,
+        reason: impl Into<String>,
+    ) {
+        if current.is_none() {
+            *current = Some(self.delivery_health.begin_transient_failure(reason));
+            ventstream_telemetry::mark_sink_unavailable();
+        }
+    }
+
+    fn finish_transient_failure(&self, current: &mut Option<SinkFailureGuard>) {
+        current.take();
+        if matches!(self.delivery_health.snapshot(), SinkHealthSnapshot::Healthy) {
+            ventstream_telemetry::mark_sink_available();
+        }
+    }
+
+    fn mark_blocked(&self, error: &OpenSearchSinkError) {
+        self.delivery_health.mark_blocked(error.to_string());
+        ventstream_telemetry::mark_sink_unavailable();
+    }
+
     fn encode_attempt(
         &self,
         events: &[ventstream_core::Event],
@@ -483,7 +521,11 @@ impl OpenSearchSink {
     /// Single prepared attempt — POST immutable NDJSON, parse response, and
     /// classify. `Bytes` cloning is O(1), so whole-request retries do not
     /// rebuild or copy the body.
-    async fn send_once(&self, body: Bytes) -> Result<SendOutcome, OpenSearchSinkError> {
+    async fn send_once(
+        &self,
+        body: Bytes,
+        expected_items: usize,
+    ) -> Result<SendOutcome, OpenSearchSinkError> {
         let mut http = self
             .client
             .post(&self.bulk_url)
@@ -497,37 +539,31 @@ impl OpenSearchSink {
             .await
             .map_err(|err| OpenSearchSinkError::Transport(err.to_string()))?;
 
-        classify_response(response).await
+        classify_response(response, expected_items).await
     }
-}
-
-fn append_failed_range(
-    failures: &mut Vec<ventstream_core::FailedItem>,
-    range: Range<usize>,
-    message: &str,
-) {
-    failures.extend(range.map(|offset| ventstream_core::FailedItem {
-        offset,
-        error: message.to_owned(),
-    }));
 }
 
 fn pressure_reason(error: &OpenSearchSinkError) -> &'static str {
     match error {
-        OpenSearchSinkError::RateLimited(_) => "http_429",
+        OpenSearchSinkError::RateLimited { .. } => "http_429",
         OpenSearchSinkError::Server { .. } => "http_5xx",
         OpenSearchSinkError::Transport(_) => "transport",
         _ => "retryable",
     }
 }
 
+fn jittered_delay(delay: Duration) -> Duration {
+    let factor = rand::thread_rng().gen_range(0.5..=1.0);
+    delay.mul_f64(factor)
+}
+
 /// Outcome of a single bulk attempt that returned an HTTP 2xx.
 ///
 /// A 2xx with `errors: true` is *not* a whole-batch failure — individual
 /// items can fail for different reasons. We split them so the caller can
-/// retry the transient subset (429 / 5xx) without re-sending the items that
-/// already succeeded, and route only the permanent failures (4xx ≠ 429) to
-/// the DLQ.
+/// retry the transient subset without re-sending the items that already
+/// succeeded, route only known permanent document failures to the DLQ, and
+/// block delivery for unknown failures.
 #[derive(Debug)]
 enum SendOutcome {
     /// Every item in the attempt was accepted.
@@ -536,28 +572,28 @@ enum SendOutcome {
     PerItem {
         /// 429 / 5xx — retryable; should be re-sent.
         transient: Vec<ventstream_core::FailedItem>,
-        /// 4xx (≠429) and other non-2xx — permanent; route to the DLQ.
+        /// Known document-level failures — permanent; route to the DLQ.
         permanent: Vec<ventstream_core::FailedItem>,
+        /// Unknown or deployment-level item failures — fail closed.
+        blocked: Vec<ventstream_core::FailedItem>,
     },
 }
 
 /// Partition a parsed bulk response into per-item outcomes.
 ///
 /// Pure (no I/O) so the transient/permanent split is unit-testable without a
-/// live HTTP server. `is_rate_limited()` (429) and any 5xx item status are
-/// treated as transient; everything else that isn't a success is permanent.
+/// live HTTP server. Only known document-level errors are permanent. Unknown
+/// item failures fail closed instead of being misclassified into the DLQ.
 fn partition_bulk_items(parsed: &BulkResponse) -> SendOutcome {
-    if !parsed.errors {
-        return SendOutcome::AllOk;
-    }
     let mut transient: Vec<ventstream_core::FailedItem> = Vec::new();
     let mut permanent: Vec<ventstream_core::FailedItem> = Vec::new();
+    let mut blocked: Vec<ventstream_core::FailedItem> = Vec::new();
     for (offset, item) in parsed.items.iter().enumerate() {
         let entry = item.action.entry();
         if entry.is_success() {
             continue;
         }
-        if item.action.is_idempotent_delete_not_found() {
+        if item.action.is_delete_not_found() {
             debug!(
                 offset,
                 "bulk delete target was already absent; treating replay as applied"
@@ -582,42 +618,74 @@ fn partition_bulk_items(parsed: &BulkResponse) -> SendOutcome {
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("status {}", entry.status));
         let failed = ventstream_core::FailedItem { offset, error };
-        if entry.is_rate_limited() || entry.status >= 500 {
+        if is_transient_item_failure(entry) {
             transient.push(failed);
-        } else {
+        } else if is_permanent_document_failure(entry) {
             permanent.push(failed);
+        } else {
+            blocked.push(failed);
         }
     }
-    if transient.is_empty() && permanent.is_empty() {
+    if transient.is_empty() && permanent.is_empty() && blocked.is_empty() {
         // `errors: true` but every item reads as a success — defensive.
         SendOutcome::AllOk
     } else {
         SendOutcome::PerItem {
             transient,
             permanent,
+            blocked,
         }
     }
 }
 
-/// Mark every still-in-flight item (the subset whose `pending` offsets are
-/// original-batch offsets) as a permanent failure carrying `err`'s message.
-///
-/// Used when a *subset* retry hits a whole-attempt error (auth expiry mid-retry,
-/// a 4xx on the subset request, malformed response, or exhausted transient
-/// retries): the failure implicates only the in-flight items, so we surface a
-/// scoped PartialFailure rather than re-DLQ-ing items that already succeeded.
-fn fold_pending_into_permanent(
-    pending: &[usize],
-    err: &OpenSearchSinkError,
-    permanent: &mut Vec<ventstream_core::FailedItem>,
-) {
-    let msg = err.to_string();
-    for &orig in pending {
-        permanent.push(ventstream_core::FailedItem {
-            offset: orig,
-            error: msg.clone(),
-        });
+fn is_transient_item_failure(entry: &super::bulk::BulkResponseEntry) -> bool {
+    if entry.is_rate_limited() || entry.status == 408 || entry.status >= 500 {
+        return true;
     }
+    is_transient_error_type(entry.error_type())
+}
+
+fn is_transient_error_type(error_type: Option<&str>) -> bool {
+    matches!(
+        error_type,
+        Some(
+            "circuit_breaking_exception"
+                | "cluster_block_exception"
+                | "es_rejected_execution_exception"
+                | "master_not_discovered_exception"
+                | "node_not_connected_exception"
+                | "snapshot_in_progress_exception"
+                | "unavailable_shards_exception"
+        )
+    )
+}
+
+fn response_error_type(body: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = parsed.get("error")?;
+    error
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            error
+                .get("root_cause")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|causes| causes.first())
+                .and_then(|cause| cause.get("type"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::to_owned)
+}
+
+fn is_permanent_document_failure(entry: &super::bulk::BulkResponseEntry) -> bool {
+    matches!(
+        entry.error_type(),
+        Some(
+            "document_parsing_exception"
+                | "mapper_parsing_exception"
+                | "strict_dynamic_mapping_exception"
+        )
+    )
 }
 
 /// Apply the configured auth mode to a request builder.
@@ -633,31 +701,64 @@ fn apply_auth(rb: reqwest::RequestBuilder, auth: &AuthMode) -> reqwest::RequestB
 /// bulk body and surface per-item failures.
 async fn classify_response(
     response: reqwest::Response,
+    expected_items: usize,
 ) -> Result<SendOutcome, OpenSearchSinkError> {
     let status = response.status();
+    let retry_after = response
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
     if status.is_success() {
-        // 2xx — check the bulk response body for per-item errors and split
-        // them into transient (retry) vs permanent (DLQ).
+        // 2xx - check each bulk item and partition failures into transient
+        // retries, known permanent document errors, or delivery blockers.
         let bytes = response
             .bytes()
             .await
             .map_err(|err| OpenSearchSinkError::Transport(err.to_string()))?;
         let parsed: BulkResponse = serde_json::from_slice(&bytes)
             .map_err(|err| OpenSearchSinkError::MalformedResponse(err.to_string()))?;
+        if parsed.items.len() != expected_items {
+            return Err(OpenSearchSinkError::MalformedResponse(format!(
+                "bulk response item count {} does not match request item count {expected_items}",
+                parsed.items.len()
+            )));
+        }
         return Ok(partition_bulk_items(&parsed));
     }
 
     // Non-2xx — read at most 1 KiB of the body for the error message so a
     // 5xx HTML error page can't dump megabytes into our logs.
     let body = read_truncated_body(response, 1024).await;
+    let error_type = response_error_type(&body);
 
     match status {
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(OpenSearchSinkError::Auth {
+        StatusCode::TOO_MANY_REQUESTS => Err(OpenSearchSinkError::RateLimited {
+            message: body,
+            retry_after,
+        }),
+        StatusCode::REQUEST_TIMEOUT => Err(OpenSearchSinkError::Server {
             status: status.as_u16(),
             message: body,
+            retry_after,
         }),
-        StatusCode::TOO_MANY_REQUESTS => Err(OpenSearchSinkError::RateLimited(body)),
         s if s.is_server_error() => Err(OpenSearchSinkError::Server {
+            status: status.as_u16(),
+            message: body,
+            retry_after,
+        }),
+        s if s.is_client_error()
+            && s != StatusCode::UNAUTHORIZED
+            && is_transient_error_type(error_type.as_deref()) =>
+        {
+            Err(OpenSearchSinkError::Server {
+                status: status.as_u16(),
+                message: body,
+                retry_after,
+            })
+        }
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(OpenSearchSinkError::Auth {
             status: status.as_u16(),
             message: body,
         }),
@@ -722,24 +823,32 @@ impl Sink for OpenSearchSink {
     }
 
     async fn write(&self, batch: SinkBatch) -> Result<(), SinkError> {
-        self.send_with_retry(&batch).await.map_err(|err| match err {
+        let result = self.send_with_retry(&batch).await;
+        if let Err(error) = &result {
+            if matches!(
+                error,
+                OpenSearchSinkError::Client { .. }
+                    | OpenSearchSinkError::Auth { .. }
+                    | OpenSearchSinkError::BlockedItems { .. }
+                    | OpenSearchSinkError::IndexTemplate(_)
+                    | OpenSearchSinkError::MalformedResponse(_)
+                    | OpenSearchSinkError::Internal(_)
+            ) {
+                self.mark_blocked(error);
+            }
+        }
+        result.map_err(|err| match err {
             OpenSearchSinkError::Transport(msg) => SinkError::Connection(msg),
-            OpenSearchSinkError::Server { status, message }
-            | OpenSearchSinkError::Client { status, message }
-            | OpenSearchSinkError::Auth { status, message } => SinkError::Rejected {
-                batch_size: batch.len(),
-                rejected_count: batch.len(),
-                message: format!("HTTP {status}: {message}"),
-                // Whole-batch HTTP failure — every event in the batch
-                // is implicated, so don't bother enumerating items.
-                failed_items: None,
-            },
-            OpenSearchSinkError::RateLimited(msg) => SinkError::Rejected {
-                batch_size: batch.len(),
-                rejected_count: batch.len(),
-                message: format!("HTTP 429: {msg}"),
-                failed_items: None,
-            },
+            OpenSearchSinkError::Server {
+                status, message, ..
+            } => SinkError::Connection(format!("HTTP {status}: {message}")),
+            OpenSearchSinkError::RateLimited { message, .. } => {
+                SinkError::Connection(format!("HTTP 429: {message}"))
+            }
+            OpenSearchSinkError::Client { status, message }
+            | OpenSearchSinkError::Auth { status, message } => {
+                SinkError::Blocked(format!("HTTP {status}: {message}"))
+            }
             OpenSearchSinkError::PartialFailure {
                 batch_size,
                 failed_count,
@@ -751,15 +860,27 @@ impl Sink for OpenSearchSink {
                 message: sample_error,
                 failed_items: Some(failed_items),
             },
+            OpenSearchSinkError::TransientItems {
+                failed_count,
+                sample_error,
+            } => SinkError::Connection(format!(
+                "{failed_count} bulk items remain transiently unavailable: {sample_error}"
+            )),
+            OpenSearchSinkError::BlockedItems {
+                failed_count,
+                sample_error,
+            } => SinkError::Blocked(format!(
+                "{failed_count} bulk items blocked delivery: {sample_error}"
+            )),
             OpenSearchSinkError::RequestTooLarge {
                 actual_bytes,
                 max_bytes,
             } => SinkError::Internal(format!(
                 "single bulk item encoded to {actual_bytes} bytes, exceeding max_bytes={max_bytes}"
             )),
-            OpenSearchSinkError::IndexTemplate(msg)
-            | OpenSearchSinkError::MalformedResponse(msg)
-            | OpenSearchSinkError::Internal(msg) => SinkError::Internal(msg),
+            OpenSearchSinkError::IndexTemplate(msg) => SinkError::Blocked(msg),
+            OpenSearchSinkError::MalformedResponse(msg) => SinkError::Blocked(msg),
+            OpenSearchSinkError::Internal(msg) => SinkError::Internal(msg),
         })
     }
 
@@ -811,6 +932,16 @@ mod tests {
             adaptive.on_success(Duration::from_millis(20));
         }
         assert_eq!(adaptive.desired(2), 2);
+    }
+
+    #[test]
+    fn retry_jitter_stays_within_half_to_full_delay() {
+        let base = Duration::from_secs(10);
+        for _ in 0..1_000 {
+            let delay = jittered_delay(base);
+            assert!(delay >= Duration::from_secs(5));
+            assert!(delay <= base);
+        }
     }
 
     #[test]
@@ -938,7 +1069,7 @@ mod tests {
         let success_body = serde_json::json!({
             "took": 1,
             "errors": false,
-            "items": []
+            "items": [{ "index": { "_id": "x", "status": 201 } }]
         });
         Mock::given(method("POST"))
             .and(path("/_bulk"))
@@ -1030,6 +1161,90 @@ mod tests {
         let sink = sink_against(&server.uri());
         let batch = SinkBatch::new(vec![make_event("a.b", "{}")]);
         sink.write(batch).await.expect("eventual success");
+        assert_eq!(sink.delivery_health.snapshot(), SinkHealthSnapshot::Healthy);
+    }
+
+    #[tokio::test]
+    async fn cluster_write_block_is_retried_even_when_reported_as_403() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": {
+                    "type": "cluster_block_exception",
+                    "reason": "index blocked"
+                },
+                "status": 403
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 1,
+                "errors": false,
+                "items": [{ "index": { "_id": "x", "status": 201 } }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sink = sink_against(&server.uri());
+        sink.write(SinkBatch::new(vec![make_event("a.b", "{}")]))
+            .await
+            .expect("cluster block should recover through retry");
+    }
+
+    #[tokio::test]
+    async fn transient_retry_is_visible_until_the_write_recovers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 1,
+                "errors": false,
+                "items": [{ "index": { "_id": "x", "status": 201 } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let health = SinkHealth::new();
+        let mut cfg = OpenSearchConfig::new("test-sink", server.uri(), "static-index")
+            .with_delivery_health(health.clone());
+        cfg.retry = super::super::config::RetryConfig {
+            max_attempts: 3,
+            initial_backoff: Duration::from_millis(250),
+            max_backoff: Duration::from_millis(250),
+            backoff_factor: 1.0,
+        };
+        let sink = std::sync::Arc::new(OpenSearchSink::new(cfg).expect("sink"));
+        let task_sink = std::sync::Arc::clone(&sink);
+        let write = tokio::spawn(async move {
+            task_sink
+                .write(SinkBatch::new(vec![make_event("a.b", "{}")]))
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !matches!(health.snapshot(), SinkHealthSnapshot::Degraded { .. }) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("transient health transition");
+        write
+            .await
+            .expect("write task")
+            .expect("write eventually recovers");
+        assert_eq!(health.snapshot(), SinkHealthSnapshot::Healthy);
     }
 
     #[tokio::test]
@@ -1046,11 +1261,64 @@ mod tests {
         let batch = SinkBatch::new(vec![make_event("a.b", "{}")]);
         let err = sink.write(batch).await.expect_err("should fail");
         match err {
-            SinkError::Rejected { message, .. } => {
+            SinkError::Blocked(message) => {
                 assert!(message.contains("HTTP 401"), "got: {message}");
             }
-            other => panic!("expected Rejected, got {other:?}"),
+            other => panic!("expected Blocked, got {other:?}"),
         }
+        assert!(matches!(
+            sink.delivery_health.snapshot(),
+            SinkHealthSnapshot::Blocked { ref reason, .. }
+                if reason.contains("authentication failed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn retry_after_delta_seconds_is_captured() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/retry"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "7")
+                    .set_body_string("slow down"),
+            )
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(format!("{}/retry", server.uri()))
+            .await
+            .expect("response");
+        let error = classify_response(response, 0)
+            .await
+            .expect_err("429 must be retryable");
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
+    }
+
+    #[tokio::test]
+    async fn incomplete_bulk_response_blocks_without_advancing_delivery() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 1,
+                "errors": false,
+                "items": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sink = sink_against(&server.uri());
+        let error = sink
+            .write(SinkBatch::new(vec![make_event("a.b", "{}")]))
+            .await
+            .expect_err("missing item acknowledgement must block");
+        assert!(matches!(error, SinkError::Blocked(_)));
+        assert!(matches!(
+            sink.delivery_health.snapshot(),
+            SinkHealthSnapshot::Blocked { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1174,8 +1442,14 @@ mod tests {
                     "error": { "type": "es_rejected_execution_exception" } } },
                 { "index": { "_id": "srv", "status": 503,
                     "error": { "type": "unavailable_shards_exception" } } },
+                { "index": { "_id": "timeout", "status": 408,
+                    "error": { "type": "request_timeout" } } },
+                { "index": { "_id": "blocked-disk", "status": 403,
+                    "error": { "type": "cluster_block_exception" } } },
                 { "index": { "_id": "bad", "status": 400,
-                    "error": { "type": "mapper_parsing_exception" } } }
+                    "error": { "type": "mapper_parsing_exception" } } },
+                { "index": { "_id": "unknown", "status": 400,
+                    "error": { "type": "unexpected_request_failure" } } }
             ]
         });
         let parsed: BulkResponse = serde_json::from_value(json).unwrap();
@@ -1183,17 +1457,71 @@ mod tests {
             SendOutcome::PerItem {
                 transient,
                 permanent,
+                blocked,
             } => {
-                // 429 (offset 1) and 503 (offset 2) are retryable.
+                // 429 (offset 1), 503 (offset 2), 408 (offset 3), and a
+                // disk-watermark cluster block (offset 4) are retryable.
                 let t: Vec<usize> = transient.iter().map(|f| f.offset).collect();
-                assert_eq!(t, vec![1, 2], "429 and 5xx must be transient");
-                // 400 (offset 3) is permanent; 201 is a success (skipped).
+                assert_eq!(
+                    t,
+                    vec![1, 2, 3, 4],
+                    "408, 429, 5xx, and transient error types must retry"
+                );
+                // The known mapping error (offset 5) is permanent.
                 assert_eq!(permanent.len(), 1);
-                assert_eq!(permanent[0].offset, 3);
+                assert_eq!(permanent[0].offset, 5);
                 assert!(permanent[0].error.contains("mapper_parsing_exception"));
+                // Unknown 4xx errors are not safe to discard.
+                assert_eq!(blocked.len(), 1);
+                assert_eq!(blocked[0].offset, 6);
             }
             other => panic!("expected PerItem, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn partition_treats_already_absent_delete_as_success() {
+        let json = serde_json::json!({
+            "took": 1,
+            "errors": true,
+            "items": [
+                { "delete": { "_id": "gone", "status": 404, "result": "not_found" } }
+            ]
+        });
+        let parsed: BulkResponse = serde_json::from_value(json).unwrap();
+        assert!(matches!(partition_bulk_items(&parsed), SendOutcome::AllOk));
+    }
+
+    #[tokio::test]
+    async fn unknown_item_failure_blocks_without_becoming_dlq_poison() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 1,
+                "errors": true,
+                "items": [{
+                    "index": {
+                        "_id": "x",
+                        "status": 400,
+                        "error": { "type": "unexpected_request_failure" }
+                    }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sink = sink_against(&server.uri());
+        let error = sink
+            .write(SinkBatch::new(vec![make_event("a.b", "{}")]))
+            .await
+            .expect_err("unknown item failure must block");
+        assert!(matches!(error, SinkError::Blocked(_)));
+        assert!(matches!(
+            sink.delivery_health.snapshot(),
+            SinkHealthSnapshot::Blocked { .. }
+        ));
     }
 
     #[test]
@@ -1268,13 +1596,15 @@ mod tests {
             SendOutcome::PerItem {
                 transient,
                 permanent,
+                blocked,
             } => {
                 assert!(transient.is_empty());
-                assert_eq!(permanent.len(), 1);
-                assert_eq!(permanent[0].offset, 1);
-                assert!(permanent[0].error.contains("index_not_found_exception"));
+                assert!(permanent.is_empty());
+                assert_eq!(blocked.len(), 1);
+                assert_eq!(blocked[0].offset, 1);
+                assert!(blocked[0].error.contains("index_not_found_exception"));
             }
-            other => panic!("expected the non-delete 404 to remain permanent, got {other:?}"),
+            other => panic!("expected the missing index to block delivery, got {other:?}"),
         }
     }
 
@@ -1383,7 +1713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_item_retries_exhausted_then_dlqd() {
+    async fn transient_item_retry_budget_exhaustion_fails_closed() {
         let server = MockServer::start().await;
         // First attempt (2 items): ok / 429.
         let first = serde_json::json!({
@@ -1421,25 +1751,18 @@ mod tests {
         let err = sink
             .write(batch)
             .await
-            .expect_err("exhausted transient -> DLQ");
+            .expect_err("bounded transient retries must fail closed");
         match err {
-            SinkError::Rejected {
-                rejected_count,
-                failed_items,
-                ..
-            } => {
-                assert_eq!(rejected_count, 1);
-                let items = failed_items.expect("per-item details");
-                assert_eq!(items.len(), 1);
-                assert_eq!(items[0].offset, 1, "the 429 item was at original offset 1");
-                assert!(items[0].error.contains("es_rejected_execution_exception"));
+            SinkError::Connection(message) => {
+                assert!(message.contains("1 bulk items"));
+                assert!(message.contains("es_rejected_execution_exception"));
             }
-            other => panic!("expected Rejected, got {other:?}"),
+            other => panic!("expected Connection, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn subset_retry_hard_error_scopes_to_inflight_items() {
+    async fn subset_retry_auth_failure_blocks_the_entire_batch() {
         let server = MockServer::start().await;
         // Attempt 1 (3 items): ok / 429 (transient) / 400 (permanent).
         let first = serde_json::json!({
@@ -1473,31 +1796,13 @@ mod tests {
             make_event("a.b", "{}"),
             make_event("a.b", "{}"),
         ]);
-        let err = sink.write(batch).await.expect_err("scoped partial failure");
+        let err = sink.write(batch).await.expect_err("auth must block");
         match err {
-            SinkError::Rejected {
-                batch_size,
-                rejected_count,
-                failed_items,
-                ..
-            } => {
-                assert_eq!(batch_size, 3);
-                // The 400 (offset 2) and the in-flight 429 (offset 1) — NOT the
-                // attempt-1 success at offset 0.
-                assert_eq!(rejected_count, 2);
-                let mut offsets: Vec<usize> = failed_items
-                    .expect("scoped per-item details, not a whole-batch failure")
-                    .iter()
-                    .map(|f| f.offset)
-                    .collect();
-                offsets.sort_unstable();
-                assert_eq!(
-                    offsets,
-                    vec![1, 2],
-                    "offset 0 succeeded and must not be DLQ'd"
-                );
+            SinkError::Blocked(message) => {
+                assert!(message.contains("HTTP 401"));
+                assert!(message.contains("token expired"));
             }
-            other => panic!("expected Rejected, got {other:?}"),
+            other => panic!("expected Blocked, got {other:?}"),
         }
     }
 }

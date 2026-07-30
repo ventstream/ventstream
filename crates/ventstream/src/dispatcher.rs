@@ -9,22 +9,22 @@
 //!   *and* the batch is non-empty.
 //! - The upstream source closes (bus receiver returns `None`) — drain
 //!   the partial batch before exiting.
-//! - The shutdown token fires — same drain-then-exit.
+//! - The shutdown token fires — cancel in-flight sink work and leave its source
+//!   progress pinned so the batch is replayed after restart.
 //!
 //! ### Failure handling
 //!
 //! - Sink returns `Ok(())` → continue.
-//! - Sink returns `Connection` / transport error → the sink already
-//!   exhausted its internal retry budget. Dispatcher logs and treats
-//!   the batch as failed (whole batch to DLQ). The engine policy
-//!   choice here is "keep flowing"; a future change can add an
-//!   engine-level backoff or a fatal-after-N policy.
+//! - Sink returns `Connection` / transport error → fail closed without
+//!   advancing source progress. Transient retries normally remain inside the
+//!   sink for the lifetime of the process; a surfaced whole-batch error is
+//!   therefore a pipeline blocker, never a DLQ candidate.
 //! - Sink returns `Rejected` with `failed_items: Some(_)` → exactly
 //!   those events go to the DLQ, each with its own per-item error
 //!   string. The rest are considered written.
-//! - Sink returns `Rejected` with `failed_items: None` → entire batch
-//!   to DLQ with a shared `message`.
-//! - Sink returns `Internal` / `Timeout` → whole batch to DLQ.
+//! - Sink returns `Rejected` with `failed_items: None`, `Blocked`, `Internal`,
+//!   or `Timeout` → fail closed. Only an explicit event offset proves that a
+//!   failure is permanent and safe to quarantine.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -117,10 +117,11 @@ impl Default for DispatcherConfig {
     }
 }
 
-/// Dispatcher failure modes. The dispatcher itself does not produce
-/// these in Phase 0 — sink and DLQ errors are absorbed and logged.
-/// `Internal` is reserved for a future engine-policy change
-/// (e.g. fatal-after-N consecutive sink errors).
+/// Dispatcher failure modes.
+///
+/// Sink and DLQ failures are converted into ordered batch outcomes so source
+/// progress remains pinned. `Internal` is reserved for a dispatcher invariant
+/// that cannot be represented by one of those outcomes.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum DispatcherError {
@@ -131,8 +132,8 @@ pub enum DispatcherError {
     Internal(String),
 }
 
-/// Drains an [`EventReceiver`] into a [`Sink`], with DLQ-on-poison
-/// semantics.
+/// Drains an [`EventReceiver`] into a [`Sink`], failing closed for
+/// whole-request errors and quarantining only exact permanent item failures.
 pub struct Dispatcher {
     sink: Arc<dyn Sink>,
     dlq: DlqWriter,
@@ -390,7 +391,8 @@ impl Dispatcher {
         }
         let sink = Arc::clone(&self.sink);
         let dlq = self.dlq.clone();
-        in_flight.spawn(async move { write_one_batch(sink, dlq, events, seq).await });
+        let shutdown = self.shutdown.clone();
+        in_flight.spawn(async move { write_one_batch(sink, dlq, events, seq, shutdown).await });
     }
 }
 
@@ -403,6 +405,11 @@ enum BatchOutcome {
     Durable,
     /// A batch routed poison events to the DLQ but could not be made durable.
     NonDurable { writes_ok: bool, synced: bool },
+    /// A whole-batch failure cannot be proven to be event poison. The source
+    /// checkpoint must remain pinned and the pipeline must stop.
+    FailedClosed,
+    /// Shutdown cancelled an in-flight write. The batch remains replayable.
+    Cancelled,
 }
 
 /// Result of writing one batch — pure data the [`OrderedCommitter`] commits in
@@ -511,6 +518,23 @@ impl OrderedCommitter {
                     self.fail();
                     return;
                 }
+                BatchOutcome::FailedClosed => {
+                    error!(
+                        seq = entry.seq,
+                        "sink batch failed closed; stopping pipeline without advancing source progress"
+                    );
+                    self.fail();
+                    return;
+                }
+                BatchOutcome::Cancelled => {
+                    debug!(
+                        seq = entry.seq,
+                        "sink batch cancelled during shutdown; source progress remains unchanged"
+                    );
+                    self.failed = true;
+                    self.pending.clear();
+                    return;
+                }
             }
         }
     }
@@ -521,8 +545,8 @@ impl OrderedCommitter {
     }
 }
 
-/// Write one batch to the sink and route failures to the DLQ, returning a
-/// [`BatchResult`] for the committer to apply in order. Does NOT touch the
+/// Write one batch to the sink and route only explicit per-item failures to the
+/// DLQ, returning a [`BatchResult`] for the committer to apply in order. Does NOT touch the
 /// sink-progress watermark or the shutdown token itself — the run task's
 /// single [`OrderedCommitter`] owns that decision so out-of-order completion
 /// can't confirm the source slot past a non-durable lower batch (C3 / H16).
@@ -531,6 +555,7 @@ async fn write_one_batch(
     dlq: DlqWriter,
     events: Vec<Event>,
     seq: u64,
+    shutdown: ShutdownToken,
 ) -> BatchResult {
     let max_watermark = max_watermark_in(&events);
     let max_transform_watermark = max_transform_watermark_in(&events);
@@ -570,7 +595,19 @@ async fn write_one_batch(
     // nor the WAL once the slot advances).
     let mut dlq_written = false;
     let mut dlq_writes_ok = true;
-    match sink.write(sink_batch).await {
+    let sink_result = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => {
+            return BatchResult {
+                seq,
+                max_watermark,
+                max_transform_watermark,
+                outcome: BatchOutcome::Cancelled,
+            };
+        }
+        result = sink.write(sink_batch) => result,
+    };
+    match sink_result {
         Ok(()) => {
             let elapsed_ms = write_started.elapsed().as_millis() as u64;
             debug!(
@@ -589,6 +626,34 @@ async fn write_one_batch(
             rejected_count,
             ..
         }) => {
+            let mut offsets_seen = vec![false; batch_size];
+            let precise = rejected_count == items.len()
+                && rejected_count > 0
+                && items.iter().all(|item| {
+                    let Some(seen) = offsets_seen.get_mut(item.offset) else {
+                        return false;
+                    };
+                    if *seen {
+                        return false;
+                    }
+                    *seen = true;
+                    true
+                });
+            if !precise {
+                error!(
+                    sink = %sink.id(),
+                    batch_size,
+                    rejected_count,
+                    item_count = items.len(),
+                    "sink returned invalid per-item rejection metadata; failing closed"
+                );
+                return BatchResult {
+                    seq,
+                    max_watermark,
+                    max_transform_watermark,
+                    outcome: BatchOutcome::FailedClosed,
+                };
+            }
             let elapsed_ms = write_started.elapsed().as_millis() as u64;
             let rejected_u64 = u64::try_from(rejected_count).unwrap_or(u64::MAX);
             ventstream_telemetry::bump_events_delivered(
@@ -613,20 +678,18 @@ async fn write_one_batch(
             }
         }
         Err(err) => {
-            ventstream_telemetry::bump_events_failed(batch_size_u64);
-            warn!(
+            error!(
                 sink = %sink.id(),
                 batch_size,
                 error = %err,
-                "sink failed for whole batch; routing all to DLQ"
+                "sink failed for whole batch; failing closed without advancing source progress"
             );
-            let reason = err.to_string();
-            for event in &events {
-                dlq_written = true;
-                // Per-event success/failure counting lives in
-                // record_best_effort now (M16).
-                dlq_writes_ok &= record_best_effort(&dlq, event, &reason).await;
-            }
+            return BatchResult {
+                seq,
+                max_watermark,
+                max_transform_watermark,
+                outcome: BatchOutcome::FailedClosed,
+            };
         }
     }
 
@@ -781,6 +844,15 @@ mod tests {
         }
     }
 
+    fn failed_closed(seq: u64, wm: u64) -> BatchResult {
+        BatchResult {
+            seq,
+            max_watermark: wm,
+            max_transform_watermark: 0,
+            outcome: BatchOutcome::FailedClosed,
+        }
+    }
+
     #[test]
     fn committer_advances_watermark_in_seq_order_despite_out_of_order_completion() {
         // Batches complete 0, 2, 1. The watermark must never reflect seq 2's
@@ -837,6 +909,27 @@ mod tests {
         );
 
         // A late-arriving result after failure must not advance anything.
+        c.commit(durable(3, 400));
+        assert_eq!(progress.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn committer_failed_closed_does_not_leapfrog_to_higher_sibling() {
+        let progress = Arc::new(AtomicU64::new(0));
+        let shutdown = ShutdownToken::new();
+        let mut c = OrderedCommitter::new(Some(Arc::clone(&progress)), None, shutdown.clone());
+
+        c.commit(durable(0, 100));
+        c.commit(durable(2, 300));
+        c.commit(failed_closed(1, 200));
+
+        assert_eq!(
+            progress.load(Ordering::Relaxed),
+            100,
+            "the source cursor must remain at the last durable contiguous batch"
+        );
+        assert!(shutdown.is_cancelled());
+
         c.commit(durable(3, 400));
         assert_eq!(progress.load(Ordering::Relaxed), 100);
     }
@@ -931,8 +1024,14 @@ mod tests {
             .headers
             .with_header(ACK_BARRIER_HEADER.to_owned(), "true".to_owned());
 
-        let result =
-            write_one_batch(Arc::clone(&sink) as Arc<dyn Sink>, dlq, vec![barrier], 0).await;
+        let result = write_one_batch(
+            Arc::clone(&sink) as Arc<dyn Sink>,
+            dlq,
+            vec![barrier],
+            0,
+            ShutdownToken::new(),
+        )
+        .await;
 
         assert_eq!(result.max_watermark, 17);
         assert!(matches!(result.outcome, BatchOutcome::Durable));
@@ -950,8 +1049,14 @@ mod tests {
             .headers
             .with_header(JOIN_BARRIER_HEADER.to_owned(), "true".to_owned());
 
-        let result =
-            write_one_batch(Arc::clone(&sink) as Arc<dyn Sink>, dlq, vec![barrier], 0).await;
+        let result = write_one_batch(
+            Arc::clone(&sink) as Arc<dyn Sink>,
+            dlq,
+            vec![barrier],
+            0,
+            ShutdownToken::new(),
+        )
+        .await;
 
         assert_eq!(result.max_watermark, 0);
         assert_eq!(result.max_transform_watermark, 23);
@@ -1063,6 +1168,23 @@ mod tests {
     struct ConcurrentScriptedSink {
         active: AtomicUsize,
         max_active: AtomicUsize,
+    }
+
+    struct PendingSink;
+
+    #[async_trait]
+    impl Sink for PendingSink {
+        fn id(&self) -> &str {
+            "pending"
+        }
+
+        fn kind(&self) -> &'static str {
+            "scripted"
+        }
+
+        async fn write(&self, _batch: SinkBatch) -> Result<(), SinkError> {
+            std::future::pending().await
+        }
     }
 
     impl ConcurrentScriptedSink {
@@ -1393,7 +1515,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poison_whole_batch_routes_to_dlq() {
+    async fn whole_batch_rejection_fails_closed_without_dlq() {
         let sink = Arc::new(ScriptedSink::with_result("test", |_| {
             Err(SinkError::Rejected {
                 batch_size: 2,
@@ -1422,11 +1544,81 @@ mod tests {
         let dlq_contents = tokio::fs::read_to_string(&dlq_path)
             .await
             .expect("read dlq");
-        let lines: Vec<&str> = dlq_contents.lines().collect();
-        assert_eq!(lines.len(), 2, "both events should be DLQ-ed");
-        for line in lines {
-            assert!(line.contains("bad mapping"));
-        }
+        assert!(
+            dlq_contents.is_empty(),
+            "a whole-batch failure has no proven poison event and must not enter the DLQ"
+        );
+        let _ = tokio::fs::remove_file(&dlq_path).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_per_item_rejection_metadata_fails_closed_without_dlq() {
+        use ventstream_core::FailedItem;
+
+        let sink = Arc::new(ScriptedSink::with_result("test", |_| {
+            Err(SinkError::Rejected {
+                batch_size: 2,
+                rejected_count: 2,
+                message: "invalid offsets".into(),
+                failed_items: Some(vec![
+                    FailedItem {
+                        offset: 0,
+                        error: "first".into(),
+                    },
+                    FailedItem {
+                        offset: 0,
+                        error: "duplicate".into(),
+                    },
+                ]),
+            })
+        }));
+        let dlq_path = temp_dlq();
+        let dlq = DlqWriter::open(dlq_path.clone()).await.expect("dlq open");
+        let result = write_one_batch(
+            sink as Arc<dyn Sink>,
+            dlq,
+            vec![make_event("e0"), make_event("e1")],
+            0,
+            ShutdownToken::new(),
+        )
+        .await;
+
+        assert!(matches!(result.outcome, BatchOutcome::FailedClosed));
+        assert!(tokio::fs::read_to_string(&dlq_path)
+            .await
+            .expect("read dlq")
+            .is_empty());
+        let _ = tokio::fs::remove_file(&dlq_path).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_stalled_sink_without_dlq_or_progress() {
+        let sink = Arc::new(PendingSink);
+        let dlq_path = temp_dlq();
+        let dlq = DlqWriter::open(dlq_path.clone()).await.expect("dlq open");
+        let shutdown = ShutdownToken::new();
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(write_one_batch(
+            sink as Arc<dyn Sink>,
+            dlq,
+            vec![make_event_with_header(LSN_HEADER, "900")],
+            0,
+            task_shutdown,
+        ));
+
+        tokio::task::yield_now().await;
+        shutdown.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("stalled sink must cancel promptly")
+            .expect("batch task");
+
+        assert!(matches!(result.outcome, BatchOutcome::Cancelled));
+        assert_eq!(result.max_watermark, 900);
+        assert!(tokio::fs::read_to_string(&dlq_path)
+            .await
+            .expect("read dlq")
+            .is_empty());
         let _ = tokio::fs::remove_file(&dlq_path).await;
     }
 
@@ -1479,7 +1671,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_drains_in_flight_batch() {
+    async fn shutdown_leaves_pending_batch_replayable() {
         let sink = Arc::new(ScriptedSink::always_ok("test"));
         let cfg = DispatcherConfig {
             max_events: 1000, // never reached
@@ -1516,11 +1708,12 @@ mod tests {
         let _ = dispatcher_handle.await;
         producer.abort();
 
-        // The in-flight batch must have been flushed despite never
-        // hitting max_events or the flush timer.
+        // Explicit shutdown cancels sink work so an unavailable sink cannot
+        // block process termination indefinitely. CDC sources replay these
+        // events because the source watermark remains pinned.
         let batches = sink.batches();
         let total: usize = batches.iter().map(Vec::len).sum();
-        assert_eq!(total, 3, "shutdown must drain pending events");
+        assert_eq!(total, 0, "shutdown must not start a new sink write");
         let _ = tokio::fs::remove_file(&dlq_path).await;
     }
 }

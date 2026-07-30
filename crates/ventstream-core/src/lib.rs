@@ -26,6 +26,7 @@ pub mod memory;
 pub mod readiness;
 pub mod shutdown;
 pub mod sink;
+pub mod sink_health;
 pub mod source;
 
 pub use bus::{EventBus, EventReceiver, EventSender};
@@ -35,4 +36,5 @@ pub use memory::{MemoryAdmission, MemoryBudget, MemoryPressure};
 pub use readiness::ReadinessSignal;
 pub use shutdown::ShutdownToken;
 pub use sink::{Sink, SinkBatch};
+pub use sink_health::{SinkFailureGuard, SinkHealth, SinkHealthSnapshot};
 pub use source::{Source, SourceContext};

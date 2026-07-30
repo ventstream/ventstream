@@ -155,6 +155,54 @@ async fn mysql_sql_bootstrap_live_change_and_binlog_restart() {
             .is_some_and(|doc| doc["status"] == "live-updated")
     })
     .await;
+
+    // A transient server restart must reconnect in-process from the last
+    // sink-confirmed binlog position. This catches the old behavior where EOF
+    // looked like a graceful source completion and left the agent alive but
+    // permanently idle.
+    drop(mysql);
+    stack
+        .mysql
+        .stop_with_timeout(Some(30))
+        .await
+        .expect("stop mysql for reconnect drill");
+    assert!(
+        !stack
+            .mysql
+            .is_running()
+            .await
+            .expect("inspect stopped mysql"),
+        "mysql should be stopped before the reconnect drill continues"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    stack.mysql.start().await.expect("restart mysql");
+    assert!(
+        stack
+            .mysql
+            .is_running()
+            .await
+            .expect("inspect restarted mysql"),
+        "mysql should be running after restart"
+    );
+    common::wait_mysql_ready(stack.mysql_port).await;
+    let mut mysql = common::mysql_root_conn(stack.mysql_port)
+        .await
+        .expect("mysql after restart");
+    mysql
+        .query_drop("UPDATE shop.orders SET status='reconnected' WHERE id='ord-1'")
+        .await
+        .expect("update after mysql restart");
+    common::wait_until(
+        Duration::from_secs(45),
+        "mysql in-process reconnect",
+        || async {
+            common::os_doc(stack.os_port, INDEX, DOC_ID)
+                .await
+                .is_some_and(|doc| doc["status"] == "reconnected")
+        },
+    )
+    .await;
+
     common::wait_until(Duration::from_secs(10), "mysql binlog cursor", || async {
         std::fs::metadata(format!("{state_dir}/mysql_binlog_pos"))
             .map(|metadata| metadata.len() > 0)

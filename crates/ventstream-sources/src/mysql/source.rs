@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -10,6 +11,7 @@ use mysql_async::binlog::events::{EventData, RowsEventData, TableMapEvent};
 use mysql_async::binlog::value::BinlogValue;
 use mysql_async::prelude::Queryable;
 use mysql_async::{BinlogStreamRequest, Conn, Opts, Pool, Row, Value};
+use rand::Rng;
 use serde_json::{Map, Value as Json};
 use tracing::{info, warn};
 use ventstream_core::{
@@ -164,8 +166,72 @@ impl MySqlCdcSource {
         // snapshot: rows deleted before that snapshot would remain in the
         // sink. Fail closed until the operator performs a full sink
         // reconciliation or a controlled drain/reset.
-        self.tail(&pool, &cursor_file, start, &ctx, &mut next_ack_sequence)
+        self.tail_with_reconnect(&pool, &cursor_file, start, &ctx, &mut next_ack_sequence)
             .await
+    }
+
+    async fn tail_with_reconnect(
+        &self,
+        pool: &Pool,
+        cursor_file: &CursorFile,
+        start: BinlogPos,
+        ctx: &SourceContext,
+        next_ack_sequence: &mut u64,
+    ) -> Result<(), MySqlCdcError> {
+        const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+        const MAX_BACKOFF: Duration = Duration::from_secs(30);
+        const HEALTHY_THRESHOLD: Duration = Duration::from_secs(30);
+
+        let mut resume = start;
+        let mut consecutive_failures = 0u32;
+        let mut backoff = INITIAL_BACKOFF;
+
+        loop {
+            if ctx.shutdown.is_cancelled() {
+                return Ok(());
+            }
+            let connected_at = Instant::now();
+            match self
+                .tail(pool, cursor_file, resume.clone(), ctx, next_ack_sequence)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error @ MySqlCdcError::Connection(_)) => {
+                    if connected_at.elapsed() >= HEALTHY_THRESHOLD {
+                        consecutive_failures = 0;
+                        backoff = INITIAL_BACKOFF;
+                    }
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    ventstream_telemetry::record_error(format!(
+                        "mysql binlog connection dropped: {error}"
+                    ));
+
+                    // The cursor contains only sink-confirmed progress. Any
+                    // events between it and the dropped connection are replayed
+                    // with stable document IDs and external ordering.
+                    if let Some(persisted) = cursor_file.read()? {
+                        resume = persisted;
+                    }
+                    let delay = jittered_delay(backoff);
+                    warn!(
+                        source = %self.config.id,
+                        attempt = consecutive_failures,
+                        backoff_ms = delay.as_millis() as u64,
+                        file = %resume.file,
+                        pos = resume.pos,
+                        error = %error,
+                        "mysql binlog connection dropped; reconnecting from sink-confirmed cursor"
+                    );
+                    tokio::select! {
+                        biased;
+                        () = ctx.shutdown.cancelled() => return Ok(()),
+                        () = tokio::time::sleep(delay) => {}
+                    }
+                    backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Keyset-paginated snapshot of every in-scope table. `false` on shutdown.
@@ -265,6 +331,8 @@ impl MySqlCdcSource {
             .with_filename(start.file.as_bytes())
             .with_pos(start.pos);
         let mut stream = conn.get_binlog_stream(req).await.map_err(stream_err)?;
+        ventstream_telemetry::clear_error();
+        ventstream_telemetry::set_phase(ventstream_telemetry::LifecyclePhase::Tailing);
 
         let mut table_map: HashMap<u64, TableMapEvent<'static>> = HashMap::new();
         let mut pos = start;
@@ -301,9 +369,22 @@ impl MySqlCdcSource {
                             &mut pending_gated,
                             &mut pending_write,
                         )?;
-                        return Ok(());
+                        return Err(MySqlCdcError::Connection(
+                            "binlog stream ended before shutdown".to_owned(),
+                        ));
                     };
-                    let event = event.map_err(stream_err)?;
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(error) => {
+                            flush_confirmed_positions(
+                                self.sink_progress.as_ref(),
+                                cursor_file,
+                                &mut pending_gated,
+                                &mut pending_write,
+                            )?;
+                            return Err(stream_err(error));
+                        }
+                    };
                     let log_pos = u64::from(event.header().log_pos());
 
                     // Decode synchronously (borrows the event), then do the
@@ -486,9 +567,11 @@ impl Source for MySqlCdcSource {
         "mysql_cdc"
     }
     async fn run(&self, ctx: SourceContext) -> Result<(), SourceError> {
-        self.run_inner(ctx)
-            .await
-            .map_err(|e| SourceError::Internal(e.to_string()))
+        self.run_inner(ctx).await.map_err(|error| match error {
+            MySqlCdcError::Connection(message) => SourceError::Connection(message),
+            MySqlCdcError::MalformedEvent(message) => SourceError::Decode(message),
+            other => SourceError::Internal(other.to_string()),
+        })
     }
 }
 
@@ -665,7 +748,11 @@ fn sanitize_binlog_filename(raw: &str) -> String {
 // Owned `Error` to satisfy `map_err`; only `Display` is used.
 #[allow(clippy::needless_pass_by_value)]
 fn op_err(e: mysql_async::Error) -> MySqlCdcError {
-    MySqlCdcError::Operation(e.to_string())
+    if e.is_fatal() {
+        MySqlCdcError::Connection(e.to_string())
+    } else {
+        MySqlCdcError::Operation(e.to_string())
+    }
 }
 #[allow(clippy::needless_pass_by_value)]
 fn conn_err(e: mysql_async::Error) -> MySqlCdcError {
@@ -688,16 +775,20 @@ fn stream_err(e: mysql_async::Error) -> MySqlCdcError {
     if purged {
         MySqlCdcError::PurgedBinlog(e.to_string())
     } else {
-        MySqlCdcError::Operation(format!("binlog stream: {e}"))
+        MySqlCdcError::Connection(format!("binlog stream: {e}"))
     }
+}
+
+fn jittered_delay(delay: Duration) -> Duration {
+    delay.mul_f64(rand::thread_rng().gen_range(0.5..=1.0))
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::{
-        allocate_ack_sequence, flush_confirmed_positions, sanitize_binlog_filename, BinlogPos,
-        CursorFile,
+        allocate_ack_sequence, flush_confirmed_positions, jittered_delay, sanitize_binlog_filename,
+        BinlogPos, CursorFile,
     };
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -774,5 +865,15 @@ mod tests {
 
         let mut exhausted = u64::MAX;
         assert!(allocate_ack_sequence(&mut exhausted).is_err());
+    }
+
+    #[test]
+    fn reconnect_jitter_stays_bounded() {
+        let base = std::time::Duration::from_secs(10);
+        for _ in 0..1_000 {
+            let delay = jittered_delay(base);
+            assert!(delay >= std::time::Duration::from_secs(5));
+            assert!(delay <= base);
+        }
     }
 }
