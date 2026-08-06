@@ -4,6 +4,7 @@
 //! Phase 1 adds `pipeline.yaml` parsing in `ventstream-config` that
 //! produces an equivalent value.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::tls::DatabaseTlsConfig;
@@ -59,6 +60,9 @@ pub struct PostgresCdcConfig {
 
     /// Optional TLS policy. `None` preserves the legacy plaintext default.
     pub tls: Option<DatabaseTlsConfig>,
+
+    /// Writable directory for transactions that exceed the in-memory WAL buffer.
+    pub transaction_spool_dir: Option<PathBuf>,
 }
 
 /// Tables to scan in a one-time snapshot bootstrap.
@@ -137,6 +141,7 @@ impl PostgresCdcConfig {
             status_interval: Duration::from_secs(10),
             bootstrap: None,
             tls: None,
+            transaction_spool_dir: None,
         }
     }
 

@@ -746,6 +746,167 @@ pub fn bump_sink_retries(n: u64) {
     });
 }
 
+/// Record one successfully acknowledged Redis pipeline.
+#[inline]
+pub fn record_redis_pipeline(
+    upserts: u64,
+    deletes: u64,
+    encoded_bytes: u64,
+    elapsed: Duration,
+    replica_acks: Option<u64>,
+    local_aof_acks: Option<u64>,
+) {
+    metrics::counter!("vs_redis_upserts_total").increment(upserts);
+    metrics::counter!("vs_redis_deletes_total").increment(deletes);
+    metrics::counter!("vs_redis_pipeline_bytes_total").increment(encoded_bytes);
+    metrics::histogram!("vs_redis_pipeline_duration_seconds").record(elapsed.as_secs_f64());
+    if let Some(replica_acks) = replica_acks {
+        metrics::histogram!("vs_redis_replica_acknowledgements").record(replica_acks as f64);
+    }
+    if let Some(local_aof_acks) = local_aof_acks {
+        metrics::histogram!("vs_redis_local_aof_acknowledgements").record(local_aof_acks as f64);
+    }
+}
+
+/// Count replayed Redis writes rejected by a newer per-key source version.
+#[inline]
+pub fn bump_redis_stale_writes_skipped(skipped: u64) {
+    metrics::counter!("vs_redis_stale_writes_skipped_total").increment(skipped);
+}
+
+/// Count a Redis pipeline attempt rejected by the server or transport.
+#[inline]
+pub fn bump_redis_pipeline_failures() {
+    metrics::counter!("vs_redis_pipeline_failures_total").increment(1);
+}
+
+/// Publish the Redis sink's current adaptive execution limits.
+#[inline]
+pub fn record_redis_adaptive_limits(concurrency: usize, batch_bytes: usize, commands: usize) {
+    metrics::gauge!("vs_redis_adaptive_concurrency").set(concurrency as f64);
+    metrics::gauge!("vs_redis_adaptive_batch_bytes").set(batch_bytes as f64);
+    metrics::gauge!("vs_redis_adaptive_commands").set(commands as f64);
+}
+
+/// Count a reduction in Redis execution limits.
+#[inline]
+pub fn bump_redis_adaptive_reductions(capacity_pressure: bool) {
+    metrics::counter!(
+        "vs_redis_adaptive_reductions_total",
+        "cause" => if capacity_pressure { "capacity" } else { "transport" }
+    )
+    .increment(1);
+}
+
+/// Count a successful Redis execution-limit recovery step.
+#[inline]
+pub fn bump_redis_adaptive_recoveries() {
+    metrics::counter!("vs_redis_adaptive_recoveries_total").increment(1);
+}
+
+/// Count a Redis script cache miss observed on a routed primary.
+#[inline]
+pub fn bump_redis_script_cache_misses() {
+    metrics::counter!("vs_redis_script_cache_misses_total").increment(1);
+}
+
+/// Count a Redis script loaded on a routed primary.
+#[inline]
+pub fn bump_redis_script_loads() {
+    metrics::counter!("vs_redis_script_loads_total").increment(1);
+}
+
+/// Count a mounted Redis credential reload check that observed a change or failed.
+#[inline]
+pub fn record_redis_credential_reload(success: bool) {
+    metrics::counter!(
+        "vs_redis_credential_reloads_total",
+        "result" => if success { "success" } else { "failure" }
+    )
+    .increment(1);
+}
+
+/// Count a Redis connection attempt for one bounded topology class.
+#[inline]
+pub fn bump_redis_connection_attempt(topology: &'static str) {
+    metrics::counter!("vs_redis_connection_attempts_total", "topology" => topology).increment(1);
+}
+
+/// Count the result of a Redis connection attempt.
+#[inline]
+pub fn record_redis_connection_result(topology: &'static str, success: bool) {
+    metrics::counter!(
+        "vs_redis_connection_results_total",
+        "topology" => topology,
+        "result" => if success { "success" } else { "failure" }
+    )
+    .increment(1);
+}
+
+/// Count a topology recovery signal observed by the sink.
+#[inline]
+pub fn bump_redis_topology_event(topology: &'static str, cause: &'static str) {
+    metrics::counter!(
+        "vs_redis_topology_events_total",
+        "topology" => topology,
+        "cause" => cause
+    )
+    .increment(1);
+}
+
+/// Record a writer lease acquisition outcome.
+#[inline]
+pub fn bump_redis_writer_lease_acquisition(result: &'static str) {
+    metrics::counter!("vs_redis_writer_lease_acquisitions_total", "result" => result).increment(1);
+}
+
+/// Count a failed writer lease renewal.
+#[inline]
+pub fn bump_redis_writer_lease_renewal_failure() {
+    metrics::counter!("vs_redis_writer_lease_renewal_failures_total").increment(1);
+}
+
+/// Publish the number of Redis targets currently held by this process.
+#[inline]
+pub fn record_redis_writer_leased_targets(targets: usize) {
+    metrics::gauge!("vs_redis_writer_leased_targets").set(targets as f64);
+}
+
+/// Record the latency and outcome of a configured Redis acknowledgement.
+#[inline]
+pub fn record_redis_acknowledgement(mode: &'static str, elapsed: Duration, success: bool) {
+    metrics::histogram!("vs_redis_acknowledgement_duration_seconds", "mode" => mode)
+        .record(elapsed.as_secs_f64());
+    if !success {
+        metrics::counter!("vs_redis_acknowledgement_failures_total", "mode" => mode).increment(1);
+    }
+}
+
+/// Record one completed target-scoped Redis keyspace clear.
+#[inline]
+pub fn record_redis_keyspace_clear(
+    removed: u64,
+    elapsed: Duration,
+    replica_acks: Option<u64>,
+    local_aof_acks: Option<u64>,
+) {
+    metrics::counter!("vs_redis_keyspace_clears_total").increment(1);
+    metrics::counter!("vs_redis_keys_unlinked_total").increment(removed);
+    metrics::histogram!("vs_redis_keyspace_clear_duration_seconds").record(elapsed.as_secs_f64());
+    if let Some(replica_acks) = replica_acks {
+        metrics::histogram!("vs_redis_replica_acknowledgements").record(replica_acks as f64);
+    }
+    if let Some(local_aof_acks) = local_aof_acks {
+        metrics::histogram!("vs_redis_local_aof_acknowledgements").record(local_aof_acks as f64);
+    }
+}
+
+/// Count a failed target-scoped Redis keyspace clear attempt.
+#[inline]
+pub fn bump_redis_keyspace_clear_failures() {
+    metrics::counter!("vs_redis_keyspace_clear_failures_total").increment(1);
+}
+
 /// Mark the downstream sink unavailable without resetting the original outage
 /// start time on every retry.
 #[inline]
@@ -996,7 +1157,13 @@ pub fn should_sample(rate: f32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::percentile;
+    use std::sync::atomic::Ordering;
+
+    use super::{
+        percentile, record_redis_pipeline, render_prometheus, set_global_counters,
+        TelemetryCounters,
+    };
+    use metrics_exporter_prometheus::PrometheusBuilder;
 
     #[test]
     fn percentile_uses_the_nearest_rank_without_exceeding_the_window() {
@@ -1004,5 +1171,48 @@ mod tests {
         assert_eq!(percentile(&[7], 95), 7);
         assert_eq!(percentile(&[1, 2, 3, 4, 100], 50), 3);
         assert_eq!(percentile(&[1, 2, 3, 4, 100], 95), 100);
+    }
+
+    #[test]
+    fn prometheus_export_keeps_atomic_and_redis_series_distinct() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let counters = TelemetryCounters::new();
+        counters.events_emitted.store(11, Ordering::Relaxed);
+        counters.events_received.store(7, Ordering::Relaxed);
+        counters.events_delivered.store(5, Ordering::Relaxed);
+        counters.events_failed.store(2, Ordering::Relaxed);
+        counters.sink_retries.store(3, Ordering::Relaxed);
+        counters.dlq_writes.store(1, Ordering::Relaxed);
+        set_global_counters(counters);
+
+        let rendered = metrics::with_local_recorder(&recorder, || {
+            record_redis_pipeline(
+                4,
+                1,
+                256,
+                std::time::Duration::from_millis(8),
+                Some(1),
+                None,
+            );
+            render_prometheus(&handle)
+        });
+
+        for expected in [
+            "vs_events_emitted_total 11",
+            "vs_events_received_total 7",
+            "vs_events_delivered_total 5",
+            "vs_events_failed_total 2",
+            "vs_sink_retries_total 3",
+            "vs_dlq_writes_total 1",
+            "vs_redis_upserts_total 4",
+            "vs_redis_deletes_total 1",
+            "vs_redis_pipeline_bytes_total 256",
+        ] {
+            assert!(
+                rendered.lines().any(|line| line == expected),
+                "missing {expected}:\n{rendered}"
+            );
+        }
     }
 }

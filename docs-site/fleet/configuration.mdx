@@ -26,6 +26,13 @@ For a new pipeline, the first selection creates its initial desired state as
 `paused`; an explicit `resume` performs the first start. Later selections
 preserve the pipeline's current run state.
 
+After a supervisor restart, the engine remains stopped until the supervisor
+has acquired a current Fleet control session and converged the deployment.
+Persisted desired state is retained, but it is not treated as fresh permission
+to start before admission. An engine that is already running can continue
+during a temporary control-plane outage, so transient management downtime does
+not interrupt the data path.
+
 Use `apply` only to deliver the selected revision again, for example after
 replacing a deployment:
 
@@ -46,6 +53,79 @@ credential values. Inject database passwords, API keys, client certificates,
 TLS private keys, and other secrets through Kubernetes Secrets or the
 customer's secret manager. Fleet validates and distributes configuration
 without becoming a credential vault or data-plane dependency.
+
+Redis sink revisions use the same boundary:
+
+```yaml
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_SINK_URL
+    auth:
+      mode: acl
+      username_ref: env:VS_REDIS_SINK_USERNAME
+      password_ref: env:VS_REDIS_SINK_PASSWORD
+    tls:
+      ca_file: /run/secrets/redis/ca.pem
+    keyspace:
+      prefix: ventstream:orders:production
+      ownership: shared
+    writer:
+      lease_ms: 30000
+```
+
+Fleet stores the references, TLS file paths, and key-routing policy. The
+deployment provides the endpoint, credentials, and mounted trust material to
+the managed engine. The agent supplies `VS_FLEET_DEPLOYMENT_ID`, which is the
+default Redis writer identity; a managed revision does not need to duplicate
+that value in YAML.
+
+For Sentinel or Cluster, replace `endpoint_ref` with an explicit topology. The
+revision still contains references rather than endpoint values or credentials:
+
+```yaml
+sink:
+  kind: redis
+  redis:
+    topology:
+      mode: sentinel
+      service_name: orders-primary
+      endpoints:
+        - env:VS_REDIS_SENTINEL_A
+        - env:VS_REDIS_SENTINEL_B
+        - env:VS_REDIS_SENTINEL_C
+      data_node_tls: true
+      sentinel_auth:
+        mode: password
+        password_ref: env:VS_REDIS_SENTINEL_PASSWORD
+    auth:
+      mode: acl
+      username_ref: env:VS_REDIS_SINK_USERNAME
+      password_ref: env:VS_REDIS_SINK_PASSWORD
+    keyspace:
+      prefix: ventstream:orders:production
+      ownership: exclusive
+```
+
+Fleet validates the topology shape before activation. The engine resolves the
+references in the agent environment, verifies the discovered primary or
+Cluster slot map, and blocks startup when the runtime topology does not match
+the revision. See the [Redis sink guide](/connectors/sinks/redis#endpoint-topology)
+for Cluster routing and Sentinel TLS requirements.
+
+Normal restarts retain the same deployment identity. During a replacement that
+must take ownership before the prior writer's lease expires, stop or drain the
+old deployment and set `writer.takeover_from_ref` to a secret-provider or
+environment reference containing its deployment ID. Redis changes ownership
+only when that expected identity matches the active lease. Otherwise the new
+writer remains backpressured. Most replacements can omit this setting and wait
+for the 30-second default lease to expire.
+
+Use `ownership: exclusive` only when the pipeline is the sole writer for its
+routed targets. Fleet and the engine reject destructive Redis drain or
+rebootstrap operations under shared ownership. Exclusive rebuilds also require
+snapshot bootstrap and a finite target set; validation completes before any
+source cursor or Redis key is removed.
 
 Public CA certificates are trust material rather than credentials. For Amazon
 RDS PostgreSQL and MySQL, select the bundle already packaged with the engine:

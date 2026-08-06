@@ -94,8 +94,8 @@ fn event(
     )
 }
 
-/// Live change. `full_doc` (the re-read row) is required for an upsert and
-/// ignored for a delete.
+/// Live change. Upserts require the re-read row. Deletes include the available
+/// binlog before-image so downstream joins can recover foreign keys.
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn change_event(
     config: &MySqlCdcConfig,
@@ -104,13 +104,33 @@ pub(crate) fn change_event(
     pk: &[String],
     full_doc: Option<Value>,
 ) -> Result<Event, MySqlCdcError> {
-    let body = if op.is_delete() {
-        b"{}".to_vec()
-    } else {
-        let doc = full_doc.ok_or_else(|| {
-            MySqlCdcError::MalformedEvent(format!("upsert for {table} has no row body"))
-        })?;
-        serde_json::to_vec(&doc).map_err(|e| MySqlCdcError::Internal(e.to_string()))?
+    change_event_with_transition(config, table, op, pk, full_doc, None)
+}
+
+pub(crate) fn change_event_with_transition(
+    config: &MySqlCdcConfig,
+    table: &str,
+    op: Op,
+    pk: &[String],
+    full_doc: Option<Value>,
+    before_doc: Option<Value>,
+) -> Result<Event, MySqlCdcError> {
+    let body = match (op, full_doc, before_doc) {
+        (Op::Delete, Some(doc), _) => serde_json::to_vec(&serde_json::json!({"old": doc}))
+            .map_err(|e| MySqlCdcError::Internal(e.to_string()))?,
+        (Op::Update, Some(doc), Some(before)) => {
+            serde_json::to_vec(&serde_json::json!({"new": doc, "old": before}))
+                .map_err(|e| MySqlCdcError::Internal(e.to_string()))?
+        }
+        (Op::Insert | Op::Update, Some(doc), _) => {
+            serde_json::to_vec(&doc).map_err(|e| MySqlCdcError::Internal(e.to_string()))?
+        }
+        (Op::Insert | Op::Update, None, _) => {
+            return Err(MySqlCdcError::MalformedEvent(format!(
+                "upsert for {table} has no row body"
+            )));
+        }
+        (Op::Delete, None, _) => b"{}".to_vec(),
     };
     event(config, table, op, pk, body, false)
 }
@@ -235,6 +255,43 @@ mod tests {
         assert_eq!(
             ev.headers.get("ventstream.doc.id"),
             Some(r#"shop.orders:["ord-1"]"#)
+        );
+        assert_eq!(ev.payload.as_slice(), b"{}");
+    }
+
+    #[test]
+    fn delete_carries_available_before_image() {
+        let ev = change_event(
+            &cfg(),
+            "line_items",
+            Op::Delete,
+            &["item-1".to_owned()],
+            Some(json!({"id": "item-1", "order_id": "ord-1"})),
+        )
+        .expect("event");
+        assert_eq!(
+            serde_json::from_slice::<Value>(ev.payload.as_slice()).expect("payload"),
+            json!({"old": {"id": "item-1", "order_id": "ord-1"}})
+        );
+    }
+
+    #[test]
+    fn update_transition_carries_both_images() {
+        let ev = change_event_with_transition(
+            &cfg(),
+            "line_items",
+            Op::Update,
+            &["item-1".to_owned()],
+            Some(json!({"id": "item-1", "order_id": "ord-2"})),
+            Some(json!({"id": "item-1", "order_id": "ord-1"})),
+        )
+        .expect("event");
+        assert_eq!(
+            serde_json::from_slice::<Value>(ev.payload.as_slice()).expect("payload"),
+            json!({
+                "new": {"id": "item-1", "order_id": "ord-2"},
+                "old": {"id": "item-1", "order_id": "ord-1"}
+            })
         );
     }
 

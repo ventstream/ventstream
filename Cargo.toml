@@ -61,7 +61,7 @@ parking_lot = "0.12"
 
 # Redis Streams broker provider for realtime gateways. The connection
 # manager supplies bounded reconnects; rustls matches the rest of the engine.
-redis = { version = "1.4", default-features = false, features = ["connection-manager", "streams", "tokio-rustls-comp"] }
+redis = { version = "1.4", default-features = false, features = ["cluster-async", "connection-manager", "script", "sentinel", "streams", "tokio-rustls-comp"] }
 
 # Big-endian binary parsing for the pgoutput logical replication format
 byteorder = "1.5"

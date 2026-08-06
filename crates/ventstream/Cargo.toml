@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "VentStream engine — single binary for CDC, broker, and SDK ingest with search sinks and WebSocket fan-out."
+description = "VentStream engine — single binary for CDC materialization and WebSocket fan-out."
 
 [[bin]]
 name = "ventstream"
@@ -55,6 +55,7 @@ testcontainers = "0.27"
 reqwest = { workspace = true }
 mongodb = { workspace = true }
 rdkafka = { workspace = true }
+redis = { workspace = true }
 
 [lints]
 workspace = true

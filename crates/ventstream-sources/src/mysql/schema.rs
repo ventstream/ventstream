@@ -13,6 +13,8 @@ use parking_lot::Mutex;
 use crate::error::MySqlCdcError;
 
 pub(crate) struct TableSchema {
+    /// Column names in table ordinal order.
+    pub(crate) column_names: Vec<String>,
     /// PK column names, in key order.
     pub(crate) pk_names: Vec<String>,
     /// PK positions in a binlog row (0-based), aligned with `pk_names`.
@@ -74,10 +76,20 @@ async fn load(pool: &Pool, db: &str, table: &str) -> Result<TableSchema, MySqlCd
         .await
         .map_err(op)?;
 
+    let column_count = cols
+        .iter()
+        .map(|(_, ordinal, _)| *ordinal as usize)
+        .max()
+        .unwrap_or(0);
+    let mut column_names = vec![String::new(); column_count];
     let mut ordinal_of: HashMap<String, usize> = HashMap::new();
     let mut json_columns = HashSet::new();
     for (name, ord, dtype) in cols {
-        ordinal_of.insert(name.clone(), (ord as usize).saturating_sub(1));
+        let ordinal = (ord as usize).saturating_sub(1);
+        if let Some(slot) = column_names.get_mut(ordinal) {
+            *slot = name.clone();
+        }
+        ordinal_of.insert(name.clone(), ordinal);
         if dtype.eq_ignore_ascii_case("json") {
             json_columns.insert(name);
         }
@@ -108,6 +120,7 @@ async fn load(pool: &Pool, db: &str, table: &str) -> Result<TableSchema, MySqlCd
         .collect();
 
     Ok(TableSchema {
+        column_names,
         pk_names,
         pk_ordinals,
         json_columns,

@@ -11,6 +11,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+use redis::AsyncCommands;
 use serde_json::Value;
 use ventstream_joins::{PkValue, RelatedFetcher};
 use ventstream_sources::postgres::PostgresFetcher;
@@ -73,6 +74,712 @@ joins:
 
 fn doc_id(order: &str) -> String {
     format!("shop.orders:[\"{order}\"]")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "local integration: requires Docker; run explicitly"]
+async fn sql_mode_materializes_to_redis_and_recovers_from_outage() {
+    const PREFIX: &str = "ventstream:it:postgres";
+    const SPEC: &str = "joins: []\n";
+    let stack = common::start_pg_redis().await;
+    let pg = common::pg_client(stack.pg_port).await;
+    pg.batch_execute(
+        "CREATE SCHEMA redis_it;
+         CREATE TABLE redis_it.orders(
+           id text PRIMARY KEY,
+           status text NOT NULL,
+           total bigint NOT NULL
+         );
+         INSERT INTO redis_it.orders VALUES ('ord-1', 'created', 100);
+         CREATE PUBLICATION ventstream_redis FOR TABLE redis_it.orders;",
+    )
+    .await
+    .expect("seed Redis sink source");
+
+    let dir = common::state_dir("postgres-redis", stack.pg_port);
+    let spec = common::write_spec(&dir, SPEC);
+    let opts = common::PgRedisEngine {
+        pg_port: stack.pg_port,
+        redis_port: stack.redis_port,
+        slot: "redis_sink_slot",
+        publication: "ventstream_redis",
+        spec_path: &spec,
+        state_dir: &dir,
+        key_prefix: PREFIX,
+        key_routing: "by_output_relation",
+        keyspace_ownership: "exclusive",
+    };
+    let mut engine = common::spawn_pg_redis_engine(&opts);
+    let key = format!("{PREFIX}:{{orders}}:redis_it.orders%3A%5B%22ord-1%22%5D");
+
+    common::wait_until(Duration::from_secs(60), "Redis snapshot", || {
+        let key = key.clone();
+        async move {
+            let Ok(mut redis) = common::redis_connection(stack.redis_port).await else {
+                return false;
+            };
+            redis
+                .get::<_, Vec<u8>>(&key)
+                .await
+                .ok()
+                .and_then(|payload| serde_json::from_slice::<Value>(&payload).ok())
+                .is_some_and(|doc| doc["status"] == "created" && doc["total"] == 100)
+        }
+    })
+    .await;
+
+    pg.batch_execute("UPDATE redis_it.orders SET status='paid', total=125 WHERE id='ord-1';")
+        .await
+        .expect("update Redis sink source");
+    common::wait_until(Duration::from_secs(30), "Redis update", || {
+        let key = key.clone();
+        async move {
+            let Ok(mut redis) = common::redis_connection(stack.redis_port).await else {
+                return false;
+            };
+            redis
+                .get::<_, Vec<u8>>(&key)
+                .await
+                .ok()
+                .and_then(|payload| serde_json::from_slice::<Value>(&payload).ok())
+                .is_some_and(|doc| doc["status"] == "paid" && doc["total"] == 125)
+        }
+    })
+    .await;
+
+    let transaction_client = common::pg_client(stack.pg_port).await;
+    let committing = tokio::spawn(async move {
+        transaction_client
+            .batch_execute(
+                "BEGIN;
+                 UPDATE redis_it.orders
+                    SET status='committing', total=140
+                  WHERE id='ord-1';
+                 SELECT pg_sleep(2);
+                 COMMIT;",
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let before_commit = common::redis_value(stack.redis_port, &key)
+        .await
+        .expect("read Redis while PostgreSQL transaction is open")
+        .and_then(|payload| serde_json::from_slice::<Value>(&payload).ok())
+        .expect("materialized document before commit");
+    assert_eq!(before_commit["status"], "paid");
+    assert_eq!(before_commit["total"], 125);
+    committing
+        .await
+        .expect("transaction task")
+        .expect("commit source transaction");
+    common::wait_until(Duration::from_secs(30), "Redis committed update", || {
+        let key = key.clone();
+        async move {
+            common::redis_value(stack.redis_port, &key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|payload| serde_json::from_slice::<Value>(&payload).ok())
+                .is_some_and(|doc| doc["status"] == "committing" && doc["total"] == 140)
+        }
+    })
+    .await;
+
+    stack.redis.pause().await.expect("pause Redis");
+    pg.batch_execute("UPDATE redis_it.orders SET status='shipped', total=150 WHERE id='ord-1';")
+        .await
+        .expect("write while Redis is unavailable");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        std::path::Path::new(&format!("{dir}/dlq.jsonl"))
+            .metadata()
+            .map_or(true, |metadata| metadata.len() == 0),
+        "transient Redis outages must not write to the DLQ"
+    );
+    stack.redis.unpause().await.expect("resume Redis");
+    common::wait_until(Duration::from_secs(60), "Redis outage recovery", || {
+        let key = key.clone();
+        async move {
+            let Ok(mut redis) = common::redis_connection(stack.redis_port).await else {
+                return false;
+            };
+            redis
+                .get::<_, Vec<u8>>(&key)
+                .await
+                .ok()
+                .and_then(|payload| serde_json::from_slice::<Value>(&payload).ok())
+                .is_some_and(|doc| doc["status"] == "shipped" && doc["total"] == 150)
+        }
+    })
+    .await;
+
+    pg.batch_execute(
+        "BEGIN;
+         TRUNCATE redis_it.orders;
+         INSERT INTO redis_it.orders(id, status, total)
+           VALUES ('ord-2', 'created-after-truncate', 200);
+         COMMIT;",
+    )
+    .await
+    .expect("truncate and insert in one transaction");
+    let post_truncate_key = format!("{PREFIX}:{{orders}}:redis_it.orders%3A%5B%22ord-2%22%5D");
+    common::wait_until(
+        Duration::from_secs(60),
+        "Redis transactional truncate and insert",
+        || {
+            let key = post_truncate_key.clone();
+            async move {
+                let keys = common::redis_keys(stack.redis_port, &format!("{PREFIX}:{{orders}}:*"))
+                    .await
+                    .unwrap_or_default();
+                keys.len() == 1
+                    && common::redis_value(stack.redis_port, &key)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|payload| serde_json::from_slice::<Value>(&payload).ok())
+                        .is_some_and(|doc| doc["status"] == "created-after-truncate")
+            }
+        },
+    )
+    .await;
+
+    engine.terminate();
+    let _restarted = common::spawn_pg_redis_engine(&opts);
+    pg.batch_execute("DELETE FROM redis_it.orders WHERE id='ord-2';")
+        .await
+        .expect("delete after engine restart");
+    common::wait_until(
+        Duration::from_secs(60),
+        "Redis delete after restart",
+        || {
+            let key = post_truncate_key.clone();
+            async move {
+                let Ok(mut redis) = common::redis_connection(stack.redis_port).await else {
+                    return false;
+                };
+                redis.exists::<_, bool>(&key).await == Ok(false)
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "local integration: requires Docker; run explicitly"]
+async fn sql_mode_redis_handles_primary_and_related_truncates() {
+    const PREFIX: &str = "ventstream:it:postgres:truncate";
+    const TARGET: &str = "orders_projection";
+    const SPEC: &str = r#"
+joins:
+  - name: orders_projection
+    primary:
+      table: redis_join.orders
+      pk: id
+    target:
+      index: orders_projection
+    related:
+      - id: items
+        table: redis_join.order_items
+        pk: id
+        join_on: { from: id, to: order_id }
+        embed_as: items
+        cardinality: many
+        sort_by: id
+        select: [id, sku]
+"#;
+    let stack = common::start_pg_redis().await;
+    let pg = common::pg_client(stack.pg_port).await;
+    pg.batch_execute(
+        "CREATE SCHEMA redis_join;
+         CREATE TABLE redis_join.orders(
+           id text PRIMARY KEY,
+           status text NOT NULL
+         );
+         CREATE TABLE redis_join.order_items(
+           id text PRIMARY KEY,
+           order_id text NOT NULL,
+           sku text NOT NULL
+         );
+         CREATE INDEX redis_join_order_items_order_id
+           ON redis_join.order_items(order_id);
+         INSERT INTO redis_join.orders VALUES
+           ('ord-1', 'open'),
+           ('ord-2', 'open');
+         INSERT INTO redis_join.order_items VALUES
+           ('item-1', 'ord-1', 'SKU-1'),
+           ('item-2', 'ord-1', 'SKU-2'),
+           ('item-3', 'ord-2', 'SKU-3');
+         CREATE PUBLICATION ventstream_redis_join
+           FOR TABLE redis_join.orders, redis_join.order_items;",
+    )
+    .await
+    .expect("seed joined Redis sink source");
+
+    let dir = common::state_dir("postgres-redis-truncate", stack.pg_port);
+    let spec = common::write_spec(&dir, SPEC);
+    let opts = common::PgRedisEngine {
+        pg_port: stack.pg_port,
+        redis_port: stack.redis_port,
+        slot: "redis_join_sink_slot",
+        publication: "ventstream_redis_join",
+        spec_path: &spec,
+        state_dir: &dir,
+        key_prefix: PREFIX,
+        key_routing: "by_projection_target",
+        keyspace_ownership: "exclusive",
+    };
+    let _engine = common::spawn_pg_redis_engine(&opts);
+    let key_pattern = format!("{PREFIX}:{{{TARGET}}}:*");
+
+    common::wait_until(Duration::from_secs(60), "joined Redis snapshot", || async {
+        let Ok(keys) = common::redis_keys(stack.redis_port, &key_pattern).await else {
+            return false;
+        };
+        if keys.len() != 2 {
+            return false;
+        }
+        for key in keys {
+            let Some(payload) = common::redis_value(stack.redis_port, &key)
+                .await
+                .ok()
+                .flatten()
+            else {
+                return false;
+            };
+            let Ok(document) = serde_json::from_slice::<Value>(&payload) else {
+                return false;
+            };
+            if document["items"].as_array().is_none_or(Vec::is_empty) {
+                return false;
+            }
+        }
+        true
+    })
+    .await;
+
+    pg.batch_execute("TRUNCATE redis_join.order_items;")
+        .await
+        .expect("truncate related table");
+    common::wait_until(
+        Duration::from_secs(60),
+        "related truncate recomposition",
+        || async {
+            let Ok(keys) = common::redis_keys(stack.redis_port, &key_pattern).await else {
+                return false;
+            };
+            if keys.len() != 2 {
+                return false;
+            }
+            for key in keys {
+                let Some(payload) = common::redis_value(stack.redis_port, &key)
+                    .await
+                    .ok()
+                    .flatten()
+                else {
+                    return false;
+                };
+                let Ok(document) = serde_json::from_slice::<Value>(&payload) else {
+                    return false;
+                };
+                if !document["items"].as_array().is_some_and(Vec::is_empty) {
+                    return false;
+                }
+            }
+            true
+        },
+    )
+    .await;
+
+    pg.batch_execute("TRUNCATE redis_join.orders;")
+        .await
+        .expect("truncate primary table");
+    common::wait_until(
+        Duration::from_secs(60),
+        "primary truncate target clear",
+        || async {
+            common::redis_keys(stack.redis_port, &key_pattern)
+                .await
+                .is_ok_and(|keys| keys.is_empty())
+        },
+    )
+    .await;
+
+    pg.batch_execute("INSERT INTO redis_join.orders VALUES ('ord-3', 'after-truncate');")
+        .await
+        .expect("insert after primary truncate");
+    common::wait_until(
+        Duration::from_secs(60),
+        "joined insert after truncate",
+        || async {
+            let Ok(keys) = common::redis_keys(stack.redis_port, &key_pattern).await else {
+                return false;
+            };
+            keys.len() == 1
+                && common::redis_value(stack.redis_port, &keys[0])
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|payload| serde_json::from_slice::<Value>(&payload).ok())
+                    .is_some_and(|document| document["status"] == "after-truncate")
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "local integration: requires Docker; run explicitly"]
+async fn sql_mode_projection_materializes_declarative_redis_views() {
+    const PREFIX: &str = "ventstream:it:postgres:views";
+    const TARGET: &str = "orders_projection";
+    const SPEC: &str = r#"
+joins:
+  - name: orders_projection
+    primary:
+      table: redis_views.orders
+      pk: id
+    target:
+      index: orders_projection
+    related:
+      - id: items
+        table: redis_views.order_items
+        pk: id
+        join_on: { from: id, to: order_id }
+        embed_as: items
+        cardinality: many
+        sort_by: id
+        select: [id, sku]
+"#;
+
+    let stack = common::start_pg_redis().await;
+    let pg = common::pg_client(stack.pg_port).await;
+    pg.batch_execute(
+        "CREATE SCHEMA redis_views;
+         CREATE TABLE redis_views.orders(
+           id text PRIMARY KEY,
+           customer_id text NOT NULL,
+           status text NOT NULL
+         );
+         CREATE TABLE redis_views.order_items(
+           id text PRIMARY KEY,
+           order_id text NOT NULL,
+           sku text NOT NULL
+         );
+         CREATE INDEX redis_views_order_items_order_id
+           ON redis_views.order_items(order_id);
+         INSERT INTO redis_views.orders VALUES
+           ('ord-1', 'customer-1', 'open');
+         INSERT INTO redis_views.order_items VALUES
+           ('item-1', 'ord-1', 'SKU-1');
+         CREATE PUBLICATION ventstream_redis_views
+           FOR TABLE redis_views.orders, redis_views.order_items;",
+    )
+    .await
+    .expect("seed PostgreSQL Redis views source");
+
+    let state_dir = common::state_dir("postgres-redis-views", stack.pg_port);
+    let spec_path = common::write_spec(&state_dir, SPEC);
+    let config_path = format!("{state_dir}/ventstream.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+schema_version: 1
+roles: [cdc]
+source:
+  kind: postgres
+  postgres:
+    host: 127.0.0.1
+    port: {pg_port}
+    user: {pg_user}
+    password_ref: env:VS_PG_PASSWORD
+    database: {pg_database}
+    publication: ventstream_redis_views
+    slot: redis_views_sink_slot
+    bootstrap:
+      mode: snapshot
+      chunk_size: 100
+    denormalize_mode: sql
+    tls:
+      mode: disabled
+specs:
+  joins: {spec_path}
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_SINK_URL
+    keyspace:
+      prefix: {PREFIX}
+      ownership: exclusive
+      routing:
+        strategy: views
+        views:
+          - name: active_order_by_customer
+            source:
+              projection_target: {TARGET}
+            key:
+              template: "customer:${{json:/customer_id}}:order:${{json:/id}}"
+            filter:
+              conditions:
+                - path: /status
+                  operator: not_equals
+                  value: cancelled
+            value:
+              mode: document
+runtime:
+  dlq_path: {state_dir}/dlq.jsonl
+  joins:
+    state_dir: {state_dir}
+    lsn_flush_ms: 100
+"#,
+            pg_port = stack.pg_port,
+            pg_user = common::PG_USER,
+            pg_database = common::PG_DB,
+        ),
+    )
+    .expect("write PostgreSQL Redis view config");
+
+    let _engine = common::spawn_engine_with_config(
+        &state_dir,
+        &config_path,
+        &[
+            ("VS_PG_PASSWORD", common::PG_PASSWORD.to_owned()),
+            ("VS_REDIS_SINK_URL", common::redis_url(stack.redis_port)),
+        ],
+    );
+    let first_key =
+        format!("{PREFIX}:{{active_order_by_customer}}:customer%3Acustomer-1%3Aorder%3Aord-1");
+    let second_key =
+        format!("{PREFIX}:{{active_order_by_customer}}:customer%3Acustomer-2%3Aorder%3Aord-1");
+
+    common::wait_until(
+        Duration::from_secs(60),
+        "PostgreSQL Redis view snapshot",
+        || async {
+            common::redis_value(stack.redis_port, &first_key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_slice::<Value>(&value).ok())
+                .is_some_and(|document| {
+                    document["status"] == "open"
+                        && document["items"]
+                            .as_array()
+                            .is_some_and(|items| items.len() == 1)
+                })
+        },
+    )
+    .await;
+
+    pg.batch_execute("INSERT INTO redis_views.order_items VALUES ('item-2', 'ord-1', 'SKU-2');")
+        .await
+        .expect("insert PostgreSQL related row");
+    common::wait_until(
+        Duration::from_secs(30),
+        "PostgreSQL Redis view recomposition",
+        || async {
+            common::redis_value(stack.redis_port, &first_key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_slice::<Value>(&value).ok())
+                .is_some_and(|document| {
+                    document["items"]
+                        .as_array()
+                        .is_some_and(|items| items.len() == 2)
+                })
+        },
+    )
+    .await;
+
+    pg.batch_execute(
+        "UPDATE redis_views.orders
+         SET customer_id='customer-2'
+         WHERE id='ord-1';",
+    )
+    .await
+    .expect("move PostgreSQL Redis view");
+    common::wait_until(
+        Duration::from_secs(30),
+        "PostgreSQL Redis view move",
+        || async {
+            common::redis_value(stack.redis_port, &first_key).await == Ok(None)
+                && common::redis_value(stack.redis_port, &second_key)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|value| serde_json::from_slice::<Value>(&value).ok())
+                    .is_some_and(|document| document["customer_id"] == "customer-2")
+        },
+    )
+    .await;
+
+    pg.batch_execute("UPDATE redis_views.orders SET status='cancelled' WHERE id='ord-1';")
+        .await
+        .expect("filter PostgreSQL Redis view");
+    common::wait_until(
+        Duration::from_secs(30),
+        "PostgreSQL Redis view filter transition",
+        || async { common::redis_value(stack.redis_port, &second_key).await == Ok(None) },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "local integration: requires Docker; run explicitly"]
+async fn redis_rebootstrap_requires_exclusive_ownership_and_restores_the_live_set() {
+    const PREFIX: &str = "ventstream:it:postgres:rebootstrap";
+    const TARGET: &str = "orders";
+    const SLOT: &str = "redis_rebootstrap_slot";
+    const SPEC: &str = "joins: []\n";
+    let stack = common::start_pg_redis().await;
+    let pg = common::pg_client(stack.pg_port).await;
+    pg.batch_execute(
+        "CREATE SCHEMA redis_rebootstrap;
+         CREATE TABLE redis_rebootstrap.orders(
+           id text PRIMARY KEY,
+           status text NOT NULL
+         );
+         INSERT INTO redis_rebootstrap.orders VALUES
+           ('ord-1', 'open'),
+           ('ord-2', 'paid');
+         CREATE PUBLICATION ventstream_redis_rebootstrap
+           FOR TABLE redis_rebootstrap.orders;",
+    )
+    .await
+    .expect("seed Redis rebootstrap source");
+
+    let dir = common::state_dir("postgres-redis-rebootstrap", stack.pg_port);
+    let spec = common::write_spec(&dir, SPEC);
+    let shared = common::PgRedisEngine {
+        pg_port: stack.pg_port,
+        redis_port: stack.redis_port,
+        slot: SLOT,
+        publication: "ventstream_redis_rebootstrap",
+        spec_path: &spec,
+        state_dir: &dir,
+        key_prefix: PREFIX,
+        key_routing: "by_output_relation",
+        keyspace_ownership: "shared",
+    };
+    let mut engine = common::spawn_pg_redis_engine(&shared);
+    let owned_pattern = format!("{PREFIX}:{{{TARGET}}}:*");
+    let stale_key = format!("{PREFIX}:{{{TARGET}}}:stale");
+    let neighboring_key = format!("{PREFIX}:{{unrelated_projection}}:keep");
+
+    common::wait_until(
+        Duration::from_secs(60),
+        "initial Redis live set",
+        || async {
+            common::redis_keys(stack.redis_port, &owned_pattern)
+                .await
+                .is_ok_and(|keys| keys.len() == 2)
+        },
+    )
+    .await;
+
+    let mut redis = common::redis_connection(stack.redis_port)
+        .await
+        .expect("connect to Redis");
+    redis
+        .set::<_, _, ()>(&stale_key, br#"{"stale":true}"#)
+        .await
+        .expect("seed stale owned key");
+    redis
+        .set::<_, _, ()>(&neighboring_key, br#"{"keep":true}"#)
+        .await
+        .expect("seed neighboring key");
+    engine.terminate();
+
+    let shared_output = common::pg_redis_engine_command(&shared)
+        .arg("--fleet-rebootstrap")
+        .output()
+        .expect("run shared-keyspace rebootstrap");
+    assert!(
+        !shared_output.status.success(),
+        "shared-keyspace rebootstrap must be refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&shared_output.stderr).contains("ownership=exclusive"),
+        "unexpected rebootstrap error: {}",
+        String::from_utf8_lossy(&shared_output.stderr)
+    );
+    let slot_exists: bool = pg
+        .query_one(
+            "SELECT EXISTS(
+               SELECT 1 FROM pg_replication_slots WHERE slot_name = $1
+             )",
+            &[&SLOT],
+        )
+        .await
+        .expect("query replication slot after refused rebootstrap")
+        .get(0);
+    assert!(
+        slot_exists,
+        "ownership validation must happen before source checkpoint removal"
+    );
+    assert_eq!(
+        common::redis_keys(stack.redis_port, &owned_pattern)
+            .await
+            .expect("read owned keys after refused rebootstrap")
+            .len(),
+        3,
+        "refused rebootstrap must leave the sink untouched"
+    );
+
+    let exclusive = common::PgRedisEngine {
+        keyspace_ownership: "exclusive",
+        ..shared
+    };
+    let exclusive_output = common::pg_redis_engine_command(&exclusive)
+        .arg("--fleet-rebootstrap")
+        .output()
+        .expect("run exclusive-keyspace rebootstrap");
+    assert!(
+        exclusive_output.status.success(),
+        "exclusive rebootstrap failed: {}",
+        String::from_utf8_lossy(&exclusive_output.stderr)
+    );
+    assert!(
+        common::redis_keys(stack.redis_port, &owned_pattern)
+            .await
+            .expect("read owned keys after rebootstrap")
+            .is_empty(),
+        "rebootstrap must clear the exclusively owned target"
+    );
+    assert!(
+        common::redis_value(stack.redis_port, &neighboring_key)
+            .await
+            .expect("read neighboring key")
+            .is_some(),
+        "rebootstrap must not clear another target under the same prefix"
+    );
+
+    let _engine = common::spawn_pg_redis_engine_with_forced_bootstrap(&exclusive);
+    common::wait_until(
+        Duration::from_secs(60),
+        "Redis live set after forced bootstrap",
+        || async {
+            common::redis_keys(stack.redis_port, &owned_pattern)
+                .await
+                .is_ok_and(|keys| keys.len() == 2 && !keys.contains(&stale_key))
+        },
+    )
+    .await;
+
+    pg.batch_execute("INSERT INTO redis_rebootstrap.orders VALUES ('ord-3', 'after-rebootstrap');")
+        .await
+        .expect("insert after Redis rebootstrap");
+    common::wait_until(
+        Duration::from_secs(60),
+        "Redis tail after rebootstrap",
+        || async {
+            common::redis_keys(stack.redis_port, &owned_pattern)
+                .await
+                .is_ok_and(|keys| keys.len() == 3)
+        },
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

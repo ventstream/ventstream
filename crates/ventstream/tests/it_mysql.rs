@@ -11,6 +11,7 @@ mod common;
 use std::time::Duration;
 
 use mysql_async::prelude::Queryable;
+use redis::AsyncCommands;
 
 const INDEX: &str = "it_mysql_orders";
 const COMPOSITE_INDEX: &str = "it_mysql_composite_items";
@@ -58,6 +59,747 @@ joins:
     backfill:
       mode: sync_on_miss
 "#;
+
+const REDIS_ORDERS_SPEC: &str = r#"
+joins:
+  - name: redis_orders
+    primary:
+      table: shop.orders
+      pk: id
+    target:
+      index: redis_orders
+    related: []
+    state:
+      backend: memory
+"#;
+
+const REDIS_JOINED_ORDERS_SPEC: &str = r#"
+joins:
+  - name: redis_joined_orders
+    primary:
+      table: shop.orders
+      pk: id
+    target:
+      index: redis_joined_orders
+    related:
+      - id: items
+        table: shop.order_items
+        pk: id
+        join_on: { from: id, to: order_id }
+        embed_as: items
+        cardinality: many
+        sort_by: id
+    state:
+      backend: memory
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "local integration: requires Docker"]
+async fn mysql_sql_mode_materializes_updates_and_deletes_in_redis() {
+    const PREFIX: &str = "ventstream:it:mysql";
+
+    let stack = common::start_mysql().await;
+    let (_redis, redis_port) = common::start_redis().await;
+    let mut mysql = common::mysql_root_conn(stack.mysql_port)
+        .await
+        .expect("mysql root connection");
+    mysql
+        .query_drop(format!(
+            "CREATE USER IF NOT EXISTS '{}'@'%' IDENTIFIED BY '{}'; \
+             GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{}'@'%'; \
+             CREATE TABLE IF NOT EXISTS {}.orders (id VARCHAR(64) PRIMARY KEY, status VARCHAR(64) NOT NULL, total INT NOT NULL); \
+             INSERT INTO {}.orders (id, status, total) VALUES ('redis-1', 'created', 10) \
+             ON DUPLICATE KEY UPDATE status=VALUES(status), total=VALUES(total)",
+            common::MYSQL_USER,
+            common::MYSQL_PASSWORD,
+            common::MYSQL_USER,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+        ))
+        .await
+        .expect("seed mysql");
+
+    let state_dir = common::state_dir("mysql-redis", stack.mysql_port);
+    let spec_path = common::write_spec(&state_dir, REDIS_ORDERS_SPEC);
+    let mut engine = common::spawn_mysql_redis_engine(
+        stack.mysql_port,
+        redis_port,
+        &spec_path,
+        &state_dir,
+        PREFIX,
+    );
+    let pattern = format!("{PREFIX}:{{orders}}:*");
+    common::wait_until(Duration::from_secs(60), "MySQL Redis snapshot", || {
+        let pattern = pattern.clone();
+        async move {
+            let Ok(keys) = common::redis_keys(redis_port, &pattern).await else {
+                return false;
+            };
+            let Some(key) = keys.first() else {
+                return false;
+            };
+            common::redis_value(redis_port, key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_slice::<serde_json::Value>(&value).ok())
+                .is_some_and(|document| document["status"] == "created")
+        }
+    })
+    .await;
+    let keys = common::redis_keys(redis_port, &pattern)
+        .await
+        .expect("MySQL Redis keys");
+    assert_eq!(keys.len(), 1);
+    let key = keys.first().expect("MySQL Redis key").clone();
+
+    mysql
+        .query_drop("UPDATE shop.orders SET status='live-updated' WHERE id='redis-1'")
+        .await
+        .expect("update mysql order");
+    common::wait_until(Duration::from_secs(30), "MySQL Redis update", || async {
+        common::redis_value(redis_port, &key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_slice::<serde_json::Value>(&value).ok())
+            .is_some_and(|document| document["status"] == "live-updated")
+    })
+    .await;
+
+    let binlog_connection: Option<u64> = mysql
+        .exec_first(
+            "SELECT ID FROM information_schema.PROCESSLIST \
+             WHERE USER = ? AND COMMAND LIKE 'Binlog Dump%' \
+             ORDER BY ID LIMIT 1",
+            (common::MYSQL_USER,),
+        )
+        .await
+        .expect("find MySQL binlog connection");
+    let binlog_connection = binlog_connection.expect("active MySQL binlog connection");
+    mysql
+        .query_drop(format!("KILL CONNECTION {binlog_connection}"))
+        .await
+        .expect("kill MySQL binlog connection");
+    mysql
+        .query_drop("UPDATE shop.orders SET status='after-binlog-reconnect' WHERE id='redis-1'")
+        .await
+        .expect("update mysql after binlog disconnect");
+    common::wait_until(
+        Duration::from_secs(45),
+        "MySQL Redis binlog reconnect",
+        || async {
+            common::redis_value(redis_port, &key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_slice::<serde_json::Value>(&value).ok())
+                .is_some_and(|document| document["status"] == "after-binlog-reconnect")
+        },
+    )
+    .await;
+    assert!(
+        engine
+            .log()
+            .contains("reconnecting from sink-confirmed cursor"),
+        "MySQL source did not report the exercised reconnect path"
+    );
+
+    engine.kill();
+    mysql
+        .query_drop("UPDATE shop.orders SET status='updated-while-stopped' WHERE id='redis-1'")
+        .await
+        .expect("update mysql while stopped");
+    let mut restarted = common::spawn_mysql_redis_engine(
+        stack.mysql_port,
+        redis_port,
+        &spec_path,
+        &state_dir,
+        PREFIX,
+    );
+    common::wait_until(Duration::from_secs(45), "MySQL Redis restart", || async {
+        common::redis_value(redis_port, &key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_slice::<serde_json::Value>(&value).ok())
+            .is_some_and(|document| document["status"] == "updated-while-stopped")
+    })
+    .await;
+
+    let cursor_path = format!("{state_dir}/mysql_binlog_pos");
+    common::wait_until(Duration::from_secs(10), "MySQL binlog position", || async {
+        std::fs::metadata(&cursor_path).is_ok()
+    })
+    .await;
+    let owned_pattern = format!("{PREFIX}:{{orders}}:*");
+    let stale_key = format!("{PREFIX}:{{orders}}:stale");
+    let neighboring_key = format!("{PREFIX}:{{inventory}}:keep");
+    let mut redis = common::redis_connection(redis_port)
+        .await
+        .expect("connect to Redis");
+    redis
+        .set::<_, _, ()>(&stale_key, br#"{"stale":true}"#)
+        .await
+        .expect("seed stale MySQL target key");
+    redis
+        .set::<_, _, ()>(&neighboring_key, br#"{"keep":true}"#)
+        .await
+        .expect("seed neighboring Redis target key");
+    restarted.terminate();
+
+    let shared_output = common::mysql_redis_engine_command(&common::MySqlRedisEngine {
+        mysql_port: stack.mysql_port,
+        redis_port,
+        spec_path: &spec_path,
+        state_dir: &state_dir,
+        key_prefix: PREFIX,
+        tables: "orders",
+        keyspace_ownership: "shared",
+    })
+    .arg("--fleet-rebootstrap")
+    .output()
+    .expect("run shared MySQL rebootstrap");
+    assert!(
+        !shared_output.status.success(),
+        "shared MySQL keyspace rebootstrap must be refused"
+    );
+    assert!(
+        std::fs::metadata(&cursor_path).is_ok(),
+        "ownership validation must preserve the MySQL binlog position"
+    );
+    assert_eq!(
+        common::redis_keys(redis_port, &owned_pattern)
+            .await
+            .expect("read MySQL target after refused rebootstrap")
+            .len(),
+        2,
+        "refused rebootstrap must preserve materialized and stale keys"
+    );
+
+    let exclusive_output = common::mysql_redis_engine_command(&common::MySqlRedisEngine {
+        mysql_port: stack.mysql_port,
+        redis_port,
+        spec_path: &spec_path,
+        state_dir: &state_dir,
+        key_prefix: PREFIX,
+        tables: "orders",
+        keyspace_ownership: "exclusive",
+    })
+    .arg("--fleet-rebootstrap")
+    .output()
+    .expect("run exclusive MySQL rebootstrap");
+    assert!(
+        exclusive_output.status.success(),
+        "exclusive MySQL rebootstrap failed: {}",
+        String::from_utf8_lossy(&exclusive_output.stderr)
+    );
+    assert!(
+        std::fs::metadata(&cursor_path).is_err(),
+        "MySQL rebootstrap must remove the binlog position"
+    );
+    assert!(
+        common::redis_keys(redis_port, &owned_pattern)
+            .await
+            .expect("read MySQL target after rebootstrap")
+            .is_empty(),
+        "MySQL rebootstrap must clear the exclusively owned target"
+    );
+    assert!(
+        common::redis_value(redis_port, &neighboring_key)
+            .await
+            .expect("read neighboring Redis target")
+            .is_some(),
+        "MySQL rebootstrap must preserve neighboring targets"
+    );
+
+    let _rebuilt = common::spawn_mysql_redis_engine_with_options(&common::MySqlRedisEngine {
+        mysql_port: stack.mysql_port,
+        redis_port,
+        spec_path: &spec_path,
+        state_dir: &state_dir,
+        key_prefix: PREFIX,
+        tables: "orders",
+        keyspace_ownership: "exclusive",
+    });
+    common::wait_until(
+        Duration::from_secs(60),
+        "MySQL Redis live set after rebootstrap",
+        || async {
+            common::redis_keys(redis_port, &owned_pattern)
+                .await
+                .is_ok_and(|keys| keys.len() == 1 && !keys.contains(&stale_key))
+        },
+    )
+    .await;
+
+    mysql
+        .query_drop("DELETE FROM shop.orders WHERE id='redis-1'")
+        .await
+        .expect("delete mysql order");
+    common::wait_until(Duration::from_secs(30), "MySQL Redis delete", || async {
+        common::redis_value(redis_port, &key).await == Ok(None)
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "local integration: requires Docker"]
+async fn mysql_sql_mode_recomposes_join_transitions_in_redis() {
+    const PREFIX: &str = "ventstream:it:mysql:joins";
+
+    let stack = common::start_mysql().await;
+    let (_redis, redis_port) = common::start_redis().await;
+    let mut mysql = common::mysql_root_conn(stack.mysql_port)
+        .await
+        .expect("mysql root connection");
+    mysql
+        .query_drop(format!(
+            "CREATE USER IF NOT EXISTS '{}'@'%' IDENTIFIED BY '{}'; \
+             GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{}'@'%'; \
+             CREATE TABLE IF NOT EXISTS {}.orders (
+               id VARCHAR(64) PRIMARY KEY,
+               status VARCHAR(64) NOT NULL
+             ); \
+             CREATE TABLE IF NOT EXISTS {}.order_items (
+               id VARCHAR(64) PRIMARY KEY,
+               order_id VARCHAR(64) NOT NULL,
+               product VARCHAR(64) NOT NULL
+             ); \
+             DELETE FROM {}.order_items; \
+             DELETE FROM {}.orders; \
+             INSERT INTO {}.orders (id, status) VALUES
+               ('join-order-1', 'created'),
+               ('join-order-2', 'created'),
+               ('pk-old', 'created'); \
+             INSERT INTO {}.order_items (id, order_id, product) VALUES
+               ('item-1', 'join-order-1', 'book'),
+               ('item-2', 'join-order-1', 'pen')",
+            common::MYSQL_USER,
+            common::MYSQL_PASSWORD,
+            common::MYSQL_USER,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+        ))
+        .await
+        .expect("seed joined mysql tables");
+
+    let state_dir = common::state_dir("mysql-redis-joins", stack.mysql_port);
+    let spec_path = common::write_spec(&state_dir, REDIS_JOINED_ORDERS_SPEC);
+    let mut engine = common::spawn_mysql_redis_engine_with_tables(
+        stack.mysql_port,
+        redis_port,
+        &spec_path,
+        &state_dir,
+        PREFIX,
+        "orders,order_items",
+    );
+    let pattern = format!("{PREFIX}:{{orders}}:*");
+
+    common::wait_until(
+        Duration::from_secs(60),
+        "MySQL Redis joined snapshot",
+        || {
+            let pattern = pattern.clone();
+            async move {
+                redis_document(redis_port, &pattern, "join-order-1")
+                    .await
+                    .is_some_and(|document| {
+                        item_ids(&document) == vec!["item-1".to_owned(), "item-2".to_owned()]
+                    })
+            }
+        },
+    )
+    .await;
+
+    mysql
+        .query_drop("DELETE FROM shop.order_items WHERE id='item-1'")
+        .await
+        .expect("delete joined child");
+    common::wait_until(Duration::from_secs(30), "MySQL Redis child delete", || {
+        let pattern = pattern.clone();
+        async move {
+            redis_document(redis_port, &pattern, "join-order-1")
+                .await
+                .is_some_and(|document| item_ids(&document) == vec!["item-2".to_owned()])
+        }
+    })
+    .await;
+
+    mysql
+        .query_drop("UPDATE shop.order_items SET order_id='join-order-2' WHERE id='item-2'")
+        .await
+        .expect("reparent joined child");
+    common::wait_until(
+        Duration::from_secs(30),
+        "MySQL Redis child reparent",
+        || {
+            let pattern = pattern.clone();
+            async move {
+                let old_parent = redis_document(redis_port, &pattern, "join-order-1").await;
+                let new_parent = redis_document(redis_port, &pattern, "join-order-2").await;
+                old_parent.is_some_and(|document| item_ids(&document).is_empty())
+                    && new_parent
+                        .is_some_and(|document| item_ids(&document) == vec!["item-2".to_owned()])
+            }
+        },
+    )
+    .await;
+
+    mysql
+        .query_drop("UPDATE shop.orders SET id='pk-new' WHERE id='pk-old'")
+        .await
+        .expect("update primary key");
+    common::wait_until(
+        Duration::from_secs(30),
+        "MySQL Redis primary-key transition",
+        || {
+            let pattern = pattern.clone();
+            async move {
+                redis_document(redis_port, &pattern, "pk-old")
+                    .await
+                    .is_none()
+                    && redis_document(redis_port, &pattern, "pk-new")
+                        .await
+                        .is_some()
+            }
+        },
+    )
+    .await;
+
+    engine.kill();
+    mysql
+        .query_drop(
+            "INSERT INTO shop.order_items (id, order_id, product) \
+             VALUES ('item-3', 'join-order-2', 'pencil')",
+        )
+        .await
+        .expect("insert joined child while stopped");
+    let _restarted = common::spawn_mysql_redis_engine_with_tables(
+        stack.mysql_port,
+        redis_port,
+        &spec_path,
+        &state_dir,
+        PREFIX,
+        "orders,order_items",
+    );
+    common::wait_until(
+        Duration::from_secs(45),
+        "MySQL Redis joined restart",
+        || {
+            let pattern = pattern.clone();
+            async move {
+                redis_document(redis_port, &pattern, "join-order-2")
+                    .await
+                    .is_some_and(|document| {
+                        item_ids(&document) == vec!["item-2".to_owned(), "item-3".to_owned()]
+                    })
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "local integration: requires Docker"]
+async fn mysql_sql_mode_projection_materializes_declarative_redis_views() {
+    const PREFIX: &str = "ventstream:it:mysql:views";
+    const TARGET: &str = "mysql_orders_projection";
+    const SPEC: &str = r#"
+joins:
+  - name: mysql_orders_projection
+    primary:
+      table: shop.orders
+      pk: id
+    target:
+      index: mysql_orders_projection
+    related:
+      - id: items
+        table: shop.order_items
+        pk: id
+        join_on: { from: id, to: order_id }
+        embed_as: items
+        cardinality: many
+        sort_by: id
+        select: [id, product]
+"#;
+
+    let stack = common::start_mysql().await;
+    let (_redis, redis_port) = common::start_redis().await;
+    let mut mysql = common::mysql_root_conn(stack.mysql_port)
+        .await
+        .expect("mysql root connection");
+    mysql
+        .query_drop(format!(
+            "CREATE USER IF NOT EXISTS '{}'@'%' IDENTIFIED BY '{}'; \
+             GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{}'@'%'; \
+             CREATE TABLE IF NOT EXISTS {}.orders (
+               id VARCHAR(64) PRIMARY KEY,
+               customer_id VARCHAR(64) NOT NULL,
+               status VARCHAR(64) NOT NULL
+             ); \
+             CREATE TABLE IF NOT EXISTS {}.order_items (
+               id VARCHAR(64) PRIMARY KEY,
+               order_id VARCHAR(64) NOT NULL,
+               product VARCHAR(64) NOT NULL
+             ); \
+             DELETE FROM {}.order_items; \
+             DELETE FROM {}.orders; \
+             INSERT INTO {}.orders (id, customer_id, status)
+               VALUES ('view-order-1', 'customer-1', 'open'); \
+             INSERT INTO {}.order_items (id, order_id, product)
+               VALUES ('view-item-1', 'view-order-1', 'book')",
+            common::MYSQL_USER,
+            common::MYSQL_PASSWORD,
+            common::MYSQL_USER,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+        ))
+        .await
+        .expect("seed MySQL Redis views source");
+
+    let state_dir = common::state_dir("mysql-redis-views", stack.mysql_port);
+    let spec_path = common::write_spec(&state_dir, SPEC);
+    let config_path = format!("{state_dir}/ventstream.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+schema_version: 1
+roles: [cdc]
+source:
+  kind: mysql
+  mysql:
+    host: 127.0.0.1
+    port: {mysql_port}
+    user: {mysql_user}
+    password_ref: env:VS_MYSQL_PASSWORD
+    database: {mysql_database}
+    namespace: {mysql_database}
+    server_id: 4000000102
+    state_dir: {state_dir}
+    tables: [orders, order_items]
+    bootstrap:
+      mode: snapshot
+      chunk_size: 100
+    pos_flush_ms: 100
+    denormalize_mode: sql
+    tls:
+      mode: disabled
+specs:
+  joins: {spec_path}
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_SINK_URL
+    keyspace:
+      prefix: {PREFIX}
+      ownership: exclusive
+      routing:
+        strategy: views
+        views:
+          - name: active_order_by_customer
+            source:
+              projection_target: {TARGET}
+            key:
+              template: "customer:${{json:/customer_id}}:order:${{json:/id}}"
+            filter:
+              conditions:
+                - path: /status
+                  operator: not_equals
+                  value: cancelled
+            value:
+              mode: document
+    contract:
+      mode: materialized_view
+runtime:
+  dlq_path: {state_dir}/dlq.jsonl
+  joins:
+    state_dir: {state_dir}
+"#,
+            mysql_port = stack.mysql_port,
+            mysql_user = common::MYSQL_USER,
+            mysql_database = common::MYSQL_DB,
+        ),
+    )
+    .expect("write MySQL Redis view config");
+
+    let _engine = common::spawn_engine_with_config(
+        &state_dir,
+        &config_path,
+        &[
+            ("VS_MYSQL_PASSWORD", common::MYSQL_PASSWORD.to_owned()),
+            ("VS_REDIS_SINK_URL", common::redis_url(redis_port)),
+        ],
+    );
+    let first_key = format!(
+        "{PREFIX}:{{active_order_by_customer}}:customer%3Acustomer-1%3Aorder%3Aview-order-1"
+    );
+    let second_key = format!(
+        "{PREFIX}:{{active_order_by_customer}}:customer%3Acustomer-2%3Aorder%3Aview-order-1"
+    );
+
+    common::wait_until(
+        Duration::from_secs(60),
+        "MySQL Redis view snapshot",
+        || async {
+            common::redis_value(redis_port, &first_key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_slice::<serde_json::Value>(&value).ok())
+                .is_some_and(|document| {
+                    document["status"] == "open"
+                        && document["items"]
+                            .as_array()
+                            .is_some_and(|items| items.len() == 1)
+                })
+        },
+    )
+    .await;
+
+    mysql
+        .query_drop(
+            "INSERT INTO shop.order_items (id, order_id, product)
+             VALUES ('view-item-2', 'view-order-1', 'pen')",
+        )
+        .await
+        .expect("insert MySQL related row");
+    common::wait_until(
+        Duration::from_secs(30),
+        "MySQL Redis view recomposition",
+        || async {
+            common::redis_value(redis_port, &first_key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_slice::<serde_json::Value>(&value).ok())
+                .is_some_and(|document| {
+                    document["items"]
+                        .as_array()
+                        .is_some_and(|items| items.len() == 2)
+                })
+        },
+    )
+    .await;
+
+    mysql
+        .query_drop(
+            "UPDATE shop.orders
+             SET customer_id='customer-2'
+             WHERE id='view-order-1'",
+        )
+        .await
+        .expect("move MySQL Redis view");
+    common::wait_until(Duration::from_secs(30), "MySQL Redis view move", || async {
+        common::redis_value(redis_port, &first_key).await == Ok(None)
+            && common::redis_value(redis_port, &second_key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_slice::<serde_json::Value>(&value).ok())
+                .is_some_and(|document| document["customer_id"] == "customer-2")
+    })
+    .await;
+
+    mysql
+        .query_drop("UPDATE shop.orders SET status='cancelled' WHERE id='view-order-1'")
+        .await
+        .expect("filter MySQL Redis view");
+    common::wait_until(
+        Duration::from_secs(30),
+        "MySQL Redis view filter transition",
+        || async { common::redis_value(redis_port, &second_key).await == Ok(None) },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "local integration: requires Docker"]
+async fn mysql_sql_mode_rejects_incomplete_join_images() {
+    const PREFIX: &str = "ventstream:it:mysql:minimal";
+
+    let stack = common::start_mysql_with_row_image("MINIMAL").await;
+    let (_redis, redis_port) = common::start_redis().await;
+    let mut mysql = common::mysql_root_conn(stack.mysql_port)
+        .await
+        .expect("mysql root connection");
+    mysql
+        .query_drop(format!(
+            "CREATE USER IF NOT EXISTS '{}'@'%' IDENTIFIED BY '{}'; \
+             GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{}'@'%'; \
+             CREATE TABLE IF NOT EXISTS {}.orders (
+               id VARCHAR(64) PRIMARY KEY,
+               status VARCHAR(64) NOT NULL
+             ); \
+             CREATE TABLE IF NOT EXISTS {}.order_items (
+               id VARCHAR(64) PRIMARY KEY,
+               order_id VARCHAR(64) NOT NULL,
+               product VARCHAR(64) NOT NULL
+             )",
+            common::MYSQL_USER,
+            common::MYSQL_PASSWORD,
+            common::MYSQL_USER,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+        ))
+        .await
+        .expect("prepare minimal-image mysql tables");
+
+    let state_dir = common::state_dir("mysql-redis-minimal", stack.mysql_port);
+    let spec_path = common::write_spec(&state_dir, REDIS_JOINED_ORDERS_SPEC);
+    let engine = common::spawn_mysql_redis_engine_with_tables(
+        stack.mysql_port,
+        redis_port,
+        &spec_path,
+        &state_dir,
+        PREFIX,
+        "orders,order_items",
+    );
+
+    common::wait_until(
+        Duration::from_secs(20),
+        "MySQL incomplete row-image rejection",
+        || {
+            let log = engine.log();
+            async move {
+                log.contains("binlog_row_image=FULL") && log.contains("server reports MINIMAL")
+            }
+        },
+    )
+    .await;
+}
+
+async fn redis_document(redis_port: u16, pattern: &str, id: &str) -> Option<serde_json::Value> {
+    let keys = common::redis_keys(redis_port, pattern).await.ok()?;
+    for key in keys {
+        let value = common::redis_value(redis_port, &key).await.ok().flatten()?;
+        let document = serde_json::from_slice::<serde_json::Value>(&value).ok()?;
+        if document.get("id").and_then(serde_json::Value::as_str) == Some(id) {
+            return Some(document);
+        }
+    }
+    None
+}
+
+fn item_ids(document: &serde_json::Value) -> Vec<String> {
+    document
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "local integration: requires Docker; run with scripts/test-sources.sh mysql"]

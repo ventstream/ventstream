@@ -20,6 +20,9 @@
 //! memory) for Postgres. Requires indexes on the FK columns to be fast.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -39,6 +42,100 @@ use ventstream_sources::postgres::{connect_client, PostgresCdcConfig};
 /// many already-queued events under load — so child deletes that arrive
 /// together collapse into a single batched reverse-lookup query per field.
 const TAIL_DRAIN_LIMIT: usize = 1024;
+const JOIN_BARRIER_HEADER: &str = "ventstream.internal.join_barrier";
+const JOIN_SEQUENCE_HEADER: &str = "ventstream.internal.join_seq";
+const TAIL_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+const TAIL_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone)]
+pub struct SqlDenormalizeDurability {
+    transform_progress: Arc<AtomicU64>,
+    source_progress: Arc<AtomicU64>,
+}
+
+impl SqlDenormalizeDurability {
+    pub fn new(transform_progress: Arc<AtomicU64>, source_progress: Arc<AtomicU64>) -> Self {
+        Self {
+            transform_progress,
+            source_progress,
+        }
+    }
+
+    async fn commit(
+        &self,
+        sender: &EventSender,
+        shutdown: &ShutdownToken,
+        next_sequence: &mut u64,
+        source_watermark: u64,
+    ) -> Result<bool> {
+        let sequence = *next_sequence;
+        *next_sequence = next_sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("SQL denormalizer durability sequence exhausted"))?;
+
+        sender
+            .send(durability_barrier(sequence)?, shutdown)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("emitting SQL denormalizer durability barrier: {err}")
+            })?;
+
+        let mut poll = tokio::time::interval(Duration::from_millis(5));
+        loop {
+            if self.transform_progress.load(Ordering::Acquire) >= sequence {
+                break;
+            }
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return Ok(false),
+                _ = poll.tick() => {}
+            }
+        }
+
+        if source_watermark > 0 {
+            self.source_progress
+                .fetch_max(source_watermark, Ordering::Release);
+        }
+        Ok(true)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TailRetry {
+    failures: u32,
+    next_backoff: Duration,
+}
+
+impl Default for TailRetry {
+    fn default() -> Self {
+        Self {
+            failures: 0,
+            next_backoff: TAIL_RETRY_INITIAL_BACKOFF,
+        }
+    }
+}
+
+impl TailRetry {
+    fn record_failure(&mut self) -> (u32, Duration) {
+        self.failures = self.failures.saturating_add(1);
+        let backoff = self.next_backoff;
+        self.next_backoff = self
+            .next_backoff
+            .checked_mul(2)
+            .unwrap_or(TAIL_RETRY_MAX_BACKOFF)
+            .min(TAIL_RETRY_MAX_BACKOFF);
+        (self.failures, backoff)
+    }
+
+    fn record_success(&mut self) -> Option<u32> {
+        if self.failures == 0 {
+            return None;
+        }
+        let failures = self.failures;
+        *self = Self::default();
+        Some(failures)
+    }
+}
 
 /// Render `"ns"."rel"` from a `ns.rel` table string (quotes each segment).
 fn quote_qualified(table: &str) -> String {
@@ -188,6 +285,7 @@ pub struct SqlDenormalizer {
     client: Client,
     defs: Vec<PreparedDef>,
     chunk_size: i64,
+    emit_target_clears: bool,
     /// When set, 1:many child deletes whose WAL lacks the parent FK (Postgres
     /// `REPLICA IDENTITY DEFAULT` logs only the child PK) are resolved by
     /// querying the sink for the parent doc that embeds the deleted child PK,
@@ -297,8 +395,16 @@ impl SqlDenormalizer {
             client,
             defs,
             chunk_size,
+            emit_target_clears: false,
             sink_lookup: None,
         })
+    }
+
+    /// Emit target-scoped clear events for sinks that support them.
+    #[must_use]
+    pub const fn with_target_clears(mut self) -> Self {
+        self.emit_target_clears = true;
+        self
     }
 
     /// Enable the sink reverse-index fallback for 1:many child deletes.
@@ -326,72 +432,7 @@ impl SqlDenormalizer {
     async fn bootstrap(&self, sender: &EventSender, shutdown: &ShutdownToken) -> Result<()> {
         for pd in &self.defs {
             let started = std::time::Instant::now();
-            let mut emitted: u64 = 0;
-            let mut last: Option<Vec<String>> = None;
-            loop {
-                if shutdown.is_cancelled() {
-                    return Ok(());
-                }
-                let order = pd.pk_cols.join(", ");
-                let (where_clause, params): (String, Vec<String>) = match &last {
-                    None => (String::new(), Vec::new()),
-                    Some(vals) => {
-                        let lhs = pd.pk_cols.join(", ");
-                        let rhs = pd
-                            .pk_types
-                            .iter()
-                            .enumerate()
-                            .map(|(i, t)| format!("${}::text::{}", i + 1, t))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        (format!("WHERE ({lhs}) > ({rhs}) "), vals.clone())
-                    }
-                };
-                let sql = format!(
-                    "{head} {where_clause}ORDER BY {order} LIMIT {limit}",
-                    head = pd.select_head(),
-                    limit = self.chunk_size,
-                );
-                let bind: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-                    .iter()
-                    .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
-                    .collect();
-                let rows = self
-                    .client
-                    .query(&sql, &bind)
-                    .await
-                    .with_context(|| format!("bootstrap select for {}", pd.primary_table))?;
-                if rows.is_empty() {
-                    break;
-                }
-                let n_pk = pd.def.primary.pk.columns().len();
-                let mut page_last: Option<Vec<String>> = None;
-                for row in &rows {
-                    let pk_text: Vec<String> = (0..n_pk).map(|i| row.get::<_, String>(i)).collect();
-                    let doc: Value = row.get(n_pk);
-                    let event = build_doc_event(
-                        &pd.primary_table,
-                        pd.def.target_index(),
-                        &pk_text,
-                        &doc,
-                        false,
-                        None,
-                    )?;
-                    if sender.send(event, shutdown).await.is_err() {
-                        return Ok(());
-                    }
-                    ventstream_telemetry::bump_events_emitted(1);
-                    emitted += 1;
-                    page_last = Some(pk_text);
-                }
-                if (rows.len() as i64) < self.chunk_size {
-                    break;
-                }
-                match page_last {
-                    Some(p) => last = Some(p),
-                    None => break,
-                }
-            }
+            let emitted = self.emit_all(pd, None, sender, shutdown).await?;
             info!(
                 primary = %pd.primary_table,
                 output = %pd.def.effective_name(),
@@ -401,6 +442,82 @@ impl SqlDenormalizer {
             );
         }
         Ok(())
+    }
+
+    async fn emit_all(
+        &self,
+        pd: &PreparedDef,
+        lsn: Option<&str>,
+        sender: &EventSender,
+        shutdown: &ShutdownToken,
+    ) -> Result<u64> {
+        let mut emitted = 0u64;
+        let mut last: Option<Vec<String>> = None;
+        loop {
+            if shutdown.is_cancelled() {
+                return Ok(emitted);
+            }
+            let order = pd.pk_cols.join(", ");
+            let (where_clause, params): (String, Vec<String>) = match &last {
+                None => (String::new(), Vec::new()),
+                Some(vals) => {
+                    let lhs = pd.pk_cols.join(", ");
+                    let rhs = pd
+                        .pk_types
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| format!("${}::text::{}", i + 1, t))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    (format!("WHERE ({lhs}) > ({rhs}) "), vals.clone())
+                }
+            };
+            let sql = format!(
+                "{head} {where_clause}ORDER BY {order} LIMIT {limit}",
+                head = pd.select_head(),
+                limit = self.chunk_size,
+            );
+            let bind: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+                .iter()
+                .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+            let rows = self
+                .client
+                .query(&sql, &bind)
+                .await
+                .with_context(|| format!("full projection select for {}", pd.primary_table))?;
+            if rows.is_empty() {
+                return Ok(emitted);
+            }
+            let n_pk = pd.def.primary.pk.columns().len();
+            let mut page_last: Option<Vec<String>> = None;
+            for row in &rows {
+                let pk_text: Vec<String> = (0..n_pk).map(|i| row.get::<_, String>(i)).collect();
+                let doc: Value = row.get(n_pk);
+                let event = build_doc_event(
+                    &pd.primary_table,
+                    pd.def.target_index(),
+                    &pk_text,
+                    &doc,
+                    false,
+                    lsn,
+                )?;
+                sender
+                    .send(event, shutdown)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("emitting full projection row: {err}"))?;
+                ventstream_telemetry::bump_events_emitted(1);
+                emitted = emitted.saturating_add(1);
+                page_last = Some(pk_text);
+            }
+            if (rows.len() as i64) < self.chunk_size {
+                return Ok(emitted);
+            }
+            match page_last {
+                Some(page_last) => last = Some(page_last),
+                None => return Ok(emitted),
+            }
+        }
     }
 
     /// Recompose a set of primary keys for one definition and emit docs.
@@ -451,9 +568,10 @@ impl SqlDenormalizer {
                     false,
                     lsn,
                 )?;
-                if sender.send(event, shutdown).await.is_err() {
-                    return Ok(emitted);
-                }
+                sender
+                    .send(event, shutdown)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("emitting recomposed projection row: {err}"))?;
                 ventstream_telemetry::bump_events_emitted(1);
                 emitted.push(pk_text);
             }
@@ -484,9 +602,9 @@ impl SqlDenormalizer {
                         false,
                         lsn,
                     )?;
-                    if sender.send(event, shutdown).await.is_err() {
-                        return Ok(emitted);
-                    }
+                    sender.send(event, shutdown).await.map_err(|err| {
+                        anyhow::anyhow!("emitting recomposed projection row: {err}")
+                    })?;
                     ventstream_telemetry::bump_events_emitted(1);
                     emitted.push(pk_text);
                 }
@@ -547,6 +665,42 @@ impl SqlDenormalizer {
             .collect();
 
         for pd in &self.defs {
+            let primary_truncated = parsed.iter().any(|(relation, op, _)| {
+                op == "truncate" && relation_of(&pd.primary_table) == relation
+            });
+            let related_truncated = parsed.iter().any(|(relation, op, _)| {
+                op == "truncate"
+                    && pd
+                        .def
+                        .related
+                        .iter()
+                        .any(|related| relation_of(&related.table) == relation)
+            });
+            if primary_truncated && self.emit_target_clears {
+                let clear =
+                    build_target_clear_event(&pd.primary_table, pd.def.target_index(), batch_lsn)?;
+                sender
+                    .send(clear, shutdown)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("emitting projection clear: {err}"))?;
+                ventstream_telemetry::bump_events_emitted(1);
+                let rows = self.emit_all(pd, batch_lsn, sender, shutdown).await?;
+                debug!(
+                    primary = %pd.primary_table,
+                    rows,
+                    "sql-denormalize primary truncate cleared and rebuilt projection"
+                );
+                continue;
+            }
+            if related_truncated {
+                let rows = self.emit_all(pd, batch_lsn, sender, shutdown).await?;
+                debug!(
+                    primary = %pd.primary_table,
+                    rows,
+                    "sql-denormalize related truncate recomposed projection"
+                );
+            }
+
             let mut affected: HashSet<Vec<String>> = HashSet::new();
             let mut deletes: HashSet<Vec<String>> = HashSet::new();
             // Child deletes missing the parent FK: bucket the child PK values
@@ -678,7 +832,10 @@ impl SqlDenormalizer {
                     true,
                     batch_lsn,
                 )?;
-                let _ = sender.send(event, shutdown).await;
+                sender
+                    .send(event, shutdown)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("emitting projection tombstone: {err}"))?;
                 ventstream_telemetry::bump_events_emitted(1);
             }
         }
@@ -852,6 +1009,7 @@ impl SqlDenormalizer {
         mut receiver: EventReceiver,
         sender: EventSender,
         shutdown: ShutdownToken,
+        durability: SqlDenormalizeDurability,
     ) {
         info!(
             defs = self.defs.len(),
@@ -863,9 +1021,25 @@ impl SqlDenormalizer {
             shutdown.cancel();
             return;
         }
+        let mut next_sequence = 1u64;
+        match durability
+            .commit(&sender, &shutdown, &mut next_sequence, 0)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(err) => {
+                warn!(error = %err, "sql-denormalize bootstrap durability boundary failed");
+                ventstream_telemetry::record_error(
+                    "postgres SQL denormalizer bootstrap durability boundary failed",
+                );
+                shutdown.cancel();
+                return;
+            }
+        }
         info!("sql-denormalize: bootstrap done, entering tail");
-        let mut tail_error = false;
-        loop {
+        let mut retry = TailRetry::default();
+        'tail: loop {
             tokio::select! {
                 biased;
                 () = shutdown.cancelled() => break,
@@ -877,20 +1051,61 @@ impl SqlDenormalizer {
                     if batch.is_empty() {
                         break; // all senders dropped
                     }
-                    if let Err(err) = self.handle_tail_batch(&batch, &sender, &shutdown).await {
-                        warn!(error = %err, "sql-denormalize tail recompose failed");
-                        if !tail_error {
-                            ventstream_telemetry::record_error(
-                                "postgres SQL denormalizer tail recompose failed",
-                            );
-                            tail_error = true;
+
+                    let source_watermark = max_lsn_u64(&batch);
+                    loop {
+                        if shutdown.is_cancelled() {
+                            break 'tail;
                         }
-                    } else if tail_error {
-                        ventstream_telemetry::clear_error();
-                        ventstream_telemetry::set_phase(
-                            ventstream_telemetry::LifecyclePhase::Tailing,
-                        );
-                        tail_error = false;
+
+                        let result = async {
+                            self.handle_tail_batch(&batch, &sender, &shutdown).await?;
+                            durability
+                                .commit(
+                                    &sender,
+                                    &shutdown,
+                                    &mut next_sequence,
+                                    source_watermark,
+                                )
+                                .await
+                        }
+                        .await;
+
+                        match result {
+                            Ok(true) => {
+                                if let Some(attempts) = retry.record_success() {
+                                    ventstream_telemetry::clear_error();
+                                    ventstream_telemetry::set_phase(
+                                        ventstream_telemetry::LifecyclePhase::Tailing,
+                                    );
+                                    info!(
+                                        attempts,
+                                        batch = batch.len(),
+                                        "postgres SQL denormalizer tail recompose recovered"
+                                    );
+                                }
+                                break;
+                            }
+                            Ok(false) => break 'tail,
+                            Err(err) => {
+                                let (attempt, backoff) = retry.record_failure();
+                                warn!(
+                                    error = %err,
+                                    attempt,
+                                    batch = batch.len(),
+                                    backoff_ms = backoff.as_millis() as u64,
+                                    "sql-denormalize tail recompose failed; retaining batch for retry"
+                                );
+                                ventstream_telemetry::record_error(format!(
+                                    "postgres SQL denormalizer tail recompose failed (attempt {attempt}): {err:#}"
+                                ));
+                                tokio::select! {
+                                    biased;
+                                    () = shutdown.cancelled() => break 'tail,
+                                    () = tokio::time::sleep(backoff) => {}
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -898,6 +1113,21 @@ impl SqlDenormalizer {
         // Drop sender → dispatcher drains.
         drop(sender);
     }
+}
+
+fn durability_barrier(sequence: u64) -> Result<Event> {
+    let source = SourceUri::new("internal://sql-denormalize-durability")
+        .map_err(|err| anyhow::anyhow!("invalid durability barrier source: {err}"))?;
+    let subject = Subject::new("ventstream.internal.sql_denormalize.barrier")
+        .map_err(|err| anyhow::anyhow!("invalid durability barrier subject: {err}"))?;
+    let mut headers = HashMap::new();
+    headers.insert(JOIN_BARRIER_HEADER.to_owned(), "true".to_owned());
+    headers.insert(JOIN_SEQUENCE_HEADER.to_owned(), sequence.to_string());
+    Ok(Event::builder(source, subject)
+        .payload(Payload::from_vec(b"{}".to_vec()))
+        .content_type(ContentType::Json)
+        .headers(Headers::from_map(headers))
+        .build())
 }
 
 /// Build one no-join projection for a publication table. The sink routing
@@ -921,7 +1151,7 @@ fn direct_projection(namespace: &str, name: &str, primary_key: Vec<String>) -> J
 /// Discover primary-keyed tables from the configured publication. Tables
 /// without a primary key cannot support deterministic upserts/deletes, so they
 /// are skipped with an operator-visible warning.
-async fn discover_direct_projections(
+pub(crate) async fn discover_direct_projections(
     client: &Client,
     publication: &str,
 ) -> Result<Vec<JoinDefinition>> {
@@ -996,6 +1226,12 @@ fn max_lsn(events: &[Event]) -> Option<String> {
         }
     }
     best.map(|(_, s)| s)
+}
+
+fn max_lsn_u64(events: &[Event]) -> u64 {
+    max_lsn(events)
+        .and_then(|lsn| lsn.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 /// Select the row whose columns identify the affected primary, by op.
@@ -1132,6 +1368,37 @@ fn build_doc_event(
     }
     Ok(Event::builder(source, subject)
         .payload(payload)
+        .content_type(ContentType::Json)
+        .headers(Headers::from_map(headers))
+        .build())
+}
+
+fn build_target_clear_event(
+    primary_table: &str,
+    target_index: Option<&str>,
+    lsn: Option<&str>,
+) -> Result<Event> {
+    let ns = namespace_of(primary_table);
+    let rel = relation_of(primary_table);
+    let subject = Subject::new(format!("postgres.{ns}.{rel}.truncate"))
+        .map_err(|err| anyhow::anyhow!("invalid subject: {err}"))?;
+    let source = SourceUri::new(format!("postgres-sqljoin://{primary_table}"))
+        .map_err(|err| anyhow::anyhow!("invalid source uri: {err}"))?;
+    let mut headers = HashMap::new();
+    headers.insert("ventstream.cdc.relation".to_owned(), rel.to_owned());
+    headers.insert("ventstream.cdc.namespace".to_owned(), ns.to_owned());
+    headers.insert("ventstream.target.clear".to_owned(), "true".to_owned());
+    if let Some(target_index) = target_index {
+        headers.insert(
+            "ventstream.target.index".to_owned(),
+            target_index.to_owned(),
+        );
+    }
+    if let Some(lsn) = lsn {
+        headers.insert("ventstream.cdc.lsn".to_owned(), lsn.to_owned());
+    }
+    Ok(Event::builder(source, subject)
+        .payload(Payload::from_vec(b"{}".to_vec()))
         .content_type(ContentType::Json)
         .headers(Headers::from_map(headers))
         .build())
@@ -1343,6 +1610,50 @@ mod tests {
         assert_eq!(max_lsn(&[]), None);
     }
 
+    #[tokio::test]
+    async fn durability_boundary_holds_source_progress_until_sink_ack() {
+        let transform_progress = Arc::new(AtomicU64::new(0));
+        let source_progress = Arc::new(AtomicU64::new(0));
+        let durability = SqlDenormalizeDurability::new(
+            Arc::clone(&transform_progress),
+            Arc::clone(&source_progress),
+        );
+        let bus = ventstream_core::EventBus::new(4);
+        let (sender, mut receiver) = bus.split();
+        let shutdown = ShutdownToken::new();
+        let task_shutdown = shutdown.clone();
+
+        let task = tokio::spawn(async move {
+            let mut sequence = 1;
+            durability
+                .commit(&sender, &task_shutdown, &mut sequence, 4242)
+                .await
+                .expect("durability boundary")
+        });
+
+        let barrier = receiver.recv().await.expect("barrier event");
+        assert_eq!(barrier.headers.get(JOIN_BARRIER_HEADER), Some("true"));
+        assert_eq!(barrier.headers.get(JOIN_SEQUENCE_HEADER), Some("1"));
+        assert_eq!(source_progress.load(Ordering::Acquire), 0);
+
+        transform_progress.store(1, Ordering::Release);
+        assert!(task.await.expect("durability task"));
+        assert_eq!(source_progress.load(Ordering::Acquire), 4242);
+    }
+
+    #[test]
+    fn tail_retry_backoff_grows_caps_and_resets() {
+        let mut retry = TailRetry::default();
+        assert_eq!(retry.record_failure(), (1, TAIL_RETRY_INITIAL_BACKOFF));
+        let mut last = Duration::ZERO;
+        for _ in 0..32 {
+            last = retry.record_failure().1;
+        }
+        assert_eq!(last, TAIL_RETRY_MAX_BACKOFF);
+        assert_eq!(retry.record_success(), Some(33));
+        assert_eq!(retry, TailRetry::default());
+    }
+
     #[test]
     fn primary_pk_from_doc_id_round_trips_single_and_composite() {
         // Single — built by the shared producer encoder.
@@ -1435,5 +1746,20 @@ mod tests {
             Some("tenant-orders")
         );
         assert!(ev3.subject.as_str().ends_with(".delete"));
+    }
+
+    #[test]
+    fn target_clear_event_is_scoped_and_checkpointed() {
+        let event = build_target_clear_event("shop.orders", Some("tenant-orders"), Some("4242"))
+            .expect("target clear");
+        assert!(event.subject.as_str().ends_with(".truncate"));
+        assert_eq!(event.headers.get("ventstream.target.clear"), Some("true"));
+        assert_eq!(
+            event.headers.get("ventstream.target.index"),
+            Some("tenant-orders")
+        );
+        assert_eq!(event.headers.get("ventstream.cdc.relation"), Some("orders"));
+        assert_eq!(event.headers.get("ventstream.cdc.lsn"), Some("4242"));
+        assert_eq!(event.headers.get("ventstream.doc.id"), None);
     }
 }

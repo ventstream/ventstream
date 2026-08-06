@@ -59,14 +59,29 @@ use ventstream_config::{
     BootstrapMode as ConfigBootstrapMode, EngineConfig as EngineFileConfig,
     JetStreamStorage as ConfigJetStreamStorage, KafkaUnwrapMode as ConfigKafkaUnwrapMode,
     LogFormat as ConfigLogFormat, MongodbFullDocumentMode as ConfigMongodbFullDocumentMode,
-    OpenSearchAuthConfig, OpenSearchIndexRouting, RealtimeBrokerProvider, Role as ConfigRole,
-    SourceKind, SqlDenormalizeMode, TlsConfig as FileTlsConfig, TlsMode as FileTlsMode,
+    OpenSearchAuthConfig, OpenSearchIndexRouting, RealtimeBrokerProvider,
+    RedisAcknowledgementConfig as FileRedisAcknowledgement, RedisAuthConfig as FileRedisAuth,
+    RedisContractConfig as FileRedisContract, RedisDocumentFormatConfig as FileRedisDocumentFormat,
+    RedisKeyRoutingConfig as FileRedisKeyRouting,
+    RedisKeyspaceOwnershipConfig as FileRedisKeyspaceOwnership,
+    RedisTlsConfig as FileRedisTlsConfig, RedisTopologyConfig as FileRedisTopology,
+    RedisViewConditionConfig as FileRedisViewCondition,
+    RedisViewFilterModeConfig as FileRedisViewFilterMode,
+    RedisViewMissingBehaviorConfig as FileRedisViewMissingBehavior,
+    RedisViewValueConfig as FileRedisViewValue, Role as ConfigRole, SinkKind, SourceKind,
+    SqlDenormalizeMode, TlsConfig as FileTlsConfig, TlsMode as FileTlsMode,
     TlsTrustProvider as FileTlsTrustProvider, ValueRef,
 };
 use ventstream_core::{MemoryAdmission, ReadinessSignal, ShutdownToken};
 use ventstream_graphql::GraphQlConfig;
 use ventstream_joins::{JoinDefinition, JoinEngine, JoinState, PersistentBackend};
 use ventstream_sinks::opensearch::{AuthMode, OpenSearchConfig, OpenSearchSink};
+use ventstream_sinks::{
+    RedisAcknowledgement, RedisConfig, RedisContract, RedisDocumentFormat, RedisKeyRouting,
+    RedisKeyspaceOwnership, RedisSentinelTopology, RedisSink, RedisTlsConfig, RedisTopology,
+    RedisView, RedisViewCondition, RedisViewConditionOperator, RedisViewFilter,
+    RedisViewFilterMode, RedisViewKey, RedisViewMissingBehavior, RedisViewSource, RedisViewValue,
+};
 use ventstream_sources::kafka::{KafkaCdcConfig, KafkaCdcSource, UnwrapMode};
 use ventstream_sources::mongodb::{
     FullDocument as MongoFullDocument, MongoCdcConfig, MongoCdcSource,
@@ -206,17 +221,24 @@ fn main() -> Result<()> {
     let fleet_reconcile = argv.iter().any(|arg| arg == "--fleet-reconcile");
     let fleet_rebootstrap = argv.iter().any(|arg| arg == "--fleet-rebootstrap");
     let validate_config = argv.iter().any(|arg| arg == "--validate-config");
+    let check_redis_sink = argv.iter().any(|arg| arg == "--check-redis-sink");
+    let check_redis_drift = argv.iter().any(|arg| arg == "--check-redis-drift");
+    let redis_drift_targets = repeated_argument_values(&argv, "--redis-target")?;
+    let redis_drift_scan_limit =
+        optional_usize_argument(&argv, "--redis-drift-scan-limit", 100_000)?;
     let fleet_delete_orphans = argv.iter().any(|arg| arg == "--delete-orphans");
-    let fleet_command_count = [
+    let one_shot_command_count = [
         drain_local_state,
         fleet_reconcile,
         fleet_rebootstrap,
         validate_config,
+        check_redis_sink,
+        check_redis_drift,
     ]
     .into_iter()
     .filter(|enabled| *enabled)
     .count();
-    if fleet_command_count > 1 {
+    if one_shot_command_count > 1 {
         return Err(anyhow!(
             "only one maintenance or validation command may be supplied at a time"
         ));
@@ -231,6 +253,14 @@ fn main() -> Result<()> {
         .context("building tokio runtime")?;
     if validate_config {
         validate_startup_config(early_engine_config.as_ref())
+    } else if check_redis_sink {
+        runtime.block_on(run_check_redis_sink(early_engine_config.as_ref()))
+    } else if check_redis_drift {
+        runtime.block_on(run_check_redis_drift(
+            early_engine_config.as_ref(),
+            redis_drift_targets,
+            redis_drift_scan_limit,
+        ))
     } else if drain_local_state {
         runtime.block_on(run_fleet_drain_local_state())
     } else if fleet_reconcile {
@@ -240,6 +270,81 @@ fn main() -> Result<()> {
     } else {
         runtime.block_on(run(telemetry_handle, early_engine_config))
     }
+}
+
+fn repeated_argument_values(argv: &[String], flag: &str) -> Result<Vec<String>> {
+    let mut values = Vec::new();
+    let mut arguments = argv.iter().skip(1);
+    while let Some(argument) = arguments.next() {
+        if argument == flag {
+            let value = arguments
+                .next()
+                .filter(|value| !value.starts_with("--"))
+                .ok_or_else(|| anyhow!("{flag} requires a value"))?;
+            values.push(value.clone());
+        }
+    }
+    Ok(values)
+}
+
+fn optional_usize_argument(argv: &[String], flag: &str, default: usize) -> Result<usize> {
+    let values = repeated_argument_values(argv, flag)?;
+    match values.as_slice() {
+        [] => Ok(default),
+        [value] => value
+            .parse::<usize>()
+            .with_context(|| format!("{flag} must be a positive integer")),
+        _ => Err(anyhow!("{flag} may only be supplied once")),
+    }
+}
+
+async fn run_check_redis_sink(engine_config: Option<&EngineFileConfig>) -> Result<()> {
+    let sink = load_sink_config(engine_config)?;
+    let SinkRuntimeConfig::Redis(config) = sink else {
+        return Err(anyhow!(
+            "--check-redis-sink requires sink.kind=redis or VS_SINK=redis"
+        ));
+    };
+    let report = RedisSink::diagnose(*config)
+        .await
+        .context("Redis sink preflight failed")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).context("encoding Redis sink preflight report")?
+    );
+    Ok(())
+}
+
+async fn run_check_redis_drift(
+    engine_config: Option<&EngineFileConfig>,
+    mut targets: Vec<String>,
+    scan_limit: usize,
+) -> Result<()> {
+    let sink = load_sink_config(engine_config)?;
+    let SinkRuntimeConfig::Redis(config) = sink else {
+        return Err(anyhow!(
+            "--check-redis-drift requires sink.kind=redis or VS_SINK=redis"
+        ));
+    };
+    if targets.is_empty() {
+        targets = match &config.key_routing {
+            RedisKeyRouting::Fixed(target) => vec![target.clone()],
+            RedisKeyRouting::Views(views) => views.iter().map(|view| view.name.clone()).collect(),
+            RedisKeyRouting::ByOutputRelation | RedisKeyRouting::ByProjectionTarget => {
+                return Err(anyhow!(
+                    "dynamic Redis routing requires one or more --redis-target values"
+                ));
+            }
+        };
+    }
+    let report = RedisSink::inspect_drift(*config, &targets, scan_limit)
+        .await
+        .context("Redis drift inspection failed")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).context("encoding Redis drift report")?
+    );
+    Ok(())
 }
 
 /// Resolve the complete startup configuration without opening connector sockets.
@@ -275,6 +380,7 @@ async fn run_fleet_drain_local_state() -> Result<()> {
     }
 
     let cdc = load_cdc_bundle(fleet_config.as_ref(), engine_config.as_ref())?;
+    let redis_targets = cdc.validate_redis_drain().await?;
     match cdc.source {
         CdcSourceConfig::Postgres(config) => {
             drain_pg_local_state(&config, engine_config.as_ref()).await?
@@ -286,6 +392,10 @@ async fn run_fleet_drain_local_state() -> Result<()> {
             info!("fleet drain: kafka offsets are server-side; no local state to release");
         }
     }
+    cdc.runtime
+        .sink
+        .reset_redis_targets_if_configured(&redis_targets)
+        .await?;
     info!("fleet-managed local drain completed");
     Ok(())
 }
@@ -311,12 +421,23 @@ async fn run_fleet_reconcile(delete_orphans: bool) -> Result<()> {
     }
 
     let cdc = load_cdc_bundle(fleet_config.as_ref(), engine_config.as_ref())?;
+    if cdc.runtime.sink.redis().is_some() {
+        return Err(anyhow!(
+            "Redis live-set reconciliation is not implemented; use an explicit rebootstrap for an exclusively owned keyspace"
+        ));
+    }
     let deleted = match cdc.source {
         CdcSourceConfig::Postgres(config) => {
-            reconcile_orphan_docs_pg(&config, &cdc.runtime.os, &cdc.joins).await?
+            let os = cdc.runtime.sink.open_search().ok_or_else(|| {
+                anyhow!("Redis orphan reconciliation is not available in this release")
+            })?;
+            reconcile_orphan_docs_pg(&config, os, &cdc.joins).await?
         }
         CdcSourceConfig::Neo4j(config) => {
-            reconcile_orphan_docs_neo4j(&config, &cdc.runtime.os).await?
+            let os = cdc.runtime.sink.open_search().ok_or_else(|| {
+                anyhow!("Redis orphan reconciliation is not available in this release")
+            })?;
+            reconcile_orphan_docs_neo4j(&config, os).await?
         }
         CdcSourceConfig::Mongo(_) => {
             info!("fleet reconcile: mongodb live-set reconciliation is not implemented yet");
@@ -355,6 +476,7 @@ async fn run_fleet_rebootstrap() -> Result<()> {
     }
 
     let cdc = load_cdc_bundle(fleet_config.as_ref(), engine_config.as_ref())?;
+    let redis_targets = cdc.validate_redis_drain().await?;
     match cdc.source {
         CdcSourceConfig::Postgres(config) => {
             drain_pg_local_state(&config, engine_config.as_ref()).await?;
@@ -371,6 +493,10 @@ async fn run_fleet_rebootstrap() -> Result<()> {
             );
         }
     }
+    cdc.runtime
+        .sink
+        .reset_redis_targets_if_configured(&redis_targets)
+        .await?;
     info!("fleet-managed rebootstrap preparation completed");
     Ok(())
 }
@@ -469,7 +595,7 @@ async fn run(
     let graphql_enabled = cfg.graphql.is_some();
     let cdc_sink_health = cfg.cdc.as_mut().map(|cdc| {
         let health = ventstream_core::SinkHealth::new();
-        cdc.runtime.os.delivery_health = Some(health.clone());
+        cdc.runtime.sink.attach_health(health.clone());
         health
     });
 
@@ -568,7 +694,7 @@ async fn run(
                 CdcSourceConfig::Neo4j(n4j) => {
                     run_cdc_neo4j(
                         *n4j,
-                        cdc.runtime.os,
+                        cdc.runtime.sink,
                         cdc.runtime.engine_config,
                         shutdown.clone(),
                     )
@@ -577,7 +703,7 @@ async fn run(
                 CdcSourceConfig::Mongo(mongo) => {
                     run_cdc_mongodb(
                         *mongo,
-                        cdc.runtime.os,
+                        cdc.runtime.sink,
                         cdc.runtime.engine_config,
                         shutdown.clone(),
                     )
@@ -589,7 +715,7 @@ async fn run(
                 CdcSourceConfig::Kafka(k) => {
                     run_cdc_kafka(
                         *k,
-                        cdc.runtime.os,
+                        cdc.runtime.sink,
                         cdc.runtime.engine_config,
                         shutdown.clone(),
                     )
@@ -597,7 +723,7 @@ async fn run(
                 }
             };
             if let Err(err) = result {
-                error!(error = %err, "cdc pipeline failed");
+                error!(error = %format!("{err:#}"), "cdc pipeline failed");
                 shutdown.cancel();
             }
         }));
@@ -693,13 +819,19 @@ enum EngineIterationOutcome {
 /// (default `opensearch`). Adding a target = implement
 /// `ventstream_core::Sink` and add a match arm here; the rest of the
 /// pipeline is sink-agnostic (it only ever sees `Arc<dyn Sink>`).
-fn build_sink(os: OpenSearchConfig) -> Result<std::sync::Arc<dyn ventstream_core::Sink>> {
-    let kind = opt("VS_SINK")?.unwrap_or_else(|| "opensearch".to_owned());
-    match kind.as_str() {
-        "opensearch" | "elasticsearch" | "es" => Ok(std::sync::Arc::new(
-            OpenSearchSink::new(os).context("building OpenSearch sink")?,
+async fn build_sink(
+    config: SinkRuntimeConfig,
+    shutdown: &ShutdownToken,
+) -> Result<std::sync::Arc<dyn ventstream_core::Sink>> {
+    match config {
+        SinkRuntimeConfig::OpenSearch(os) => Ok(std::sync::Arc::new(
+            OpenSearchSink::new(*os).context("building OpenSearch sink")?,
         )),
-        other => anyhow::bail!("unknown VS_SINK '{other}' (supported: opensearch)"),
+        SinkRuntimeConfig::Redis(redis) => Ok(std::sync::Arc::new(
+            RedisSink::connect_with_shutdown(*redis, shutdown)
+                .await
+                .context("building Redis sink")?,
+        )),
     }
 }
 
@@ -711,6 +843,9 @@ fn build_sink(os: OpenSearchConfig) -> Result<std::sync::Arc<dyn ventstream_core
 /// implementing this trait and handing the backend to `run_cdc_loop`.
 #[async_trait::async_trait]
 trait CdcBackend: Send {
+    /// Reject a drain before any cursor or local state is removed when the
+    /// configured sink cannot be rebuilt safely.
+    async fn validate_drain(&self) -> Result<()>;
     /// Drop local resume state (PG slot bookkeeping / Neo4j cursor file)
     /// so the next iteration re-bootstraps cleanly.
     async fn drain_local(&self) -> Result<()>;
@@ -754,6 +889,7 @@ async fn run_cdc_loop<B: CdcBackend>(mut backend: B, shutdown: ShutdownToken) ->
             // Paused with a valid cursor → idle; paused with
             // cursor_invalidated → drain locally + idle as Drained.
             if cmd.cursor_invalidated && !already_drained_locally {
+                backend.validate_drain().await?;
                 backend
                     .drain_local()
                     .await
@@ -778,19 +914,16 @@ async fn run_cdc_loop<B: CdcBackend>(mut backend: B, shutdown: ShutdownToken) ->
         let needs_bootstrap_after_drain = already_drained_locally || cmd.cursor_invalidated;
         if needs_bootstrap_after_drain {
             if !already_drained_locally && cmd.cursor_invalidated {
+                backend.validate_drain().await?;
                 backend
                     .drain_local()
                     .await
                     .context("post-restart drain failed; refusing an unsafe bootstrap")?;
             }
-            // Non-fatal — better to bootstrap with stale orphans than to
-            // fail to resume.
-            if let Err(err) = backend.reconcile_orphans().await {
-                warn!(
-                    error = %err,
-                    "drain-resume reconciliation failed; orphan docs may persist in OS"
-                );
-            }
+            backend
+                .reconcile_orphans()
+                .await
+                .context("drain-resume reconciliation failed; refusing an unsafe bootstrap")?;
             backend.prepare_bootstrap()?;
             already_drained_locally = false;
         }
@@ -810,6 +943,8 @@ async fn run_cdc_loop<B: CdcBackend>(mut backend: B, shutdown: ShutdownToken) ->
         match iteration_outcome {
             Ok(EngineIterationOutcome::Shutdown) => break,
             Ok(EngineIterationOutcome::Paused) => continue,
+            Err(_) if shutdown.is_cancelled() => break,
+            Err(_) if inner_shutdown.is_cancelled() => continue,
             Err(err) => last_iteration_error = Some(err),
         }
     }
@@ -827,11 +962,30 @@ struct PgBackend {
 
 #[async_trait::async_trait]
 impl CdcBackend for PgBackend {
+    async fn validate_drain(&self) -> Result<()> {
+        let targets =
+            postgres_redis_drain_targets(&self.runtime.sink, &self.pg, &self.joins).await?;
+        self.runtime.sink.validate_redis_drain(true, &targets)
+    }
+
     async fn drain_local(&self) -> Result<()> {
         drain_pg_local_state(&self.pg, self.runtime.engine_file_config.as_ref()).await
     }
     async fn reconcile_orphans(&self) -> Result<()> {
-        reconcile_orphan_docs_pg(&self.pg, &self.runtime.os, &self.joins)
+        let targets =
+            postgres_redis_drain_targets(&self.runtime.sink, &self.pg, &self.joins).await?;
+        if self
+            .runtime
+            .sink
+            .reset_redis_targets_if_configured(&targets)
+            .await?
+        {
+            return Ok(());
+        }
+        let os = self.runtime.sink.open_search().ok_or_else(|| {
+            anyhow!("Redis orphan reconciliation is not available; drain-resume is blocked")
+        })?;
+        reconcile_orphan_docs_pg(&self.pg, os, &self.joins)
             .await
             .map(|_| ())
     }
@@ -884,17 +1038,34 @@ impl CdcBackend for PgBackend {
 /// Neo4j source plugged into [`run_cdc_loop`].
 struct Neo4jBackend {
     config: Neo4jCdcConfig,
-    os: OpenSearchConfig,
+    sink: SinkRuntimeConfig,
     engine_config: EngineConfig,
 }
 
 #[async_trait::async_trait]
 impl CdcBackend for Neo4jBackend {
+    async fn validate_drain(&self) -> Result<()> {
+        let targets = neo4j_redis_drain_targets(&self.sink, &self.config)?;
+        self.sink
+            .validate_redis_drain(self.config.bootstrap.is_some(), &targets)
+    }
+
     async fn drain_local(&self) -> Result<()> {
         drain_neo4j_local_state(&self.config)
     }
     async fn reconcile_orphans(&self) -> Result<()> {
-        reconcile_orphan_docs_neo4j(&self.config, &self.os)
+        let targets = neo4j_redis_drain_targets(&self.sink, &self.config)?;
+        if self
+            .sink
+            .reset_redis_targets_if_configured(&targets)
+            .await?
+        {
+            return Ok(());
+        }
+        let os = self.sink.open_search().ok_or_else(|| {
+            anyhow!("Redis orphan reconciliation is not available; drain-resume is blocked")
+        })?;
+        reconcile_orphan_docs_neo4j(&self.config, os)
             .await
             .map(|_| ())
     }
@@ -909,7 +1080,7 @@ impl CdcBackend for Neo4jBackend {
     ) -> Result<EngineIterationOutcome> {
         build_and_run_neo4j_engine(
             self.config.clone(),
-            self.os.clone(),
+            self.sink.clone(),
             self.engine_config.clone(),
             inner,
             outer,
@@ -921,16 +1092,31 @@ impl CdcBackend for Neo4jBackend {
 /// MongoDB source plugged into [`run_cdc_loop`].
 struct MongoBackend {
     config: MongoCdcConfig,
-    os: OpenSearchConfig,
+    sink: SinkRuntimeConfig,
     engine_config: EngineConfig,
 }
 
 #[async_trait::async_trait]
 impl CdcBackend for MongoBackend {
+    async fn validate_drain(&self) -> Result<()> {
+        let targets = mongodb_redis_drain_targets(&self.sink, &self.config)?;
+        self.sink
+            .validate_redis_drain(self.config.bootstrap, &targets)
+    }
+
     async fn drain_local(&self) -> Result<()> {
         drain_mongodb_local_state(&self.config)
     }
     async fn reconcile_orphans(&self) -> Result<()> {
+        let targets = mongodb_redis_drain_targets(&self.sink, &self.config)?;
+        if self
+            .sink
+            .reset_redis_targets_if_configured(&targets)
+            .await?
+        {
+            return Ok(());
+        }
+        self.sink.ensure_drain_reconciliation_supported()?;
         // Phase 1 (raw 1:1) writes deterministic doc IDs and does not yet
         // run a collection-`_id` live-set reconcile pass; deletes are caught
         // live as tombstones. Orphan reconciliation lands with join mode.
@@ -948,7 +1134,7 @@ impl CdcBackend for MongoBackend {
     ) -> Result<EngineIterationOutcome> {
         build_and_run_mongodb_engine(
             self.config.clone(),
-            self.os.clone(),
+            self.sink.clone(),
             self.engine_config.clone(),
             inner,
             outer,
@@ -966,10 +1152,27 @@ struct MysqlBackend {
 
 #[async_trait::async_trait]
 impl CdcBackend for MysqlBackend {
+    async fn validate_drain(&self) -> Result<()> {
+        let targets = mysql_redis_drain_targets(&self.runtime.sink, &self.config, &self.joins)?;
+        self.runtime
+            .sink
+            .validate_redis_drain(self.config.bootstrap, &targets)
+    }
+
     async fn drain_local(&self) -> Result<()> {
         drain_mysql_local_state(&self.config, self.runtime.engine_file_config.as_ref())
     }
     async fn reconcile_orphans(&self) -> Result<()> {
+        let targets = mysql_redis_drain_targets(&self.runtime.sink, &self.config, &self.joins)?;
+        if self
+            .runtime
+            .sink
+            .reset_redis_targets_if_configured(&targets)
+            .await?
+        {
+            return Ok(());
+        }
+        self.runtime.sink.ensure_drain_reconciliation_supported()?;
         // Phase 1: deletes are caught live as tombstones; no live-set
         // reconcile pass yet (lands later, shared with the join modes).
         Ok(())
@@ -1027,12 +1230,21 @@ fn mysql_sql_denormalize_enabled(engine_config: Option<&EngineFileConfig>) -> bo
 /// Kafka/Redpanda source plugged into [`run_cdc_loop`].
 struct KafkaBackend {
     config: KafkaCdcConfig,
-    os: OpenSearchConfig,
+    sink: SinkRuntimeConfig,
     engine_config: EngineConfig,
 }
 
 #[async_trait::async_trait]
 impl CdcBackend for KafkaBackend {
+    async fn validate_drain(&self) -> Result<()> {
+        if self.sink.redis().is_some() {
+            return Err(anyhow!(
+                "Redis drain/rebuild is not supported for Kafka because consumer offsets cannot be reset atomically by the engine"
+            ));
+        }
+        Ok(())
+    }
+
     async fn drain_local(&self) -> Result<()> {
         // Kafka resume lives in the consumer group's committed offsets
         // (server-side), not a local file. There's nothing to wipe here; to
@@ -1042,6 +1254,7 @@ impl CdcBackend for KafkaBackend {
         Ok(())
     }
     async fn reconcile_orphans(&self) -> Result<()> {
+        self.sink.ensure_drain_reconciliation_supported()?;
         // Phase 1 (raw 1:1): deletes arrive as Debezium op=d tombstones; no
         // live-set reconcile pass (lands with join mode).
         Ok(())
@@ -1056,7 +1269,7 @@ impl CdcBackend for KafkaBackend {
     ) -> Result<EngineIterationOutcome> {
         build_and_run_kafka_engine(
             self.config.clone(),
-            self.os.clone(),
+            self.sink.clone(),
             self.engine_config.clone(),
             inner,
             outer,
@@ -1079,14 +1292,14 @@ async fn run_cdc_postgres(
     // the intent obvious.
     ventstream_telemetry::set_phase(ventstream_telemetry::LifecyclePhase::Starting);
     ventstream_telemetry::set_source("postgres");
-    ventstream_telemetry::set_target("opensearch");
+    ventstream_telemetry::set_target(runtime.sink.kind());
 
     info!(
         pg_host = %pg.host,
         pg_db = %pg.database,
         pg_slot = %pg.slot_name,
-        os_endpoint = %runtime.os.endpoint,
-        index_template = %runtime.os.index_template,
+        sink = runtime.sink.kind(),
+        sink_endpoint = %runtime.sink.endpoint(),
         joins_count = joins.len(),
         "cdc pipeline configured"
     );
@@ -1550,7 +1763,7 @@ async fn build_and_run_pg_engine(
         .with_sink_progress(std::sync::Arc::clone(&sink_progress))
         .with_lsn_flush_interval(lsn_flush)
         .with_existing_slot_bootstrap(bootstrap_existing_slot);
-    let sink = build_sink(runtime.os.clone())?;
+    let sink = build_sink(runtime.sink.clone(), &inner_shutdown).await?;
 
     info!(
         bus_capacity = runtime.engine_config.bus_capacity,
@@ -1730,18 +1943,31 @@ async fn build_and_run_pg_sql_denormalize_engine(
     let mut denorm = sql_denormalize::SqlDenormalizer::connect(&pg, &pg.publication, joins, chunk)
         .await
         .context("building SQL denormalizer")?;
-    // Sink-as-reverse-index fallback for 1:many child deletes under Postgres
-    // `REPLICA IDENTITY DEFAULT` (the WAL pre-image lacks the parent FK). The
-    // denormalizer queries the same OS index the dispatcher writes to recover
-    // the parent and recompose it — bounded memory, no DB-side replica-identity
-    // change. On by default; set VS_PG_SINK_REVERSE_LOOKUP=false to disable
-    // (then child tables need REPLICA IDENTITY FULL/USING INDEX to propagate
-    // child deletes).
-    if postgres_sink_reverse_lookup_enabled(runtime.engine_file_config.as_ref()) {
-        denorm = denorm.with_reverse_lookup(runtime.os.clone());
+    if runtime.sink.kind() == "redis" {
+        denorm = denorm.with_target_clears();
+    }
+    // OpenSearch can serve as a reverse index when the WAL delete pre-image
+    // lacks the parent key. Other sinks require complete replica identity.
+    if postgres_sink_reverse_lookup_enabled(
+        runtime.engine_file_config.as_ref(),
+        runtime.sink.kind() == "opensearch",
+    ) {
+        let os = runtime.sink.open_search().ok_or_else(|| {
+            anyhow!(
+                "Postgres sink reverse lookup requires OpenSearch; set \
+                 source.postgres.sink_reverse_lookup=false after configuring child tables \
+                 with a complete replica identity"
+            )
+        })?;
+        denorm = denorm.with_reverse_lookup(os.clone());
     }
 
     let sink_progress = Arc::new(AtomicU64::new(0));
+    let transform_progress = Arc::new(AtomicU64::new(0));
+    let denormalize_durability = sql_denormalize::SqlDenormalizeDurability::new(
+        Arc::clone(&transform_progress),
+        Arc::clone(&sink_progress),
+    );
     let lsn_flush = config_duration_ms_or_env(
         runtime
             .engine_file_config
@@ -1753,7 +1979,7 @@ async fn build_and_run_pg_sql_denormalize_engine(
     let source = PostgresCdcSource::new(pg)
         .with_sink_progress(Arc::clone(&sink_progress))
         .with_lsn_flush_interval(lsn_flush);
-    let sink = build_sink(runtime.os.clone())?;
+    let sink = build_sink(runtime.sink.clone(), &inner_shutdown).await?;
 
     info!(
         bus_capacity = runtime.engine_config.bus_capacity,
@@ -1777,7 +2003,7 @@ async fn build_and_run_pg_sql_denormalize_engine(
         runtime.engine_config.dispatcher.clone(),
         inner_shutdown.clone(),
     )
-    .with_sink_progress(Arc::clone(&sink_progress));
+    .with_transform_progress(Arc::clone(&transform_progress));
     if let Some(memory) = &memory_runtime {
         dispatcher = dispatcher.with_memory_budget(memory.budget());
     }
@@ -1811,7 +2037,12 @@ async fn build_and_run_pg_sql_denormalize_engine(
     let denorm_shutdown = inner_shutdown.clone();
     let denorm_handle = tokio::spawn(async move {
         denorm
-            .run(source_receiver, join_sender, denorm_shutdown)
+            .run(
+                source_receiver,
+                join_sender,
+                denorm_shutdown,
+                denormalize_durability,
+            )
             .await;
     });
     let dispatcher_handle = tokio::spawn(dispatcher.run(join_receiver));
@@ -1847,19 +2078,19 @@ async fn build_and_run_pg_sql_denormalize_engine(
 /// apply to every source.
 async fn run_cdc_neo4j(
     config: Neo4jCdcConfig,
-    os: OpenSearchConfig,
+    sink: SinkRuntimeConfig,
     engine_config: EngineConfig,
     shutdown: ShutdownToken,
 ) -> Result<()> {
     ventstream_telemetry::set_phase(ventstream_telemetry::LifecyclePhase::Starting);
     ventstream_telemetry::set_source("neo4j");
-    ventstream_telemetry::set_target("opensearch");
+    ventstream_telemetry::set_target(sink.kind());
 
     info!(
         neo4j_uri = %config.uri,
         neo4j_database = %config.database,
-        os_endpoint = %os.endpoint,
-        index_template = %os.index_template,
+        sink = sink.kind(),
+        sink_endpoint = %sink.endpoint(),
         "cdc pipeline configured (neo4j source)"
     );
 
@@ -1868,7 +2099,7 @@ async fn run_cdc_neo4j(
     run_cdc_loop(
         Neo4jBackend {
             config,
-            os,
+            sink,
             engine_config,
         },
         shutdown,
@@ -1967,7 +2198,7 @@ fn drain_neo4j_local_state(config: &Neo4jCdcConfig) -> Result<()> {
 /// return value to decide whether to terminate, idle, or restart.
 async fn build_and_run_neo4j_engine(
     config: Neo4jCdcConfig,
-    os: OpenSearchConfig,
+    sink_config: SinkRuntimeConfig,
     engine_cfg: EngineConfig,
     inner_shutdown: ShutdownToken,
     outer_shutdown: ShutdownToken,
@@ -1979,7 +2210,7 @@ async fn build_and_run_neo4j_engine(
     let sink_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let source =
         Neo4jCdcSource::new(config).with_sink_progress(std::sync::Arc::clone(&sink_progress));
-    let sink = build_sink(os)?;
+    let sink = build_sink(sink_config, &inner_shutdown).await?;
 
     info!(
         bus_capacity = engine_cfg.bus_capacity,
@@ -2005,19 +2236,19 @@ async fn build_and_run_neo4j_engine(
 
 async fn run_cdc_mongodb(
     config: MongoCdcConfig,
-    os: OpenSearchConfig,
+    sink: SinkRuntimeConfig,
     engine_config: EngineConfig,
     shutdown: ShutdownToken,
 ) -> Result<()> {
     ventstream_telemetry::set_phase(ventstream_telemetry::LifecyclePhase::Starting);
     ventstream_telemetry::set_source("mongodb");
-    ventstream_telemetry::set_target("opensearch");
+    ventstream_telemetry::set_target(sink.kind());
 
     info!(
         mongo_database = %config.database,
         mongo_namespace = %config.namespace,
-        os_endpoint = %os.endpoint,
-        index_template = %os.index_template,
+        sink = sink.kind(),
+        sink_endpoint = %sink.endpoint(),
         "cdc pipeline configured (mongodb source)"
     );
 
@@ -2025,7 +2256,7 @@ async fn run_cdc_mongodb(
     run_cdc_loop(
         MongoBackend {
             config,
-            os,
+            sink,
             engine_config,
         },
         shutdown,
@@ -2054,13 +2285,13 @@ fn drain_mongodb_local_state(config: &MongoCdcConfig) -> Result<()> {
 /// idempotent doc-id upserts make re-emits harmless on restart).
 async fn build_and_run_mongodb_engine(
     config: MongoCdcConfig,
-    os: OpenSearchConfig,
+    sink_config: SinkRuntimeConfig,
     engine_cfg: EngineConfig,
     inner_shutdown: ShutdownToken,
     outer_shutdown: ShutdownToken,
 ) -> Result<EngineIterationOutcome> {
     let source = MongoCdcSource::new(config);
-    let sink = build_sink(os)?;
+    let sink = build_sink(sink_config, &inner_shutdown).await?;
 
     info!(
         bus_capacity = engine_cfg.bus_capacity,
@@ -2092,13 +2323,13 @@ async fn run_cdc_mysql(
 ) -> Result<()> {
     ventstream_telemetry::set_phase(ventstream_telemetry::LifecyclePhase::Starting);
     ventstream_telemetry::set_source("mysql");
-    ventstream_telemetry::set_target("opensearch");
+    ventstream_telemetry::set_target(runtime.sink.kind());
 
     info!(
         mysql_host = %config.host,
         mysql_database = %config.database,
-        os_endpoint = %runtime.os.endpoint,
-        index_template = %runtime.os.index_template,
+        sink = runtime.sink.kind(),
+        sink_endpoint = %runtime.sink.endpoint(),
         joins_count = joins.len(),
         "cdc pipeline configured (mysql source)"
     );
@@ -2260,7 +2491,7 @@ async fn build_and_run_mysql_engine(
         .with_sink_progress(Arc::clone(&sink_progress))
         .with_snapshot_completion_marker(join_engine.is_some())
         .with_forced_snapshot_from_cursor(force_snapshot_from_cursor);
-    let sink = build_sink(runtime.os.clone())?;
+    let sink = build_sink(runtime.sink.clone(), &inner_shutdown).await?;
     let mut engine_config = runtime.engine_config;
     engine_config.dispatcher = mysql_dispatcher_config(engine_config.dispatcher);
 
@@ -2330,19 +2561,38 @@ async fn build_and_run_mysql_sql_denormalize_engine(
         "VS_MYSQL_RECOMPOSE_CONCURRENCY",
         4,
     )?;
+    let requires_full_row_image = mysql_joins_require_full_row_image(&joins);
     let mut denorm = mysql_sql_denormalize::MySqlDenormalizer::connect(&config, joins, chunk)
         .await
         .context("building MySQL SQL denormalizer")?
         .with_recompose_limits(recompose_chunk, recompose_concurrency);
-    // Sink reverse-lookup for 1:many child deletes (the `{}` delete carries no
-    // FK; the parent is found via the OS index). On by default.
-    if mysql_sink_reverse_lookup_enabled(runtime.engine_file_config.as_ref()) {
-        denorm = denorm.with_reverse_lookup(runtime.os.clone());
+    if requires_full_row_image {
+        denorm
+            .require_full_binlog_row_image()
+            .await
+            .context("validating MySQL joined-delete pre-images")?;
+    }
+    // OpenSearch remains a fallback for reduced delete images. Other sinks
+    // consume the MySQL before-image and require binlog_row_image=FULL.
+    if mysql_sink_reverse_lookup_enabled(
+        runtime.engine_file_config.as_ref(),
+        runtime.sink.kind() == "opensearch",
+    ) {
+        let os = runtime.sink.open_search().ok_or_else(|| {
+            anyhow!(
+                "MySQL sink reverse lookup requires OpenSearch; set \
+                 source.mysql.sink_reverse_lookup=false only when child deletes carry the \
+                 parent key"
+            )
+        })?;
+        denorm = denorm.with_reverse_lookup(os.clone());
     }
 
     let sink_progress = Arc::new(AtomicU64::new(0));
-    let source = MySqlCdcSource::new(config).with_sink_progress(Arc::clone(&sink_progress));
-    let sink = build_sink(runtime.os.clone())?;
+    let source = MySqlCdcSource::new(config)
+        .with_sink_progress(Arc::clone(&sink_progress))
+        .with_transition_images(true);
+    let sink = build_sink(runtime.sink.clone(), &inner_shutdown).await?;
     let dispatcher_config = mysql_dispatcher_config(runtime.engine_config.dispatcher.clone());
 
     info!(
@@ -2435,26 +2685,26 @@ async fn build_and_run_mysql_sql_denormalize_engine(
 
 async fn run_cdc_kafka(
     config: KafkaCdcConfig,
-    os: OpenSearchConfig,
+    sink: SinkRuntimeConfig,
     engine_config: EngineConfig,
     shutdown: ShutdownToken,
 ) -> Result<()> {
     ventstream_telemetry::set_phase(ventstream_telemetry::LifecyclePhase::Starting);
     ventstream_telemetry::set_source("kafka");
-    ventstream_telemetry::set_target("opensearch");
+    ventstream_telemetry::set_target(sink.kind());
 
     info!(
         kafka_brokers = %config.brokers,
         kafka_group = %config.group_id,
-        os_endpoint = %os.endpoint,
-        index_template = %os.index_template,
+        sink = sink.kind(),
+        sink_endpoint = %sink.endpoint(),
         "cdc pipeline configured (kafka source)"
     );
 
     run_cdc_loop(
         KafkaBackend {
             config,
-            os,
+            sink,
             engine_config,
         },
         shutdown,
@@ -2467,7 +2717,7 @@ async fn run_cdc_kafka(
 /// seq the sink has durably written — no-loss at-least-once.
 async fn build_and_run_kafka_engine(
     config: KafkaCdcConfig,
-    os: OpenSearchConfig,
+    sink_config: SinkRuntimeConfig,
     engine_cfg: EngineConfig,
     inner_shutdown: ShutdownToken,
     outer_shutdown: ShutdownToken,
@@ -2475,7 +2725,7 @@ async fn build_and_run_kafka_engine(
     let sink_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let source =
         KafkaCdcSource::new(config).with_sink_progress(std::sync::Arc::clone(&sink_progress));
-    let sink = build_sink(os)?;
+    let sink = build_sink(sink_config, &inner_shutdown).await?;
 
     info!(
         bus_capacity = engine_cfg.bus_capacity,
@@ -2515,11 +2765,276 @@ struct CdcBundle {
     joins_yaml_text: Option<String>,
 }
 
+impl CdcBundle {
+    async fn validate_redis_drain(&self) -> Result<Vec<String>> {
+        let (targets, replayable) = match &self.source {
+            CdcSourceConfig::Postgres(config) => (
+                postgres_redis_drain_targets(&self.runtime.sink, config, &self.joins).await?,
+                true,
+            ),
+            CdcSourceConfig::Neo4j(config) => (
+                neo4j_redis_drain_targets(&self.runtime.sink, config)?,
+                config.bootstrap.is_some(),
+            ),
+            CdcSourceConfig::Mongo(config) => (
+                mongodb_redis_drain_targets(&self.runtime.sink, config)?,
+                config.bootstrap,
+            ),
+            CdcSourceConfig::Mysql(config) => (
+                mysql_redis_drain_targets(&self.runtime.sink, config, &self.joins)?,
+                config.bootstrap,
+            ),
+            CdcSourceConfig::Kafka(_) => {
+                if self.runtime.sink.redis().is_some() {
+                    return Err(anyhow!(
+                        "Redis drain/rebuild is not supported for Kafka because consumer offsets cannot be reset atomically by the engine"
+                    ));
+                }
+                (Vec::new(), true)
+            }
+        };
+        self.runtime
+            .sink
+            .validate_redis_drain(replayable, &targets)?;
+        Ok(targets)
+    }
+}
+
 #[derive(Clone)]
 struct CdcRuntime {
-    os: OpenSearchConfig,
+    sink: SinkRuntimeConfig,
     engine_config: EngineConfig,
     engine_file_config: Option<EngineFileConfig>,
+}
+
+#[derive(Clone)]
+enum SinkRuntimeConfig {
+    OpenSearch(Box<OpenSearchConfig>),
+    Redis(Box<RedisConfig>),
+}
+
+impl SinkRuntimeConfig {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::OpenSearch(_) => "opensearch",
+            Self::Redis(_) => "redis",
+        }
+    }
+
+    fn endpoint(&self) -> &str {
+        match self {
+            Self::OpenSearch(config) => &config.endpoint,
+            Self::Redis(config) => config
+                .discovery_endpoint()
+                .unwrap_or("redis://unconfigured"),
+        }
+    }
+
+    fn open_search(&self) -> Option<&OpenSearchConfig> {
+        match self {
+            Self::OpenSearch(config) => Some(config),
+            Self::Redis(_) => None,
+        }
+    }
+
+    fn redis(&self) -> Option<&RedisConfig> {
+        match self {
+            Self::OpenSearch(_) => None,
+            Self::Redis(config) => Some(config),
+        }
+    }
+
+    fn validate_redis_drain(&self, replayable: bool, targets: &[String]) -> Result<()> {
+        let Some(redis) = self.redis() else {
+            return Ok(());
+        };
+        if redis.keyspace_ownership != RedisKeyspaceOwnership::Exclusive {
+            return Err(anyhow!(
+                "Redis drain/rebuild requires sink.redis.keyspace.ownership=exclusive; no local cursor state was removed"
+            ));
+        }
+        if !replayable {
+            return Err(anyhow!(
+                "Redis drain/rebuild requires snapshot bootstrap to be enabled; no local cursor state was removed"
+            ));
+        }
+        if targets.is_empty() {
+            return Err(anyhow!(
+                "Redis drain/rebuild requires a finite, statically known target set; no local cursor state was removed"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn reset_redis_targets_if_configured(&self, targets: &[String]) -> Result<bool> {
+        let Some(redis) = self.redis() else {
+            return Ok(false);
+        };
+        RedisSink::reset_owned_targets(redis.clone(), targets)
+            .await
+            .context("resetting exclusively owned Redis targets")?;
+        Ok(true)
+    }
+
+    fn ensure_drain_reconciliation_supported(&self) -> Result<()> {
+        match self {
+            Self::OpenSearch(_) => Ok(()),
+            Self::Redis(_) => Err(anyhow!(
+                "Redis orphan reconciliation is not available; drain-resume is blocked"
+            )),
+        }
+    }
+
+    fn attach_health(&mut self, health: ventstream_core::SinkHealth) {
+        match self {
+            Self::OpenSearch(config) => config.delivery_health = Some(health),
+            Self::Redis(config) => config.delivery_health = Some(health),
+        }
+    }
+}
+
+fn routed_redis_drain_targets(
+    sink: &SinkRuntimeConfig,
+    relations: Vec<String>,
+    projection_targets: Vec<Option<String>>,
+) -> Result<Vec<String>> {
+    let Some(redis) = sink.redis() else {
+        return Ok(Vec::new());
+    };
+    let targets = match &redis.key_routing {
+        RedisKeyRouting::Fixed(target) => vec![target.clone()],
+        RedisKeyRouting::ByOutputRelation => relations,
+        RedisKeyRouting::ByProjectionTarget => {
+            if projection_targets.iter().any(Option::is_none) {
+                return Err(anyhow!(
+                    "Redis drain/rebuild with by_projection_target routing requires every projection to declare target.index"
+                ));
+            }
+            projection_targets.into_iter().flatten().collect()
+        }
+        RedisKeyRouting::Views(views) => views.iter().map(|view| view.name.clone()).collect(),
+    };
+    let targets = targets
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Err(anyhow!(
+            "Redis drain/rebuild cannot infer a finite target set for the configured routing"
+        ));
+    }
+    Ok(targets)
+}
+
+async fn postgres_redis_drain_targets(
+    sink: &SinkRuntimeConfig,
+    config: &PostgresCdcConfig,
+    joins: &[JoinDefinition],
+) -> Result<Vec<String>> {
+    let relations = if joins.is_empty() {
+        let configured = config
+            .bootstrap
+            .as_ref()
+            .map(|bootstrap| {
+                bootstrap
+                    .tables
+                    .iter()
+                    .map(|table| table.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !configured.is_empty()
+            || !matches!(
+                sink.redis().map(|redis| &redis.key_routing),
+                Some(RedisKeyRouting::ByOutputRelation)
+            )
+        {
+            configured
+        } else {
+            let client = ventstream_sources::postgres::connect_client(
+                config,
+                "Redis drain target discovery",
+            )
+            .await
+            .context("connecting for Redis drain target discovery")?;
+            sql_denormalize::discover_direct_projections(&client, &config.publication)
+                .await?
+                .iter()
+                .map(|projection| split_table(&projection.primary.table).1)
+                .collect()
+        }
+    } else {
+        joins
+            .iter()
+            .map(|join| split_table(&join.primary.table).1)
+            .collect()
+    };
+    let projection_targets = joins
+        .iter()
+        .map(|join| join.target_index().map(str::to_owned))
+        .collect();
+    routed_redis_drain_targets(sink, relations, projection_targets)
+}
+
+fn mysql_redis_drain_targets(
+    sink: &SinkRuntimeConfig,
+    config: &MySqlCdcConfig,
+    joins: &[JoinDefinition],
+) -> Result<Vec<String>> {
+    let relations = if joins.is_empty() {
+        config.tables.clone()
+    } else {
+        joins
+            .iter()
+            .map(|join| split_table(&join.primary.table).1)
+            .collect()
+    };
+    let projection_targets = joins
+        .iter()
+        .map(|join| join.target_index().map(str::to_owned))
+        .collect();
+    routed_redis_drain_targets(sink, relations, projection_targets)
+}
+
+fn mongodb_redis_drain_targets(
+    sink: &SinkRuntimeConfig,
+    config: &MongoCdcConfig,
+) -> Result<Vec<String>> {
+    routed_redis_drain_targets(sink, config.collections.clone(), Vec::new())
+}
+
+fn neo4j_redis_drain_targets(
+    sink: &SinkRuntimeConfig,
+    config: &Neo4jCdcConfig,
+) -> Result<Vec<String>> {
+    let relations = if let Some(specs) = &config.denormalize {
+        specs
+            .denormalize
+            .iter()
+            .map(|spec| spec.output_table.clone())
+            .collect()
+    } else {
+        config
+            .label_filter
+            .iter()
+            .map(|label| {
+                config
+                    .label_table_map
+                    .get(label)
+                    .cloned()
+                    .unwrap_or_else(|| label.clone())
+            })
+            .chain(config.reltype_filter.iter().map(|rel_type| {
+                config
+                    .reltype_table_map
+                    .get(rel_type)
+                    .cloned()
+                    .unwrap_or_else(|| rel_type.clone())
+            }))
+            .collect()
+    };
+    routed_redis_drain_targets(sink, relations, Vec::new())
 }
 
 /// Discriminated union of source-specific configs, picked by env.
@@ -3007,6 +3522,532 @@ fn load_cdc_bundle(
     }
 }
 
+fn load_sink_config(engine_config: Option<&EngineFileConfig>) -> Result<SinkRuntimeConfig> {
+    let configured_kind = engine_config
+        .and_then(|config| config.sink.as_ref())
+        .map(|sink| sink.kind);
+    let env_kind = if configured_kind.is_none() {
+        opt("VS_SINK")?.unwrap_or_else(|| "opensearch".to_owned())
+    } else {
+        String::new()
+    };
+    match configured_kind {
+        Some(SinkKind::Opensearch | SinkKind::Elasticsearch) => {
+            load_opensearch_config(engine_config)
+                .map(Box::new)
+                .map(SinkRuntimeConfig::OpenSearch)
+        }
+        Some(SinkKind::Redis) => load_redis_sink_config(engine_config)
+            .map(Box::new)
+            .map(SinkRuntimeConfig::Redis),
+        None => match env_kind.trim().to_ascii_lowercase().as_str() {
+            "opensearch" | "elasticsearch" | "es" => load_opensearch_config(engine_config)
+                .map(Box::new)
+                .map(SinkRuntimeConfig::OpenSearch),
+            "redis" => load_redis_sink_config(engine_config)
+                .map(Box::new)
+                .map(SinkRuntimeConfig::Redis),
+            other => Err(anyhow!(
+                "unknown VS_SINK '{other}' (expected 'opensearch', 'elasticsearch', or 'redis')"
+            )),
+        },
+    }
+}
+
+fn load_redis_sink_config(engine_config: Option<&EngineFileConfig>) -> Result<RedisConfig> {
+    let file = engine_config
+        .and_then(|config| config.sink.as_ref())
+        .and_then(|sink| sink.redis.as_ref());
+    let topology = match file {
+        Some(config) => match &config.topology {
+            None => RedisTopology::Standalone {
+                endpoint: resolve_value_ref(config.endpoint_ref.as_ref().ok_or_else(|| {
+                    anyhow!("sink.redis.endpoint_ref is required for standalone topology")
+                })?)?,
+            },
+            Some(FileRedisTopology::Cluster { endpoints }) => RedisTopology::Cluster {
+                endpoints: endpoints
+                    .iter()
+                    .map(resolve_value_ref)
+                    .collect::<Result<Vec<_>>>()?,
+            },
+            Some(FileRedisTopology::Sentinel {
+                service_name,
+                endpoints,
+                data_node_tls,
+                sentinel_auth,
+                sentinel_tls,
+            }) => {
+                let ResolvedRedisAuth {
+                    username,
+                    password,
+                    username_file,
+                    password_file,
+                } = resolve_redis_auth(sentinel_auth.as_ref())?;
+                RedisTopology::Sentinel(RedisSentinelTopology {
+                    endpoints: endpoints
+                        .iter()
+                        .map(resolve_value_ref)
+                        .collect::<Result<Vec<_>>>()?,
+                    service_name: service_name.clone(),
+                    data_node_tls: *data_node_tls,
+                    username,
+                    password,
+                    username_file,
+                    password_file,
+                    tls: load_redis_tls(
+                        sentinel_tls.as_ref(),
+                        "VS_REDIS_SINK_SENTINEL_TLS_CA_FILE",
+                        "VS_REDIS_SINK_SENTINEL_TLS_CLIENT_CERT_FILE",
+                        "VS_REDIS_SINK_SENTINEL_TLS_CLIENT_KEY_FILE",
+                    )?,
+                })
+            }
+        },
+        None => match opt("VS_REDIS_SINK_TOPOLOGY")?
+            .unwrap_or_else(|| "standalone".to_owned())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "standalone" => RedisTopology::Standalone {
+                endpoint: req("VS_REDIS_SINK_URL")?,
+            },
+            "cluster" => RedisTopology::Cluster {
+                endpoints: redis_endpoint_list_env("VS_REDIS_SINK_CLUSTER_URLS")?,
+            },
+            "sentinel" => RedisTopology::Sentinel(RedisSentinelTopology {
+                endpoints: redis_endpoint_list_env("VS_REDIS_SINK_SENTINEL_URLS")?,
+                service_name: req("VS_REDIS_SINK_SENTINEL_SERVICE")?,
+                data_node_tls: bool_env("VS_REDIS_SINK_SENTINEL_DATA_NODE_TLS", false),
+                username: std::env::var("VS_REDIS_SINK_SENTINEL_USERNAME").ok(),
+                password: std::env::var("VS_REDIS_SINK_SENTINEL_PASSWORD").ok(),
+                username_file: opt("VS_REDIS_SINK_SENTINEL_USERNAME_FILE")?.map(PathBuf::from),
+                password_file: opt("VS_REDIS_SINK_SENTINEL_PASSWORD_FILE")?.map(PathBuf::from),
+                tls: load_redis_tls(
+                    None,
+                    "VS_REDIS_SINK_SENTINEL_TLS_CA_FILE",
+                    "VS_REDIS_SINK_SENTINEL_TLS_CLIENT_CERT_FILE",
+                    "VS_REDIS_SINK_SENTINEL_TLS_CLIENT_KEY_FILE",
+                )?,
+            }),
+            other => {
+                return Err(anyhow!(
+                    "unknown VS_REDIS_SINK_TOPOLOGY '{other}' (expected standalone, sentinel, or cluster)"
+                ))
+            }
+        },
+    };
+    let key_prefix = match file {
+        Some(config) => config.keyspace.prefix.clone(),
+        None => req("VS_REDIS_SINK_KEY_PREFIX")?,
+    };
+    let key_routing = match file.map(|config| &config.keyspace.routing) {
+        Some(FileRedisKeyRouting::ByOutputRelation) => RedisKeyRouting::ByOutputRelation,
+        Some(FileRedisKeyRouting::ByProjectionTarget) => RedisKeyRouting::ByProjectionTarget,
+        Some(FileRedisKeyRouting::Fixed { name }) => RedisKeyRouting::Fixed(name.clone()),
+        Some(FileRedisKeyRouting::Views { views }) => RedisKeyRouting::Views(
+            views
+                .iter()
+                .map(|view| RedisView {
+                    name: view.name.clone(),
+                    source: RedisViewSource {
+                        namespace: view.source.namespace.clone(),
+                        relation: view.source.relation.clone(),
+                        projection_target: view.source.projection_target.clone(),
+                    },
+                    key: RedisViewKey {
+                        template: view.key.template.clone(),
+                        on_missing: match view.key.on_missing {
+                            FileRedisViewMissingBehavior::Block => RedisViewMissingBehavior::Block,
+                            FileRedisViewMissingBehavior::Skip => RedisViewMissingBehavior::Skip,
+                        },
+                    },
+                    filter: view.filter.as_ref().map(|filter| RedisViewFilter {
+                        mode: match filter.mode {
+                            FileRedisViewFilterMode::All => RedisViewFilterMode::All,
+                            FileRedisViewFilterMode::Any => RedisViewFilterMode::Any,
+                        },
+                        conditions: filter
+                            .conditions
+                            .iter()
+                            .map(|condition| match condition {
+                                FileRedisViewCondition::Equals { path, value } => {
+                                    RedisViewCondition {
+                                        path: path.clone(),
+                                        operator: RedisViewConditionOperator::Equals(value.clone()),
+                                    }
+                                }
+                                FileRedisViewCondition::NotEquals { path, value } => {
+                                    RedisViewCondition {
+                                        path: path.clone(),
+                                        operator: RedisViewConditionOperator::NotEquals(
+                                            value.clone(),
+                                        ),
+                                    }
+                                }
+                                FileRedisViewCondition::In { path, values } => RedisViewCondition {
+                                    path: path.clone(),
+                                    operator: RedisViewConditionOperator::In(values.clone()),
+                                },
+                                FileRedisViewCondition::NotIn { path, values } => {
+                                    RedisViewCondition {
+                                        path: path.clone(),
+                                        operator: RedisViewConditionOperator::NotIn(values.clone()),
+                                    }
+                                }
+                                FileRedisViewCondition::Exists { path } => RedisViewCondition {
+                                    path: path.clone(),
+                                    operator: RedisViewConditionOperator::Exists,
+                                },
+                                FileRedisViewCondition::NotExists { path } => RedisViewCondition {
+                                    path: path.clone(),
+                                    operator: RedisViewConditionOperator::NotExists,
+                                },
+                            })
+                            .collect(),
+                    }),
+                    value: match &view.value {
+                        FileRedisViewValue::Document => RedisViewValue::Document,
+                        FileRedisViewValue::Pointer { path } => {
+                            RedisViewValue::Pointer(path.clone())
+                        }
+                        FileRedisViewValue::Fields { fields } => {
+                            RedisViewValue::Fields(fields.clone())
+                        }
+                    },
+                })
+                .collect(),
+        ),
+        None => match opt("VS_REDIS_SINK_KEY_ROUTING")?
+            .unwrap_or_else(|| "by_output_relation".to_owned())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "by_output_relation" | "relation" => RedisKeyRouting::ByOutputRelation,
+            "by_projection_target" | "projection" => RedisKeyRouting::ByProjectionTarget,
+            "fixed" => RedisKeyRouting::Fixed(req("VS_REDIS_SINK_FIXED_TARGET")?),
+            other => {
+                return Err(anyhow!(
+                    "unknown VS_REDIS_SINK_KEY_ROUTING '{other}' \
+                     (expected by_output_relation, by_projection_target, or fixed)"
+                ))
+            }
+        },
+    };
+    let keyspace_ownership = match file.map(|config| config.keyspace.ownership) {
+        Some(FileRedisKeyspaceOwnership::Shared) => RedisKeyspaceOwnership::Shared,
+        Some(FileRedisKeyspaceOwnership::Exclusive) => RedisKeyspaceOwnership::Exclusive,
+        None => match opt("VS_REDIS_SINK_KEYSPACE_OWNERSHIP")?
+            .unwrap_or_else(|| "shared".to_owned())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "shared" => RedisKeyspaceOwnership::Shared,
+            "exclusive" => RedisKeyspaceOwnership::Exclusive,
+            other => {
+                return Err(anyhow!(
+                    "unknown VS_REDIS_SINK_KEYSPACE_OWNERSHIP '{other}' \
+                     (expected shared or exclusive)"
+                ))
+            }
+        },
+    };
+    let ResolvedRedisAuth {
+        username,
+        password,
+        username_file,
+        password_file,
+    } = match file {
+        None => ResolvedRedisAuth {
+            username: std::env::var("VS_REDIS_SINK_USERNAME").ok(),
+            password: std::env::var("VS_REDIS_SINK_PASSWORD").ok(),
+            username_file: opt("VS_REDIS_SINK_USERNAME_FILE")?.map(PathBuf::from),
+            password_file: opt("VS_REDIS_SINK_PASSWORD_FILE")?.map(PathBuf::from),
+        },
+        Some(config) => resolve_redis_auth(config.auth.as_ref())?,
+    };
+    let document_format = match file.map(|config| config.document.format) {
+        Some(FileRedisDocumentFormat::String) => RedisDocumentFormat::String,
+        Some(FileRedisDocumentFormat::Json) => RedisDocumentFormat::Json,
+        None => match opt("VS_REDIS_SINK_DOCUMENT_FORMAT")?
+            .unwrap_or_else(|| "string".to_owned())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "string" => RedisDocumentFormat::String,
+            "json" | "redis_json" => RedisDocumentFormat::Json,
+            other => {
+                return Err(anyhow!(
+                    "unknown VS_REDIS_SINK_DOCUMENT_FORMAT '{other}' (expected string or json)"
+                ))
+            }
+        },
+    };
+    let contract = match file.map(|config| &config.contract) {
+        Some(FileRedisContract::MaterializedView) => RedisContract::MaterializedView,
+        Some(FileRedisContract::Cache { ttl_ms }) => RedisContract::Cache {
+            ttl: Duration::from_millis(*ttl_ms),
+        },
+        None => match opt("VS_REDIS_SINK_CONTRACT")?
+            .unwrap_or_else(|| "materialized_view".to_owned())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "materialized_view" | "materialized" => RedisContract::MaterializedView,
+            "cache" => RedisContract::Cache {
+                ttl: Duration::from_millis(lenient_int::<u64>(
+                    "VS_REDIS_SINK_TTL_MS",
+                    &req("VS_REDIS_SINK_TTL_MS")?,
+                )?),
+            },
+            other => {
+                return Err(anyhow!(
+                    "unknown VS_REDIS_SINK_CONTRACT '{other}' (expected materialized_view or cache)"
+                ))
+            }
+        },
+    };
+    let acknowledgement = match file.map(|config| &config.acknowledgement) {
+        Some(FileRedisAcknowledgement::Primary) => RedisAcknowledgement::Primary,
+        Some(FileRedisAcknowledgement::Replicated {
+            replicas,
+            timeout_ms,
+        }) => RedisAcknowledgement::Replicated {
+            replicas: *replicas,
+            timeout: Duration::from_millis(*timeout_ms),
+        },
+        Some(FileRedisAcknowledgement::Aof {
+            local,
+            replicas,
+            timeout_ms,
+        }) => RedisAcknowledgement::Aof {
+            local: *local,
+            replicas: *replicas,
+            timeout: Duration::from_millis(*timeout_ms),
+        },
+        None => load_redis_acknowledgement_from_env()?,
+    };
+    let tls = load_redis_tls(
+        file.and_then(|config| config.tls.as_ref()),
+        "VS_REDIS_SINK_TLS_CA_FILE",
+        "VS_REDIS_SINK_TLS_CLIENT_CERT_FILE",
+        "VS_REDIS_SINK_TLS_CLIENT_KEY_FILE",
+    )?;
+    let writer_id = match file.and_then(|config| config.writer.id_ref.as_ref()) {
+        Some(reference) => resolve_value_ref(reference)?,
+        None => opt("VS_REDIS_SINK_WRITER_ID")?
+            .or_else(|| std::env::var("VS_FLEET_DEPLOYMENT_ID").ok())
+            .unwrap_or_else(|| "standalone".to_owned()),
+    };
+    let writer_takeover_from =
+        match file.and_then(|config| config.writer.takeover_from_ref.as_ref()) {
+            Some(reference) => Some(resolve_value_ref(reference)?),
+            None => opt("VS_REDIS_SINK_WRITER_TAKEOVER_FROM")?,
+        };
+
+    let bootstrap_endpoint = match &topology {
+        RedisTopology::Standalone { endpoint } => endpoint.clone(),
+        RedisTopology::Sentinel(sentinel) => sentinel
+            .endpoints
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("Redis Sentinel requires at least one endpoint"))?,
+        RedisTopology::Cluster { endpoints } => endpoints
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("Redis Cluster requires at least one endpoint"))?,
+    };
+    let mut config = RedisConfig::new("redis", bootstrap_endpoint, key_prefix, key_routing)
+        .with_topology(topology)
+        .with_keyspace_ownership(keyspace_ownership)
+        .with_auth_sources(username, password, username_file, password_file)
+        .with_tls(tls)
+        .with_document_format(document_format)
+        .with_contract(contract)
+        .with_acknowledgement(acknowledgement)
+        .with_writer_id(writer_id);
+    if let Some(previous) = writer_takeover_from {
+        config = config.with_writer_takeover_from(previous);
+    }
+    config.writer_lease = config_duration_ms_or_env(
+        file.and_then(|config| config.writer.lease_ms),
+        "VS_REDIS_SINK_WRITER_LEASE_MS",
+        config.writer_lease,
+    )?;
+    config.max_batch_bytes = config_usize_or_env(
+        file.and_then(|config| config.max_batch_bytes),
+        "VS_REDIS_SINK_MAX_BATCH_BYTES",
+        config.max_batch_bytes,
+    )?;
+    config.max_key_bytes = config_usize_or_env(
+        file.and_then(|config| config.max_key_bytes),
+        "VS_REDIS_SINK_MAX_KEY_BYTES",
+        config.max_key_bytes,
+    )?;
+    config.max_value_bytes = config_usize_or_env(
+        file.and_then(|config| config.max_value_bytes),
+        "VS_REDIS_SINK_MAX_VALUE_BYTES",
+        config.max_value_bytes,
+    )?;
+    config.connect_timeout = config_duration_ms_or_env(
+        file.and_then(|config| config.connect_timeout_ms),
+        "VS_REDIS_SINK_CONNECT_TIMEOUT_MS",
+        config.connect_timeout,
+    )?;
+    config.response_timeout = config_duration_ms_or_env(
+        file.and_then(|config| config.response_timeout_ms),
+        "VS_REDIS_SINK_RESPONSE_TIMEOUT_MS",
+        config.response_timeout,
+    )?;
+    Ok(config)
+}
+
+fn load_redis_acknowledgement_from_env() -> Result<RedisAcknowledgement> {
+    let mode = opt("VS_REDIS_SINK_ACK_MODE")?.map(|value| value.trim().to_ascii_lowercase());
+    let replicas = || -> Result<usize> {
+        match opt("VS_REDIS_SINK_ACK_REPLICAS")? {
+            Some(value) => lenient_int("VS_REDIS_SINK_ACK_REPLICAS", &value),
+            None => Ok(0),
+        }
+    };
+    let timeout = || opt_duration_ms("VS_REDIS_SINK_ACK_TIMEOUT_MS", Duration::from_secs(1));
+    match mode.as_deref() {
+        Some("primary") => Ok(RedisAcknowledgement::Primary),
+        Some("replicated") => {
+            let replicas = replicas()?;
+            if replicas == 0 {
+                return Err(anyhow!(
+                    "VS_REDIS_SINK_ACK_REPLICAS must be positive when VS_REDIS_SINK_ACK_MODE=replicated"
+                ));
+            }
+            Ok(RedisAcknowledgement::Replicated {
+                replicas,
+                timeout: timeout()?,
+            })
+        }
+        Some("aof") => Ok(RedisAcknowledgement::Aof {
+            local: strict_bool_env("VS_REDIS_SINK_ACK_LOCAL_AOF", true)?,
+            replicas: replicas()?,
+            timeout: timeout()?,
+        }),
+        Some(other) => Err(anyhow!(
+            "unknown VS_REDIS_SINK_ACK_MODE '{other}' (expected primary, replicated, or aof)"
+        )),
+        None => match opt("VS_REDIS_SINK_ACK_REPLICAS")? {
+            Some(value) => Ok(RedisAcknowledgement::Replicated {
+                replicas: lenient_int("VS_REDIS_SINK_ACK_REPLICAS", &value)?,
+                timeout: timeout()?,
+            }),
+            None => Ok(RedisAcknowledgement::Primary),
+        },
+    }
+}
+
+fn strict_bool_env(name: &str, default: bool) -> Result<bool> {
+    let Some(value) = opt(name)? else {
+        return Ok(default);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(anyhow!(
+            "env var {name} must be true, false, 1, 0, yes, no, on, or off"
+        )),
+    }
+}
+
+struct ResolvedRedisAuth {
+    username: Option<String>,
+    password: Option<String>,
+    username_file: Option<PathBuf>,
+    password_file: Option<PathBuf>,
+}
+
+fn resolve_redis_auth(auth: Option<&FileRedisAuth>) -> Result<ResolvedRedisAuth> {
+    match auth {
+        None | Some(FileRedisAuth::None) => Ok(ResolvedRedisAuth {
+            username: None,
+            password: None,
+            username_file: None,
+            password_file: None,
+        }),
+        Some(FileRedisAuth::Acl {
+            username_ref,
+            password_ref,
+        }) => {
+            let (username, username_file) = resolve_redis_credential_ref(username_ref)?;
+            let (password, password_file) = resolve_redis_credential_ref(password_ref)?;
+            Ok(ResolvedRedisAuth {
+                username,
+                password,
+                username_file,
+                password_file,
+            })
+        }
+        Some(FileRedisAuth::Password { password_ref }) => {
+            let (password, password_file) = resolve_redis_credential_ref(password_ref)?;
+            Ok(ResolvedRedisAuth {
+                username: None,
+                password,
+                username_file: None,
+                password_file,
+            })
+        }
+    }
+}
+
+fn resolve_redis_credential_ref(reference: &ValueRef) -> Result<(Option<String>, Option<PathBuf>)> {
+    match reference {
+        ValueRef::Env(name) => Ok((Some(req(name)?), None)),
+        ValueRef::File(path) => Ok((None, Some(path.clone()))),
+    }
+}
+
+fn redis_endpoint_list_env(name: &str) -> Result<Vec<String>> {
+    let value = req(name)?;
+    let endpoints = value
+        .split(',')
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if endpoints.is_empty() {
+        return Err(anyhow!("{name} must contain at least one Redis endpoint"));
+    }
+    Ok(endpoints)
+}
+
+fn load_redis_tls(
+    config: Option<&FileRedisTlsConfig>,
+    ca_env: &str,
+    cert_env: &str,
+    key_env: &str,
+) -> Result<RedisTlsConfig> {
+    Ok(RedisTlsConfig {
+        ca_file: redis_tls_path(config, ca_env, |tls| tls.ca_file.clone())?,
+        client_cert_file: redis_tls_path(config, cert_env, |tls| tls.client_cert_file.clone())?,
+        client_key_file: redis_tls_path(config, key_env, |tls| tls.client_key_file.clone())?,
+    })
+}
+
+fn redis_tls_path(
+    config: Option<&FileRedisTlsConfig>,
+    env_name: &str,
+    from_config: impl FnOnce(&FileRedisTlsConfig) -> Option<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    if let Some(path) = config.and_then(from_config) {
+        return Ok(Some(path));
+    }
+    Ok(opt(env_name)?
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from))
+}
+
 fn load_opensearch_config(engine_config: Option<&EngineFileConfig>) -> Result<OpenSearchConfig> {
     let Some(config) = engine_config.and_then(|config| config.sink.as_ref()) else {
         return load_opensearch_config_from_env();
@@ -3127,7 +4168,35 @@ fn load_opensearch_config_from_env() -> Result<OpenSearchConfig> {
 fn resolve_value_ref(reference: &ValueRef) -> Result<String> {
     match reference {
         ValueRef::Env(name) => req(name),
+        ValueRef::File(path) => read_value_ref_file(path),
     }
+}
+
+fn read_value_ref_file(path: &Path) -> Result<String> {
+    const MAX_VALUE_REF_BYTES: u64 = 1024 * 1024;
+
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("unable to inspect value reference {}", path.display()))?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_VALUE_REF_BYTES {
+        return Err(anyhow!(
+            "value reference {} must be a regular file of 1 to {MAX_VALUE_REF_BYTES} bytes",
+            path.display()
+        ));
+    }
+    let value = std::fs::read_to_string(path)
+        .with_context(|| format!("unable to read value reference {}", path.display()))?;
+    let value = value
+        .strip_suffix("\r\n")
+        .or_else(|| value.strip_suffix('\n'))
+        .unwrap_or(&value)
+        .to_owned();
+    if value.is_empty() {
+        return Err(anyhow!(
+            "value reference {} must not be empty",
+            path.display()
+        ));
+    }
+    Ok(value)
 }
 
 fn database_tls_or_env(
@@ -3409,26 +4478,46 @@ fn mysql_bootstrap_chunk_size(
     )
 }
 
-fn postgres_sink_reverse_lookup_enabled(engine_config: Option<&EngineFileConfig>) -> bool {
+fn postgres_sink_reverse_lookup_enabled(
+    engine_config: Option<&EngineFileConfig>,
+    default: bool,
+) -> bool {
     config_bool_or_env(
         engine_config
             .and_then(|config| config.source.as_ref())
             .and_then(|source| source.postgres.as_ref())
             .and_then(|postgres| postgres.sink_reverse_lookup),
         "VS_PG_SINK_REVERSE_LOOKUP",
-        true,
+        default,
     )
 }
 
-fn mysql_sink_reverse_lookup_enabled(engine_config: Option<&EngineFileConfig>) -> bool {
+fn mysql_sink_reverse_lookup_enabled(
+    engine_config: Option<&EngineFileConfig>,
+    default: bool,
+) -> bool {
     config_bool_or_env(
         engine_config
             .and_then(|config| config.source.as_ref())
             .and_then(|source| source.mysql.as_ref())
             .and_then(|mysql| mysql.sink_reverse_lookup),
         "VS_MYSQL_SINK_REVERSE_LOOKUP",
-        true,
+        default,
     )
+}
+
+fn mysql_joins_require_full_row_image(joins: &[JoinDefinition]) -> bool {
+    joins.iter().any(|definition| {
+        definition.related.iter().any(|related| {
+            let related_pk = related.pk.columns();
+            related
+                .join_on
+                .to
+                .columns()
+                .iter()
+                .any(|column| !related_pk.contains(column))
+        })
+    })
 }
 
 fn load_dlq_path(engine_config: Option<&EngineFileConfig>) -> Result<PathBuf> {
@@ -3626,14 +4715,14 @@ fn load_cdc_bundle_mongodb(engine_config: Option<&EngineFileConfig>) -> Result<C
     )?;
 
     // Sink + DLQ — same OpenSearch config the other sources load.
-    let os = load_opensearch_config(engine_config)?;
+    let sink = load_sink_config(engine_config)?;
     let dlq_path = load_dlq_path(engine_config)?;
     let engine_runtime = load_engine_runtime_config(engine_config, dlq_path)?;
 
     Ok(CdcBundle {
         source: CdcSourceConfig::Mongo(Box::new(config)),
         runtime: CdcRuntime {
-            os,
+            sink,
             engine_config: engine_runtime,
             engine_file_config: engine_config.cloned(),
         },
@@ -3745,14 +4834,14 @@ fn load_cdc_bundle_mysql(
         }
     }
 
-    let os = load_opensearch_config(engine_config)?;
+    let sink = load_sink_config(engine_config)?;
     let dlq_path = load_dlq_path(engine_config)?;
     let engine_runtime = load_engine_runtime_config(engine_config, dlq_path)?;
 
     Ok(CdcBundle {
         source: CdcSourceConfig::Mysql(Box::new(config)),
         runtime: CdcRuntime {
-            os,
+            sink,
             engine_config: engine_runtime,
             engine_file_config: engine_config.cloned(),
         },
@@ -3842,14 +4931,14 @@ fn load_cdc_bundle_kafka(engine_config: Option<&EngineFileConfig>) -> Result<Cdc
         Duration::from_millis(1000),
     )?;
 
-    let os = load_opensearch_config(engine_config)?;
+    let sink = load_sink_config(engine_config)?;
     let dlq_path = load_dlq_path(engine_config)?;
     let engine_runtime = load_engine_runtime_config(engine_config, dlq_path)?;
 
     Ok(CdcBundle {
         source: CdcSourceConfig::Kafka(Box::new(config)),
         runtime: CdcRuntime {
-            os,
+            sink,
             engine_config: engine_runtime,
             engine_file_config: engine_config.cloned(),
         },
@@ -3969,7 +5058,7 @@ fn load_cdc_bundle_neo4j(
         }
     };
 
-    let os = load_opensearch_config(engine_config)?;
+    let sink = load_sink_config(engine_config)?;
     let dlq_path = load_dlq_path(engine_config)?;
     let engine_runtime = load_engine_runtime_config(engine_config, dlq_path)?;
 
@@ -4077,7 +5166,7 @@ fn load_cdc_bundle_neo4j(
     Ok(CdcBundle {
         source: CdcSourceConfig::Neo4j(Box::new(neo)),
         runtime: CdcRuntime {
-            os,
+            sink,
             engine_config: engine_runtime,
             engine_file_config: engine_config.cloned(),
         },
@@ -4166,7 +5255,7 @@ fn load_cdc_bundle_postgres(
         "VS_PG_SLOT",
     )?;
 
-    let os = load_opensearch_config(engine_config)?;
+    let sink = load_sink_config(engine_config)?;
     let dlq_path = load_dlq_path(engine_config)?;
     let engine_runtime = load_engine_runtime_config(engine_config, dlq_path)?;
 
@@ -4186,6 +5275,14 @@ fn load_cdc_bundle_postgres(
         "VS_PG_TLS_CA_FILE",
         Some("VS_PG_TLS_TRUST_PROVIDER"),
     )?;
+    let transaction_spool_dir =
+        match source_config.and_then(|config| config.transaction_spool_dir.clone()) {
+            Some(directory) => Some(directory),
+            None => opt("VS_PG_TRANSACTION_SPOOL_DIR")?
+                .filter(|directory| !directory.trim().is_empty())
+                .map(PathBuf::from),
+        };
+    pg.transaction_spool_dir = transaction_spool_dir;
 
     let (joins, joins_yaml_text) = load_joins_yaml(fleet_config, engine_config)?;
     validate_projection_target_indexes(engine_config, &joins)?;
@@ -4233,7 +5330,7 @@ fn load_cdc_bundle_postgres(
     Ok(CdcBundle {
         source: CdcSourceConfig::Postgres(Box::new(pg)),
         runtime: CdcRuntime {
-            os,
+            sink,
             engine_config: engine_runtime,
             engine_file_config: engine_config.cloned(),
         },
@@ -4731,6 +5828,221 @@ mod tests {
     use super::*;
 
     #[test]
+    fn maintenance_arguments_parse_repeated_targets_and_bounded_numbers() {
+        let argv = vec![
+            "ventstream".to_owned(),
+            "--check-redis-drift".to_owned(),
+            "--redis-target".to_owned(),
+            "orders".to_owned(),
+            "--redis-target".to_owned(),
+            "customers".to_owned(),
+            "--redis-drift-scan-limit".to_owned(),
+            "25000".to_owned(),
+        ];
+        assert_eq!(
+            repeated_argument_values(&argv, "--redis-target").expect("targets"),
+            ["orders", "customers"]
+        );
+        assert_eq!(
+            optional_usize_argument(&argv, "--redis-drift-scan-limit", 100_000)
+                .expect("scan limit"),
+            25_000
+        );
+    }
+
+    #[test]
+    fn maintenance_arguments_reject_missing_and_repeated_scalar_values() {
+        let missing = vec!["ventstream".to_owned(), "--redis-target".to_owned()];
+        assert!(repeated_argument_values(&missing, "--redis-target").is_err());
+
+        let repeated = vec![
+            "ventstream".to_owned(),
+            "--redis-drift-scan-limit".to_owned(),
+            "10".to_owned(),
+            "--redis-drift-scan-limit".to_owned(),
+            "20".to_owned(),
+        ];
+        assert!(optional_usize_argument(&repeated, "--redis-drift-scan-limit", 100).is_err());
+    }
+
+    struct EnvOverride {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvOverride {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvOverride {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.name, previous);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+
+    #[test]
+    fn redis_runtime_loader_resolves_sentinel_and_cluster_topologies() {
+        let _sentinel_a = EnvOverride::set(
+            "VS_TEST_REDIS_SENTINEL_A",
+            "redis://sentinel-a.internal:26379",
+        );
+        let _sentinel_b = EnvOverride::set(
+            "VS_TEST_REDIS_SENTINEL_B",
+            "redis://sentinel-b.internal:26379",
+        );
+        let _sentinel_password =
+            EnvOverride::set("VS_TEST_REDIS_SENTINEL_PASSWORD", "sentinel-secret");
+        let _writer_id = EnvOverride::set("VS_TEST_REDIS_WRITER_ID", "revision-b");
+        let _previous_writer = EnvOverride::set("VS_TEST_REDIS_PREVIOUS_WRITER_ID", "revision-a");
+        let file = EngineFileConfig::from_yaml_str(
+            r#"
+schema_version: 1
+roles: [cdc]
+source:
+  kind: mongodb
+  mongodb:
+    uri_ref: env:VS_TEST_MONGO_URI
+    database: shop
+    collections: [orders]
+sink:
+  kind: redis
+  redis:
+    topology:
+      mode: sentinel
+      service_name: orders-primary
+      endpoints:
+        - env:VS_TEST_REDIS_SENTINEL_A
+        - env:VS_TEST_REDIS_SENTINEL_B
+      data_node_tls: false
+      sentinel_auth:
+        mode: password
+        password_ref: env:VS_TEST_REDIS_SENTINEL_PASSWORD
+    keyspace:
+      prefix: ventstream:shop
+    acknowledgement:
+      mode: aof
+      replicas: 1
+      timeout_ms: 2000
+    writer:
+      id_ref: env:VS_TEST_REDIS_WRITER_ID
+      lease_ms: 15000
+      takeover_from_ref: env:VS_TEST_REDIS_PREVIOUS_WRITER_ID
+"#,
+        )
+        .expect("valid Sentinel engine config");
+        let sentinel = load_redis_sink_config(Some(&file)).expect("load Sentinel topology");
+        match &sentinel.topology {
+            RedisTopology::Sentinel(topology) => {
+                assert_eq!(topology.service_name, "orders-primary");
+                assert_eq!(
+                    topology.endpoints,
+                    [
+                        "redis://sentinel-a.internal:26379",
+                        "redis://sentinel-b.internal:26379"
+                    ]
+                );
+                assert_eq!(topology.password.as_deref(), Some("sentinel-secret"));
+                assert!(!topology.data_node_tls);
+            }
+            other => panic!("expected Sentinel topology, got {other:?}"),
+        }
+        assert_eq!(sentinel.writer_id, "revision-b");
+        assert_eq!(sentinel.writer_lease, Duration::from_secs(15));
+        assert_eq!(sentinel.writer_takeover_from.as_deref(), Some("revision-a"));
+        assert!(matches!(
+            sentinel.acknowledgement,
+            RedisAcknowledgement::Aof {
+                local: true,
+                replicas: 1,
+                timeout
+            } if timeout == Duration::from_secs(2)
+        ));
+
+        let _mode = EnvOverride::set("VS_REDIS_SINK_TOPOLOGY", "cluster");
+        let _nodes = EnvOverride::set(
+            "VS_REDIS_SINK_CLUSTER_URLS",
+            "redis://cluster-a.internal:6379, redis://cluster-b.internal:6379",
+        );
+        let _prefix = EnvOverride::set("VS_REDIS_SINK_KEY_PREFIX", "ventstream:shop");
+        let cluster = load_redis_sink_config(None).expect("load Cluster topology");
+        match cluster.topology {
+            RedisTopology::Cluster { endpoints } => assert_eq!(
+                endpoints,
+                [
+                    "redis://cluster-a.internal:6379",
+                    "redis://cluster-b.internal:6379"
+                ]
+            ),
+            other => panic!("expected Cluster topology, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redis_runtime_loader_resolves_aof_acknowledgement_from_env() {
+        let _mode = EnvOverride::set("VS_REDIS_SINK_ACK_MODE", "aof");
+        let _local = EnvOverride::set("VS_REDIS_SINK_ACK_LOCAL_AOF", "false");
+        let _replicas = EnvOverride::set("VS_REDIS_SINK_ACK_REPLICAS", "2");
+        let _timeout = EnvOverride::set("VS_REDIS_SINK_ACK_TIMEOUT_MS", "2500");
+        let acknowledgement =
+            load_redis_acknowledgement_from_env().expect("load AOF acknowledgement");
+        assert!(matches!(
+            acknowledgement,
+            RedisAcknowledgement::Aof {
+                local: false,
+                replicas: 2,
+                timeout
+            } if timeout == Duration::from_millis(2500)
+        ));
+    }
+
+    #[test]
+    fn redis_runtime_loader_preserves_mounted_credentials_for_rotation() {
+        let _endpoint =
+            EnvOverride::set("VS_TEST_REDIS_ROTATION_URL", "redis://redis.internal:6379");
+        let _username = EnvOverride::set("VS_TEST_REDIS_ROTATION_USERNAME", "ventstream");
+        let file = EngineFileConfig::from_yaml_str(
+            r#"
+schema_version: 1
+roles: [cdc]
+source:
+  kind: mongodb
+  mongodb:
+    uri_ref: env:VS_TEST_MONGO_URI
+    database: shop
+    collections: [orders]
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_TEST_REDIS_ROTATION_URL
+    auth:
+      mode: acl
+      username_ref: env:VS_TEST_REDIS_ROTATION_USERNAME
+      password_ref: file:/run/secrets/redis-password
+    keyspace:
+      prefix: ventstream:shop
+"#,
+        )
+        .expect("valid mounted-credential config");
+
+        let redis = load_redis_sink_config(Some(&file)).expect("load Redis config");
+        assert_eq!(redis.username.as_deref(), Some("ventstream"));
+        assert!(redis.username_file.is_none());
+        assert_eq!(
+            redis.password_file.as_deref(),
+            Some(Path::new("/run/secrets/redis-password"))
+        );
+        assert!(redis.password.is_none());
+    }
+
+    #[test]
     fn mysql_dispatcher_is_serialized_for_document_ordering() {
         let config = DispatcherConfig {
             max_parallel_bulks: 8,
@@ -4776,6 +6088,44 @@ specs:
     }
 
     #[test]
+    fn mysql_non_primary_related_join_key_requires_full_row_images() {
+        let joins = joins_from_yaml(
+            r#"
+joins:
+  - name: orders
+    primary: { table: shop.orders, pk: id }
+    related:
+      - id: items
+        table: shop.order_items
+        pk: id
+        join_on: { from: id, to: order_id }
+        embed_as: items
+        cardinality: many
+"#,
+        );
+        assert!(mysql_joins_require_full_row_image(&joins));
+    }
+
+    #[test]
+    fn mysql_related_primary_key_join_does_not_require_full_row_images() {
+        let joins = joins_from_yaml(
+            r#"
+joins:
+  - name: orders
+    primary: { table: shop.orders, pk: id }
+    related:
+      - id: customer
+        table: shop.customers
+        pk: id
+        join_on: { from: customer_id, to: id }
+        embed_as: customer
+        cardinality: one
+"#,
+        );
+        assert!(!mysql_joins_require_full_row_image(&joins));
+    }
+
+    #[test]
     fn projection_target_routing_requires_target_on_every_join() {
         let config = projection_target_config();
         let joins = joins_from_yaml(
@@ -4813,6 +6163,80 @@ joins:
 
         validate_projection_target_indexes(Some(&config), &joins)
             .expect("complete projection targets should pass startup validation");
+    }
+
+    fn redis_runtime(
+        routing: RedisKeyRouting,
+        ownership: RedisKeyspaceOwnership,
+    ) -> SinkRuntimeConfig {
+        SinkRuntimeConfig::Redis(Box::new(
+            RedisConfig::new(
+                "redis",
+                "redis://127.0.0.1:6379",
+                "ventstream:test",
+                routing,
+            )
+            .with_keyspace_ownership(ownership),
+        ))
+    }
+
+    #[test]
+    fn shared_redis_keyspace_rejects_drain_before_state_removal() {
+        let sink = redis_runtime(
+            RedisKeyRouting::ByOutputRelation,
+            RedisKeyspaceOwnership::Shared,
+        );
+        let targets =
+            routed_redis_drain_targets(&sink, vec!["orders".to_owned()], Vec::new()).unwrap();
+
+        let error = sink
+            .validate_redis_drain(true, &targets)
+            .expect_err("shared keyspace must reject drain");
+
+        assert!(error.to_string().contains("ownership=exclusive"));
+        assert!(error
+            .to_string()
+            .contains("no local cursor state was removed"));
+    }
+
+    #[test]
+    fn exclusive_fixed_redis_keyspace_allows_finite_replayable_drain() {
+        let sink = redis_runtime(
+            RedisKeyRouting::Fixed("orders".to_owned()),
+            RedisKeyspaceOwnership::Exclusive,
+        );
+        let targets = routed_redis_drain_targets(&sink, Vec::new(), Vec::new()).unwrap();
+
+        assert_eq!(targets, vec!["orders"]);
+        sink.validate_redis_drain(true, &targets)
+            .expect("exclusive replayable keyspace should drain");
+    }
+
+    #[test]
+    fn redis_drain_requires_bootstrap_and_complete_projection_targets() {
+        let sink = redis_runtime(
+            RedisKeyRouting::ByProjectionTarget,
+            RedisKeyspaceOwnership::Exclusive,
+        );
+        let error = routed_redis_drain_targets(
+            &sink,
+            vec!["orders".to_owned()],
+            vec![Some("orders-view".to_owned()), None],
+        )
+        .expect_err("missing projection target must reject drain");
+        assert!(error.to_string().contains("every projection"));
+
+        let targets = routed_redis_drain_targets(
+            &sink,
+            vec!["orders".to_owned()],
+            vec![
+                Some("orders-view".to_owned()),
+                Some("orders-view".to_owned()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(targets, vec!["orders-view"]);
+        assert!(sink.validate_redis_drain(false, &targets).is_err());
     }
 
     fn one_shot_health_server(status: u16) -> (String, std::thread::JoinHandle<String>) {

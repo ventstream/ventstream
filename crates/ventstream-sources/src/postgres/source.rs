@@ -68,9 +68,14 @@
 //! conflict resolution). `FULL` writes more WAL — measure on large tables.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use pgwire_replication::{
     Lsn as PgwLsn, ReplicationClient, ReplicationConfig, ReplicationEvent, TlsConfig,
 };
+use std::collections::VecDeque;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -84,6 +89,8 @@ pub const LSN_HEADER: &str = "ventstream.cdc.lsn";
 /// values trade more PG-side traffic for faster slot reclamation;
 /// larger values trade slot lag for less wire chatter.
 const DEFAULT_LSN_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
+const TRANSACTION_MEMORY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+static TRANSACTION_SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 use tracing::{debug, info, warn};
 use ventstream_core::{Event, Source, SourceContext, SourceError};
 
@@ -94,6 +101,198 @@ use super::schema::RelationCache;
 use super::snapshot;
 use crate::error::PostgresCdcError;
 use crate::tls::DatabaseTlsMode;
+
+struct WalRecord {
+    wal_start: u64,
+    data: Bytes,
+}
+
+enum TransactionStorage {
+    Memory {
+        records: VecDeque<WalRecord>,
+        bytes: usize,
+    },
+    Disk {
+        file: File,
+        path: PathBuf,
+        remaining: usize,
+        reading: bool,
+    },
+}
+
+struct TransactionBuffer {
+    storage: TransactionStorage,
+    spool_dir: PathBuf,
+}
+
+impl TransactionBuffer {
+    fn new(spool_dir: PathBuf) -> Self {
+        Self {
+            storage: TransactionStorage::Memory {
+                records: VecDeque::new(),
+                bytes: 0,
+            },
+            spool_dir,
+        }
+    }
+
+    fn push(&mut self, record: WalRecord) -> io::Result<()> {
+        let record_bytes = record.data.len().saturating_add(16);
+        match &mut self.storage {
+            TransactionStorage::Memory { records, bytes }
+                if bytes.saturating_add(record_bytes) <= TRANSACTION_MEMORY_LIMIT_BYTES =>
+            {
+                records.push_back(record);
+                *bytes = bytes.saturating_add(record_bytes);
+                Ok(())
+            }
+            TransactionStorage::Memory { .. } => {
+                self.spill_to_disk(&record)?;
+                Ok(())
+            }
+            TransactionStorage::Disk {
+                file, remaining, ..
+            } => {
+                write_wal_record(file, &record)?;
+                *remaining = remaining.saturating_add(1);
+                Ok(())
+            }
+        }
+    }
+
+    fn next_record(&mut self) -> io::Result<Option<WalRecord>> {
+        match &mut self.storage {
+            TransactionStorage::Memory { records, .. } => Ok(records.pop_front()),
+            TransactionStorage::Disk {
+                file,
+                remaining,
+                reading,
+                ..
+            } => {
+                if !*reading {
+                    file.flush()?;
+                    file.seek(SeekFrom::Start(0))?;
+                    *reading = true;
+                }
+                if *remaining == 0 {
+                    return Ok(None);
+                }
+                let record = read_wal_record(file)?;
+                *remaining = remaining.saturating_sub(1);
+                Ok(Some(record))
+            }
+        }
+    }
+
+    fn spill_to_disk(&mut self, next: &WalRecord) -> io::Result<()> {
+        let (mut records, count) = match std::mem::replace(
+            &mut self.storage,
+            TransactionStorage::Memory {
+                records: VecDeque::new(),
+                bytes: 0,
+            },
+        ) {
+            TransactionStorage::Memory { records, .. } => {
+                let count = records.len().saturating_add(1);
+                (records, count)
+            }
+            TransactionStorage::Disk { .. } => unreachable!("spill called for disk storage"),
+        };
+        let (mut file, path) = create_spool_file(&self.spool_dir)?;
+        while let Some(record) = records.pop_front() {
+            write_wal_record(&mut file, &record)?;
+        }
+        write_wal_record(&mut file, next)?;
+        self.storage = TransactionStorage::Disk {
+            file,
+            path,
+            remaining: count,
+            reading: false,
+        };
+        metrics::counter!("vs_postgres_transaction_spills_total").increment(1);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn is_spilled(&self) -> bool {
+        matches!(self.storage, TransactionStorage::Disk { .. })
+    }
+
+    #[cfg(test)]
+    fn spool_path(&self) -> Option<&Path> {
+        match &self.storage {
+            TransactionStorage::Disk { path, .. } => Some(path),
+            TransactionStorage::Memory { .. } => None,
+        }
+    }
+}
+
+impl Drop for TransactionBuffer {
+    fn drop(&mut self) {
+        let storage = std::mem::replace(
+            &mut self.storage,
+            TransactionStorage::Memory {
+                records: VecDeque::new(),
+                bytes: 0,
+            },
+        );
+        if let TransactionStorage::Disk { file, path, .. } = storage {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn create_spool_file(directory: &Path) -> io::Result<(File, PathBuf)> {
+    std::fs::create_dir_all(directory)?;
+    for _ in 0..32 {
+        let sequence = TRANSACTION_SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!("transaction-{}-{sequence}.wal", std::process::id()));
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((file, path)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a PostgreSQL transaction spool file",
+    ))
+}
+
+fn write_wal_record(file: &mut File, record: &WalRecord) -> io::Result<()> {
+    let length = u64::try_from(record.data.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "WAL record is too large"))?;
+    file.write_all(&record.wal_start.to_le_bytes())?;
+    file.write_all(&length.to_le_bytes())?;
+    file.write_all(&record.data)
+}
+
+fn read_wal_record(file: &mut File) -> io::Result<WalRecord> {
+    let mut wal_start = [0u8; 8];
+    let mut length = [0u8; 8];
+    file.read_exact(&mut wal_start)?;
+    file.read_exact(&mut length)?;
+    let length = usize::try_from(u64::from_le_bytes(length)).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "spooled WAL record length exceeds this platform",
+        )
+    })?;
+    let mut data = vec![0u8; length];
+    file.read_exact(&mut data)?;
+    Ok(WalRecord {
+        wal_start: u64::from_le_bytes(wal_start),
+        data: Bytes::from(data),
+    })
+}
 
 /// Source adapter for a Postgres logical replication slot.
 pub struct PostgresCdcSource {
@@ -112,18 +311,24 @@ pub struct PostgresCdcSource {
     /// Rebuild local join state from a snapshot while retaining an existing
     /// replication slot for subsequent WAL replay.
     bootstrap_existing_slot: bool,
+    transaction_spool_dir: PathBuf,
 }
 
 impl PostgresCdcSource {
     /// Construct a new source from configuration. Connection setup
     /// happens lazily inside [`Source::run`].
     pub fn new(config: PostgresCdcConfig) -> Self {
+        let transaction_spool_dir = config
+            .transaction_spool_dir
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("ventstream-postgres-transactions"));
         Self {
             config,
             relations: RelationCache::new(),
             sink_progress: None,
             lsn_flush_interval: DEFAULT_LSN_FLUSH_INTERVAL,
             bootstrap_existing_slot: false,
+            transaction_spool_dir,
         }
     }
 
@@ -149,6 +354,14 @@ impl PostgresCdcSource {
     #[must_use]
     pub fn with_existing_slot_bootstrap(mut self, enabled: bool) -> Self {
         self.bootstrap_existing_slot = enabled;
+        self
+    }
+
+    /// Set the directory used when a PostgreSQL transaction exceeds the
+    /// in-memory transaction buffer.
+    #[must_use]
+    pub fn with_transaction_spool_dir(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.transaction_spool_dir = directory.into();
         self
     }
 
@@ -447,6 +660,7 @@ impl PostgresCdcSource {
         lsn_flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // First tick fires immediately — discard so we don't double-advance.
         let _ = lsn_flush_timer.tick().await;
+        let mut transaction: Option<TransactionBuffer> = None;
 
         loop {
             tokio::select! {
@@ -476,29 +690,7 @@ impl PostgresCdcSource {
                 event = client.recv() => {
                     match event.map_err(|err| PostgresCdcError::Connection(err.to_string()))? {
                         Some(ReplicationEvent::XLogData { wal_start, wal_end, data, .. }) => {
-                            let events = match self.process_payload(&data) {
-                                Ok(events) => events,
-                                // A row message for a relation we have no
-                                // RELATION metadata for (not in the publication,
-                                // or its RELATION message was never seen).
-                                // Propagating this is FATAL and the slot resumes
-                                // at the same LSN on restart → the same record
-                                // re-fails forever (crash loop, zero progress).
-                                // Skip-and-log instead: emit nothing and let the
-                                // cursor advance past it (M11).
-                                Err(PostgresCdcError::UnknownRelation(oid)) => {
-                                    warn!(
-                                        relation_oid = oid,
-                                        metric = "pg.replication.unknown_relation_skipped",
-                                        "skipping WAL message for an uncached relation; advancing past it"
-                                    );
-                                    ventstream_telemetry::record_error(format!(
-                                        "pg unknown relation oid {oid} skipped"
-                                    ));
-                                    Vec::new()
-                                }
-                                Err(other) => return Err(other),
-                            };
+                            let events = self.decode_payload_or_skip_unknown(&data)?;
                             let wal_start_u64 = wal_start.as_u64();
                             let wal_end_u64 = wal_end.as_u64();
                             // Per-payload breadcrumb — operators chasing
@@ -515,51 +707,50 @@ impl PostgresCdcSource {
                                 metric = "pg.replication.xlog_data",
                                 "wal payload yielded events"
                             );
-                            for event in events {
-                                // Stamp the record's OWN start LSN, not wal_end.
-                                // wal_end is the server's current end-of-WAL (>=
-                                // this record) and is documented as possibly 0
-                                // for mid-transaction messages; stamping it would
-                                // let sink_progress reflect a position ahead of
-                                // the actual durable event — or 0 — and the
-                                // contiguous-watermark ack gating would lose
-                                // precision (or break on the 0). wal_start is the
-                                // precise, always-valid, monotonic position.
-                                let stamped = stamp_lsn(event, wal_start_u64);
-                                ctx.sender.send(stamped, &ctx.shutdown).await.map_err(|err| {
-                                    PostgresCdcError::Internal(format!("publish failed: {err}"))
-                                })?;
-                                ventstream_telemetry::bump_events_emitted(1);
+                            if events.is_empty() {
+                                continue;
                             }
-                            // Raise the ack ceiling from whichever pointer is
-                            // higher; wal_end can be 0 mid-transaction, so fall
-                            // back to wal_start so the ceiling still advances.
-                            // Acking stays gated by sink_progress, so a ceiling
-                            // at an uncommitted record's start is never acked
-                            // until that record is sink-confirmed.
-                            let bound = wal_end_u64.max(wal_start_u64);
-                            if bound > wal_high_water {
-                                wal_high_water = bound;
-                            }
-                            // No immediate update_applied_lsn — defer
-                            // to the periodic flush, gated by sink
-                            // progress. Falls back to wal_high_water
-                            // when no sink-progress watermark is
-                            // attached (legacy behavior).
-                            let advance_to = self.compute_safe_ack(wal_high_water);
-                            if advance_to > last_acked {
-                                debug!(
-                                    advance_to,
-                                    last_acked,
-                                    wal_high_water,
-                                    metric = "pg.replication.lsn_advance",
-                                    "advancing replication slot"
-                                );
-                                client.update_applied_lsn(PgwLsn(advance_to));
-                                last_acked = advance_to;
+                            if let Some(buffer) = transaction.as_mut() {
+                                buffer
+                                    .push(WalRecord {
+                                        wal_start: wal_start_u64,
+                                        data,
+                                    })
+                                    .map_err(|error| {
+                                        PostgresCdcError::Internal(format!(
+                                            "buffering PostgreSQL transaction: {error}"
+                                        ))
+                                    })?;
+                            } else {
+                                self.publish_events(events, wal_start_u64, ctx).await?;
+                                let bound = wal_end_u64.max(wal_start_u64);
+                                if bound > wal_high_water {
+                                    wal_high_water = bound;
+                                }
+                                let advance_to = self.compute_safe_ack(wal_high_water);
+                                if advance_to > last_acked {
+                                    debug!(
+                                        advance_to,
+                                        last_acked,
+                                        wal_high_water,
+                                        metric = "pg.replication.lsn_advance",
+                                        "advancing replication slot"
+                                    );
+                                    client.update_applied_lsn(PgwLsn(advance_to));
+                                    last_acked = advance_to;
+                                }
                             }
                         }
                         Some(ReplicationEvent::Begin { final_lsn, xid, .. }) => {
+                            if transaction.is_some() {
+                                return Err(PostgresCdcError::Internal(
+                                    "received PostgreSQL BEGIN before the prior transaction committed"
+                                        .to_owned(),
+                                ));
+                            }
+                            transaction = Some(TransactionBuffer::new(
+                                self.transaction_spool_dir.clone(),
+                            ));
                             debug!(
                                 xid,
                                 final_lsn = %final_lsn,
@@ -568,6 +759,16 @@ impl PostgresCdcSource {
                             );
                         }
                         Some(ReplicationEvent::Commit { lsn, end_lsn, .. }) => {
+                            if let Some(mut buffered) = transaction.take() {
+                                while let Some(record) = buffered.next_record().map_err(|error| {
+                                    PostgresCdcError::Internal(format!(
+                                        "reading buffered PostgreSQL transaction: {error}"
+                                    ))
+                                })? {
+                                    let events = self.decode_payload_or_skip_unknown(&record.data)?;
+                                    self.publish_events(events, record.wal_start, ctx).await?;
+                                }
+                            }
                             debug!(
                                 commit_lsn = %lsn,
                                 end_lsn = %end_lsn,
@@ -625,6 +826,41 @@ impl PostgresCdcSource {
                 }
             }
         }
+    }
+
+    fn decode_payload_or_skip_unknown(&self, data: &[u8]) -> Result<Vec<Event>, PostgresCdcError> {
+        match self.process_payload(data) {
+            Ok(events) => Ok(events),
+            Err(PostgresCdcError::UnknownRelation(oid)) => {
+                warn!(
+                    relation_oid = oid,
+                    metric = "pg.replication.unknown_relation_skipped",
+                    "skipping WAL message for an uncached relation; advancing past it"
+                );
+                ventstream_telemetry::record_error(format!(
+                    "pg unknown relation oid {oid} skipped"
+                ));
+                Ok(Vec::new())
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    async fn publish_events(
+        &self,
+        events: Vec<Event>,
+        wal_start: u64,
+        ctx: &SourceContext,
+    ) -> Result<(), PostgresCdcError> {
+        for event in events {
+            let stamped = stamp_lsn(event, wal_start);
+            ctx.sender
+                .send(stamped, &ctx.shutdown)
+                .await
+                .map_err(|error| PostgresCdcError::Internal(format!("publish failed: {error}")))?;
+            ventstream_telemetry::bump_events_emitted(1);
+        }
+        Ok(())
     }
 
     /// Compute the safe ack point for the WAL slot. With a sink
@@ -1010,5 +1246,60 @@ mod tests {
             events[0].subject.as_str(),
             "postgres.tenant_42.audit_log.insert"
         );
+    }
+
+    #[test]
+    fn transaction_buffer_preserves_in_memory_wal_order() {
+        let directory = std::env::temp_dir().join(format!(
+            "ventstream-pg-tx-memory-{}",
+            TRANSACTION_SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut buffer = TransactionBuffer::new(directory);
+        for wal_start in [11, 12, 13] {
+            buffer
+                .push(WalRecord {
+                    wal_start,
+                    data: Bytes::from(vec![u8::try_from(wal_start).expect("test byte")]),
+                })
+                .expect("buffer record");
+        }
+        assert!(!buffer.is_spilled());
+        let mut observed = Vec::new();
+        while let Some(record) = buffer.next_record().expect("read record") {
+            observed.push((record.wal_start, record.data[0]));
+        }
+        assert_eq!(observed, vec![(11, 11), (12, 12), (13, 13)]);
+    }
+
+    #[test]
+    fn large_transaction_spills_and_removes_its_private_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "ventstream-pg-tx-spill-{}",
+            TRANSACTION_SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut buffer = TransactionBuffer::new(directory.clone());
+        for wal_start in 1..=5 {
+            buffer
+                .push(WalRecord {
+                    wal_start,
+                    data: Bytes::from(vec![
+                        u8::try_from(wal_start).expect("test byte");
+                        2 * 1024 * 1024
+                    ]),
+                })
+                .expect("buffer record");
+        }
+        assert!(buffer.is_spilled());
+        let spool_path = buffer.spool_path().expect("spool path").to_path_buf();
+        assert!(spool_path.exists());
+
+        let mut observed = Vec::new();
+        while let Some(record) = buffer.next_record().expect("read record") {
+            observed.push((record.wal_start, record.data[0]));
+        }
+        assert_eq!(observed, vec![(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]);
+        drop(buffer);
+        assert!(!spool_path.exists());
+        let _ = std::fs::remove_dir(directory);
     }
 }

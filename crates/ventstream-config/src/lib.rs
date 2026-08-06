@@ -184,6 +184,17 @@ impl EngineConfig {
                     opensearch.index_routing,
                     OpenSearchIndexRouting::ByProjectionTarget
                 )
+            }) || sink.redis.as_ref().is_some_and(|redis| {
+                matches!(
+                    redis.keyspace.routing,
+                    RedisKeyRoutingConfig::ByProjectionTarget
+                ) || matches!(
+                    &redis.keyspace.routing,
+                    RedisKeyRoutingConfig::Views { views }
+                        if views
+                            .iter()
+                            .any(|view| view.source.projection_target.is_some())
+                )
             });
             if by_projection_target {
                 if self.specs.joins.is_none() {
@@ -355,6 +366,9 @@ pub struct PostgresSourceConfig {
     /// Maximum pooled connections for in-memory related-row fetches.
     #[serde(default)]
     pub related_fetch_pool_size: Option<usize>,
+    /// Writable directory for transaction records that exceed the in-memory buffer.
+    #[serde(default)]
+    pub transaction_spool_dir: Option<PathBuf>,
     /// TLS transport policy.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
@@ -395,6 +409,15 @@ impl PostgresSourceConfig {
         if self.related_fetch_pool_size == Some(0) {
             return Err(ConfigError::InvalidField(
                 "source.postgres.related_fetch_pool_size must be positive",
+            ));
+        }
+        if self
+            .transaction_spool_dir
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(ConfigError::InvalidField(
+                "source.postgres.transaction_spool_dir must not be empty",
             ));
         }
         if let Some(tls) = &self.tls {
@@ -856,18 +879,39 @@ pub struct SinkConfig {
     /// OpenSearch/Elasticsearch sink settings.
     #[serde(default)]
     pub opensearch: Option<OpenSearchSinkConfig>,
+    /// Redis sink settings.
+    #[serde(default)]
+    pub redis: Option<RedisSinkConfig>,
 }
 
 impl SinkConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         match self.kind {
             SinkKind::Opensearch | SinkKind::Elasticsearch => {
+                if self.redis.is_some() {
+                    return Err(ConfigError::InvalidField(
+                        "sink.redis cannot be set for opensearch/elasticsearch sinks",
+                    ));
+                }
                 let Some(opensearch) = &self.opensearch else {
                     return Err(ConfigError::InvalidField(
                         "sink.opensearch is required for opensearch/elasticsearch sinks",
                     ));
                 };
                 opensearch.validate()
+            }
+            SinkKind::Redis => {
+                if self.opensearch.is_some() {
+                    return Err(ConfigError::InvalidField(
+                        "sink.opensearch cannot be set for redis sinks",
+                    ));
+                }
+                let Some(redis) = &self.redis else {
+                    return Err(ConfigError::InvalidField(
+                        "sink.redis is required for redis sinks",
+                    ));
+                };
+                redis.validate()
             }
         }
     }
@@ -881,6 +925,860 @@ pub enum SinkKind {
     Opensearch,
     /// Elasticsearch-compatible sink.
     Elasticsearch,
+    /// Redis materialization sink.
+    Redis,
+}
+
+/// Redis materialization sink settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisSinkConfig {
+    /// Deployment-provided `redis://` or `rediss://` endpoint reference.
+    #[serde(default)]
+    pub endpoint_ref: Option<ValueRef>,
+    /// Optional Sentinel or Cluster topology.
+    #[serde(default)]
+    pub topology: Option<RedisTopologyConfig>,
+    /// Optional Redis ACL credentials.
+    #[serde(default)]
+    pub auth: Option<RedisAuthConfig>,
+    /// Optional custom trust or mutual-TLS identity files.
+    #[serde(default)]
+    pub tls: Option<RedisTlsConfig>,
+    /// Deterministic key construction.
+    pub keyspace: RedisKeyspaceConfig,
+    /// Stored value representation.
+    #[serde(default)]
+    pub document: RedisDocumentConfig,
+    /// Retention contract.
+    #[serde(default)]
+    pub contract: RedisContractConfig,
+    /// Required downstream acknowledgement.
+    #[serde(default)]
+    pub acknowledgement: RedisAcknowledgementConfig,
+    /// Renewable writer ownership and controlled handoff settings.
+    #[serde(default)]
+    pub writer: RedisWriterConfig,
+    /// Maximum approximate pipeline bytes.
+    #[serde(default)]
+    pub max_batch_bytes: Option<usize>,
+    /// Maximum encoded key bytes accepted from one event.
+    #[serde(default)]
+    pub max_key_bytes: Option<usize>,
+    /// Maximum value bytes accepted from one event.
+    #[serde(default)]
+    pub max_value_bytes: Option<usize>,
+    /// Connection timeout.
+    #[serde(default)]
+    pub connect_timeout_ms: Option<u64>,
+    /// Command response timeout.
+    #[serde(default)]
+    pub response_timeout_ms: Option<u64>,
+}
+
+impl RedisSinkConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        const DEFAULT_MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
+        const DEFAULT_MAX_KEY_BYTES: usize = 16 * 1024;
+        const DEFAULT_MAX_VALUE_BYTES: usize = 8 * 1024 * 1024;
+        const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
+        const MAX_KEY_BYTES: usize = 1024 * 1024;
+        const MAX_VALUE_BYTES: usize = 64 * 1024 * 1024;
+        const DEFAULT_RESPONSE_TIMEOUT_MS: u64 = 30_000;
+        const MAX_CONNECT_TIMEOUT_MS: u64 = 120_000;
+        const MAX_RESPONSE_TIMEOUT_MS: u64 = 600_000;
+
+        match (&self.endpoint_ref, &self.topology) {
+            (Some(endpoint), None) => endpoint.validate()?,
+            (None, Some(topology)) => topology.validate()?,
+            (Some(_), Some(_)) => {
+                return Err(ConfigError::InvalidField(
+                    "sink.redis must configure endpoint_ref or topology, not both",
+                ));
+            }
+            (None, None) => {
+                return Err(ConfigError::InvalidField(
+                    "sink.redis requires endpoint_ref or topology",
+                ));
+            }
+        }
+        if let Some(auth) = &self.auth {
+            auth.validate()?;
+        }
+        if let Some(tls) = &self.tls {
+            tls.validate()?;
+        }
+        self.keyspace.validate()?;
+        if matches!(self.topology, Some(RedisTopologyConfig::Cluster { .. }))
+            && matches!(&self.keyspace.routing, RedisKeyRoutingConfig::Views { views } if views.len() > 1)
+        {
+            return Err(ConfigError::InvalidField(
+                "sink.redis Cluster topology supports at most one declarative view",
+            ));
+        }
+        self.contract.validate()?;
+        self.acknowledgement.validate()?;
+        self.writer.validate()?;
+        if self.max_batch_bytes == Some(0)
+            || self.max_key_bytes == Some(0)
+            || self.max_value_bytes == Some(0)
+        {
+            return Err(ConfigError::InvalidField(
+                "sink.redis byte limits must be positive",
+            ));
+        }
+        let max_batch_bytes = self.max_batch_bytes.unwrap_or(DEFAULT_MAX_BATCH_BYTES);
+        let max_key_bytes = self.max_key_bytes.unwrap_or(DEFAULT_MAX_KEY_BYTES);
+        let max_value_bytes = self.max_value_bytes.unwrap_or(DEFAULT_MAX_VALUE_BYTES);
+        if max_batch_bytes > MAX_BATCH_BYTES
+            || max_key_bytes > MAX_KEY_BYTES
+            || max_value_bytes > MAX_VALUE_BYTES
+        {
+            return Err(ConfigError::InvalidField(
+                "sink.redis byte limits exceed the supported safety ceilings",
+            ));
+        }
+        if self.connect_timeout_ms == Some(0) || self.response_timeout_ms == Some(0) {
+            return Err(ConfigError::InvalidField(
+                "sink.redis timeouts must be positive",
+            ));
+        }
+        if self
+            .connect_timeout_ms
+            .is_some_and(|timeout| timeout > MAX_CONNECT_TIMEOUT_MS)
+            || self
+                .response_timeout_ms
+                .is_some_and(|timeout| timeout > MAX_RESPONSE_TIMEOUT_MS)
+        {
+            return Err(ConfigError::InvalidField(
+                "sink.redis timeouts exceed the supported safety ceilings",
+            ));
+        }
+        if matches!(
+            self.acknowledgement,
+            RedisAcknowledgementConfig::Replicated { timeout_ms, .. }
+                | RedisAcknowledgementConfig::Aof { timeout_ms, .. }
+                if timeout_ms > self.response_timeout_ms.unwrap_or(DEFAULT_RESPONSE_TIMEOUT_MS)
+        ) {
+            return Err(ConfigError::InvalidField(
+                "sink.redis acknowledgement timeout must not exceed response_timeout_ms",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Renewable Redis target writer ownership.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisWriterConfig {
+    /// Stable deployment identity. Fleet deployments normally reference their deployment ID.
+    #[serde(default)]
+    pub id_ref: Option<ValueRef>,
+    /// Writer lease duration. The active engine renews it while idle.
+    #[serde(default)]
+    pub lease_ms: Option<u64>,
+    /// Previous writer identity accepted for one controlled compare-and-swap handoff.
+    #[serde(default)]
+    pub takeover_from_ref: Option<ValueRef>,
+}
+
+impl RedisWriterConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        const MIN_LEASE_MS: u64 = 3_000;
+        const MAX_LEASE_MS: u64 = 600_000;
+        if let Some(reference) = &self.id_ref {
+            reference.validate()?;
+        }
+        if let Some(reference) = &self.takeover_from_ref {
+            reference.validate()?;
+        }
+        if self
+            .lease_ms
+            .is_some_and(|lease| !(MIN_LEASE_MS..=MAX_LEASE_MS).contains(&lease))
+        {
+            return Err(ConfigError::InvalidField(
+                "sink.redis.writer.lease_ms must be between 3000 and 600000",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Redis discovery and client-side routing mode.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, tag = "mode", rename_all = "snake_case")]
+pub enum RedisTopologyConfig {
+    /// Discover the current writable primary through Redis Sentinel.
+    Sentinel {
+        /// Sentinel master service name.
+        service_name: String,
+        /// Sentinel endpoint references tried in order.
+        endpoints: Vec<ValueRef>,
+        /// Whether Sentinel-discovered Redis data nodes require TLS.
+        data_node_tls: bool,
+        /// Optional Sentinel-specific credentials.
+        #[serde(default)]
+        sentinel_auth: Option<RedisAuthConfig>,
+        /// Optional Sentinel-specific trust or mutual-TLS identity.
+        #[serde(default)]
+        sentinel_tls: Option<RedisTlsConfig>,
+    },
+    /// Discover and route Redis Cluster hash slots from initial nodes.
+    Cluster {
+        /// Initial Cluster endpoint references.
+        endpoints: Vec<ValueRef>,
+    },
+}
+
+impl RedisTopologyConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        const MAX_ENDPOINTS: usize = 32;
+        match self {
+            Self::Sentinel {
+                service_name,
+                endpoints,
+                sentinel_auth,
+                sentinel_tls,
+                ..
+            } => {
+                if service_name.is_empty()
+                    || service_name.trim() != service_name
+                    || service_name.len() > 256
+                    || service_name.chars().any(char::is_control)
+                {
+                    return Err(ConfigError::InvalidField(
+                        "sink.redis.topology.service_name must be trimmed safe text of at most 256 bytes",
+                    ));
+                }
+                validate_redis_topology_endpoints(endpoints, MAX_ENDPOINTS)?;
+                if let Some(auth) = sentinel_auth {
+                    auth.validate()?;
+                }
+                if let Some(tls) = sentinel_tls {
+                    tls.validate()?;
+                }
+            }
+            Self::Cluster { endpoints } => {
+                validate_redis_topology_endpoints(endpoints, MAX_ENDPOINTS)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_redis_topology_endpoints(
+    endpoints: &[ValueRef],
+    maximum: usize,
+) -> Result<(), ConfigError> {
+    if endpoints.is_empty() || endpoints.len() > maximum {
+        return Err(ConfigError::InvalidField(
+            "sink.redis.topology.endpoints must contain 1 to 32 references",
+        ));
+    }
+    for endpoint in endpoints {
+        endpoint.validate()?;
+    }
+    Ok(())
+}
+
+/// Custom TLS material for a Redis sink.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisTlsConfig {
+    /// PEM CA bundle used instead of system roots.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    /// PEM client certificate chain for mutual TLS.
+    #[serde(default)]
+    pub client_cert_file: Option<PathBuf>,
+    /// PEM private key for mutual TLS.
+    #[serde(default)]
+    pub client_key_file: Option<PathBuf>,
+}
+
+impl RedisTlsConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        for path in [
+            self.ca_file.as_ref(),
+            self.client_cert_file.as_ref(),
+            self.client_key_file.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if path.as_os_str().is_empty() {
+                return Err(ConfigError::InvalidField(
+                    "sink.redis.tls file paths must not be empty",
+                ));
+            }
+        }
+        if self.client_cert_file.is_some() != self.client_key_file.is_some() {
+            return Err(ConfigError::InvalidField(
+                "sink.redis.tls requires both client_cert_file and client_key_file for mutual TLS",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Redis authentication mode.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, tag = "mode", rename_all = "snake_case")]
+pub enum RedisAuthConfig {
+    /// No Redis authentication.
+    None,
+    /// Redis ACL username and password.
+    Acl {
+        /// Username reference.
+        username_ref: ValueRef,
+        /// Password reference.
+        password_ref: ValueRef,
+    },
+    /// Password-only Redis authentication.
+    Password {
+        /// Password reference.
+        password_ref: ValueRef,
+    },
+}
+
+impl RedisAuthConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        match self {
+            Self::None => Ok(()),
+            Self::Acl {
+                username_ref,
+                password_ref,
+            } => {
+                username_ref.validate()?;
+                password_ref.validate()
+            }
+            Self::Password { password_ref } => password_ref.validate(),
+        }
+    }
+}
+
+/// Redis key construction.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisKeyspaceConfig {
+    /// Key prefix owned by this pipeline.
+    pub prefix: String,
+    /// Target routing strategy.
+    #[serde(default)]
+    pub routing: RedisKeyRoutingConfig,
+    /// Permission for target-wide keyspace operations.
+    #[serde(default)]
+    pub ownership: RedisKeyspaceOwnershipConfig,
+}
+
+impl RedisKeyspaceConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.prefix.is_empty()
+            || self.prefix.len() > 256
+            || !self.prefix.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'_' | b'-' | b'.')
+            })
+        {
+            return Err(ConfigError::InvalidField(
+                "sink.redis.keyspace.prefix must be 1 to 256 ASCII letters, digits, ':', '_', '-', or '.'",
+            ));
+        }
+        if matches!(self.routing, RedisKeyRoutingConfig::Views { .. })
+            && self.ownership != RedisKeyspaceOwnershipConfig::Exclusive
+        {
+            return Err(ConfigError::InvalidField(
+                "sink.redis views routing requires keyspace.ownership=exclusive",
+            ));
+        }
+        self.routing.validate()
+    }
+}
+
+/// Whether a Redis pipeline may perform target-wide keyspace operations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedisKeyspaceOwnershipConfig {
+    /// Other writers may use the same prefix and targets.
+    #[default]
+    Shared,
+    /// This pipeline exclusively owns every routed target under the prefix.
+    Exclusive,
+}
+
+/// Redis key target routing.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, tag = "strategy", rename_all = "snake_case")]
+pub enum RedisKeyRoutingConfig {
+    /// Route by `ventstream.cdc.relation`.
+    #[default]
+    ByOutputRelation,
+    /// Route by `ventstream.target.index`.
+    ByProjectionTarget,
+    /// Route all documents to one target.
+    Fixed {
+        /// Fixed target segment.
+        name: String,
+    },
+    /// Materialize declarative lookup views.
+    Views {
+        /// Bounded view definitions.
+        views: Vec<RedisViewConfig>,
+    },
+}
+
+impl RedisKeyRoutingConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if matches!(
+            self,
+            Self::Fixed { name }
+                if name.trim().is_empty()
+                    || name.trim() != name
+                    || name.len() > 1024
+                    || name.chars().any(char::is_control)
+        ) {
+            return Err(ConfigError::InvalidField(
+                "sink.redis.keyspace.routing.name must be trimmed, 1 to 1024 bytes, and contain no control characters",
+            ));
+        }
+        if let Self::Views { views } = self {
+            validate_redis_views(views)?;
+        }
+        Ok(())
+    }
+}
+
+/// Declarative Redis lookup view.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisViewConfig {
+    /// Stable target name.
+    pub name: String,
+    /// Exact source selection.
+    pub source: RedisViewSourceConfig,
+    /// Deterministic key template.
+    pub key: RedisViewKeyConfig,
+    /// Optional document filter.
+    #[serde(default)]
+    pub filter: Option<RedisViewFilterConfig>,
+    /// Stored value selection.
+    #[serde(default)]
+    pub value: RedisViewValueConfig,
+}
+
+/// Raw relation or projection selected by a view.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisViewSourceConfig {
+    /// Optional source namespace.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// Raw relation or collection.
+    #[serde(default)]
+    pub relation: Option<String>,
+    /// Denormalized projection target.
+    #[serde(default)]
+    pub projection_target: Option<String>,
+}
+
+/// View key template.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisViewKeyConfig {
+    /// `${doc_id}`, `${header:NAME}`, and `${json:/pointer}` template.
+    pub template: String,
+    /// Missing placeholder behavior.
+    #[serde(default)]
+    pub on_missing: RedisViewMissingBehaviorConfig,
+}
+
+/// Missing key placeholder behavior.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedisViewMissingBehaviorConfig {
+    /// Block the pipeline.
+    #[default]
+    Block,
+    /// Remove the prior view entry and omit the new one.
+    Skip,
+}
+
+/// Bounded JSON filter.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisViewFilterConfig {
+    /// Condition composition.
+    #[serde(default)]
+    pub mode: RedisViewFilterModeConfig,
+    /// Scalar JSON-pointer conditions.
+    pub conditions: Vec<RedisViewConditionConfig>,
+}
+
+/// View filter composition.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedisViewFilterModeConfig {
+    /// Every condition must match.
+    #[default]
+    All,
+    /// At least one condition must match.
+    Any,
+}
+
+/// Supported view filter comparisons.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, tag = "operator", rename_all = "snake_case")]
+pub enum RedisViewConditionConfig {
+    /// Exact equality.
+    Equals {
+        /// RFC 6901 JSON pointer.
+        path: String,
+        /// Expected scalar.
+        value: serde_json::Value,
+    },
+    /// Exact inequality.
+    NotEquals {
+        /// RFC 6901 JSON pointer.
+        path: String,
+        /// Excluded scalar.
+        value: serde_json::Value,
+    },
+    /// Membership.
+    In {
+        /// RFC 6901 JSON pointer.
+        path: String,
+        /// Accepted scalars.
+        values: Vec<serde_json::Value>,
+    },
+    /// Non-membership.
+    NotIn {
+        /// RFC 6901 JSON pointer.
+        path: String,
+        /// Excluded scalars.
+        values: Vec<serde_json::Value>,
+    },
+    /// Pointer existence.
+    Exists {
+        /// RFC 6901 JSON pointer.
+        path: String,
+    },
+    /// Pointer absence.
+    NotExists {
+        /// RFC 6901 JSON pointer.
+        path: String,
+    },
+}
+
+/// Value emitted by a Redis view.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, tag = "mode", rename_all = "snake_case")]
+pub enum RedisViewValueConfig {
+    /// Complete document.
+    #[default]
+    Document,
+    /// One JSON subtree.
+    Pointer {
+        /// RFC 6901 JSON pointer.
+        path: String,
+    },
+    /// Named JSON object fields.
+    Fields {
+        /// Output field name to JSON pointer.
+        fields: BTreeMap<String, String>,
+    },
+}
+
+fn validate_redis_views(views: &[RedisViewConfig]) -> Result<(), ConfigError> {
+    if views.is_empty() || views.len() > 32 {
+        return Err(ConfigError::InvalidField(
+            "sink.redis views routing requires 1 to 32 views",
+        ));
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for view in views {
+        if invalid_bounded_redis_view_text(&view.name, 256) || view.name.starts_with("__ventstream")
+        {
+            return Err(ConfigError::InvalidField(
+                "sink.redis view names must be trimmed, unique, 1 to 256 bytes, and not use the reserved __ventstream prefix",
+            ));
+        }
+        if !names.insert(view.name.as_str()) {
+            return Err(ConfigError::InvalidField(
+                "sink.redis view names must be trimmed, unique, 1 to 256 bytes, and not use the reserved __ventstream prefix",
+            ));
+        }
+        if usize::from(view.source.relation.is_some())
+            + usize::from(view.source.projection_target.is_some())
+            != 1
+        {
+            return Err(ConfigError::InvalidField(
+                "sink.redis view source must define exactly one of relation or projection_target",
+            ));
+        }
+        for value in [
+            view.source.namespace.as_deref(),
+            view.source.relation.as_deref(),
+            view.source.projection_target.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if invalid_bounded_redis_view_text(value, 1024) {
+                return Err(ConfigError::InvalidField(
+                    "sink.redis view source selectors must be trimmed, 1 to 1024 bytes, and contain no control characters",
+                ));
+            }
+        }
+        validate_redis_view_template(&view.key.template)?;
+        if let Some(filter) = &view.filter {
+            if filter.conditions.is_empty() || filter.conditions.len() > 32 {
+                return Err(ConfigError::InvalidField(
+                    "sink.redis view filters require 1 to 32 conditions",
+                ));
+            }
+            for condition in &filter.conditions {
+                match condition {
+                    RedisViewConditionConfig::Equals { path, value }
+                    | RedisViewConditionConfig::NotEquals { path, value } => {
+                        validate_redis_view_pointer(path)?;
+                        validate_redis_view_scalar(value)?;
+                    }
+                    RedisViewConditionConfig::In { path, values }
+                    | RedisViewConditionConfig::NotIn { path, values } => {
+                        validate_redis_view_pointer(path)?;
+                        if values.is_empty() || values.len() > 64 {
+                            return Err(ConfigError::InvalidField(
+                                "sink.redis view membership conditions require 1 to 64 scalar values",
+                            ));
+                        }
+                        for value in values {
+                            validate_redis_view_scalar(value)?;
+                        }
+                    }
+                    RedisViewConditionConfig::Exists { path }
+                    | RedisViewConditionConfig::NotExists { path } => {
+                        validate_redis_view_pointer(path)?;
+                    }
+                }
+            }
+        }
+        match &view.value {
+            RedisViewValueConfig::Document => {}
+            RedisViewValueConfig::Pointer { path } => validate_redis_view_pointer(path)?,
+            RedisViewValueConfig::Fields { fields } => {
+                if fields.is_empty() || fields.len() > 128 {
+                    return Err(ConfigError::InvalidField(
+                        "sink.redis view value fields require 1 to 128 entries",
+                    ));
+                }
+                for (name, path) in fields {
+                    if invalid_bounded_redis_view_text(name, 256) {
+                        return Err(ConfigError::InvalidField(
+                            "sink.redis view output field names must be trimmed, 1 to 256 bytes, and contain no control characters",
+                        ));
+                    }
+                    validate_redis_view_pointer(path)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_redis_view_template(template: &str) -> Result<(), ConfigError> {
+    if template.is_empty() || template.len() > 4096 || template.chars().any(char::is_control) {
+        return Err(ConfigError::InvalidField(
+            "sink.redis view key templates must be 1 to 4096 bytes with no control characters",
+        ));
+    }
+    let mut remaining = template;
+    let mut parts = 0usize;
+    let mut has_identity = false;
+    while let Some(start) = remaining.find("${") {
+        parts = parts.saturating_add(usize::from(start > 0));
+        let expression = &remaining[start + 2..];
+        let Some(end) = expression.find('}') else {
+            return Err(ConfigError::InvalidField(
+                "sink.redis view key template has an unterminated placeholder",
+            ));
+        };
+        let token = &expression[..end];
+        if token == "doc_id" {
+            has_identity = true;
+        } else if let Some(header) = token.strip_prefix("header:") {
+            if header.is_empty() || header.len() > 2048 || header.chars().any(char::is_control) {
+                return Err(ConfigError::InvalidField(
+                    "sink.redis view key header reference is invalid",
+                ));
+            }
+        } else if let Some(pointer) = token.strip_prefix("json:") {
+            validate_redis_view_pointer(pointer)?;
+            has_identity = true;
+        } else {
+            return Err(ConfigError::InvalidField(
+                "sink.redis view key template contains an unsupported placeholder",
+            ));
+        }
+        parts = parts.saturating_add(1);
+        remaining = &expression[end + 1..];
+    }
+    parts = parts.saturating_add(usize::from(!remaining.is_empty()));
+    if parts > 64 {
+        return Err(ConfigError::InvalidField(
+            "sink.redis view key template exceeds 64 parts",
+        ));
+    }
+    if !has_identity {
+        return Err(ConfigError::InvalidField(
+            "sink.redis view key template must include ${doc_id} or ${json:/pointer}",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_redis_view_pointer(pointer: &str) -> Result<(), ConfigError> {
+    if pointer.len() > 2048
+        || (!pointer.is_empty() && !pointer.starts_with('/'))
+        || pointer.chars().any(char::is_control)
+    {
+        return Err(ConfigError::InvalidField(
+            "sink.redis view paths must be RFC 6901 JSON pointers up to 2048 bytes",
+        ));
+    }
+    let mut bytes = pointer.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'~' && !matches!(bytes.next(), Some(b'0' | b'1')) {
+            return Err(ConfigError::InvalidField(
+                "sink.redis view path contains an invalid JSON pointer escape",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_redis_view_scalar(value: &serde_json::Value) -> Result<(), ConfigError> {
+    if matches!(
+        value,
+        serde_json::Value::Array(_) | serde_json::Value::Object(_)
+    ) {
+        return Err(ConfigError::InvalidField(
+            "sink.redis view filter values must be JSON scalars",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_bounded_redis_view_text(value: &str, max_bytes: usize) -> bool {
+    value.trim().is_empty()
+        || value.trim() != value
+        || value.len() > max_bytes
+        || value.chars().any(char::is_control)
+}
+
+/// Redis value settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedisDocumentConfig {
+    /// Stored representation.
+    #[serde(default)]
+    pub format: RedisDocumentFormatConfig,
+}
+
+/// Redis value representation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedisDocumentFormatConfig {
+    /// Store compact bytes with `SET`.
+    #[default]
+    String,
+    /// Store JSON with RedisJSON `JSON.SET`.
+    Json,
+}
+
+/// Redis retention contract.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, tag = "mode", rename_all = "snake_case")]
+pub enum RedisContractConfig {
+    /// Retain materialized state without expiry.
+    #[default]
+    MaterializedView,
+    /// Expire every upsert after the configured TTL.
+    Cache {
+        /// Key TTL.
+        ttl_ms: u64,
+    },
+}
+
+impl RedisContractConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if let Self::Cache { ttl_ms } = self {
+            if *ttl_ms == 0 || *ttl_ms > i64::MAX as u64 {
+                return Err(ConfigError::InvalidField(
+                    "sink.redis.contract.ttl_ms must be within the Redis integer range",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Redis write acknowledgement policy.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, tag = "mode", rename_all = "snake_case")]
+pub enum RedisAcknowledgementConfig {
+    /// Advance after the primary applies the pipeline.
+    #[default]
+    Primary,
+    /// Require replica acknowledgement via `WAIT`.
+    Replicated {
+        /// Minimum replica acknowledgements.
+        replicas: usize,
+        /// Maximum acknowledgement wait.
+        timeout_ms: u64,
+    },
+    /// Require local and/or replica AOF fsync via Redis 7.2+ `WAITAOF`.
+    Aof {
+        /// Require the writable primary to fsync its local AOF.
+        #[serde(default = "default_redis_aof_local")]
+        local: bool,
+        /// Minimum replica AOF fsync acknowledgements.
+        #[serde(default)]
+        replicas: usize,
+        /// Maximum acknowledgement wait.
+        timeout_ms: u64,
+    },
+}
+
+impl RedisAcknowledgementConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let (local, replicas, timeout_ms) = match self {
+            Self::Primary => return Ok(()),
+            Self::Replicated {
+                replicas,
+                timeout_ms,
+            } => (false, *replicas, *timeout_ms),
+            Self::Aof {
+                local,
+                replicas,
+                timeout_ms,
+            } => (*local, *replicas, *timeout_ms),
+        };
+        if timeout_ms == 0
+            || replicas > usize::try_from(i64::MAX).unwrap_or(usize::MAX)
+            || timeout_ms > i64::MAX as u64
+            || (matches!(self, Self::Replicated { .. }) && replicas == 0)
+            || (matches!(self, Self::Aof { .. }) && !local && replicas == 0)
+        {
+            return Err(ConfigError::InvalidField(
+                "sink.redis.acknowledgement requires a positive timeout and at least one requested acknowledgement",
+            ));
+        }
+        Ok(())
+    }
+}
+
+const fn default_redis_aof_local() -> bool {
+    true
 }
 
 /// OpenSearch/Elasticsearch sink settings.
@@ -1663,28 +2561,41 @@ impl DispatchConfig {
 pub enum ValueRef {
     /// Read the value from an environment variable.
     Env(String),
+    /// Read the value from a deployment-mounted file.
+    File(PathBuf),
 }
 
 impl ValueRef {
-    /// Parse a value reference such as `env:VS_OS_ENDPOINT`.
+    /// Parse an environment or mounted-file value reference.
     pub fn parse(value: &str) -> Result<Self, ConfigError> {
-        let Some(name) = value.strip_prefix("env:") else {
-            return Err(ConfigError::InvalidReference(value.to_owned()));
-        };
-        validate_env_name(name)?;
-        Ok(Self::Env(name.to_owned()))
+        if let Some(name) = value.strip_prefix("env:") {
+            validate_env_name(name)?;
+            return Ok(Self::Env(name.to_owned()));
+        }
+        if let Some(path) = value.strip_prefix("file:") {
+            if path.is_empty() {
+                return Err(ConfigError::InvalidReference(value.to_owned()));
+            }
+            return Ok(Self::File(PathBuf::from(path)));
+        }
+        Err(ConfigError::InvalidReference(value.to_owned()))
     }
 
     /// Return the reference as a displayable string.
     pub fn as_str(&self) -> String {
         match self {
             Self::Env(name) => format!("env:{name}"),
+            Self::File(path) => format!("file:{}", path.display()),
         }
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
         match self {
             Self::Env(name) => validate_env_name(name),
+            Self::File(path) if path.as_os_str().is_empty() => {
+                Err(ConfigError::InvalidReference("file:".to_owned()))
+            }
+            Self::File(_) => Ok(()),
         }
     }
 }
@@ -1712,7 +2623,7 @@ pub enum ConfigError {
     #[error("invalid engine config: {0}")]
     InvalidField(&'static str),
     /// A value reference is not supported.
-    #[error("invalid value reference {0:?}; expected env:NAME")]
+    #[error("invalid value reference {0:?}; expected env:NAME or file:/path")]
     InvalidReference(String),
 }
 
@@ -1878,6 +2789,12 @@ specs:
         );
         assert!(ValueRef::parse("https://search.example.com").is_err());
         assert!(ValueRef::parse("env:lowercase").is_err());
+        assert_eq!(
+            ValueRef::parse("file:/run/secrets/redis-password")
+                .expect("mounted file reference should parse"),
+            ValueRef::File(PathBuf::from("/run/secrets/redis-password"))
+        );
+        assert!(ValueRef::parse("file:").is_err());
     }
 
     #[test]
@@ -2540,6 +3457,496 @@ sink:
 "#,
         ] {
             EngineConfig::from_yaml_str(yaml).expect("accept AWS RDS provider trust");
+        }
+    }
+
+    #[test]
+    fn parses_redis_materialized_view_sink() {
+        let config = EngineConfig::from_yaml_str(
+            r#"
+schema_version: 1
+roles: [cdc]
+source:
+  kind: mongodb
+  mongodb:
+    uri_ref: env:VS_MONGO_URI
+    database: app
+    collections: [orders]
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_URL
+    auth:
+      mode: acl
+      username_ref: env:VS_REDIS_USERNAME
+      password_ref: env:VS_REDIS_PASSWORD
+    tls:
+      ca_file: /run/secrets/redis-ca.pem
+      client_cert_file: /run/secrets/redis-client.crt
+      client_key_file: /run/secrets/redis-client.key
+    keyspace:
+      prefix: ventstream:example:production
+      ownership: exclusive
+      routing:
+        strategy: by_output_relation
+    document:
+      format: json
+    contract:
+      mode: materialized_view
+    acknowledgement:
+      mode: replicated
+      replicas: 1
+      timeout_ms: 1000
+"#,
+        )
+        .expect("parse Redis sink");
+        let sink = config.sink.expect("sink");
+        assert_eq!(sink.kind, SinkKind::Redis);
+        let redis = sink.redis.expect("Redis settings");
+        assert_eq!(redis.document.format, RedisDocumentFormatConfig::Json);
+        assert!(matches!(
+            redis.keyspace.routing,
+            RedisKeyRoutingConfig::ByOutputRelation
+        ));
+        assert_eq!(
+            redis.keyspace.ownership,
+            RedisKeyspaceOwnershipConfig::Exclusive
+        );
+        assert!(matches!(
+            redis.acknowledgement,
+            RedisAcknowledgementConfig::Replicated {
+                replicas: 1,
+                timeout_ms: 1000
+            }
+        ));
+        let tls = redis.tls.expect("Redis TLS settings");
+        assert_eq!(
+            tls.ca_file.as_deref(),
+            Some(std::path::Path::new("/run/secrets/redis-ca.pem"))
+        );
+    }
+
+    #[test]
+    fn parses_redis_aof_acknowledgement_with_local_default() {
+        let config = EngineConfig::from_yaml_str(
+            r#"
+schema_version: 1
+roles: [cdc]
+source: { kind: mongodb }
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_URL
+    keyspace:
+      prefix: app
+    acknowledgement:
+      mode: aof
+      replicas: 1
+      timeout_ms: 2000
+"#,
+        )
+        .expect("parse Redis AOF acknowledgement");
+        let acknowledgement = config
+            .sink
+            .and_then(|sink| sink.redis)
+            .map(|redis| redis.acknowledgement)
+            .expect("Redis acknowledgement");
+        assert!(matches!(
+            acknowledgement,
+            RedisAcknowledgementConfig::Aof {
+                local: true,
+                replicas: 1,
+                timeout_ms: 2000
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_redis_sentinel_and_cluster_topologies() {
+        let sentinel = EngineConfig::from_yaml_str(
+            r#"
+schema_version: 1
+roles: [cdc]
+source: { kind: mongodb }
+sink:
+  kind: redis
+  redis:
+    topology:
+      mode: sentinel
+      service_name: cache-primary
+      endpoints:
+        - env:VS_REDIS_SENTINEL_1
+        - env:VS_REDIS_SENTINEL_2
+      data_node_tls: true
+      sentinel_auth:
+        mode: password
+        password_ref: env:VS_REDIS_SENTINEL_PASSWORD
+      sentinel_tls:
+        ca_file: /run/secrets/sentinel-ca.pem
+    auth:
+      mode: acl
+      username_ref: env:VS_REDIS_USERNAME
+      password_ref: env:VS_REDIS_PASSWORD
+    keyspace:
+      prefix: ventstream:sentinel
+      routing: { strategy: fixed, name: orders }
+"#,
+        )
+        .expect("parse Redis Sentinel topology");
+        let sentinel_redis = sentinel
+            .sink
+            .and_then(|sink| sink.redis)
+            .expect("Sentinel Redis settings");
+        assert!(matches!(
+            sentinel_redis.topology,
+            Some(RedisTopologyConfig::Sentinel {
+                data_node_tls: true,
+                ..
+            })
+        ));
+
+        let cluster = EngineConfig::from_yaml_str(
+            r#"
+schema_version: 1
+roles: [cdc]
+source: { kind: mongodb }
+sink:
+  kind: redis
+  redis:
+    topology:
+      mode: cluster
+      endpoints: [env:VS_REDIS_CLUSTER_1, env:VS_REDIS_CLUSTER_2]
+    keyspace:
+      prefix: ventstream:cluster
+      routing: { strategy: by_output_relation }
+"#,
+        )
+        .expect("parse Redis Cluster topology");
+        let cluster_redis = cluster
+            .sink
+            .and_then(|sink| sink.redis)
+            .expect("Cluster Redis settings");
+        assert!(matches!(
+            cluster_redis.topology,
+            Some(RedisTopologyConfig::Cluster { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_ambiguous_redis_topology_and_cross_slot_views() {
+        for yaml in [
+            r#"
+schema_version: 1
+roles: [cdc]
+source: { kind: mongodb }
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_URL
+    topology:
+      mode: cluster
+      endpoints: [env:VS_REDIS_CLUSTER_1]
+    keyspace:
+      prefix: ventstream:cluster
+      routing: { strategy: by_output_relation }
+"#,
+            r#"
+schema_version: 1
+roles: [cdc]
+source: { kind: mongodb }
+sink:
+  kind: redis
+  redis:
+    topology:
+      mode: cluster
+      endpoints: [env:VS_REDIS_CLUSTER_1]
+    keyspace:
+      prefix: ventstream:cluster
+      ownership: exclusive
+      routing:
+        strategy: views
+        views:
+          - name: first
+            source: { relation: orders }
+            key: { template: "first:${doc_id}" }
+          - name: second
+            source: { relation: orders }
+            key: { template: "second:${doc_id}" }
+"#,
+        ] {
+            assert!(EngineConfig::from_yaml_str(yaml).is_err());
+        }
+    }
+
+    #[test]
+    fn parses_bounded_redis_lookup_views() {
+        let config = EngineConfig::from_yaml_str(
+            r#"
+schema_version: 1
+roles: [cdc]
+source:
+  kind: mongodb
+  mongodb:
+    uri_ref: env:VS_MONGO_URI
+    database: app
+    collections: [orders]
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_URL
+    keyspace:
+      prefix: ventstream:app
+      ownership: exclusive
+      routing:
+        strategy: views
+        views:
+          - name: open_order_by_id
+            source:
+              namespace: app
+              relation: orders
+            key:
+              template: "order:${json:/id}"
+              on_missing: block
+            filter:
+              mode: all
+              conditions:
+                - path: /status
+                  operator: in
+                  values: [pending, processing]
+                - path: /deleted_at
+                  operator: not_exists
+            value:
+              mode: fields
+              fields:
+                id: /id
+                status: /status
+"#,
+        )
+        .expect("parse Redis views");
+
+        let redis = config
+            .sink
+            .and_then(|sink| sink.redis)
+            .expect("Redis settings");
+        let views = match redis.keyspace.routing {
+            RedisKeyRoutingConfig::Views { views } => views,
+            _ => Vec::new(),
+        };
+        assert_eq!(views.len(), 1);
+        let Some(view) = views.first() else {
+            return;
+        };
+        assert_eq!(view.name, "open_order_by_id");
+        assert!(matches!(view.value, RedisViewValueConfig::Fields { .. }));
+    }
+
+    #[test]
+    fn rejects_unsafe_redis_lookup_views() {
+        for yaml in [
+            r#"
+schema_version: 1
+roles: [cdc]
+source:
+  kind: mongodb
+  mongodb:
+    uri_ref: env:VS_MONGO_URI
+    database: app
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_URL
+    keyspace:
+      prefix: ventstream:app
+      routing:
+        strategy: views
+        views:
+          - name: orders
+            source: { relation: orders }
+            key: { template: "order:${doc_id}" }
+"#,
+            r#"
+schema_version: 1
+roles: [cdc]
+source:
+  kind: mongodb
+  mongodb:
+    uri_ref: env:VS_MONGO_URI
+    database: app
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_URL
+    keyspace:
+      prefix: ventstream:app
+      ownership: exclusive
+      routing:
+        strategy: views
+        views:
+          - name: orders
+            source:
+              relation: orders
+              projection_target: order_projection
+            key: { template: "order:${doc_id}" }
+"#,
+            r#"
+schema_version: 1
+roles: [cdc]
+source:
+  kind: mongodb
+  mongodb:
+    uri_ref: env:VS_MONGO_URI
+    database: app
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_URL
+    keyspace:
+      prefix: ventstream:app
+      ownership: exclusive
+      routing:
+        strategy: views
+        views:
+          - name: orders
+            source: { relation: orders }
+            key: { template: "constant" }
+"#,
+            r#"
+schema_version: 1
+roles: [cdc]
+source:
+  kind: mongodb
+  mongodb:
+    uri_ref: env:VS_MONGO_URI
+    database: app
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_URL
+    keyspace:
+      prefix: ventstream:app
+      ownership: exclusive
+      routing:
+        strategy: views
+        views:
+          - name: orders
+            source: { relation: orders }
+            key: { template: "order:${doc_id}" }
+            filter:
+              conditions:
+                - path: /status~
+                  operator: equals
+                  value: { unsafe: object }
+"#,
+        ] {
+            assert!(
+                EngineConfig::from_yaml_str(yaml).is_err(),
+                "unsafe Redis view was accepted:\n{yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_unbounded_redis_sink_settings() {
+        for yaml in [
+            r#"
+schema_version: 1
+sink:
+  kind: redis
+  opensearch:
+    endpoint_ref: env:VS_OS_ENDPOINT
+  redis:
+    endpoint_ref: env:VS_REDIS_URL
+    keyspace:
+      prefix: app
+"#,
+            r#"
+schema_version: 1
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_URL
+    keyspace:
+      prefix: app
+    contract:
+      mode: cache
+      ttl_ms: 0
+"#,
+            r#"
+schema_version: 1
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_URL
+    keyspace:
+      prefix: app
+    acknowledgement:
+      mode: replicated
+      replicas: 0
+      timeout_ms: 1000
+"#,
+            r#"
+schema_version: 1
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_URL
+    tls:
+      client_cert_file: /run/secrets/redis-client.crt
+    keyspace:
+      prefix: app
+"#,
+            r#"
+schema_version: 1
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_URL
+    keyspace:
+      prefix: " app "
+      routing:
+        strategy: fixed
+        name: " orders "
+"#,
+            r#"
+schema_version: 1
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_URL
+    keyspace:
+      prefix: app
+    max_batch_bytes: 67108865
+"#,
+            r#"
+schema_version: 1
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_URL
+    keyspace:
+      prefix: app
+    acknowledgement:
+      mode: replicated
+      replicas: 1
+      timeout_ms: 2000
+    response_timeout_ms: 1000
+"#,
+            r#"
+schema_version: 1
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_URL
+    keyspace:
+      prefix: app
+    acknowledgement:
+      mode: aof
+      local: false
+      replicas: 0
+      timeout_ms: 1000
+"#,
+        ] {
+            assert!(EngineConfig::from_yaml_str(yaml).is_err());
         }
     }
 }

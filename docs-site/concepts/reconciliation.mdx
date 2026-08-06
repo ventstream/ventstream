@@ -10,6 +10,14 @@ documents would linger in the index as orphans.
 
 Reconciliation removes them.
 
+<Info>
+Delete reconciliation currently applies to OpenSearch and Elasticsearch
+sinks. Redis uses a different rebuild contract: normal pause and resume
+preserve the cursor, while an exclusively owned keyspace can be cleared by
+finite routed targets and restored from a source snapshot. Shared Redis
+keyspaces reject destructive drain and rebootstrap operations.
+</Info>
+
 ## When it runs
 
 On a **drain → resume** cycle, before the bootstrap re-emits documents.
