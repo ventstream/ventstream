@@ -15,6 +15,8 @@ mod common;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use redis::AsyncCommands;
+
 const USER_SPEC: &str = r#"
 denormalize:
   - primary_label: User
@@ -46,6 +48,195 @@ fn process_rss_kib(pid: u32) -> u64 {
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .and_then(|rss| rss.trim().parse().ok())
         .unwrap_or(0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "local integration: requires Docker"]
+async fn neo4j_materializes_relationship_updates_and_deletes_in_redis() {
+    const PREFIX: &str = "ventstream:it:neo4j";
+
+    let stack = common::start_neo4j_os().await;
+    let (_redis, redis_port) = common::start_redis().await;
+    common::neo4j_exec(
+        &stack.neo4j,
+        "CREATE (:User {id:'redis-1', name:'Ada'})-[:HAS_ROLE]->(:Role {name:'editor'})",
+    )
+    .await;
+
+    let state_dir = common::state_dir("neo4j-redis", stack.neo4j_port);
+    let spec_path = common::write_spec(&state_dir, USER_SPEC);
+    let mut engine = common::spawn_neo4j_redis_engine(
+        stack.neo4j_port,
+        redis_port,
+        &spec_path,
+        &state_dir,
+        PREFIX,
+    );
+    let pattern = format!("{PREFIX}:{{users}}:*");
+    common::wait_until(Duration::from_secs(90), "Neo4j Redis snapshot", || {
+        let pattern = pattern.clone();
+        async move {
+            let Ok(keys) = common::redis_keys(redis_port, &pattern).await else {
+                return false;
+            };
+            let Some(key) = keys.first() else {
+                return false;
+            };
+            common::redis_value(redis_port, key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_slice::<serde_json::Value>(&value).ok())
+                .is_some_and(|document| {
+                    document["name"] == "Ada"
+                        && document["activeRoles"]
+                            .as_array()
+                            .is_some_and(|roles| roles.iter().any(|role| role == "editor"))
+                })
+        }
+    })
+    .await;
+    let keys = common::redis_keys(redis_port, &pattern)
+        .await
+        .expect("Neo4j Redis keys");
+    assert_eq!(keys.len(), 1);
+    let key = keys.first().expect("Neo4j Redis key").clone();
+
+    common::neo4j_exec(
+        &stack.neo4j,
+        "MATCH (:User {id:'redis-1'})-[:HAS_ROLE]->(role:Role) SET role.name='administrator'",
+    )
+    .await;
+    common::wait_until(
+        Duration::from_secs(60),
+        "Neo4j Redis relationship update",
+        || async {
+            common::redis_value(redis_port, &key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_slice::<serde_json::Value>(&value).ok())
+                .is_some_and(|document| {
+                    document["activeRoles"]
+                        .as_array()
+                        .is_some_and(|roles| roles.iter().any(|role| role == "administrator"))
+                })
+        },
+    )
+    .await;
+
+    let cursor_path = format!("{state_dir}/neo4j_cursor");
+    common::wait_until(Duration::from_secs(15), "Neo4j CDC cursor", || async {
+        std::fs::metadata(&cursor_path).is_ok()
+    })
+    .await;
+    let owned_pattern = format!("{PREFIX}:{{users}}:*");
+    let stale_key = format!("{PREFIX}:{{users}}:stale");
+    let neighboring_key = format!("{PREFIX}:{{roles}}:keep");
+    let mut redis = common::redis_connection(redis_port)
+        .await
+        .expect("connect to Redis");
+    redis
+        .set::<_, _, ()>(&stale_key, br#"{"stale":true}"#)
+        .await
+        .expect("seed stale Neo4j target key");
+    redis
+        .set::<_, _, ()>(&neighboring_key, br#"{"keep":true}"#)
+        .await
+        .expect("seed neighboring Redis target key");
+    engine.terminate();
+
+    let shared_output = common::neo4j_redis_engine_command(
+        stack.neo4j_port,
+        redis_port,
+        &spec_path,
+        &state_dir,
+        PREFIX,
+        "shared",
+    )
+    .arg("--fleet-rebootstrap")
+    .output()
+    .expect("run shared Neo4j rebootstrap");
+    assert!(
+        !shared_output.status.success(),
+        "shared Neo4j keyspace rebootstrap must be refused"
+    );
+    assert!(
+        std::fs::metadata(&cursor_path).is_ok(),
+        "ownership validation must preserve the Neo4j cursor"
+    );
+    assert_eq!(
+        common::redis_keys(redis_port, &owned_pattern)
+            .await
+            .expect("read Neo4j target after refused rebootstrap")
+            .len(),
+        2,
+        "refused rebootstrap must preserve materialized and stale keys"
+    );
+
+    let exclusive_output = common::neo4j_redis_engine_command(
+        stack.neo4j_port,
+        redis_port,
+        &spec_path,
+        &state_dir,
+        PREFIX,
+        "exclusive",
+    )
+    .arg("--fleet-rebootstrap")
+    .output()
+    .expect("run exclusive Neo4j rebootstrap");
+    assert!(
+        exclusive_output.status.success(),
+        "exclusive Neo4j rebootstrap failed: {}",
+        String::from_utf8_lossy(&exclusive_output.stderr)
+    );
+    assert!(
+        std::fs::metadata(&cursor_path).is_err(),
+        "Neo4j rebootstrap must remove the CDC cursor"
+    );
+    assert!(
+        common::redis_keys(redis_port, &owned_pattern)
+            .await
+            .expect("read Neo4j target after rebootstrap")
+            .is_empty(),
+        "Neo4j rebootstrap must clear the exclusively owned target"
+    );
+    assert!(
+        common::redis_value(redis_port, &neighboring_key)
+            .await
+            .expect("read neighboring Redis target")
+            .is_some(),
+        "Neo4j rebootstrap must preserve neighboring targets"
+    );
+
+    let _rebuilt = common::spawn_neo4j_redis_engine_with_ownership(
+        stack.neo4j_port,
+        redis_port,
+        &spec_path,
+        &state_dir,
+        PREFIX,
+        "exclusive",
+    );
+    common::wait_until(
+        Duration::from_secs(90),
+        "Neo4j Redis live set after rebootstrap",
+        || async {
+            common::redis_keys(redis_port, &owned_pattern)
+                .await
+                .is_ok_and(|keys| keys.len() == 1 && !keys.contains(&stale_key))
+        },
+    )
+    .await;
+
+    common::neo4j_exec(
+        &stack.neo4j,
+        "MATCH (user:User {id:'redis-1'}) DETACH DELETE user",
+    )
+    .await;
+    common::wait_until(Duration::from_secs(60), "Neo4j Redis delete", || async {
+        common::redis_value(redis_port, &key).await == Ok(None)
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

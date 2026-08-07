@@ -20,6 +20,99 @@ const INDEX: &str = "it_kafka_orders";
 const DOC_ID: &str = r#"shop.orders:["ord-1"]"#;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "local integration: requires Docker"]
+async fn kafka_materializes_and_resumes_in_redis() {
+    const PREFIX: &str = "ventstream:it:kafka";
+
+    let stack = common::start_kafka_os().await;
+    let (_redis, redis_port) = common::start_redis().await;
+    let brokers = format!("127.0.0.1:{}", stack.kafka_port);
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .create()
+        .expect("create kafka admin client");
+    admin
+        .create_topics(
+            &[NewTopic::new("orders", 1, TopicReplication::Fixed(1))],
+            &AdminOptions::new(),
+        )
+        .await
+        .expect("create kafka topic")
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("kafka topic result");
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .create()
+        .expect("create kafka producer");
+    publish(&producer, "created").await;
+
+    let state_dir = common::state_dir("kafka-redis", stack.kafka_port);
+    let mut engine = common::spawn_kafka_redis_engine(
+        stack.kafka_port,
+        redis_port,
+        &state_dir,
+        "ventstream-it-redis-orders",
+        PREFIX,
+    );
+    let pattern = format!("{PREFIX}:{{orders}}:*");
+    common::wait_until(Duration::from_secs(60), "Kafka Redis replay", || {
+        let pattern = pattern.clone();
+        async move {
+            let Ok(keys) = common::redis_keys(redis_port, &pattern).await else {
+                return false;
+            };
+            let Some(key) = keys.first() else {
+                return false;
+            };
+            common::redis_value(redis_port, key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|value| serde_json::from_slice::<serde_json::Value>(&value).ok())
+                .is_some_and(|document| document["status"] == "created")
+        }
+    })
+    .await;
+    let keys = common::redis_keys(redis_port, &pattern)
+        .await
+        .expect("Kafka Redis keys");
+    assert_eq!(keys.len(), 1);
+    let key = keys.first().expect("Kafka Redis key").clone();
+
+    publish(&producer, "live-updated").await;
+    common::wait_until(Duration::from_secs(30), "Kafka Redis update", || async {
+        common::redis_value(redis_port, &key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_slice::<serde_json::Value>(&value).ok())
+            .is_some_and(|document| document["status"] == "live-updated")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    engine.terminate();
+    publish(&producer, "updated-while-stopped").await;
+    let _restarted = common::spawn_kafka_redis_engine(
+        stack.kafka_port,
+        redis_port,
+        &state_dir,
+        "ventstream-it-redis-orders",
+        PREFIX,
+    );
+    common::wait_until(Duration::from_secs(90), "Kafka Redis restart", || async {
+        common::redis_value(redis_port, &key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|value| serde_json::from_slice::<serde_json::Value>(&value).ok())
+            .is_some_and(|document| document["status"] == "updated-while-stopped")
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "local integration: requires Docker; run with scripts/test-sources.sh kafka"]
 async fn kafka_live_change_and_consumer_offset_restart() {
     let stack = common::start_kafka_os().await;

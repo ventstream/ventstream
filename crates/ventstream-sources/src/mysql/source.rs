@@ -35,13 +35,13 @@ pub struct MySqlCdcSource {
     sink_progress: Option<Arc<AtomicU64>>,
     emit_snapshot_completion_marker: bool,
     force_snapshot_from_cursor: bool,
+    emit_transition_images: bool,
 }
 
-/// One decoded row image — the full positional column values, owned so they
-/// survive across the async work. `process` slices the PK by schema ordinals
-/// (the body itself comes from a re-`SELECT`).
+/// One decoded row change, retaining both images and omitted-column markers.
 struct RowChange {
-    values: Vec<Value>,
+    before: Option<Vec<Option<Value>>>,
+    after: Option<Vec<Option<Value>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +58,7 @@ impl MySqlCdcSource {
             sink_progress: None,
             emit_snapshot_completion_marker: false,
             force_snapshot_from_cursor: false,
+            emit_transition_images: false,
         }
     }
 
@@ -81,6 +82,13 @@ impl MySqlCdcSource {
     #[must_use]
     pub fn with_forced_snapshot_from_cursor(mut self, enabled: bool) -> Self {
         self.force_snapshot_from_cursor = enabled;
+        self
+    }
+
+    /// Include update pre-images for SQL recomposition.
+    #[must_use]
+    pub fn with_transition_images(mut self, enabled: bool) -> Self {
+        self.emit_transition_images = enabled;
         self
     }
 
@@ -484,14 +492,23 @@ impl MySqlCdcSource {
         }
         let mut emitted = false;
         for change in rows {
+            let before_doc = row_image_to_json(
+                change.before.as_deref(),
+                &schema.column_names,
+                &schema.json_columns,
+            );
             let pk_values: Vec<Value> = schema
                 .pk_ordinals
                 .iter()
-                .map(|&o| change.values.get(o).cloned().unwrap_or(Value::NULL))
+                .map(|&ordinal| {
+                    row_change_value(&change, op, ordinal)
+                        .cloned()
+                        .unwrap_or(Value::NULL)
+                })
                 .collect();
             let pk = pk_components(&pk_values);
             let ev = if op.is_delete() {
-                event_mapper::change_event(&self.config, &table, op, &pk, None)?
+                event_mapper::change_event(&self.config, &table, op, &pk, Some(before_doc))?
             } else {
                 let qualified = format!("`{}`.`{}`", esc(&db), esc(&table));
                 let where_clause = schema
@@ -505,6 +522,16 @@ impl MySqlCdcSource {
                 let row: Option<Row> = conn.exec_first(sql, pk_values).await.map_err(op_err)?;
                 drop(conn);
                 match row {
+                    Some(r) if self.emit_transition_images && matches!(op, Op::Update) => {
+                        event_mapper::change_event_with_transition(
+                            &self.config,
+                            &table,
+                            op,
+                            &pk,
+                            Some(row_to_json(&r, &schema.json_columns)),
+                            Some(before_doc),
+                        )?
+                    }
                     Some(r) => event_mapper::change_event(
                         &self.config,
                         &table,
@@ -607,15 +634,25 @@ fn decode_rows(
     for row in rows.rows(tme) {
         let (before, after) =
             row.map_err(|e| MySqlCdcError::MalformedEvent(format!("binlog row: {e}")))?;
-        let image = if op.is_delete() { before } else { after };
-        let Some(image) = image else { continue };
-        let values: Vec<Value> = (0..image.len())
-            .map(|i| match image.as_ref(i) {
-                Some(BinlogValue::Value(v)) => v.clone(),
-                _ => Value::NULL, // non-PK JSONB/etc — unused (body is re-read)
-            })
-            .collect();
-        out.push(RowChange { values });
+        let before = before.map(|image| {
+            (0..image.len())
+                .map(|index| match image.as_ref(index) {
+                    Some(BinlogValue::Value(value)) => Some(value.clone()),
+                    _ => None,
+                })
+                .collect()
+        });
+        let after = after.map(|image| {
+            (0..image.len())
+                .map(|index| match image.as_ref(index) {
+                    Some(BinlogValue::Value(value)) => Some(value.clone()),
+                    _ => None,
+                })
+                .collect()
+        });
+        if before.is_some() || after.is_some() {
+            out.push(RowChange { before, after });
+        }
     }
     Ok(Some(RowBatch {
         db,
@@ -641,6 +678,52 @@ fn pk_components(values: &[Value]) -> Vec<String> {
         .iter()
         .map(|v| doc_id::component_text(&value_to_json(v, false)))
         .collect()
+}
+
+fn row_change_value(change: &RowChange, op: Op, ordinal: usize) -> Option<&Value> {
+    let before = || {
+        change
+            .before
+            .as_ref()
+            .and_then(|image| image.get(ordinal))
+            .and_then(Option::as_ref)
+    };
+    let after = || {
+        change
+            .after
+            .as_ref()
+            .and_then(|image| image.get(ordinal))
+            .and_then(Option::as_ref)
+    };
+    match op {
+        Op::Insert => after(),
+        Op::Update => after().or_else(before),
+        Op::Delete => before(),
+    }
+}
+
+fn row_image_to_json(
+    image: Option<&[Option<Value>]>,
+    column_names: &[String],
+    json_columns: &std::collections::HashSet<String>,
+) -> Json {
+    let mut map = Map::new();
+    let Some(image) = image else {
+        return Json::Object(map);
+    };
+    for (ordinal, value) in image.iter().enumerate() {
+        let (Some(value), Some(name)) = (value.as_ref(), column_names.get(ordinal)) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        map.insert(
+            name.clone(),
+            value_to_json(value, json_columns.contains(name)),
+        );
+    }
+    Json::Object(map)
 }
 
 fn row_to_json(row: &Row, json_columns: &std::collections::HashSet<String>) -> Json {
@@ -787,10 +870,11 @@ fn jittered_delay(delay: Duration) -> Duration {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::{
-        allocate_ack_sequence, flush_confirmed_positions, jittered_delay, sanitize_binlog_filename,
-        BinlogPos, CursorFile,
+        allocate_ack_sequence, flush_confirmed_positions, jittered_delay, row_change_value,
+        row_image_to_json, sanitize_binlog_filename, BinlogPos, CursorFile, Op, RowChange,
     };
-    use std::collections::VecDeque;
+    use mysql_async::Value;
+    use std::collections::{HashSet, VecDeque};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
@@ -875,5 +959,42 @@ mod tests {
             assert!(delay >= std::time::Duration::from_secs(5));
             assert!(delay <= base);
         }
+    }
+
+    #[test]
+    fn update_primary_key_uses_after_image_then_before_fallback() {
+        let change = RowChange {
+            before: Some(vec![
+                Some(Value::Bytes(b"old-id".to_vec())),
+                Some(Value::Bytes(b"stable".to_vec())),
+            ]),
+            after: Some(vec![Some(Value::Bytes(b"new-id".to_vec())), None]),
+        };
+        assert_eq!(
+            row_change_value(&change, Op::Update, 0),
+            Some(&Value::Bytes(b"new-id".to_vec()))
+        );
+        assert_eq!(
+            row_change_value(&change, Op::Update, 1),
+            Some(&Value::Bytes(b"stable".to_vec()))
+        );
+    }
+
+    #[test]
+    fn delete_before_image_preserves_present_columns_and_omits_missing_ones() {
+        let image = vec![
+            Some(Value::Bytes(b"item-1".to_vec())),
+            Some(Value::Bytes(b"order-7".to_vec())),
+            None,
+        ];
+        let document = row_image_to_json(
+            Some(&image),
+            &["id".into(), "order_id".into(), "description".into()],
+            &HashSet::new(),
+        );
+        assert_eq!(
+            document,
+            serde_json::json!({"id": "item-1", "order_id": "order-7"})
+        );
     }
 }

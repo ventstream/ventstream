@@ -1,0 +1,49 @@
+schema_version: 1
+roles: [cdc]
+
+source:
+  kind: postgres
+  postgres:
+    host_ref: env:VS_PG_HOST
+    port: 5432
+    user_ref: env:VS_PG_USER
+    password_ref: env:VS_PG_PASSWORD
+    database_ref: env:VS_PG_DATABASE
+    publication_ref: env:VS_PG_PUBLICATION
+    slot_ref: env:VS_PG_SLOT
+    bootstrap:
+      mode: snapshot
+      chunk_size: 10000
+    denormalize_mode: sql
+    sink_reverse_lookup: false
+
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_SINK_URL
+    auth:
+      mode: acl
+      username_ref: env:VS_REDIS_SINK_USERNAME
+      password_ref: env:VS_REDIS_SINK_PASSWORD
+    keyspace:
+      prefix: ventstream:orders:development
+      ownership: shared
+      routing:
+        strategy: by_output_relation
+    document:
+      format: string
+    contract:
+      mode: materialized_view
+    acknowledgement:
+      mode: primary
+    writer:
+      lease_ms: 30000
+
+runtime:
+  health_listen: 127.0.0.1:4043
+  dlq_path: ./ventstream-state/dlq.jsonl
+  memory:
+    enabled: true
+    budget_bytes: 268435456
+    max_event_bytes: 33554432
+    recovery_ms: 1000

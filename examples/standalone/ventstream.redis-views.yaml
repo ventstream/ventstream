@@ -1,0 +1,74 @@
+schema_version: 1
+roles: [cdc]
+
+source:
+  kind: mongodb
+  mongodb:
+    uri_ref: env:VS_MONGO_URI
+    database_ref: env:VS_MONGO_DATABASE
+    namespace: commerce
+    collections: [orders]
+    full_document: update_lookup
+    bootstrap:
+      mode: snapshot
+      chunk_size: 1000
+    state_dir: ./ventstream-state/mongodb
+    token_flush_ms: 1000
+
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_SINK_URL
+    auth:
+      mode: acl
+      username_ref: env:VS_REDIS_SINK_USERNAME
+      password_ref: env:VS_REDIS_SINK_PASSWORD
+    keyspace:
+      prefix: ventstream:orders:development
+      ownership: exclusive
+      routing:
+        strategy: views
+        views:
+          - name: pending_order_by_id
+            source:
+              namespace: commerce
+              relation: orders
+            key:
+              template: "order:${json:/id}"
+            filter:
+              conditions:
+                - path: /status
+                  operator: in
+                  values: [pending, processing]
+            value:
+              mode: fields
+              fields:
+                id: /id
+                status: /status
+                total: /total
+
+          - name: order_by_customer
+            source:
+              namespace: commerce
+              relation: orders
+            key:
+              template: "customer:${json:/customer_id}:order:${json:/id}"
+            value:
+              mode: document
+    document:
+      format: string
+    contract:
+      mode: materialized_view
+    acknowledgement:
+      mode: primary
+    writer:
+      lease_ms: 30000
+
+runtime:
+  health_listen: 127.0.0.1:4043
+  dlq_path: ./ventstream-state/dlq.jsonl
+  memory:
+    enabled: true
+    budget_bytes: 268435456
+    max_event_bytes: 33554432
+    recovery_ms: 1000

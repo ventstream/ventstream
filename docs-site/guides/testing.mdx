@@ -32,6 +32,19 @@ one source or the complete sequential matrix explicitly:
 These are local qualification tests, not part of the default pull-request
 suite. Run the source relevant to your change before release.
 
+The Redis sink has a separate local qualification runner. It provisions
+isolated standalone, authenticated, RedisJSON, replica, failover, pressure,
+mutual-TLS, Sentinel, and Cluster deployments, then exercises recovery and
+topology changes serially:
+
+```bash
+./scripts/test-redis-sink.sh all
+```
+
+Use `contracts` or `topology` instead of `all` to run one half of the suite.
+Set `VS_TEST_REDIS_KEEP=1` only when you need to retain the containers after a
+failure for inspection.
+
 ## The matrix
 
 For each path your spec embeds, exercise all three operations and

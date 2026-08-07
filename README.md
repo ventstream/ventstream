@@ -14,12 +14,11 @@ event core, run together or apart:
 
 1. **Change streaming → any target.** Capture changes from PostgreSQL, Neo4j,
    MongoDB, MySQL/MariaDB, or Kafka/Redpanda and stream them continuously into a
-   downstream target — idempotent, bounded, crash-safe. The **sink is an
-   interface, not a constraint**: OpenSearch is implemented and tested
-   today; any other target is a connector away. Projections are declared
+   downstream target — idempotent, bounded, crash-safe. OpenSearch,
+   Elasticsearch, and Redis sinks are implemented today. Projections are declared
    in YAML and can run standalone or under the optional Fleet control plane.
 2. **Real-time socket delivery → clients.** Publishers emit events to
-   NATS; VentStream pushes them to subscribed clients over a native
+   NATS or Redis Streams; VentStream pushes them to subscribed clients over a native
    WebSocket protocol **and** GraphQL subscriptions (`graphql-transport-ws`,
    Apollo-compatible). Typed subscriptions are authored in GraphQL SDL.
 
@@ -31,8 +30,7 @@ matrix that's built and tested; more backends are planned)
 - **Sources:** PostgreSQL logical replication, Neo4j 5.17+ Enterprise CDC,
   MongoDB change streams, MySQL/MariaDB row binlog, and Kafka/Redpanda
   Debezium or raw topics
-- **Targets (sinks):** OpenSearch / Elasticsearch — *one* sink behind a
-  pluggable interface, not the point of the engine
+- **Targets (sinks):** OpenSearch / Elasticsearch and Redis
 - **Real-time:** native WebSocket + GraphQL subscriptions over NATS or Redis Streams
 
 **Docs:** the full docs live in `docs-site/` (Mintlify) — concepts, guides,
@@ -135,7 +133,7 @@ ventstream/
 │   ├── ventstream-config/      Pipeline/spec YAML parsing & validation
 │   ├── ventstream-sources/     Source adapters — Postgres, Neo4j, MongoDB, MySQL, Kafka
 │   ├── ventstream-joins/       Stateful in-memory joins / denormalization (redb-persisted)
-│   ├── ventstream-sinks/       Sink adapters — OpenSearch / Elasticsearch today
+│   ├── ventstream-sinks/       Sink adapters — OpenSearch / Elasticsearch and Redis
 │   ├── ventstream-jetstream/   Shared JetStream consumer lifecycle (naming, RAII handle, reaper)
 │   ├── ventstream-realtime/    Provider-neutral broker, session, capability, and cursor contract
 │   ├── ventstream-redis/       Redis Streams shared tailer, replay, retention, and cursor adapter
@@ -208,9 +206,11 @@ below show Postgres and Neo4j.
 - `VS_NEO4J_RECOMPOSE_CHUNK` (128), `VS_NEO4J_RECOMPOSE_CONCURRENCY` (8) — live multi-hop recompose tuning.
 
 ### Sink
-- `VS_OS_ENDPOINT` — OpenSearch URL.
+- `VS_SINK` — `opensearch` (default), `elasticsearch`, or `redis`.
+- `VS_OS_ENDPOINT` — OpenSearch or Elasticsearch URL.
 - `VS_OS_TLS_MODE=verify_full`, with optional `VS_OS_TLS_CA_FILE`, enforces HTTPS certificate and hostname verification.
 - `VS_INDEX_TEMPLATE` — destination index pattern; supports `${header:…}` and `%Y/%m/%d`.
+- `VS_REDIS_SINK_TOPOLOGY`, `VS_REDIS_SINK_URL`, `VS_REDIS_SINK_KEY_PREFIX` — Redis materialization topology and key namespace. Standalone, Sentinel, and Cluster modes support strict TLS, optional custom trust, mutual TLS, and renewable per-target writer leases.
 
 ### Joins
 - `VS_JOINS_YAML` — path to the joins manifest.

@@ -242,6 +242,22 @@ impl MySqlDenormalizer {
         })
     }
 
+    pub async fn require_full_binlog_row_image(&self) -> Result<()> {
+        let mut conn = self.conn().await?;
+        let mode: Option<String> = conn
+            .query_first("SELECT @@GLOBAL.binlog_row_image")
+            .await
+            .context("reading MySQL binlog_row_image")?;
+        match mode.as_deref() {
+            Some(mode) if mode.eq_ignore_ascii_case("FULL") => Ok(()),
+            Some(mode) => anyhow::bail!(
+                "MySQL SQL joins require binlog_row_image=FULL when a related join key is not \
+                 contained in the related primary key; server reports {mode}"
+            ),
+            None => anyhow::bail!("MySQL did not report @@GLOBAL.binlog_row_image"),
+        }
+    }
+
     /// Override the bounded tail-recomposition limits.
     #[must_use]
     pub fn with_recompose_limits(mut self, key_chunk: usize, concurrency: usize) -> Self {
@@ -323,9 +339,12 @@ impl MySqlDenormalizer {
                         &doc,
                         false,
                     )?;
-                    if sender.send(event, shutdown).await.is_err() {
-                        return Ok(());
-                    }
+                    sender.send(event, shutdown).await.map_err(|err| {
+                        anyhow::anyhow!(
+                            "publishing MySQL bootstrap document for {}: {err}",
+                            pd.primary_table
+                        )
+                    })?;
                     ventstream_telemetry::bump_events_emitted(1);
                     emitted += 1;
                     page_last = Some(pk_text);
@@ -395,9 +414,12 @@ impl MySqlDenormalizer {
                     &doc,
                     false,
                 )?;
-                if sender.send(event, shutdown).await.is_err() {
-                    return Ok(emitted);
-                }
+                sender.send(event, shutdown).await.map_err(|err| {
+                    anyhow::anyhow!(
+                        "publishing MySQL recomposed document for {}: {err}",
+                        pd.primary_table
+                    )
+                })?;
                 ventstream_telemetry::bump_events_emitted(1);
                 emitted.push(pk_text);
             }
@@ -417,7 +439,7 @@ impl MySqlDenormalizer {
         if events.is_empty() {
             return Ok(());
         }
-        // Parse each event: relation, op, full-image row (None for `{}` delete),
+        // Parse each event: relation, op, available row image,
         // and the changed row's PK from the doc-id header.
         let parsed: Vec<ParsedEvent> = events.iter().map(parse_event).collect();
 
@@ -439,6 +461,17 @@ impl MySqlDenormalizer {
                             affected.insert(pk.clone());
                         }
                     }
+                    if ev.op == "update" {
+                        if let Some(old_pk) = ev
+                            .old_row
+                            .as_ref()
+                            .and_then(|row| extract_cols(row, pd.def.primary.pk.columns()))
+                        {
+                            if ev.doc_id_pk.as_ref() != Some(&old_pk) {
+                                deletes.insert(old_pk);
+                            }
+                        }
+                    }
                 }
                 // Related-table events → reverse-resolve to affected primaries.
                 for (rel_idx, related) in pd.def.related.iter().enumerate() {
@@ -455,12 +488,12 @@ impl MySqlDenormalizer {
                         None if related.pk.columns() == to => ev.doc_id_pk.clone(),
                         None => None,
                     };
-                    match to_vals {
+                    match &to_vals {
                         Some(vals) => {
                             if from == pd.def.primary.pk.columns() {
-                                affected.insert(vals); // 1:many — `to` is the parent PK
+                                affected.insert(vals.clone()); // 1:many — `to` is the parent PK
                             } else {
-                                many1_buckets.entry(rel_idx).or_default().push(vals);
+                                many1_buckets.entry(rel_idx).or_default().push(vals.clone());
                             }
                         }
                         None => {
@@ -478,6 +511,18 @@ impl MySqlDenormalizer {
                                             .or_default()
                                             .push(child_pk.clone());
                                     }
+                                }
+                            }
+                        }
+                    }
+                    if ev.op == "update" {
+                        let old_to_vals = ev.old_row.as_ref().and_then(|row| extract_cols(row, to));
+                        if let Some(old_vals) = old_to_vals {
+                            if to_vals.as_ref() != Some(&old_vals) {
+                                if from == pd.def.primary.pk.columns() {
+                                    affected.insert(old_vals);
+                                } else {
+                                    many1_buckets.entry(rel_idx).or_default().push(old_vals);
                                 }
                             }
                         }
@@ -536,7 +581,9 @@ impl MySqlDenormalizer {
                     &Value::Null,
                     true,
                 )?;
-                let _ = sender.send(event, shutdown).await;
+                sender.send(event, shutdown).await.map_err(|err| {
+                    anyhow::anyhow!("publishing MySQL tombstone for {}: {err}", pd.primary_table)
+                })?;
                 ventstream_telemetry::bump_events_emitted(1);
             }
         }
@@ -827,6 +874,7 @@ struct ParsedEvent {
     relation: String,
     op: String,
     row: Option<Value>,
+    old_row: Option<Value>,
     doc_id_pk: Option<Vec<String>>,
 }
 
@@ -843,14 +891,26 @@ fn parse_event(event: &Event) -> ParsedEvent {
         .next()
         .unwrap_or("")
         .to_owned();
-    // Full-image sources put the row directly in the payload on insert/update
-    // and `{}` on delete.
-    let row = if op == "delete" {
-        None
-    } else {
-        serde_json::from_slice::<Value>(event.payload.as_slice())
-            .ok()
-            .filter(Value::is_object)
+    let raw = serde_json::from_slice::<Value>(event.payload.as_slice()).ok();
+    let nonempty_object =
+        |value: &Value| value.as_object().is_some_and(|object| !object.is_empty());
+    let (row, old_row) = match (op.as_str(), raw) {
+        ("update", Some(raw)) if raw.get("new").is_some() => (
+            raw.get("new")
+                .filter(|value| nonempty_object(value))
+                .cloned(),
+            raw.get("old")
+                .filter(|value| nonempty_object(value))
+                .cloned(),
+        ),
+        ("delete", Some(raw)) if raw.get("old").is_some() => (
+            raw.get("old")
+                .filter(|value| nonempty_object(value))
+                .cloned(),
+            None,
+        ),
+        (_, Some(raw)) if nonempty_object(&raw) => (Some(raw), None),
+        _ => (None, None),
     };
     let doc_id_pk = event
         .headers
@@ -860,6 +920,7 @@ fn parse_event(event: &Event) -> ParsedEvent {
         relation,
         op,
         row,
+        old_row,
         doc_id_pk,
     }
 }
@@ -1196,6 +1257,104 @@ mod tests {
             Some(vec!["1".to_owned()])
         );
         assert_eq!(primary_pk_from_doc_id(&id, "shop.other"), None);
+    }
+
+    #[test]
+    fn parse_delete_uses_before_image_when_present() {
+        let source = SourceUri::new("mysql://shop/order_items").expect("source");
+        let subject = Subject::new("mysql.shop.order_items.delete").expect("subject");
+        let mut headers = HashMap::new();
+        headers.insert(
+            "ventstream.cdc.relation".to_owned(),
+            "order_items".to_owned(),
+        );
+        headers.insert(
+            "ventstream.doc.id".to_owned(),
+            ventstream_core::doc_id::doc_id("shop.order_items", &["item-1".to_owned()]),
+        );
+        let event = Event::builder(source, subject)
+            .payload(Payload::from_vec(
+                serde_json::to_vec(&json!({"id": "item-1", "order_id": "order-7"}))
+                    .expect("payload"),
+            ))
+            .content_type(ContentType::Json)
+            .headers(Headers::from_map(headers))
+            .build();
+
+        let parsed = parse_event(&event);
+        assert_eq!(parsed.op, "delete");
+        assert_eq!(
+            parsed
+                .row
+                .as_ref()
+                .and_then(|row| extract_cols(row, &["order_id".to_owned()])),
+            Some(vec!["order-7".to_owned()])
+        );
+        assert_eq!(parsed.doc_id_pk, Some(vec!["item-1".to_owned()]));
+        assert!(parsed.old_row.is_none());
+    }
+
+    #[test]
+    fn parse_empty_delete_keeps_doc_id_fallback() {
+        let source = SourceUri::new("mysql://shop/order_items").expect("source");
+        let subject = Subject::new("mysql.shop.order_items.delete").expect("subject");
+        let mut headers = HashMap::new();
+        headers.insert(
+            "ventstream.cdc.relation".to_owned(),
+            "order_items".to_owned(),
+        );
+        headers.insert(
+            "ventstream.doc.id".to_owned(),
+            ventstream_core::doc_id::doc_id("shop.order_items", &["item-1".to_owned()]),
+        );
+        let event = Event::builder(source, subject)
+            .payload(Payload::from_vec(b"{}".to_vec()))
+            .content_type(ContentType::Json)
+            .headers(Headers::from_map(headers))
+            .build();
+
+        let parsed = parse_event(&event);
+        assert!(parsed.row.is_none());
+        assert!(parsed.old_row.is_none());
+        assert_eq!(parsed.doc_id_pk, Some(vec!["item-1".to_owned()]));
+    }
+
+    #[test]
+    fn parse_update_preserves_old_and_new_join_keys() {
+        let source = SourceUri::new("mysql://shop/order_items").expect("source");
+        let subject = Subject::new("mysql.shop.order_items.update").expect("subject");
+        let mut headers = HashMap::new();
+        headers.insert(
+            "ventstream.cdc.relation".to_owned(),
+            "order_items".to_owned(),
+        );
+        let event = Event::builder(source, subject)
+            .payload(Payload::from_vec(
+                serde_json::to_vec(&json!({
+                    "new": {"id": "item-1", "order_id": "order-2"},
+                    "old": {"id": "item-1", "order_id": "order-1"}
+                }))
+                .expect("payload"),
+            ))
+            .content_type(ContentType::Json)
+            .headers(Headers::from_map(headers))
+            .build();
+
+        let parsed = parse_event(&event);
+        assert_eq!(
+            parsed
+                .row
+                .as_ref()
+                .and_then(|row| extract_cols(row, &["order_id".to_owned()])),
+            Some(vec!["order-2".to_owned()])
+        );
+        assert_eq!(
+            parsed
+                .old_row
+                .as_ref()
+                .and_then(|row| extract_cols(row, &["order_id".to_owned()])),
+            Some(vec!["order-1".to_owned()])
+        );
     }
 
     #[test]

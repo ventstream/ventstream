@@ -38,12 +38,67 @@ pub struct PgOsStack {
     pub os_port: u16,
 }
 
+pub struct PgRedisStack {
+    pub pg: ContainerAsync<GenericImage>,
+    pub redis: ContainerAsync<GenericImage>,
+    pub pg_port: u16,
+    pub redis_port: u16,
+}
+
 static POSTGRES_TEST_OS: tokio::sync::OnceCell<(ContainerAsync<GenericImage>, u16)> =
     tokio::sync::OnceCell::const_new();
 
 /// Start Postgres (logical replication enabled) + OpenSearch (security
 /// off) and wait until both accept connections.
 pub async fn start_pg_os() -> PgOsStack {
+    let (pg, pg_port) = start_postgres().await;
+
+    // OpenSearch is comparatively expensive to start and leaves enough JVM
+    // teardown pressure to stall Docker when every test creates a fresh one.
+    // The Postgres suite uses isolated indices, so one process-scoped instance
+    // is both faster and more reliable.
+    let (_, os_port) = POSTGRES_TEST_OS.get_or_init(start_os).await;
+    PgOsStack {
+        pg,
+        pg_port,
+        os_port: *os_port,
+    }
+}
+
+pub async fn start_pg_redis() -> PgRedisStack {
+    let (pg, pg_port) = start_postgres().await;
+    let (redis, redis_port) = start_redis().await;
+    PgRedisStack {
+        pg,
+        redis,
+        pg_port,
+        redis_port,
+    }
+}
+
+pub async fn start_redis() -> (ContainerAsync<GenericImage>, u16) {
+    let redis = GenericImage::new("redis", "7.4-alpine")
+        .with_exposed_port(6379.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+        .with_cmd([
+            "redis-server",
+            "--appendonly",
+            "yes",
+            "--appendfsync",
+            "everysec",
+        ])
+        .start()
+        .await
+        .expect("start Redis container");
+    let redis_port = redis
+        .get_host_port_ipv4(6379.tcp())
+        .await
+        .expect("Redis host port");
+    wait_redis_ready(redis_port).await;
+    (redis, redis_port)
+}
+
+async fn start_postgres() -> (ContainerAsync<GenericImage>, u16) {
     let pg = GenericImage::new("postgres", "16")
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
@@ -68,20 +123,8 @@ pub async fn start_pg_os() -> PgOsStack {
         .get_host_port_ipv4(5432.tcp())
         .await
         .expect("pg host port");
-
-    // OpenSearch is comparatively expensive to start and leaves enough JVM
-    // teardown pressure to stall Docker when every test creates a fresh one.
-    // The Postgres suite uses isolated indices, so one process-scoped instance
-    // is both faster and more reliable.
-    let (_, os_port) = POSTGRES_TEST_OS.get_or_init(start_os).await;
-    let stack = PgOsStack {
-        pg,
-        pg_port,
-        os_port: *os_port,
-    };
-    // PG logs "ready" twice (init + final); confirm a real connection.
-    wait_pg_ready(stack.pg_port).await;
-    stack
+    wait_pg_ready(pg_port).await;
+    (pg, pg_port)
 }
 
 /// Start an OpenSearch container (security disabled) and wait until its
@@ -138,6 +181,20 @@ async fn wait_os_ready(port: u16) {
     }
 }
 
+async fn wait_redis_ready(port: u16) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let ready = redis_connection(port).await.is_ok();
+        if ready {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("Redis never became ready on port {port}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 async fn try_pg_connect(port: u16) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
     let (client, conn) = tokio_postgres::connect(&pg_conn_str(port), tokio_postgres::NoTls).await?;
     tokio::spawn(async move {
@@ -159,6 +216,47 @@ pub async fn pg_client(port: u16) -> tokio_postgres::Client {
 
 pub fn os_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
+}
+
+pub fn redis_url(port: u16) -> String {
+    format!("redis://127.0.0.1:{port}/")
+}
+
+pub async fn redis_connection(port: u16) -> redis::RedisResult<redis::aio::ConnectionManager> {
+    redis::Client::open(redis_url(port))?
+        .get_connection_manager()
+        .await
+}
+
+pub async fn redis_keys(port: u16, pattern: &str) -> redis::RedisResult<Vec<String>> {
+    let mut connection = redis_connection(port).await?;
+    let mut cursor = 0u64;
+    let mut keys = Vec::new();
+    loop {
+        let (next, page): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg(1_000)
+            .query_async(&mut connection)
+            .await?;
+        keys.extend(page);
+        cursor = next;
+        if cursor == 0 {
+            break;
+        }
+    }
+    keys.sort();
+    Ok(keys)
+}
+
+pub async fn redis_value(port: u16, key: &str) -> redis::RedisResult<Option<Vec<u8>>> {
+    let mut connection = redis_connection(port).await?;
+    redis::cmd("GET")
+        .arg(key)
+        .query_async::<Option<Vec<u8>>>(&mut connection)
+        .await
 }
 
 /// Doc count for an index (0 if the index doesn't exist yet). Refreshes
@@ -268,6 +366,18 @@ pub struct PgEngine<'a> {
     pub denormalize_mode: &'a str,
 }
 
+pub struct PgRedisEngine<'a> {
+    pub pg_port: u16,
+    pub redis_port: u16,
+    pub slot: &'a str,
+    pub publication: &'a str,
+    pub spec_path: &'a str,
+    pub state_dir: &'a str,
+    pub key_prefix: &'a str,
+    pub key_routing: &'a str,
+    pub keyspace_ownership: &'a str,
+}
+
 /// A spawned engine; killed on drop.
 pub struct EngineHandle {
     child: Child,
@@ -344,6 +454,63 @@ pub fn spawn_pg_engine(opts: &PgEngine<'_>) -> EngineHandle {
     }
     let child = cmd.spawn().expect("spawn engine binary");
     EngineHandle { child, log_path }
+}
+
+pub fn spawn_pg_redis_engine(opts: &PgRedisEngine<'_>) -> EngineHandle {
+    spawn_pg_redis_engine_with_bootstrap_override(opts, false)
+}
+
+pub fn spawn_pg_redis_engine_with_forced_bootstrap(opts: &PgRedisEngine<'_>) -> EngineHandle {
+    spawn_pg_redis_engine_with_bootstrap_override(opts, true)
+}
+
+fn spawn_pg_redis_engine_with_bootstrap_override(
+    opts: &PgRedisEngine<'_>,
+    force_bootstrap: bool,
+) -> EngineHandle {
+    let log_path = format!("{}/engine.log", opts.state_dir);
+    std::fs::create_dir_all(opts.state_dir).ok();
+    let log = std::fs::File::create(&log_path).expect("engine log file");
+    let err = log.try_clone().expect("clone log fd");
+    let mut command = pg_redis_engine_command(opts);
+    if force_bootstrap {
+        command.env("VS_FLEET_FORCE_BOOTSTRAP", "1");
+    }
+    let child = command
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(err))
+        .spawn()
+        .expect("spawn Redis sink engine");
+    EngineHandle { child, log_path }
+}
+
+pub fn pg_redis_engine_command(opts: &PgRedisEngine<'_>) -> Command {
+    let bin = env!("CARGO_BIN_EXE_ventstream");
+    let mut command = Command::new(bin);
+    command
+        .env("VS_ROLES", "cdc")
+        .env("VS_CDC_SOURCE", "postgres")
+        .env("VS_PG_HOST", "127.0.0.1")
+        .env("VS_PG_PORT", opts.pg_port.to_string())
+        .env("VS_PG_USER", PG_USER)
+        .env("VS_PG_PASSWORD", PG_PASSWORD)
+        .env("VS_PG_DATABASE", PG_DB)
+        .env("VS_PG_PUBLICATION", opts.publication)
+        .env("VS_PG_SLOT", opts.slot)
+        .env("VS_PG_BOOTSTRAP_MODE", "snapshot")
+        .env("VS_PG_DENORMALIZE_MODE", "sql")
+        .env("VS_JOINS_YAML", opts.spec_path)
+        .env("VS_JOINS_STATE_DIR", opts.state_dir)
+        .env("VS_SINK", "redis")
+        .env("VS_REDIS_SINK_URL", redis_url(opts.redis_port))
+        .env("VS_REDIS_SINK_KEY_PREFIX", opts.key_prefix)
+        .env("VS_REDIS_SINK_KEY_ROUTING", opts.key_routing)
+        .env("VS_REDIS_SINK_KEYSPACE_OWNERSHIP", opts.keyspace_ownership)
+        .env("VS_REDIS_SINK_DOCUMENT_FORMAT", "string")
+        .env("VS_REDIS_SINK_CONTRACT", "materialized_view")
+        .env("VS_DLQ_PATH", format!("{}/dlq.jsonl", opts.state_dir))
+        .env("RUST_LOG", "info,ventstream_sinks=debug");
+    command
 }
 
 /// Write a join spec to a temp file and return its path.
@@ -541,6 +708,68 @@ pub fn spawn_neo4j_engine(opts: &Neo4jEngine<'_>) -> EngineHandle {
     EngineHandle { child, log_path }
 }
 
+pub fn spawn_neo4j_redis_engine(
+    neo4j_port: u16,
+    redis_port: u16,
+    spec_path: &str,
+    state_dir: &str,
+    key_prefix: &str,
+) -> EngineHandle {
+    spawn_neo4j_redis_engine_with_ownership(
+        neo4j_port, redis_port, spec_path, state_dir, key_prefix, "shared",
+    )
+}
+
+pub fn spawn_neo4j_redis_engine_with_ownership(
+    neo4j_port: u16,
+    redis_port: u16,
+    spec_path: &str,
+    state_dir: &str,
+    key_prefix: &str,
+    keyspace_ownership: &str,
+) -> EngineHandle {
+    let command = neo4j_redis_engine_command(
+        neo4j_port,
+        redis_port,
+        spec_path,
+        state_dir,
+        key_prefix,
+        keyspace_ownership,
+    );
+    spawn_engine_command(command, state_dir)
+}
+
+pub fn neo4j_redis_engine_command(
+    neo4j_port: u16,
+    redis_port: u16,
+    spec_path: &str,
+    state_dir: &str,
+    key_prefix: &str,
+    keyspace_ownership: &str,
+) -> Command {
+    engine_command(
+        state_dir,
+        &[
+            ("VS_ROLES", "cdc".to_owned()),
+            ("VS_CDC_SOURCE", "neo4j".to_owned()),
+            ("VS_NEO4J_URI", format!("bolt://127.0.0.1:{neo4j_port}")),
+            ("VS_NEO4J_USER", NEO4J_USER.to_owned()),
+            ("VS_NEO4J_PASSWORD", NEO4J_PASSWORD.to_owned()),
+            ("VS_NEO4J_DATABASE", "neo4j".to_owned()),
+            ("VS_NEO4J_DENORMALIZE_YAML", spec_path.to_owned()),
+            ("VS_NEO4J_STATE_DIR", state_dir.to_owned()),
+            ("VS_SINK", "redis".to_owned()),
+            ("VS_REDIS_SINK_URL", redis_url(redis_port)),
+            ("VS_REDIS_SINK_KEY_PREFIX", key_prefix.to_owned()),
+            ("VS_REDIS_SINK_KEY_ROUTING", "by_output_relation".to_owned()),
+            (
+                "VS_REDIS_SINK_KEYSPACE_OWNERSHIP",
+                keyspace_ownership.to_owned(),
+            ),
+        ],
+    )
+}
+
 // ---- MongoDB -----------------------------------------------------------
 
 pub const MONGO_DB: &str = "shop";
@@ -633,6 +862,57 @@ pub fn spawn_mongodb_engine(opts: &MongoEngine<'_>) -> EngineHandle {
     )
 }
 
+pub fn spawn_mongodb_redis_engine(
+    uri: &str,
+    redis_port: u16,
+    state_dir: &str,
+    key_prefix: &str,
+) -> EngineHandle {
+    spawn_mongodb_redis_engine_with_ownership(uri, redis_port, state_dir, key_prefix, "shared")
+}
+
+pub fn spawn_mongodb_redis_engine_with_ownership(
+    uri: &str,
+    redis_port: u16,
+    state_dir: &str,
+    key_prefix: &str,
+    keyspace_ownership: &str,
+) -> EngineHandle {
+    let command =
+        mongodb_redis_engine_command(uri, redis_port, state_dir, key_prefix, keyspace_ownership);
+    spawn_engine_command(command, state_dir)
+}
+
+pub fn mongodb_redis_engine_command(
+    uri: &str,
+    redis_port: u16,
+    state_dir: &str,
+    key_prefix: &str,
+    keyspace_ownership: &str,
+) -> Command {
+    engine_command(
+        state_dir,
+        &[
+            ("VS_ROLES", "cdc".to_owned()),
+            ("VS_CDC_SOURCE", "mongodb".to_owned()),
+            ("VS_MONGO_URI", uri.to_owned()),
+            ("VS_MONGO_DATABASE", MONGO_DB.to_owned()),
+            ("VS_MONGO_COLLECTIONS", "orders".to_owned()),
+            ("VS_MONGO_STATE_DIR", state_dir.to_owned()),
+            ("VS_MONGO_BOOTSTRAP_MODE", "snapshot".to_owned()),
+            ("VS_MONGO_TOKEN_FLUSH_MS", "100".to_owned()),
+            ("VS_SINK", "redis".to_owned()),
+            ("VS_REDIS_SINK_URL", redis_url(redis_port)),
+            ("VS_REDIS_SINK_KEY_PREFIX", key_prefix.to_owned()),
+            ("VS_REDIS_SINK_KEY_ROUTING", "by_output_relation".to_owned()),
+            (
+                "VS_REDIS_SINK_KEYSPACE_OWNERSHIP",
+                keyspace_ownership.to_owned(),
+            ),
+        ],
+    )
+}
+
 // ---- MySQL -------------------------------------------------------------
 
 pub const MYSQL_USER: &str = "ventstream";
@@ -646,33 +926,48 @@ pub struct MySqlOsStack {
     pub os_port: u16,
 }
 
-pub async fn start_mysql_os() -> MySqlOsStack {
-    // Docker may assign a different ephemeral host port when a stopped
-    // container is restarted. Pin one test-local port so the running engine
-    // can reconnect to the same address during outage drills.
+pub struct MySqlStack {
+    pub mysql: ContainerAsync<GenericImage>,
+    pub mysql_port: u16,
+}
+
+pub async fn start_mysql() -> MySqlStack {
+    start_mysql_with_row_image("FULL").await
+}
+
+pub async fn start_mysql_with_row_image(row_image: &str) -> MySqlStack {
     let mysql_port = reserve_local_port();
     let mysql = GenericImage::new("mysql", "8.4")
         .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
         .with_env_var("MYSQL_ROOT_PASSWORD", MYSQL_PASSWORD)
         .with_env_var("MYSQL_ROOT_HOST", "%")
         .with_env_var("MYSQL_DATABASE", MYSQL_DB)
-        .with_cmd([
-            "mysqld",
-            "--server-id=1",
-            "--log-bin=mysql-bin",
-            "--binlog-format=ROW",
-            "--binlog-row-image=FULL",
+        .with_cmd(vec![
+            "mysqld".to_owned(),
+            "--server-id=1".to_owned(),
+            "--log-bin=mysql-bin".to_owned(),
+            "--binlog-format=ROW".to_owned(),
+            format!("--binlog-row-image={row_image}"),
         ])
         .with_mapped_port(mysql_port, 3306.tcp())
         .start()
         .await
         .expect("start mysql container");
     wait_mysql_ready(mysql_port).await;
+    MySqlStack { mysql, mysql_port }
+}
+
+pub async fn start_mysql_os() -> MySqlOsStack {
+    start_mysql_os_with_row_image("FULL").await
+}
+
+pub async fn start_mysql_os_with_row_image(row_image: &str) -> MySqlOsStack {
+    let mysql = start_mysql_with_row_image(row_image).await;
     let (os, os_port) = start_os().await;
     MySqlOsStack {
-        mysql,
+        mysql: mysql.mysql,
         _os: os,
-        mysql_port,
+        mysql_port: mysql.mysql_port,
         os_port,
     }
 }
@@ -738,6 +1033,89 @@ pub fn spawn_mysql_engine(opts: &MySqlEngine<'_>) -> EngineHandle {
             ("VS_JOINS_STATE_DIR", opts.state_dir.to_owned()),
             ("VS_OS_ENDPOINT", os_url(opts.os_port)),
             ("VS_INDEX_TEMPLATE", opts.index_template.to_owned()),
+        ],
+    )
+}
+
+pub fn spawn_mysql_redis_engine(
+    mysql_port: u16,
+    redis_port: u16,
+    spec_path: &str,
+    state_dir: &str,
+    key_prefix: &str,
+) -> EngineHandle {
+    spawn_mysql_redis_engine_with_options(&MySqlRedisEngine {
+        mysql_port,
+        redis_port,
+        spec_path,
+        state_dir,
+        key_prefix,
+        tables: "orders",
+        keyspace_ownership: "shared",
+    })
+}
+
+pub fn spawn_mysql_redis_engine_with_tables(
+    mysql_port: u16,
+    redis_port: u16,
+    spec_path: &str,
+    state_dir: &str,
+    key_prefix: &str,
+    tables: &str,
+) -> EngineHandle {
+    spawn_mysql_redis_engine_with_options(&MySqlRedisEngine {
+        mysql_port,
+        redis_port,
+        spec_path,
+        state_dir,
+        key_prefix,
+        tables,
+        keyspace_ownership: "shared",
+    })
+}
+
+pub struct MySqlRedisEngine<'a> {
+    pub mysql_port: u16,
+    pub redis_port: u16,
+    pub spec_path: &'a str,
+    pub state_dir: &'a str,
+    pub key_prefix: &'a str,
+    pub tables: &'a str,
+    pub keyspace_ownership: &'a str,
+}
+
+pub fn spawn_mysql_redis_engine_with_options(opts: &MySqlRedisEngine<'_>) -> EngineHandle {
+    let command = mysql_redis_engine_command(opts);
+    spawn_engine_command(command, opts.state_dir)
+}
+
+pub fn mysql_redis_engine_command(opts: &MySqlRedisEngine<'_>) -> Command {
+    engine_command(
+        opts.state_dir,
+        &[
+            ("VS_ROLES", "cdc".to_owned()),
+            ("VS_CDC_SOURCE", "mysql".to_owned()),
+            ("VS_MYSQL_HOST", "127.0.0.1".to_owned()),
+            ("VS_MYSQL_PORT", opts.mysql_port.to_string()),
+            ("VS_MYSQL_USER", MYSQL_USER.to_owned()),
+            ("VS_MYSQL_PASSWORD", MYSQL_PASSWORD.to_owned()),
+            ("VS_MYSQL_DATABASE", MYSQL_DB.to_owned()),
+            ("VS_MYSQL_TABLES", opts.tables.to_owned()),
+            ("VS_MYSQL_SERVER_ID", "4000000002".to_owned()),
+            ("VS_MYSQL_STATE_DIR", opts.state_dir.to_owned()),
+            ("VS_MYSQL_BOOTSTRAP_MODE", "snapshot".to_owned()),
+            ("VS_MYSQL_POS_FLUSH_MS", "100".to_owned()),
+            ("VS_MYSQL_DENORMALIZE_MODE", "sql".to_owned()),
+            ("VS_JOINS_YAML", opts.spec_path.to_owned()),
+            ("VS_JOINS_STATE_DIR", opts.state_dir.to_owned()),
+            ("VS_SINK", "redis".to_owned()),
+            ("VS_REDIS_SINK_URL", redis_url(opts.redis_port)),
+            ("VS_REDIS_SINK_KEY_PREFIX", opts.key_prefix.to_owned()),
+            ("VS_REDIS_SINK_KEY_ROUTING", "by_output_relation".to_owned()),
+            (
+                "VS_REDIS_SINK_KEYSPACE_OWNERSHIP",
+                opts.keyspace_ownership.to_owned(),
+            ),
         ],
     )
 }
@@ -830,8 +1208,58 @@ pub fn spawn_kafka_engine(opts: &KafkaEngine<'_>) -> EngineHandle {
     )
 }
 
-fn spawn_engine(state_dir: &str, env: &[(&str, String)]) -> EngineHandle {
+pub fn spawn_kafka_redis_engine(
+    kafka_port: u16,
+    redis_port: u16,
+    state_dir: &str,
+    group_id: &str,
+    key_prefix: &str,
+) -> EngineHandle {
+    spawn_engine(
+        state_dir,
+        &[
+            ("VS_ROLES", "cdc".to_owned()),
+            ("VS_CDC_SOURCE", "kafka".to_owned()),
+            ("VS_KAFKA_BROKERS", format!("127.0.0.1:{kafka_port}")),
+            ("VS_KAFKA_TOPICS", "orders".to_owned()),
+            ("VS_KAFKA_GROUP_ID", group_id.to_owned()),
+            ("VS_KAFKA_NAMESPACE", "shop".to_owned()),
+            ("VS_KAFKA_UNWRAP", "raw".to_owned()),
+            ("VS_KAFKA_AUTO_OFFSET_RESET", "earliest".to_owned()),
+            ("VS_KAFKA_COMMIT_MS", "100".to_owned()),
+            ("VS_SINK", "redis".to_owned()),
+            ("VS_REDIS_SINK_URL", redis_url(redis_port)),
+            ("VS_REDIS_SINK_KEY_PREFIX", key_prefix.to_owned()),
+            ("VS_REDIS_SINK_KEY_ROUTING", "by_output_relation".to_owned()),
+        ],
+    )
+}
+fn engine_command(state_dir: &str, env: &[(&str, String)]) -> Command {
     let bin = env!("CARGO_BIN_EXE_ventstream");
+    let mut command = Command::new(bin);
+    command
+        .envs(env.iter().map(|(key, value)| (*key, value)))
+        .env("VS_DLQ_PATH", format!("{state_dir}/dlq.jsonl"))
+        .env("RUST_LOG", "info");
+    command
+}
+
+fn spawn_engine(state_dir: &str, env: &[(&str, String)]) -> EngineHandle {
+    let command = engine_command(state_dir, env);
+    spawn_engine_command(command, state_dir)
+}
+
+pub fn spawn_engine_with_config(
+    state_dir: &str,
+    config_path: &str,
+    env: &[(&str, String)],
+) -> EngineHandle {
+    let mut command = engine_command(state_dir, env);
+    command.env("VS_ENGINE_CONFIG", config_path);
+    spawn_engine_command(command, state_dir)
+}
+
+fn spawn_engine_command(mut command: Command, state_dir: &str) -> EngineHandle {
     let log_path = format!("{state_dir}/engine.log");
     std::fs::create_dir_all(state_dir).ok();
     let log = std::fs::OpenOptions::new()
@@ -840,12 +1268,7 @@ fn spawn_engine(state_dir: &str, env: &[(&str, String)]) -> EngineHandle {
         .open(&log_path)
         .expect("engine log file");
     let err = log.try_clone().expect("clone log fd");
-    let mut cmd = Command::new(bin);
-    cmd.envs(env.iter().map(|(key, value)| (*key, value)))
-        .env("VS_DLQ_PATH", format!("{state_dir}/dlq.jsonl"))
-        .env("RUST_LOG", "info")
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(err));
-    let child = cmd.spawn().expect("spawn engine binary");
+    command.stdout(Stdio::from(log)).stderr(Stdio::from(err));
+    let child = command.spawn().expect("spawn engine binary");
     EngineHandle { child, log_path }
 }

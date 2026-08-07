@@ -1,0 +1,804 @@
+---
+title: "Redis sink"
+description: "Maintain deterministic Redis keys from CDC output as retained views or expiring cache entries."
+---
+
+The Redis sink materializes each VentStream output document at a deterministic
+key. Source inserts and updates replace the value, source deletes remove the
+key, and source progress advances only after Redis acknowledges the ordered
+write pipeline.
+
+This connector is separate from the
+[Redis Streams realtime broker](/concepts/realtime-brokers). The sink stores
+queryable state with `SET` or `JSON.SET`; the realtime provider appends events
+to Redis Streams for WebSocket and GraphQL subscribers.
+
+## Requirements
+
+The current connector test matrix uses Redis 7.4 for string documents and
+Redis Stack 7.4 for RedisJSON documents. The configured identity must be able
+to run the commands listed under [ACL permissions](#acl-permissions).
+
+VentStream supports a standalone or managed primary endpoint, Redis Sentinel,
+and Redis Cluster. Choose the matching [endpoint topology](#endpoint-topology)
+so failover and routing are handled with the correct Redis protocol.
+
+## Preflight a deployment
+
+Run an online check with the same configuration and secret references the
+engine will use in production:
+
+```bash
+VS_ENGINE_CONFIG=./ventstream.yaml ventstream --check-redis-sink
+```
+
+The command verifies connectivity, authentication, TLS, required Redis and
+RedisJSON commands, cleanup permissions, replication or AOF acknowledgements,
+and stored view-schema compatibility. It exits without starting a source or
+claiming a writer fence. The JSON report does not include endpoints or
+credentials.
+
+## Inspect materialization drift
+
+Use the read-only drift check to inspect the bounded Redis structures owned by
+one or more routing targets:
+
+```bash
+VS_ENGINE_CONFIG=./ventstream.yaml ventstream \
+  --check-redis-drift \
+  --redis-target orders \
+  --redis-target customers
+```
+
+`fixed` and `views` routing derive their targets from configuration. Supply
+`--redis-target` for `by_output_relation` and `by_projection_target`, where the
+set of target names is data dependent. The default scan limit is 100,000 keys
+per target and key class; set a lower bounded limit when checking a large
+keyspace:
+
+```bash
+VS_ENGINE_CONFIG=./ventstream.yaml ventstream \
+  --check-redis-drift \
+  --redis-target orders \
+  --redis-drift-scan-limit 25000
+```
+
+The report checks for leaked staging keys and, for declarative views, missing
+values, missing or mismatched ownership records, incomplete manifests, orphan
+owners, and unowned values. `complete: false` means the scan reached its limit;
+it is not a clean result. The command does not claim a writer or change Redis.
+
+This structural check cannot discover a source row that is absent from both the
+Redis value and its metadata. Compare the report with the authoritative source
+before declaring parity. For a stable incident snapshot, drain the pipeline
+before inspection. If `requires_rebootstrap` is true, rebuild the exclusively
+owned target from its source rather than deleting individual metadata keys.
+
+## Configuration
+
+```yaml
+schema_version: 1
+roles: [cdc]
+
+source:
+  kind: postgres
+  postgres:
+    host_ref: env:VS_PG_HOST
+    user_ref: env:VS_PG_USER
+    password_ref: env:VS_PG_PASSWORD
+    database_ref: env:VS_PG_DATABASE
+    publication_ref: env:VS_PG_PUBLICATION
+    slot_ref: env:VS_PG_SLOT
+    denormalize_mode: sql
+    sink_reverse_lookup: false
+
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_SINK_URL
+    auth:
+      mode: acl
+      username_ref: env:VS_REDIS_SINK_USERNAME
+      password_ref: env:VS_REDIS_SINK_PASSWORD
+    keyspace:
+      prefix: ventstream:orders:production
+      ownership: shared
+      routing:
+        strategy: by_output_relation
+    document:
+      format: string
+    contract:
+      mode: materialized_view
+    acknowledgement:
+      mode: replicated
+      replicas: 1
+      timeout_ms: 1000
+    writer:
+      id_ref: env:VS_REDIS_SINK_WRITER_ID
+      lease_ms: 30000
+
+runtime:
+  dlq_path: /var/lib/ventstream/dlq.jsonl
+```
+
+Use `redis://` for an unencrypted local endpoint and `rediss://` for TLS with a
+publicly trusted certificate. Keep credentials in environment variables or a
+mounted secret provider rather than embedding them in the URL or YAML.
+
+For credentials that must rotate without restarting the engine, point the auth
+references at mounted files:
+
+```yaml
+auth:
+  mode: acl
+  username_ref: file:/run/secrets/redis/username
+  password_ref: file:/run/secrets/redis/password
+```
+
+VentStream checks mounted Redis credentials at most once every five seconds per
+active connection lane. When a value changes, it discards the old connection
+and authenticates a new one before writing. A trailing newline written by a
+secret manager is removed. Empty, non-UTF-8, non-regular, and files larger than
+1 MiB are rejected without logging their contents. Static environment
+credentials remain fail-fast; authentication failures from mounted files
+backpressure and retry so a corrected secret can recover the pipeline.
+
+For a private certificate authority, mount its PEM bundle and configure:
+
+```yaml
+tls:
+  ca_file: /run/secrets/redis/ca.pem
+```
+
+Redis deployments that require mutual TLS can also provide a client identity:
+
+```yaml
+tls:
+  ca_file: /run/secrets/redis/ca.pem
+  client_cert_file: /run/secrets/redis/client.crt
+  client_key_file: /run/secrets/redis/client.key
+```
+
+The client certificate and key must be configured together. VentStream verifies
+the certificate chain and server hostname and does not accept Redis's
+`#insecure` URL mode. Apply CA, client certificate, or client key changes with a
+rolling engine restart. Mounted ACL username and password files use the live
+rotation behavior described above.
+
+## Key construction
+
+Every key has this form:
+
+```text
+<prefix>:{<target>}:<document-id>
+```
+
+VentStream percent-encodes reserved bytes in the target and document ID. The
+braced target is a Redis Cluster hash tag, so every data, fencing, staging,
+manifest, and ownership key for one routed target shares a slot.
+
+The document ID is derived from the source key and remains stable across
+snapshots, updates, retries, and process restarts. For example:
+
+```text
+ventstream:orders:production:{orders}:public.orders%3A%5B%22ord-42%22%5D
+```
+
+VentStream stores two internal writer keys per target:
+
+```text
+ventstream:orders:production:__ventstream:writer:{orders}:current
+ventstream:orders:production:__ventstream:writer:{orders}:lineage
+```
+
+Neither key matches the target's data-key pattern
+`ventstream:orders:production:{orders}:*`. `current` is the renewable lease.
+`lineage` is a non-expiring witness for the latest process token. If failover
+outlasts the lease, the same process can recover ownership only while the
+lineage remains unchanged. A process replaced by a newer writer stays fenced
+even after the replacement lease expires. Do not modify either key.
+
+RedisJSON cache writes also use a short-lived staging key outside the data-key
+pattern. The engine sets the JSON value and TTL on that key, then renames it
+into place so a failed expiry cannot expose a replacement value without its
+cache TTL.
+
+Routing strategies:
+
+| Strategy | Target segment |
+|---|---|
+| `by_output_relation` | `ventstream.cdc.relation`; suitable for raw tables, collections, and default projection output |
+| `by_projection_target` | `ventstream.target.index`; requires a joins spec and `target.index` on each projection |
+| `fixed` | One configured `name` for every document |
+| `views` | One or more declarative lookup views selected from raw relations or joined projection targets |
+
+Use a unique prefix for each pipeline and environment. VentStream maintenance
+operations must never share a prefix with application-owned keys.
+
+## Lookup views
+
+Use `views` when application access patterns need keys derived from document
+fields rather than source primary keys. A single source event can update
+multiple views atomically:
+
+```yaml
+keyspace:
+  prefix: ventstream:orders:production
+  ownership: exclusive
+  routing:
+    strategy: views
+    views:
+      - name: pending_order_by_id
+        source:
+          namespace: commerce
+          relation: orders
+        key:
+          template: "order:${json:/id}"
+        filter:
+          conditions:
+            - path: /status
+              operator: in
+              values: [pending, processing]
+        value:
+          mode: fields
+          fields:
+            id: /id
+            status: /status
+            total: /total
+
+      - name: order_by_customer
+        source:
+          namespace: commerce
+          relation: orders
+        key:
+          template: "customer:${json:/customer_id}:order:${json:/id}"
+        value:
+          mode: document
+```
+
+`source.relation` selects a raw table, collection, label mapping, or topic
+relation. `source.projection_target` selects `target.index` from a PostgreSQL or
+MySQL joins spec. Define exactly one selector per view. `source.namespace` is
+optional and narrows a relation to one logical source namespace.
+
+Key templates support:
+
+| Expression | Value |
+|---|---|
+| `${doc_id}` | Stable VentStream document identity |
+| `${header:NAME}` | Exact event header |
+| `${json:/pointer}` | RFC 6901 JSON pointer into the materialized document |
+
+All placeholders must resolve by default. Set `key.on_missing: skip` only when
+the intended behavior is to remove the source document's previous entry from
+that view and omit its replacement. JSON key pointers must resolve to a string,
+number, or boolean; null, arrays, and objects are not valid key segments.
+
+Filters combine conditions with `mode: all` by default; `mode: any` is also
+available. Conditions support `equals`, `not_equals`, `in`, `not_in`, `exists`,
+and `not_exists`. Comparisons operate on JSON scalar values. A missing pointer
+does not match `equals` or `in`; it does match `not_equals` and `not_in`. Pair a
+negative comparison with `exists` when the field must be present.
+`value.mode` can store the complete `document`, one `pointer`, or a named
+`fields` object.
+
+VentStream keeps a source manifest and target ownership record for every
+materialized entry. An update that changes a derived key removes the old key
+and writes the new key in the same fenced Lua operation. A filter transition,
+source delete, or truncate removes every entry previously owned by the affected
+source document even when the delete event has no document payload. Runtime key
+collisions block the batch before any view is changed. Within one batch, source
+event order also governs key handoff: a document may claim a key only after its
+current owner has released it.
+
+View routing requires `keyspace.ownership: exclusive`. VentStream stores a
+non-expiring schema fingerprint and target inventory below the configured
+prefix. Changing a view selector, key, filter, value, document format, or
+retention contract requires a controlled drain/rebootstrap. Reordering
+unchanged view declarations does not. Rebootstrap clears targets removed by the
+new configuration as well as targets still present, then installs the new
+fingerprint before snapshot delivery resumes.
+
+View transformation errors fail closed instead of entering the DLQ because
+skipping one update could leave an older key visible. This includes malformed
+JSON, unresolved required pointers, missing stable document IDs, size-limit
+violations, and ownership metadata conflicts.
+
+## Keyspace ownership
+
+`keyspace.ownership: shared` is the default. It permits deterministic point
+upserts and deletes but rejects target-wide cleanup before changing the source
+cursor or Redis. Use it when another pipeline or application may write below
+the same prefix.
+
+Set `keyspace.ownership: exclusive` only when this pipeline is the sole writer
+for every routed target below its prefix:
+
+```yaml
+keyspace:
+  prefix: ventstream:orders:production
+  ownership: exclusive
+  routing:
+    strategy: by_output_relation
+```
+
+Exclusive ownership enables bounded target cleanup for source truncates and
+full rebootstrap. The engine still requires snapshot bootstrap and a finite
+target set. PostgreSQL, MySQL, MongoDB, and Neo4j can rebuild Redis from their
+current source data. Kafka consumer offsets cannot be reset atomically with
+Redis cleanup, so Kafka-to-Redis rebootstrap is rejected.
+
+## Value format
+
+`document.format: string` stores the compact JSON payload as a Redis string
+using `SET`.
+
+`document.format: json` uses RedisJSON `JSON.SET`. The engine checks for
+`JSON.SET` during startup when the ACL permits command inspection and fails
+closed if the module is unavailable. JSON cache writes apply the value and TTL
+atomically.
+
+## Retention contract
+
+Use a materialized view when Redis is the retained read model:
+
+```yaml
+contract:
+  mode: materialized_view
+```
+
+These keys do not expire. Run Redis with persistence, a suitable eviction
+policy, replication, backups, and memory sized for the complete materialized
+working set.
+
+Use `maxmemory-policy noeviction` for materialized views. Silent key eviction
+would make the Redis view incomplete. The same policy gives caches the most
+predictable writer availability: cache entries still expire at their configured
+TTL, while memory pressure backpressures new writes instead of selecting the
+expiring writer lease. A `volatile-*` policy may also evict that lease.
+VentStream can recover it when the durable lineage is unchanged, but repeated
+lease eviction creates avoidable retry and readiness churn.
+
+Use cache mode for rebuildable entries:
+
+```yaml
+contract:
+  mode: cache
+  ttl_ms: 3600000
+```
+
+The TTL starts again whenever an insert or update is materialized. VentStream
+does not refresh unchanged entries in the background, so a record with no later
+source event expires after the configured interval. Use `materialized_view`
+when Redis must retain every current source record until an explicit delete,
+truncate, or rebuild.
+
+Each upsert refreshes the TTL. Deletes remove the key immediately.
+
+## Acknowledgement
+
+`mode: primary` advances after the primary applies the ordered pipeline.
+
+`mode: replicated` issues `WAIT` on the same connection after the pipeline and
+requires the configured number of replica acknowledgements before source
+progress can advance:
+
+```yaml
+acknowledgement:
+  mode: replicated
+  replicas: 1
+  timeout_ms: 1000
+```
+
+`WAIT` confirms replication, not disk persistence. Configure Redis persistence
+and failover according to the recovery point the materialized view requires.
+If the acknowledgement target is not met, VentStream keeps retrying with
+backpressure and does not send the batch to the DLQ.
+
+`mode: aof` uses Redis 7.2 or later
+[`WAITAOF`](https://redis.io/docs/latest/commands/waitaof/) on the same connection as the
+materialization write. It can require the writable primary, replica AOFs, or
+both to fsync before source progress advances:
+
+```yaml
+acknowledgement:
+  mode: aof
+  local: true
+  replicas: 1
+  timeout_ms: 2000
+```
+
+Every requested node must have AOF enabled. The Redis sink diagnostic checks
+the configured fsync targets and reports the observed local and replica counts.
+An unmet timeout remains backpressured; a Redis version without `WAITAOF` or a
+primary without required AOF persistence is a deployment error. `WAITAOF`
+improves durability but does not make asynchronous Redis replication strongly
+consistent during every failover.
+
+Set `response_timeout_ms` to at least `acknowledgement.timeout_ms`; validation
+rejects a shorter command timeout.
+
+## Endpoint topology
+
+Configure exactly one of `endpoint_ref` or `topology`.
+
+### Standalone or managed endpoint
+
+Use `endpoint_ref` for one writable Redis endpoint or a managed endpoint that
+follows the provider's current primary:
+
+```yaml
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_SINK_URL
+    keyspace:
+      prefix: ventstream:orders:production
+      routing:
+        strategy: by_output_relation
+```
+
+VentStream reconnects through the same endpoint after transport or read-only
+failures. Do not use this mode with a Redis Cluster node address; configure
+Cluster topology so redirects and slot ownership are handled correctly.
+
+### Redis Sentinel
+
+Sentinel topology discovers and verifies the writable primary for a named
+Sentinel service:
+
+```yaml
+sink:
+  kind: redis
+  redis:
+    topology:
+      mode: sentinel
+      service_name: orders-primary
+      endpoints:
+        - env:VS_REDIS_SENTINEL_A
+        - env:VS_REDIS_SENTINEL_B
+        - env:VS_REDIS_SENTINEL_C
+      data_node_tls: true
+      sentinel_auth:
+        mode: password
+        password_ref: env:VS_REDIS_SENTINEL_PASSWORD
+      sentinel_tls:
+        ca_file: /run/secrets/redis/sentinel-ca.pem
+    auth:
+      mode: acl
+      username_ref: env:VS_REDIS_SINK_USERNAME
+      password_ref: env:VS_REDIS_SINK_PASSWORD
+    tls:
+      ca_file: /run/secrets/redis/data-ca.pem
+    keyspace:
+      prefix: ventstream:orders:production
+      routing:
+        strategy: by_output_relation
+```
+
+The endpoints are Sentinel servers, not Redis data nodes. VentStream tries them
+in order, asks for `service_name`, verifies the returned node is a primary, and
+rediscovers after connection loss, a read-only response, or a temporary
+election gap. Configure multiple Sentinel endpoints from separate failure
+domains. Sentinel endpoint URLs must use Redis database 0.
+
+`sentinel_auth` and `sentinel_tls` protect Sentinel connections. The top-level
+`auth` and `tls` blocks protect the discovered Redis data-node connection. Set
+`data_node_tls: true` when the discovered nodes require TLS, including when
+top-level data-node trust or client-certificate files are configured.
+
+Sentinel must advertise addresses reachable from the VentStream process. For
+TLS deployments it should advertise hostnames covered by the data-node
+certificate; an IP address absent from the certificate's subject alternative
+names will fail hostname verification.
+
+### Redis Cluster
+
+Cluster topology accepts a bounded list of initial nodes and discovers the
+complete hash-slot map:
+
+```yaml
+sink:
+  kind: redis
+  redis:
+    topology:
+      mode: cluster
+      endpoints:
+        - env:VS_REDIS_CLUSTER_A
+        - env:VS_REDIS_CLUSTER_B
+        - env:VS_REDIS_CLUSTER_C
+    auth:
+      mode: acl
+      username_ref: env:VS_REDIS_SINK_USERNAME
+      password_ref: env:VS_REDIS_SINK_PASSWORD
+    keyspace:
+      prefix: ventstream:orders:production
+      ownership: exclusive
+      routing:
+        strategy: by_output_relation
+```
+
+VentStream routes commands to the primary that owns each target's hash slot,
+refreshes the slot map after `MOVED`, and follows one-shot `ASK` redirects with
+`ASKING`. Cluster nodes must advertise addresses reachable from the VentStream
+process. For TLS clusters, every configured and advertised hostname must match
+the node certificate. Cluster endpoint URLs must use Redis database 0.
+
+A source batch may contain several targets. VentStream splits it into one
+ordered, fenced operation per target so Lua never crosses hash slots. Progress
+advances only after every target operation succeeds. Replicated and AOF
+acknowledgement run against each target's owning primary and report the lowest
+observed acknowledgement counts.
+
+During an active slot migration, Redis may accept single-key commands through
+`ASK` while rejecting a target's multi-key Lua operation with `TRYAGAIN` until
+slot ownership converges. VentStream keeps the source backpressured and retries;
+it does not send the event to the DLQ or advance the source checkpoint.
+
+Cluster topology supports at most one declarative lookup view. Multiple views
+for one source event can map to different hash slots and cannot be updated
+atomically by Redis. Direct routing remains supported across any number of
+targets. RedisJSON must be installed on every primary that may own a target
+slot.
+
+## Writer fencing
+
+Each process acquires a renewable lease independently for every target it first
+modifies. Active writers renew idle leases in the background and before each
+mutation. A duplicate process cannot overwrite an active lease; it remains
+backpressured without changing Redis or advancing its source checkpoint. After
+an ungraceful exit, the next writer can acquire the target when the lease
+expires. The default lease is 30 seconds.
+
+Each lease has a durable lineage witness. When a primary or network outage
+lasts longer than the lease, a process may recreate its lease only if no newer
+writer has changed that lineage. This allows automatic failover recovery
+without allowing a superseded process to reclaim a target.
+
+Give each deployment revision a stable writer identity. Fleet deployments use
+their deployment ID automatically. A standalone deployment should set
+`writer.id_ref` or `VS_REDIS_SINK_WRITER_ID`.
+
+For an intentional handoff that must not wait for lease expiry, identify both
+the new writer and the expected previous writer:
+
+```yaml
+writer:
+  id_ref: env:VS_REDIS_SINK_WRITER_ID
+  lease_ms: 30000
+  takeover_from_ref: env:VS_REDIS_SINK_WRITER_TAKEOVER_FROM
+```
+
+Redis replaces the lease only when its recorded owner matches
+`takeover_from_ref`. A stale handoff therefore cannot evict an unexpected
+writer. Stop or drain the previous deployment before using this setting. Every
+write and target cleanup still verifies the lease generation before changing
+data. Targets below the same prefix are independent, so handing off `orders`
+does not change ownership of `customers`.
+
+Fencing coordinates VentStream processes that use the same prefix and target.
+It does not prevent an application, script, or another Redis client from
+changing those keys directly. A prefix declared `exclusive` must not have
+external writers.
+
+In Fleet-managed mode, a restarted supervisor also keeps the engine stopped
+until it acquires the current control session and receives convergence work.
+An already-running engine may continue through a temporary control-plane
+outage; if Fleet later admits a replacement, Redis fencing prevents the older
+process from overwriting the replacement.
+
+## ACL permissions
+
+The Redis identity needs access only to its configured key prefix. Required
+commands are:
+
+- `PING`, `GET`, `SET`, `DEL`, `PEXPIRE`, `EVALSHA`, and `SCRIPT LOAD` for
+  writer-leased materialization
+- `HGET`, `HSET`, and `EXISTS` for lookup-view manifests and ownership checks
+- `SCAN` and `UNLINK` for target cleanup after a source truncate or controlled
+  rebuild
+- `WAIT` when replicated acknowledgement is enabled
+- `WAITAOF` when AOF acknowledgement is enabled
+- `ROLE` and, as a compatibility fallback, `INFO REPLICATION` for
+  Sentinel-discovered data-node role verification
+- `CLUSTER SLOTS` for Cluster slot discovery and refresh
+- `CLUSTER KEYSLOT`, `CLUSTER MYID`, and `CLUSTER NODES` when exclusive
+  ownership permits target cleanup; these checks prevent a node-local `SCAN`
+  from running across a slot ownership change
+- `JSON.SET` for RedisJSON documents
+- `TYPE`, `PEXPIRE`, and `RENAME` for RedisJSON cache entries
+- `COMMAND INFO` is optional; without it, RedisJSON support is verified on the
+  first write
+
+The Sentinel identity configured under `sentinel_auth` also needs
+`SENTINEL MASTERS`. Keep Sentinel and data-node ACLs separate when the
+deployment uses different identities.
+
+An ACL command denial is a permanent configuration error. Static authentication
+failures also block. Authentication failures from mounted credential files
+remain backpressured and retryable so credential rotation does not require an
+engine restart. None of these failures advances the source checkpoint.
+
+## Truncate handling
+
+PostgreSQL `TRUNCATE` is handled without loading the target keyspace into
+memory. VentStream scans one routed target in bounded pages and deletes keys
+with `UNLINK`. A transient failure restarts the idempotent cleanup and keeps
+source progress behind the truncate.
+
+- `by_output_relation` clears only the truncated relation.
+- `by_projection_target` is supported for SQL-mode projections because the
+  denormalizer emits an explicit target-scoped clear before rebuilding current
+  rows.
+- `views` clears every matching view target. Source manifests and target
+  ownership records are removed with the materialized keys.
+- Truncating a related table in PostgreSQL SQL mode recomposes the affected
+  projection in bounded primary-key pages.
+- `fixed` routing rejects raw truncate events because multiple relations may
+  share the target.
+
+## Reliability
+
+- Each bounded batch verifies its target generations and applies its ordered
+  writes in one Lua invocation without interleaving from other Redis clients.
+- Dispatcher batches are issued serially because Redis values do not carry a
+  source-version guard. This prevents a slower, older batch from overwriting a
+  newer value while still allowing up to 1,000 ordered commands per Lua call.
+- RedisJSON cache replacements become visible only after the staged value has
+  its TTL.
+- Batches are split at the configured byte boundary without changing event
+  order. One Lua invocation is also capped at 1,000 commands to limit Redis
+  event-loop occupancy when upstream batches contain many small records.
+- Upserts and deletes are idempotent because every event carries a stable
+  document ID.
+- Connection loss, timeout, loading, capacity pressure, persistence pressure,
+  replica availability, failover, read-only, and cluster-down responses retry
+  with capped exponential backoff and jitter.
+- Authentication, ACL, invalid topology configuration, and unknown command
+  failures block delivery without advancing the source checkpoint.
+- Target cleanup uses bounded `SCAN` pages and `UNLINK` batches. It preserves
+  write-before-truncate and write-after-truncate ordering.
+- Cluster cleanup verifies the routed primary and slot state before and after
+  the node-local scan. Resharding or an ownership change retries the complete,
+  idempotent cleanup.
+- With direct routing, invalid JSON, malformed key headers, configured key- or
+  value-size violations, and a RedisJSON wrong-type conflict identify the exact
+  event and use the DLQ path. Lookup views fail closed on transformation errors
+  so an older materialization cannot remain visible while source progress
+  advances.
+- `/readyz` reflects sustained transient sink failure and immediate permanent
+  blockers through the shared sink-health gate.
+- A superseded writer fails closed. A missing or expired current lease is
+  recovered only when its durable lineage still belongs to the same process;
+  otherwise a new process must acquire the target.
+
+Normal pause and resume preserve the source cursor. A destructive
+drain/rebootstrap requires exclusive ownership, clears each known target, and
+then snapshots the complete live set before tailing resumes. Validation occurs
+before source state or Redis is changed. A failure after source invalidation is
+safe to retry because the next start snapshots again and point writes are
+idempotent.
+
+## Safety limits
+
+Redis sink limits are validated before the connector opens a socket:
+
+| Setting | Default | Maximum |
+|---|---:|---:|
+| `max_batch_bytes` | 16 MiB | 64 MiB |
+| `max_key_bytes` | 16 KiB | 1 MiB |
+| `max_value_bytes` | 8 MiB | 64 MiB |
+| `connect_timeout_ms` | 5,000 | 120,000 |
+| `response_timeout_ms` | 30,000 | 600,000 |
+
+With direct routing, records that exceed a configured key or value limit, or
+whose complete command cannot fit within `max_batch_bytes`, are identified
+exactly and follow the DLQ path. Lookup views block the pipeline on the same
+violations.
+
+Lookup-view configuration is also bounded:
+
+| Resource | Maximum |
+|---|---:|
+| Views per sink | 32 |
+| Key template length | 4 KiB |
+| Template expressions | 64 |
+| Filter conditions per view | 32 |
+| Values in one `in` or `not_in` condition | 64 |
+| JSON pointer length | 2 KiB |
+| Named fields per value | 128 |
+
+View key rendering and selected-value serialization enforce these limits while
+they write. A field projection cannot duplicate a large JSON subtree beyond the
+configured value or batch limit before the pipeline rejects it.
+
+## SQL projections
+
+PostgreSQL and MySQL SQL-mode projections use an optional OpenSearch reverse
+lookup to recover a parent after a 1:many child delete whose source pre-image
+does not contain the parent key. Redis pipelines must disable that lookup:
+
+```yaml
+sink_reverse_lookup: false
+```
+
+For joined projections, configure child-table change images so deletes carry
+the parent identity. PostgreSQL commonly uses `REPLICA IDENTITY FULL` or a
+suitable replica-identity index for those child tables. MySQL joined
+projections require `binlog_row_image=FULL` so deletes and reparenting contain
+the previous parent key. Direct publication tables and projections without that
+delete dependency do not need a sink lookup.
+
+## Environment-only configuration
+
+Canonical YAML is preferred. The equivalent sink-specific variables are:
+
+| Variable | Purpose |
+|---|---|
+| `VS_SINK=redis` | Select the Redis sink |
+| `VS_REDIS_SINK_TOPOLOGY` | `standalone` (default), `sentinel`, or `cluster` |
+| `VS_REDIS_SINK_URL` | Standalone `redis://` or `rediss://` endpoint |
+| `VS_REDIS_SINK_CLUSTER_URLS` | Comma-separated initial Cluster endpoints |
+| `VS_REDIS_SINK_SENTINEL_URLS` | Comma-separated Sentinel endpoints |
+| `VS_REDIS_SINK_SENTINEL_SERVICE` | Sentinel service name |
+| `VS_REDIS_SINK_SENTINEL_DATA_NODE_TLS` | Use TLS for Sentinel-discovered Redis data nodes |
+| `VS_REDIS_SINK_SENTINEL_USERNAME` / `VS_REDIS_SINK_SENTINEL_PASSWORD` | Optional static Sentinel credentials; data-node credentials use the variables below |
+| `VS_REDIS_SINK_SENTINEL_USERNAME_FILE` / `VS_REDIS_SINK_SENTINEL_PASSWORD_FILE` | Reloadable mounted Sentinel credential files |
+| `VS_REDIS_SINK_USERNAME` / `VS_REDIS_SINK_PASSWORD` | Static data-node ACL credentials |
+| `VS_REDIS_SINK_USERNAME_FILE` / `VS_REDIS_SINK_PASSWORD_FILE` | Reloadable mounted data-node credential files |
+| `VS_REDIS_SINK_KEY_PREFIX` | Required key namespace |
+| `VS_REDIS_SINK_KEY_ROUTING` | `by_output_relation`, `by_projection_target`, or `fixed` |
+| `VS_REDIS_SINK_FIXED_TARGET` | Target name for `fixed` routing |
+| `VS_REDIS_SINK_KEYSPACE_OWNERSHIP` | `shared` (default) or `exclusive` |
+| `VS_REDIS_SINK_DOCUMENT_FORMAT` | `string` or `json` |
+| `VS_REDIS_SINK_CONTRACT` | `materialized_view` or `cache` |
+| `VS_REDIS_SINK_TTL_MS` | Required for cache mode |
+| `VS_REDIS_SINK_ACK_MODE` | `primary`, `replicated`, or Redis 7.2+ `aof` |
+| `VS_REDIS_SINK_ACK_REPLICAS` | Required replica acknowledgements; when mode is omitted, setting this retains the legacy `replicated` behavior |
+| `VS_REDIS_SINK_ACK_LOCAL_AOF` | Require a local primary fsync in `aof` mode (default `true`) |
+| `VS_REDIS_SINK_ACK_TIMEOUT_MS` | Replication or AOF acknowledgement timeout |
+| `VS_REDIS_SINK_WRITER_ID` | Stable deployment revision identity used in writer leases |
+| `VS_REDIS_SINK_WRITER_LEASE_MS` | Renewable writer lease duration, from 3,000 to 600,000 milliseconds |
+| `VS_REDIS_SINK_WRITER_TAKEOVER_FROM` | Expected previous writer identity for a controlled handoff |
+| `VS_REDIS_SINK_MAX_BATCH_BYTES` | Approximate maximum bytes in one atomic write batch |
+| `VS_REDIS_SINK_MAX_KEY_BYTES` | Maximum encoded key bytes for one event |
+| `VS_REDIS_SINK_MAX_VALUE_BYTES` | Maximum payload bytes for one value |
+| `VS_REDIS_SINK_CONNECT_TIMEOUT_MS` | Connection timeout |
+| `VS_REDIS_SINK_RESPONSE_TIMEOUT_MS` | Command response timeout |
+| `VS_REDIS_SINK_TLS_CA_FILE` | Optional PEM CA bundle for `rediss://` |
+| `VS_REDIS_SINK_TLS_CLIENT_CERT_FILE` | Optional PEM client certificate chain |
+| `VS_REDIS_SINK_TLS_CLIENT_KEY_FILE` | Optional PEM client private key |
+| `VS_REDIS_SINK_SENTINEL_TLS_CA_FILE` | Optional PEM CA bundle for Sentinel connections |
+| `VS_REDIS_SINK_SENTINEL_TLS_CLIENT_CERT_FILE` | Optional Sentinel client certificate chain |
+| `VS_REDIS_SINK_SENTINEL_TLS_CLIENT_KEY_FILE` | Optional Sentinel client private key |
+
+Lookup views are configured only through canonical YAML because their
+selectors, templates, filters, and values form a versioned data contract.
+
+## Metrics
+
+The engine exports the standard sink availability, outage, retry, delivery, and
+bulk-latency metrics. Redis writes also expose:
+
+| Metric | Meaning |
+|---|---|
+| `vs_redis_upserts_total` | Acknowledged Redis upserts |
+| `vs_redis_deletes_total` | Acknowledged Redis deletes |
+| `vs_redis_pipeline_bytes_total` | Approximate bytes acknowledged in Redis pipelines |
+| `vs_redis_pipeline_duration_seconds` | Latency of a successful Redis pipeline attempt, including `WAIT` or `WAITAOF` when enabled |
+| `vs_redis_pipeline_failures_total` | Failed Redis pipeline attempts, including attempts later recovered |
+| `vs_redis_replica_acknowledgements` | Replica acknowledgement count returned by `WAIT` or `WAITAOF` |
+| `vs_redis_local_aof_acknowledgements` | Local primary fsync count returned by `WAITAOF` |
+| `vs_redis_acknowledgement_duration_seconds{mode}` | Time spent waiting for the configured primary, replicated, or AOF acknowledgement |
+| `vs_redis_acknowledgement_failures_total{mode}` | Acknowledgement attempts that did not meet their configured contract |
+| `vs_redis_connection_attempts_total{topology}` | Connection attempts by standalone, Sentinel, or Cluster topology |
+| `vs_redis_connection_results_total{topology,result}` | Successful and failed connection attempts |
+| `vs_redis_topology_events_total{topology,cause}` | Bounded failover, redirect, and slot-refresh recovery signals |
+| `vs_redis_credential_reloads_total{result}` | Changed mounted credentials loaded successfully or failed during reload |
+| `vs_redis_writer_lease_acquisitions_total{result}` | Writer lease acquisitions, failover recoveries, controlled handoffs, conflicts, and failures |
+| `vs_redis_writer_lease_renewal_failures_total` | Failed writer lease heartbeat renewals |
+| `vs_redis_writer_leased_targets` | Targets currently fenced to this engine process |
+| `vs_redis_keyspace_clears_total` | Completed target-scoped truncate cleanup operations |
+| `vs_redis_keys_unlinked_total` | Keys removed by target-scoped cleanup |
+| `vs_redis_keyspace_clear_duration_seconds` | Latency of a successful target cleanup attempt |
+| `vs_redis_keyspace_clear_failures_total` | Failed cleanup attempts, including attempts later recovered |

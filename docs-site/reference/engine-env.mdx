@@ -15,7 +15,7 @@ Validation fails when a required reference is missing.
 | `VS_ENGINE_CONFIG` | Optional path to canonical `ventstream.yaml`. When set, roles, source kind, sink endpoint/auth references, sink index routing, spec file paths, and DLQ path are read from the file with legacy env fallback for connector details. |
 | `VS_ROLES` | `cdc` (and/or `ws`, `graphql`). The CDC role is the pipeline. |
 | `VS_CDC_SOURCE` | `postgres`, `neo4j`, `mongodb`, `mysql` (`mariadb` alias), or `kafka` (`redpanda` alias). |
-| `VS_SINK` | Sink kind. The current supported value and default is `opensearch`. |
+| `VS_SINK` | Sink kind: `opensearch` (default), `elasticsearch`, or `redis`. |
 | `VS_AGENT_NAME` | Standalone process identifier and default Kafka consumer-group ID. Managed identity comes from the Cloud deployment certificate. |
 | `VS_TENANT` | Server-authorized tenant for `ws` and `graphql`. Set it outside local development so clients cannot select another tenant during the handshake. |
 | `VS_OS_ENDPOINT` | OpenSearch base URL. |
@@ -39,10 +39,54 @@ Validation fails when a required reference is missing.
 | `VS_OS_TLS_CA_FILE` | Optional PEM CA bundle for a privately issued OpenSearch certificate. |
 | `VS_INSECURE_TLS` | Disable sink certificate verification. Default `false`; use only for isolated local testing. |
 
+## Redis sink
+
+| Variable | Meaning |
+|---|---|
+| `VS_REDIS_SINK_TOPOLOGY` | `standalone` (default), `sentinel`, or `cluster`. |
+| `VS_REDIS_SINK_URL` | Required standalone `redis://` or `rediss://` endpoint. |
+| `VS_REDIS_SINK_CLUSTER_URLS` | Comma-separated initial Cluster endpoints when topology is `cluster`. |
+| `VS_REDIS_SINK_SENTINEL_URLS` | Comma-separated Sentinel endpoints when topology is `sentinel`. |
+| `VS_REDIS_SINK_SENTINEL_SERVICE` | Sentinel service name used to discover the current writable primary. |
+| `VS_REDIS_SINK_SENTINEL_DATA_NODE_TLS` | `true` when Sentinel-discovered Redis data nodes require TLS. |
+| `VS_REDIS_SINK_SENTINEL_USERNAME` / `VS_REDIS_SINK_SENTINEL_PASSWORD` | Optional static Sentinel-specific credentials. |
+| `VS_REDIS_SINK_SENTINEL_USERNAME_FILE` / `VS_REDIS_SINK_SENTINEL_PASSWORD_FILE` | Optional mounted Sentinel credentials, reloaded without an engine restart. |
+| `VS_REDIS_SINK_USERNAME` / `VS_REDIS_SINK_PASSWORD` | Optional static data-node ACL credentials. |
+| `VS_REDIS_SINK_USERNAME_FILE` / `VS_REDIS_SINK_PASSWORD_FILE` | Optional mounted data-node ACL credentials, reloaded without an engine restart. |
+| `VS_REDIS_SINK_KEY_PREFIX` | Required namespace prepended to every materialized key. |
+| `VS_REDIS_SINK_KEY_ROUTING` | `by_output_relation` (default), `by_projection_target`, or `fixed`. |
+| `VS_REDIS_SINK_FIXED_TARGET` | Required target segment for `fixed` routing. |
+| `VS_REDIS_SINK_KEYSPACE_OWNERSHIP` | `shared` (default) permits point writes only; `exclusive` enables validated target-wide truncate and rebootstrap cleanup. |
+| `VS_REDIS_SINK_DOCUMENT_FORMAT` | `string` (default) or `json`; JSON requires RedisJSON. |
+| `VS_REDIS_SINK_CONTRACT` | `materialized_view` (default) or `cache`. |
+| `VS_REDIS_SINK_TTL_MS` | Required positive TTL for cache mode. |
+| `VS_REDIS_SINK_ACK_MODE` | `primary`, `replicated`, or Redis 7.2+ `aof`. When unset, `VS_REDIS_SINK_ACK_REPLICAS` retains the earlier replicated-mode behavior. |
+| `VS_REDIS_SINK_ACK_REPLICAS` | Required replica acknowledgements for `WAIT` or replica AOF fsync acknowledgements for `WAITAOF`. |
+| `VS_REDIS_SINK_ACK_LOCAL_AOF` | Require the writable primary to fsync its local AOF in `aof` mode (default `true`). |
+| `VS_REDIS_SINK_ACK_TIMEOUT_MS` | Replication or AOF wait timeout (default 1000 when either mode is enabled). |
+| `VS_REDIS_SINK_WRITER_ID` | Stable identity stored in each target's renewable writer lease. Managed agents default to `VS_FLEET_DEPLOYMENT_ID`; standalone engines default to `standalone`. |
+| `VS_REDIS_SINK_WRITER_LEASE_MS` | Lease duration from 3000 through 600000 milliseconds (default 30000). The engine renews active targets while idle. |
+| `VS_REDIS_SINK_WRITER_TAKEOVER_FROM` | Expected previous writer identity for an intentional compare-and-swap handoff. Leave unset during normal startup. |
+| `VS_REDIS_SINK_MAX_BATCH_BYTES` | Maximum approximate bytes in one atomic Redis write batch (default 16777216). |
+| `VS_REDIS_SINK_MAX_KEY_BYTES` | Maximum encoded key bytes for one event (default 16384). |
+| `VS_REDIS_SINK_MAX_VALUE_BYTES` | Maximum value bytes for one event (default 8388608). |
+| `VS_REDIS_SINK_CONNECT_TIMEOUT_MS` | Connection timeout (default 5000). |
+| `VS_REDIS_SINK_RESPONSE_TIMEOUT_MS` | Command response timeout (default 30000). |
+| `VS_REDIS_SINK_TLS_CA_FILE` | Optional PEM CA bundle for a `rediss://` endpoint. |
+| `VS_REDIS_SINK_TLS_CLIENT_CERT_FILE` | Optional PEM client certificate chain for mutual TLS. |
+| `VS_REDIS_SINK_TLS_CLIENT_KEY_FILE` | Optional PEM client key for mutual TLS; configure it with the client certificate. |
+| `VS_REDIS_SINK_SENTINEL_TLS_CA_FILE` | Optional PEM CA bundle for Sentinel TLS. |
+| `VS_REDIS_SINK_SENTINEL_TLS_CLIENT_CERT_FILE` | Optional Sentinel client certificate chain. |
+| `VS_REDIS_SINK_SENTINEL_TLS_CLIENT_KEY_FILE` | Optional Sentinel client key; configure it with the Sentinel client certificate. |
+
+These variables are intentionally separate from `VS_REDIS_URL` and
+`VS_REDIS_KEY_PREFIX`, which configure Redis Streams for realtime roles. See
+the [Redis sink guide](/connectors/sinks/redis).
+
 ## Canonical engine config
 
 `VS_ENGINE_CONFIG` points at a non-secret YAML file. The file can select the
-source kind, OpenSearch connection reference, index routing policy, and larger
+source kind, sink connection reference, routing policy, and larger
 spec file paths while secrets remain in environment variables or mounted secret
 providers.
 
@@ -107,6 +151,12 @@ OpenSearch routing strategies:
 | `fixed` | Route every output document to one index: `name: orders`. |
 | `template` | Use the existing per-event template syntax: `template: "events-${header:ventstream.cdc.relation}"`. |
 
+Redis key-routing strategies use `by_output_relation`,
+`by_projection_target`, `fixed`, and declarative `views`. Lookup views are
+canonical-YAML-only because their selectors, key templates, filters, and value
+mappings form one versioned contract. See the
+[Redis sink guide](/connectors/sinks/redis) for the complete schema.
+
 ## Fleet-managed configuration
 
 `VS_FLEET_APPLIED_CONFIG_PATH` is set by the Fleet supervisor in managed mode.
@@ -126,7 +176,7 @@ the matching legacy file-path environment variables when supplied:
 | `graphql_manifest_yaml` | `VS_GRAPHQL_MANIFEST` |
 
 Fleet config is for topology, projection, and runtime-safe settings. Keep
-database passwords, OpenSearch credentials, NATS credentials, API keys, and
+database passwords, sink credentials, NATS credentials, API keys, and
 certificates in Kubernetes Secrets or a local secret provider.
 
 ## Postgres source
@@ -201,6 +251,9 @@ require a replica set or sharded cluster.
 
 See the [MySQL connector](/connectors/sources/mysql). Requires
 `binlog_format=ROW` and a `server_id` unique across the replication topology.
+Joined projections also require `binlog_row_image=FULL` so child deletes,
+foreign-key changes, and primary-key changes include complete before/after
+images.
 
 | Variable | Meaning |
 |---|---|

@@ -62,7 +62,8 @@
               {
                 "group": "Sinks",
                 "pages": [
-                  "connectors/sinks/opensearch"
+                  "connectors/sinks/opensearch",
+                  "connectors/sinks/redis"
                 ]
               }
             ]

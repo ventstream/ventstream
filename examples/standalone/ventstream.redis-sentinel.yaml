@@ -1,0 +1,58 @@
+schema_version: 1
+roles: [cdc]
+
+source:
+  kind: mongodb
+  mongodb:
+    uri_ref: env:VS_MONGO_URI
+    database_ref: env:VS_MONGO_DATABASE
+    namespace: commerce
+    collections: [orders]
+    full_document: update_lookup
+    bootstrap:
+      mode: snapshot
+      chunk_size: 1000
+    state_dir: ./ventstream-state/mongodb
+
+sink:
+  kind: redis
+  redis:
+    topology:
+      mode: sentinel
+      service_name: orders-primary
+      endpoints:
+        - env:VS_REDIS_SENTINEL_A
+        - env:VS_REDIS_SENTINEL_B
+        - env:VS_REDIS_SENTINEL_C
+      data_node_tls: false
+      sentinel_auth:
+        mode: password
+        password_ref: env:VS_REDIS_SENTINEL_PASSWORD
+    auth:
+      mode: acl
+      username_ref: env:VS_REDIS_SINK_USERNAME
+      password_ref: env:VS_REDIS_SINK_PASSWORD
+    keyspace:
+      prefix: ventstream:orders:development
+      ownership: exclusive
+      routing:
+        strategy: by_output_relation
+    document:
+      format: string
+    contract:
+      mode: materialized_view
+    acknowledgement:
+      mode: replicated
+      replicas: 1
+      timeout_ms: 1000
+    writer:
+      lease_ms: 30000
+
+runtime:
+  health_listen: 127.0.0.1:4043
+  dlq_path: ./ventstream-state/dlq.jsonl
+  memory:
+    enabled: true
+    budget_bytes: 268435456
+    max_event_bytes: 33554432
+    recovery_ms: 1000

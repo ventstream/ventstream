@@ -40,12 +40,37 @@ fn validate_config(path: &Path) -> Result<String, String> {
         .current_dir(std::env::temp_dir())
         .env_clear()
         .env("VS_ENGINE_CONFIG", path)
+        .env("VS_PG_HOST", "postgres.example.com")
+        .env("VS_PG_USER", "ventstream")
         .env("VS_PG_PASSWORD", "postgres-secret")
+        .env("VS_PG_DATABASE", "shop")
+        .env("VS_PG_PUBLICATION", "ventstream_shop")
+        .env("VS_PG_SLOT", "ventstream_shop_slot")
         .env("VS_NEO4J_PASSWORD", "neo4j-secret")
         .env("VS_MONGO_URI", "mongodb://mongo:27017")
+        .env("VS_MONGO_DATABASE", "shop")
         .env("VS_MYSQL_PASSWORD", "mysql-secret")
         .env("VS_KAFKA_SASL_PASSWORD", "kafka-secret")
         .env("VS_OS_ENDPOINT", "https://search.example.com")
+        .env("VS_REDIS_SINK_URL", "rediss://redis.example.com:6379/")
+        .env("VS_REDIS_SINK_USERNAME", "ventstream")
+        .env("VS_REDIS_SINK_PASSWORD", "redis-secret")
+        .env(
+            "VS_REDIS_SENTINEL_A",
+            "redis://sentinel-a.example.com:26379",
+        )
+        .env(
+            "VS_REDIS_SENTINEL_B",
+            "redis://sentinel-b.example.com:26379",
+        )
+        .env(
+            "VS_REDIS_SENTINEL_C",
+            "redis://sentinel-c.example.com:26379",
+        )
+        .env("VS_REDIS_SENTINEL_PASSWORD", "sentinel-secret")
+        .env("VS_REDIS_CLUSTER_A", "redis://redis-a.example.com:6379")
+        .env("VS_REDIS_CLUSTER_B", "redis://redis-b.example.com:6379")
+        .env("VS_REDIS_CLUSTER_C", "redis://redis-c.example.com:6379")
         .output()
         .map_err(|error| error.to_string())?;
     if !output.status.success() {
@@ -191,6 +216,97 @@ runtime:
             .lines()
             .any(|line| line == "configuration valid: roles=cdc"));
     }
+    Ok(())
+}
+
+#[test]
+fn validates_redis_sink_example() -> Result<(), Box<dyn std::error::Error>> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/standalone/ventstream.redis.yaml");
+    let stdout = validate_config(&path)?;
+    assert!(stdout
+        .lines()
+        .any(|line| line == "configuration valid: roles=cdc"));
+    Ok(())
+}
+
+#[test]
+fn validates_redis_lookup_views_example() -> Result<(), Box<dyn std::error::Error>> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/standalone/ventstream.redis-views.yaml");
+    let stdout = validate_config(&path)?;
+    assert!(stdout
+        .lines()
+        .any(|line| line == "configuration valid: roles=cdc"));
+    Ok(())
+}
+
+#[test]
+fn validates_redis_topology_examples() -> Result<(), Box<dyn std::error::Error>> {
+    for file in [
+        "ventstream.redis-sentinel.yaml",
+        "ventstream.redis-cluster.yaml",
+    ] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/standalone")
+            .join(file);
+        let stdout = validate_config(&path).map_err(|error| format!("{file}: {error}"))?;
+        assert!(stdout
+            .lines()
+            .any(|line| line == "configuration valid: roles=cdc"));
+    }
+    Ok(())
+}
+
+#[test]
+fn validates_redis_lookup_views_through_the_runtime_loader(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = TestDirectory::new()?;
+    let path = directory.path("ventstream-redis-views.yaml");
+    fs::write(
+        &path,
+        r#"
+schema_version: 1
+roles: [cdc]
+source:
+  kind: mongodb
+  mongodb:
+    uri_ref: env:VS_MONGO_URI
+    database: shop
+    collections: [orders]
+sink:
+  kind: redis
+  redis:
+    endpoint_ref: env:VS_REDIS_SINK_URL
+    keyspace:
+      prefix: ventstream:shop:views
+      ownership: exclusive
+      routing:
+        strategy: views
+        views:
+          - name: pending_order_by_id
+            source:
+              namespace: shop
+              relation: orders
+            key:
+              template: "order:${json:/id}"
+            filter:
+              conditions:
+                - path: /status
+                  operator: equals
+                  value: pending
+            value:
+              mode: fields
+              fields:
+                id: /id
+                status: /status
+"#,
+    )?;
+
+    let stdout = validate_config(&path)?;
+    assert!(stdout
+        .lines()
+        .any(|line| line == "configuration valid: roles=cdc"));
     Ok(())
 }
 
