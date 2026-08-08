@@ -1,0 +1,152 @@
+---
+title: "One deleted node, 59,498 rebuilds: taming hot nodes in graph CDC"
+description: "Why the Neo4j source exists, how graph fan-out inverts under denormalization, and the per-relationship-type hot-endpoint filter that made recompose cascades O(1)."
+---
+
+Graph databases are brilliant at storing connected data — and terrible
+at serving it. Nobody wants a two-hop Cypher traversal on the hot path
+of an API, so teams copy graph data into search indexes and caches, and
+that copy is where things fall apart.
+
+The usual answers for syncing Neo4j outward are thin: hand-rolled
+pollers (miss deletes, hammer the database), app-level dual writes
+(drift, always), or Kafka-tethered connector plugins that move raw
+change events and leave the hard part — reshaping a graph into
+documents — to you.
+
+The hard part is the whole point. A search index doesn't want nodes and
+edges; it wants documents: a `Product` plus its `Category`, its
+`Supplier`, and the supplier's `Region` — a two-hop neighborhood
+flattened into one JSON object, kept current as *any* of those nodes
+change. That's why VentStream's Neo4j source exists: it consumes Neo4j
+Enterprise CDC, walks projection paths declared in YAML, and streams
+denormalized documents into OpenSearch or Redis — snapshot bootstrap
+included, deletes handled, crash-safe resume.
+
+```yaml
+# projection spec (abridged)
+primary: Product
+paths:
+  - [BELONGS_TO, Category]
+  - [SUPPLIED_BY, Supplier, LOCATED_IN, Region]
+fan_out_max_hops: 2
+```
+
+## Fan-out inversion
+
+The interesting engineering problem is that denormalization inverts the
+graph's direction of reference. In the graph, a `Region` points at
+nothing — products point *toward* it through suppliers. But in
+document-land, when a region renames, every affected product document
+must recompose. Your reads' fan-in becomes your writes' fan-out.
+
+The engine finds recompose targets by anchoring a Cypher match on the
+changed element:
+
+```cypher
+MATCH (p:Product)-[:SUPPLIED_BY]->(:Supplier)-[:LOCATED_IN]->(x)
+WHERE elementId(x) IN $eids
+RETURN p
+```
+
+At event time `$eids` is fed from the event's element IDs — and for a
+relationship event, that includes **both endpoints**. That sentence is
+the bug.
+
+## The hot-node cascade
+
+Real graphs contain low-cardinality hub nodes: one `PublishStatus` node
+linked from every `Author`, one `Currency` node on every account, a
+handful of `Region` nodes. Delete one Author and its relationship-delete
+event carries two endpoints: the Author — and the hub. The hub lands in
+`$eids`, the anchor query asks "which Authors reference this
+PublishStatus?", and the honest answer is *all of them*.
+
+Measured at 100k-Author scale: one delete triggered a
+**59,498-document recompose cascade**, and a 1,000-operation burst
+spawned roughly 5,800 such cascades — hours of CPU recomputing
+documents that hadn't changed.
+
+The cruelty of this class of bug is that it's invisible in tests. Ten
+authors, one status node: the cascade recomposes ten documents in
+milliseconds and CI stays green. It's scale-activated — the output is
+correct, the cost is catastrophically wrong.
+
+## The fix: know your hubs before traffic arrives
+
+At spec-validation time (startup), the engine walks every projection
+path and probes the cardinality of the node set at **every hop depth**
+— every prefix, not just the leaf, which is what catches a hub sitting
+mid-path. Any endpoint below a threshold is recorded as *hot*, keyed by
+the relationship type that reaches it.
+
+At event time, the filter is two hash lookups:
+
+```rust
+/// Decide whether to keep each endpoint of a relationship event in
+/// the fan-out anchor. Returns `(keep_start, keep_end)`.
+///
+/// Fail-safe: an unknown rel type (or a node event with no type)
+/// keeps both endpoints — we only ever *remove* an endpoint we've
+/// proven is the low-cardinality far side of that exact rel type.
+pub fn keep_endpoints(
+    &self,
+    rel_type: Option<&str>,
+    start_eid: Option<&str>,
+    end_eid: Option<&str>,
+) -> (bool, bool) {
+    let Some(rt) = rel_type else { return (true, true) };
+    let Some(hot) = self.by_rel.get(rt) else { return (true, true) };
+    match hot.far_side {
+        FarSide::End => (true, !end_eid.is_some_and(|e| hot.eids.contains(e))),
+        FarSide::Start => (!start_eid.is_some_and(|s| hot.eids.contains(s)), true),
+    }
+}
+```
+
+Three details carried the design:
+
+**Key by relationship type, not by node.** The same node can be a hub
+for one edge type and a legitimate anchor for another. A `Supplier` is
+the far side of `SUPPLIED_BY` (filter it — a product's edge change must
+not fan out through its supplier) but the near side of `LOCATED_IN`
+(keep it — a region change must cascade through the supplier to its
+products). A flat "always ignore this node" set breaks the second case;
+a per-relationship-type map expresses both.
+
+**Probe prefixes, not just leaves.** Hubs sit mid-path as often as at
+path ends.
+
+**Fail open, in the cheap direction.** Anything static analysis cannot
+prove — undirected hops, a relationship type whose orientation
+conflicts across paths, a spec that can't be walked — gets no
+filtering. Under-filtering wastes CPU on recomputes that are still
+correct; over-filtering would silently skip a real update and leave a
+stale document. Waste is recoverable; staleness is not.
+
+One thing the filter deliberately does **not** touch: a property update
+*on* the hub itself still cascades to every referencing document. If
+the PublishStatus text changes, all 59k author documents genuinely
+embed a stale value — that cascade is the feature working as intended.
+
+## Cost
+
+Startup: one count query per path prefix, a few milliseconds each,
+once. Memory: a relationship-type → element-ID map, kilobytes. Runtime:
+O(1) per relationship event. The 59,498-document cascade became a
+single-document recompose.
+
+## The transferable lesson
+
+Denormalization inverts fan-in into write-time fan-out, and every real
+dataset hides a few low-cardinality hubs that make that fan-out
+pathological. Whatever the stack, the shape of the answer holds:
+measure cardinality before traffic arrives, scope suppression to the
+exact edge that makes a hub a hub, and when analysis is uncertain, fail
+toward wasted work rather than stale data.
+
+The implementation lives in
+[`crates/ventstream-sources/src/neo4j/hot_endpoints.rs`](https://github.com/ventstream/ventstream/blob/main/crates/ventstream-sources/src/neo4j/hot_endpoints.rs);
+the [demo](https://github.com/ventstream/ventstream/tree/main/demo/stack)
+streams a seeded Neo4j graph and Postgres database into OpenSearch in
+one command.
