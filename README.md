@@ -8,9 +8,20 @@
   <img src="docs-site/images/ventstream-architecture.svg" alt="VentStream architecture — one Rust binary with a change-streaming pipeline and a real-time socket-delivery pipeline" width="860">
 </p>
 
-**VentStream is a data-streaming engine — one Rust binary that streams
-your data wherever it needs to go, in real time.** Two pipelines off one
-event core, run together or apart:
+**Sync your database into search indexes and caches — joined, current,
+one binary.** VentStream captures changes from PostgreSQL, MySQL,
+MongoDB, Neo4j, or Kafka, runs stateful denormalizing joins, and
+materializes documents into OpenSearch/Elasticsearch or Redis —
+idempotent, crash-safe, and typically current within a couple of
+seconds. The same engine also fans events out to browsers over native
+WebSockets and Apollo-compatible GraphQL subscriptions.
+
+Benchmarked end to end on 2 vCPUs / 1 GiB: **58k events/s from
+PostgreSQL, 73k/s from MongoDB, 88k/s from Kafka** — every run verified
+for exact document counts, zero gaps, zero duplicates
+(`benchmarks/container-matrix/`).
+
+Two pipelines off one event core, run together or apart:
 
 1. **Change streaming → any target.** Capture changes from PostgreSQL, Neo4j,
    MongoDB, MySQL/MariaDB, or Kafka/Redpanda and stream them continuously into a
@@ -42,14 +53,22 @@ cd docs-site
 mint dev             # → http://localhost:3000 (hot-reloads on edits)
 ```
 
-## Try it locally
+## Try it in 5 minutes
 
-The self-contained demo brings up its Postgres and Neo4j sources plus the sink
-with seeded data in one command — see `demo/stack/` (copy-paste runbook).
+The self-contained demo brings up Postgres and Neo4j sources plus
+OpenSearch with seeded e-commerce data, and streams joined documents end
+to end. It pulls the published engine image — no Rust toolchain, no
+source build:
 
 ```bash
-cd demo/stack && docker compose up -d
+git clone https://github.com/ventstream/ventstream
+cd ventstream/demo/stack && docker compose up -d
+# then follow demo/stack/README.md — insert an order, watch the joined
+# document appear in OpenSearch in real time
 ```
+
+To build the engine from source instead:
+`docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build`
 
 ## Deploy
 
