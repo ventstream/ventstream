@@ -79,6 +79,12 @@
             ]
           },
           {
+            "group": "Engineering",
+            "pages": [
+              "engineering/neo4j-hot-nodes"
+            ]
+          },
+          {
             "group": "VentStream Cloud",
             "pages": [
               "fleet/overview",
