@@ -100,7 +100,7 @@ services:
 
   # ── Engine: Postgres → OpenSearch ──────────────────────────────────
   engine-orders:
-    image: ghcr.io/ventstream/ventstream:0.1.19
+    image: ghcr.io/ventstream/ventstream:0.1.20
     depends_on:
       postgres:
         condition: service_healthy
@@ -141,7 +141,7 @@ services:
 
   # ── Engine: Neo4j → OpenSearch ─────────────────────────────────────
   engine-products:
-    image: ghcr.io/ventstream/ventstream:0.1.19
+    image: ghcr.io/ventstream/ventstream:0.1.20
     depends_on:
       neo4j:
         condition: service_healthy
