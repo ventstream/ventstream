@@ -3,10 +3,16 @@
 //! Materialization adapters for VentStream CDC pipelines.
 
 pub mod error;
+pub mod meilisearch;
 pub mod opensearch;
 pub mod redis;
+mod util;
 
 pub use error::OpenSearchSinkError;
+pub use meilisearch::{
+    MeilisearchBatchConfig, MeilisearchConfig, MeilisearchIndexRouting, MeilisearchSettings,
+    MeilisearchSink, MeilisearchSinkError, MeilisearchTaskConfig,
+};
 pub use opensearch::{AuthMode, BulkConfig, OpenSearchConfig, OpenSearchSink, RetryConfig};
 pub use redis::{
     RedisAcknowledgement, RedisConfig, RedisContract, RedisDiagnosticReport, RedisDocumentFormat,

@@ -58,8 +58,9 @@ use tracing_subscriber::EnvFilter;
 use ventstream_config::{
     BootstrapMode as ConfigBootstrapMode, EngineConfig as EngineFileConfig,
     JetStreamStorage as ConfigJetStreamStorage, KafkaUnwrapMode as ConfigKafkaUnwrapMode,
-    LogFormat as ConfigLogFormat, MongodbFullDocumentMode as ConfigMongodbFullDocumentMode,
-    OpenSearchAuthConfig, OpenSearchIndexRouting, RealtimeBrokerProvider,
+    LogFormat as ConfigLogFormat, MeilisearchIndexRoutingConfig as FileMeilisearchIndexRouting,
+    MongodbFullDocumentMode as ConfigMongodbFullDocumentMode, OpenSearchAuthConfig,
+    OpenSearchIndexRouting, RealtimeBrokerProvider,
     RedisAcknowledgementConfig as FileRedisAcknowledgement, RedisAuthConfig as FileRedisAuth,
     RedisContractConfig as FileRedisContract, RedisDocumentFormatConfig as FileRedisDocumentFormat,
     RedisKeyRoutingConfig as FileRedisKeyRouting,
@@ -77,6 +78,7 @@ use ventstream_graphql::GraphQlConfig;
 use ventstream_joins::{JoinDefinition, JoinEngine, JoinState, PersistentBackend};
 use ventstream_sinks::opensearch::{AuthMode, OpenSearchConfig, OpenSearchSink};
 use ventstream_sinks::{
+    MeilisearchConfig, MeilisearchIndexRouting, MeilisearchSettings, MeilisearchSink,
     RedisAcknowledgement, RedisConfig, RedisContract, RedisDocumentFormat, RedisKeyRouting,
     RedisKeyspaceOwnership, RedisSentinelTopology, RedisSink, RedisTlsConfig, RedisTopology,
     RedisView, RedisViewCondition, RedisViewConditionOperator, RedisViewFilter,
@@ -831,6 +833,11 @@ async fn build_sink(
             RedisSink::connect_with_shutdown(*redis, shutdown)
                 .await
                 .context("building Redis sink")?,
+        )),
+        SinkRuntimeConfig::Meilisearch(meili) => Ok(std::sync::Arc::new(
+            MeilisearchSink::connect_with_shutdown(*meili, shutdown)
+                .await
+                .context("building Meilisearch sink")?,
         )),
     }
 }
@@ -1943,7 +1950,7 @@ async fn build_and_run_pg_sql_denormalize_engine(
     let mut denorm = sql_denormalize::SqlDenormalizer::connect(&pg, &pg.publication, joins, chunk)
         .await
         .context("building SQL denormalizer")?;
-    if runtime.sink.kind() == "redis" {
+    if matches!(runtime.sink.kind(), "redis" | "meilisearch") {
         denorm = denorm.with_target_clears();
     }
     // OpenSearch can serve as a reverse index when the WAL delete pre-image
@@ -2811,6 +2818,7 @@ struct CdcRuntime {
 enum SinkRuntimeConfig {
     OpenSearch(Box<OpenSearchConfig>),
     Redis(Box<RedisConfig>),
+    Meilisearch(Box<MeilisearchConfig>),
 }
 
 impl SinkRuntimeConfig {
@@ -2818,6 +2826,7 @@ impl SinkRuntimeConfig {
         match self {
             Self::OpenSearch(_) => "opensearch",
             Self::Redis(_) => "redis",
+            Self::Meilisearch(_) => "meilisearch",
         }
     }
 
@@ -2827,19 +2836,20 @@ impl SinkRuntimeConfig {
             Self::Redis(config) => config
                 .discovery_endpoint()
                 .unwrap_or("redis://unconfigured"),
+            Self::Meilisearch(config) => &config.endpoint,
         }
     }
 
     fn open_search(&self) -> Option<&OpenSearchConfig> {
         match self {
             Self::OpenSearch(config) => Some(config),
-            Self::Redis(_) => None,
+            Self::Redis(_) | Self::Meilisearch(_) => None,
         }
     }
 
     fn redis(&self) -> Option<&RedisConfig> {
         match self {
-            Self::OpenSearch(_) => None,
+            Self::OpenSearch(_) | Self::Meilisearch(_) => None,
             Self::Redis(config) => Some(config),
         }
     }
@@ -2882,6 +2892,9 @@ impl SinkRuntimeConfig {
             Self::Redis(_) => Err(anyhow!(
                 "Redis orphan reconciliation is not available; drain-resume is blocked"
             )),
+            Self::Meilisearch(_) => Err(anyhow!(
+                "Meilisearch orphan reconciliation is not available; drain-resume is blocked"
+            )),
         }
     }
 
@@ -2889,6 +2902,7 @@ impl SinkRuntimeConfig {
         match self {
             Self::OpenSearch(config) => config.delivery_health = Some(health),
             Self::Redis(config) => config.delivery_health = Some(health),
+            Self::Meilisearch(config) => config.delivery_health = Some(health),
         }
     }
 }
@@ -3540,6 +3554,9 @@ fn load_sink_config(engine_config: Option<&EngineFileConfig>) -> Result<SinkRunt
         Some(SinkKind::Redis) => load_redis_sink_config(engine_config)
             .map(Box::new)
             .map(SinkRuntimeConfig::Redis),
+        Some(SinkKind::Meilisearch) => load_meilisearch_config(engine_config)
+            .map(Box::new)
+            .map(SinkRuntimeConfig::Meilisearch),
         None => match env_kind.trim().to_ascii_lowercase().as_str() {
             "opensearch" | "elasticsearch" | "es" => load_opensearch_config(engine_config)
                 .map(Box::new)
@@ -3547,11 +3564,117 @@ fn load_sink_config(engine_config: Option<&EngineFileConfig>) -> Result<SinkRunt
             "redis" => load_redis_sink_config(engine_config)
                 .map(Box::new)
                 .map(SinkRuntimeConfig::Redis),
+            "meilisearch" | "meili" => load_meilisearch_config(engine_config)
+                .map(Box::new)
+                .map(SinkRuntimeConfig::Meilisearch),
             other => Err(anyhow!(
-                "unknown VS_SINK '{other}' (expected 'opensearch', 'elasticsearch', or 'redis')"
+                "unknown VS_SINK '{other}' (expected 'opensearch', 'elasticsearch', 'redis', or 'meilisearch')"
             )),
         },
     }
+}
+
+fn load_meilisearch_config(engine_config: Option<&EngineFileConfig>) -> Result<MeilisearchConfig> {
+    let file = engine_config
+        .and_then(|config| config.sink.as_ref())
+        .and_then(|sink| sink.meilisearch.as_ref());
+    let Some(meili) = file else {
+        return load_meilisearch_config_from_env();
+    };
+    let endpoint = resolve_value_ref(&meili.endpoint_ref)?;
+    let mut config = MeilisearchConfig::new("meilisearch", endpoint);
+    config.api_key = meili
+        .api_key_ref
+        .as_ref()
+        .map(resolve_value_ref)
+        .transpose()?;
+    config.index_routing = match &meili.index_routing {
+        FileMeilisearchIndexRouting::ByOutputRelation => MeilisearchIndexRouting::ByOutputRelation,
+        FileMeilisearchIndexRouting::ByProjectionTarget => {
+            MeilisearchIndexRouting::ByProjectionTarget
+        }
+        FileMeilisearchIndexRouting::Fixed { index } => {
+            MeilisearchIndexRouting::Fixed(index.clone())
+        }
+    };
+    if let Some(prefix) = &meili.index_prefix {
+        config.index_prefix = prefix.clone();
+    }
+    if let Some(auto_create) = meili.auto_create_indexes {
+        config.auto_create_indexes = auto_create;
+    }
+    if let Some(field) = &meili.primary_key_field {
+        config.primary_key_field = field.clone();
+    }
+    if let Some(docs) = meili.max_batch_docs {
+        config.batching.max_docs = docs;
+    }
+    if let Some(bytes) = meili.max_batch_bytes {
+        config.batching.max_bytes = bytes;
+    }
+    if let Some(deadline) = meili.task_deadline_ms {
+        config.task.deadline = Duration::from_millis(deadline);
+    }
+    if let Some(timeout) = meili.request_timeout_ms {
+        config.request_timeout = Duration::from_millis(timeout);
+    }
+    config.settings = meili.settings.as_ref().map(|settings| MeilisearchSettings {
+        filterable_attributes: settings.filterable_attributes.clone(),
+        sortable_attributes: settings.sortable_attributes.clone(),
+    });
+    let tls = database_tls_or_env(
+        meili.tls.as_ref(),
+        "VS_MEILI_TLS_MODE",
+        "VS_MEILI_TLS_CA_FILE",
+        None,
+    )?;
+    let insecure_tls = config_bool_or_env(meili.insecure_tls, "VS_INSECURE_TLS", false);
+    if tls.is_some() && insecure_tls {
+        return Err(anyhow!(
+            "strict Meilisearch TLS and VS_INSECURE_TLS=true are mutually exclusive"
+        ));
+    }
+    if let Some(tls) = tls {
+        match tls.mode {
+            DatabaseTlsMode::VerifyFull => {
+                if !config.endpoint.starts_with("https://") {
+                    return Err(anyhow!(
+                        "sink.meilisearch.tls.mode=verify_full requires an https:// endpoint"
+                    ));
+                }
+                if let Some(path) = tls.ca_file {
+                    config.ca_file = Some(path);
+                }
+            }
+            DatabaseTlsMode::Disabled => {
+                if !config.endpoint.starts_with("http://") {
+                    return Err(anyhow!(
+                        "sink.meilisearch.tls.mode=disabled requires an http:// endpoint"
+                    ));
+                }
+            }
+        }
+    }
+    if insecure_tls {
+        config.verify_tls = false;
+    }
+    Ok(config)
+}
+
+fn load_meilisearch_config_from_env() -> Result<MeilisearchConfig> {
+    let endpoint = req("VS_MEILI_ENDPOINT")?;
+    let mut config = MeilisearchConfig::new("meilisearch", endpoint);
+    config.api_key = opt("VS_MEILI_API_KEY")?;
+    if let Some(prefix) = opt("VS_MEILI_INDEX_PREFIX")? {
+        config.index_prefix = prefix;
+    }
+    if let Some(index) = opt("VS_MEILI_INDEX")? {
+        config.index_routing = MeilisearchIndexRouting::Fixed(index);
+    }
+    if opt("VS_INSECURE_TLS")?.as_deref() == Some("true") {
+        config.verify_tls = false;
+    }
+    Ok(config)
 }
 
 fn load_redis_sink_config(engine_config: Option<&EngineFileConfig>) -> Result<RedisConfig> {
