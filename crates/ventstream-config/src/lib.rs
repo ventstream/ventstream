@@ -184,6 +184,11 @@ impl EngineConfig {
                     opensearch.index_routing,
                     OpenSearchIndexRouting::ByProjectionTarget
                 )
+            }) || sink.meilisearch.as_ref().is_some_and(|meilisearch| {
+                matches!(
+                    meilisearch.index_routing,
+                    MeilisearchIndexRoutingConfig::ByProjectionTarget
+                )
             }) || sink.redis.as_ref().is_some_and(|redis| {
                 matches!(
                     redis.keyspace.routing,
@@ -882,6 +887,9 @@ pub struct SinkConfig {
     /// Redis sink settings.
     #[serde(default)]
     pub redis: Option<RedisSinkConfig>,
+    /// Meilisearch sink settings.
+    #[serde(default)]
+    pub meilisearch: Option<MeilisearchSinkConfig>,
 }
 
 impl SinkConfig {
@@ -891,6 +899,11 @@ impl SinkConfig {
                 if self.redis.is_some() {
                     return Err(ConfigError::InvalidField(
                         "sink.redis cannot be set for opensearch/elasticsearch sinks",
+                    ));
+                }
+                if self.meilisearch.is_some() {
+                    return Err(ConfigError::InvalidField(
+                        "sink.meilisearch cannot be set for opensearch/elasticsearch sinks",
                     ));
                 }
                 let Some(opensearch) = &self.opensearch else {
@@ -906,12 +919,35 @@ impl SinkConfig {
                         "sink.opensearch cannot be set for redis sinks",
                     ));
                 }
+                if self.meilisearch.is_some() {
+                    return Err(ConfigError::InvalidField(
+                        "sink.meilisearch cannot be set for redis sinks",
+                    ));
+                }
                 let Some(redis) = &self.redis else {
                     return Err(ConfigError::InvalidField(
                         "sink.redis is required for redis sinks",
                     ));
                 };
                 redis.validate()
+            }
+            SinkKind::Meilisearch => {
+                if self.opensearch.is_some() {
+                    return Err(ConfigError::InvalidField(
+                        "sink.opensearch cannot be set for meilisearch sinks",
+                    ));
+                }
+                if self.redis.is_some() {
+                    return Err(ConfigError::InvalidField(
+                        "sink.redis cannot be set for meilisearch sinks",
+                    ));
+                }
+                let Some(meilisearch) = &self.meilisearch else {
+                    return Err(ConfigError::InvalidField(
+                        "sink.meilisearch is required for meilisearch sinks",
+                    ));
+                };
+                meilisearch.validate()
             }
         }
     }
@@ -927,6 +963,152 @@ pub enum SinkKind {
     Elasticsearch,
     /// Redis materialization sink.
     Redis,
+    /// Meilisearch search sink.
+    Meilisearch,
+}
+
+/// Meilisearch sink settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeilisearchSinkConfig {
+    /// Deployment-provided endpoint reference, usually `env:VS_MEILI_ENDPOINT`.
+    pub endpoint_ref: ValueRef,
+    /// API key reference. Use a scoped key, never the master key.
+    #[serde(default)]
+    pub api_key_ref: Option<ValueRef>,
+    /// Per-event index routing policy.
+    #[serde(default)]
+    pub index_routing: MeilisearchIndexRoutingConfig,
+    /// Prefix prepended to routed index UIDs. `[A-Za-z0-9_-]` only.
+    #[serde(default)]
+    pub index_prefix: Option<String>,
+    /// Create missing indexes implicitly on first write. Default true.
+    #[serde(default)]
+    pub auto_create_indexes: Option<bool>,
+    /// Document attribute holding the encoded primary key. Default `_vs_pk`.
+    #[serde(default)]
+    pub primary_key_field: Option<String>,
+    /// Maximum documents per request. Default 2000.
+    #[serde(default)]
+    pub max_batch_docs: Option<usize>,
+    /// Maximum request body bytes. Default 16MiB.
+    #[serde(default)]
+    pub max_batch_bytes: Option<usize>,
+    /// Task-poll deadline in milliseconds. Default 120000.
+    #[serde(default)]
+    pub task_deadline_ms: Option<u64>,
+    /// Per-request HTTP timeout in milliseconds. Default 30000.
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+    /// Declared managed index settings (fixed routing only).
+    #[serde(default)]
+    pub settings: Option<MeilisearchSettingsConfig>,
+    /// Disable TLS certificate verification. Development only.
+    #[serde(default)]
+    pub insecure_tls: Option<bool>,
+    /// TLS transport policy. Prefer this over `insecure_tls`.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+impl MeilisearchSinkConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        const MAX_BATCH_DOCS: usize = 50_000;
+        const MAX_BATCH_BYTES: usize = 96 * 1024 * 1024;
+        const MAX_TASK_DEADLINE_MS: u64 = 3_600_000;
+        const MAX_REQUEST_TIMEOUT_MS: u64 = 600_000;
+
+        if let Some(prefix) = &self.index_prefix {
+            if !prefix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            {
+                return Err(ConfigError::InvalidField(
+                    "sink.meilisearch.index_prefix must match [A-Za-z0-9_-]",
+                ));
+            }
+        }
+        if let Some(field) = &self.primary_key_field {
+            if field.is_empty()
+                || !field
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            {
+                return Err(ConfigError::InvalidField(
+                    "sink.meilisearch.primary_key_field must be non-empty [A-Za-z0-9_-]",
+                ));
+            }
+        }
+        if matches!(self.max_batch_docs, Some(v) if v == 0 || v > MAX_BATCH_DOCS) {
+            return Err(ConfigError::InvalidField(
+                "sink.meilisearch.max_batch_docs must be between 1 and 50000",
+            ));
+        }
+        if matches!(self.max_batch_bytes, Some(v) if v == 0 || v > MAX_BATCH_BYTES) {
+            return Err(ConfigError::InvalidField(
+                "sink.meilisearch.max_batch_bytes must be between 1 and 96MiB",
+            ));
+        }
+        if matches!(self.task_deadline_ms, Some(v) if v == 0 || v > MAX_TASK_DEADLINE_MS) {
+            return Err(ConfigError::InvalidField(
+                "sink.meilisearch.task_deadline_ms must be between 1 and 3600000",
+            ));
+        }
+        if matches!(self.request_timeout_ms, Some(v) if v == 0 || v > MAX_REQUEST_TIMEOUT_MS) {
+            return Err(ConfigError::InvalidField(
+                "sink.meilisearch.request_timeout_ms must be between 1 and 600000",
+            ));
+        }
+        if let Some(tls) = &self.tls {
+            tls.validate("sink.meilisearch.tls")?;
+            if self.insecure_tls == Some(true) {
+                return Err(ConfigError::InvalidField(
+                    "sink.meilisearch.tls and sink.meilisearch.insecure_tls=true are mutually exclusive",
+                ));
+            }
+        }
+        if let MeilisearchIndexRoutingConfig::Fixed { index } = &self.index_routing {
+            if index.is_empty() {
+                return Err(ConfigError::InvalidField(
+                    "sink.meilisearch.index_routing.index must not be empty",
+                ));
+            }
+        } else if self.settings.is_some() {
+            return Err(ConfigError::InvalidField(
+                "sink.meilisearch.settings requires fixed index routing",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Meilisearch index routing policy.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, tag = "mode", rename_all = "snake_case")]
+pub enum MeilisearchIndexRoutingConfig {
+    /// Route by the event output relation. Default.
+    #[default]
+    ByOutputRelation,
+    /// Route by the projection target header.
+    ByProjectionTarget,
+    /// All events target one index.
+    Fixed {
+        /// Target index name, before prefixing and encoding.
+        index: String,
+    },
+}
+
+/// Declared Meilisearch index settings. Only declared attributes are
+/// asserted; everything else is left untouched.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeilisearchSettingsConfig {
+    /// Attributes usable in filter expressions.
+    #[serde(default)]
+    pub filterable_attributes: Vec<String>,
+    /// Attributes usable in sort expressions.
+    #[serde(default)]
+    pub sortable_attributes: Vec<String>,
 }
 
 /// Redis materialization sink settings.

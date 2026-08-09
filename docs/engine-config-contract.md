@@ -93,6 +93,14 @@ The engine now consumes:
   `by_projection_target`, `fixed`, or `template` strategy
 - `sink.opensearch.reconcile_allow_full_purge`
 - `sink.opensearch.insecure_tls`
+- `sink.meilisearch.endpoint_ref`
+- `sink.meilisearch.api_key_ref`
+- `sink.meilisearch.index_routing` with `by_output_relation`,
+  `by_projection_target`, or `fixed` mode
+- `sink.meilisearch.index_prefix`, `primary_key_field`,
+  `auto_create_indexes`, `max_batch_docs`, `max_batch_bytes`,
+  `task_deadline_ms`, `request_timeout_ms`, `settings`, `tls`,
+  `insecure_tls`
 - `specs.joins`
 - `specs.neo4j_denormalize`
 - `specs.graphql_schema`
