@@ -223,6 +223,34 @@ Operational notes from the run:
   possible future DX improvement.
 - Memory-mode joins need `VS_JOINS_STATE_DIR` (durable state guard).
 
+## Multi-source stability battery (2026-08-09)
+
+32/32 assertions passed across four sources, all against live databases
+(native processes; Meilisearch v1.52), every DLQ empty, zero engine errors:
+
+- **Postgres joins (12/12)**: customer-update fan-out into embedded docs
+  across orders, child item insert/update/delete propagating into parent
+  items arrays (REPLICA IDENTITY FULL), parent deletes, order reparenting,
+  and a 240-op burst matching SQL ground truth exactly (54 = 54, no
+  orphans).
+- **MongoDB change streams (7/7)**: update_lookup full docs, replaceOne,
+  string `_id` deletes, unicode/emoji round-trips, 100-op burst matching
+  collection counts.
+- **MySQL 9.7 binlog (5/5)**: GTID row events, quoted/escaped strings,
+  60-op burst matching table counts. Finding: MySQL DECIMAL columns
+  materialize as precision-preserving strings ("49.00") — document that
+  sortable numeric attributes need casts.
+- **Neo4j Enterprise CDC, complex graph (8/8)**: 300 products × 5 rels
+  incl. a hub node all products share. Category rename fanned out to 100
+  docs; region rename cascaded 2 hops to 120 docs; supplier region move
+  followed; hot-endpoint detection identified all three low-cardinality
+  far-nodes at startup and **a DETACH DELETE severing a hub relationship
+  removed exactly one document in 1.4s with no mass rebuild**, while a hub
+  property rename still propagated to all docs (no over-filtering).
+
+Not covered: Kafka source (no local broker; the source is
+payload-passthrough and shares the tested delivery path).
+
 ## Effort estimate
 
 3–5 focused days for v1 (everything except D2 bisection), +1–2 days for
