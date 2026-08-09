@@ -248,6 +248,19 @@ Operational notes from the run:
   removed exactly one document in 1.4s with no mass rebuild**, while a hub
   property rename still propagated to all docs (no over-filtering).
 
+**Edge-case and failure-injection battery (12/12, same day):** composite
+primary keys (`["region","sku"]`) incl. deletes; nested JSONB + unicode
+fidelity; all-NULL rows; 100x same-row churn resolving to the final state;
+delete-then-reinsert of the same pk; the index deleted out from under the
+sink → recreated on the next write; **sink outage** (Meilisearch
+SIGKILLed mid-stream, 10 rows written during the outage — fail-closed
+retry delivered all 10 after restart, DLQ empty); **engine crash** (engine
+SIGKILLed, 10 rows written while down — WAL cursor resume delivered all
+10, post-chaos doc count exactly matching SQL); a 1 MiB document; a
+3,000-row single-transaction flood delivered in 2.0s through the
+concurrency-1 write path; and `TRUNCATE` clearing the index with
+subsequent inserts flowing normally.
+
 Not covered: Kafka source (no local broker; the source is
 payload-passthrough and shares the tested delivery path).
 
