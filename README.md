@@ -26,7 +26,7 @@ Two pipelines off one event core, run together or apart:
 1. **Change streaming → any target.** Capture changes from PostgreSQL, Neo4j,
    MongoDB, MySQL/MariaDB, or Kafka/Redpanda and stream them continuously into a
    downstream target — idempotent, bounded, crash-safe. OpenSearch,
-   Elasticsearch, and Redis sinks are implemented today. Projections are declared
+   Elasticsearch, Meilisearch, and Redis sinks are implemented today. Projections are declared
    in YAML and can run standalone or under the optional Fleet control plane.
 2. **Real-time socket delivery → clients.** Publishers emit events to
    NATS or Redis Streams; VentStream pushes them to subscribed clients over a native
