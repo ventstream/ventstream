@@ -1,0 +1,34 @@
+# Postgres → Meilisearch: continuous search-index sync with delete
+# propagation. See docs-site/connectors/sinks/meilisearch.mdx.
+schema_version: 1
+roles: [cdc]
+
+source:
+  kind: postgres
+  postgres:
+    host_ref: env:VS_PG_HOST
+    port: 5432
+    user_ref: env:VS_PG_USER
+    password_ref: env:VS_PG_PASSWORD
+    database_ref: env:VS_PG_DATABASE
+    publication_ref: env:VS_PG_PUBLICATION
+    slot_ref: env:VS_PG_SLOT
+    bootstrap:
+      mode: snapshot
+      chunk_size: 10000
+    denormalize_mode: sql
+    sink_reverse_lookup: false
+
+sink:
+  kind: meilisearch
+  meilisearch:
+    endpoint_ref: env:VS_MEILI_ENDPOINT
+    api_key_ref: env:VS_MEILI_API_KEY
+    index_prefix: "vs_"
+
+specs:
+  joins: joins.yaml
+
+runtime:
+  health_listen: 127.0.0.1:4043
+  dlq_path: ./ventstream-state/dlq.jsonl
