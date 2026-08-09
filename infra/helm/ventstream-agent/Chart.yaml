@@ -3,8 +3,8 @@ name: ventstream-agent
 description: Deprecated legacy telemetry-based VentStream CDC agent chart
 type: application
 deprecated: true
-version: 0.1.19
-appVersion: "0.1.19"
+version: 0.1.20
+appVersion: "0.1.20"
 keywords:
   - ventstream
   - cdc
