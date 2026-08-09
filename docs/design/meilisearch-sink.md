@@ -198,6 +198,31 @@ module instead of making a third copy.
   demo is `DELETE FROM products WHERE id=...` → document gone from search
   in <1s (delete propagation is the community's #1 documented pain).
 
+## Live validation (2026-08-09)
+
+Verified end-to-end against Meilisearch v1.52 and Postgres 16 logical
+replication (single-table joins projection):
+
+- Snapshot bootstrap materialized the table; primary keys arrived as
+  base64url with `_vs_id` preserved for debugging.
+- Live INSERT and UPDATE streamed through; typo-tolerant search returned
+  the updated document.
+- **A row DELETE propagated to the search index in 0.22s** — the
+  documented community pain (polling can't see deletions) demonstrably
+  solved.
+- Startup probe correctly failed fast on a missing API key (HTTP 401
+  surfaced as Blocked before the pipeline started).
+
+Operational notes from the run:
+- Postgres pipelines require a `specs.joins` projection (even
+  single-table, `related: []`) because raw postgres events carry no
+  `ventstream.doc.id`; Mongo/Neo4j/Kafka/MySQL stamp ids at the source.
+  Without joins, every event DLQs with an exact per-item reason (the
+  contract behaved as designed). Quickstart docs must include the
+  single-table joins snippet; a source-side auto-projection is a
+  possible future DX improvement.
+- Memory-mode joins need `VS_JOINS_STATE_DIR` (durable state guard).
+
 ## Effort estimate
 
 3–5 focused days for v1 (everything except D2 bisection), +1–2 days for
