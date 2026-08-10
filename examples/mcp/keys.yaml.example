@@ -1,0 +1,4 @@
+keys:
+  - name: demo-agent
+    token_hash: sha256:REPLACE_WITH_HASH_FROM_generate-token
+    targets: [orders]

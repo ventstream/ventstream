@@ -1,0 +1,21 @@
+joins:
+  - name: orders
+    primary:
+      table: public.orders
+      pk: id
+    related:
+      - id: customer
+        table: public.customers
+        pk: id
+        join_on: { from: customer_id, to: id }
+        embed_as: customer
+        cardinality: one
+      - id: items
+        table: public.order_items
+        pk: id
+        join_on: { from: id, to: order_id }
+        embed_as: items
+        cardinality: many
+        sort_by: id
+    target:
+      index: orders
