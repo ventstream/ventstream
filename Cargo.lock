@@ -5378,6 +5378,7 @@ dependencies = [
  "mongodb",
  "mysql_async",
  "parking_lot",
+ "rand 0.8.6",
  "rdkafka",
  "redis",
  "reqwest",

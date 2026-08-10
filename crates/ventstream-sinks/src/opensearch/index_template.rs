@@ -141,7 +141,7 @@ fn substitute(token: &str, event: &Event) -> String {
 
 /// Lowercase and replace any character outside `[a-z0-9_-]` with `_`.
 /// Applied to every substitution result.
-fn sanitize_index_segment(input: &str) -> String {
+pub(crate) fn sanitize_index_segment(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
         let lower = ch.to_ascii_lowercase();

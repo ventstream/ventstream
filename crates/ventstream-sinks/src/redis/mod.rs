@@ -7,11 +7,11 @@ mod contract;
 mod diagnostic;
 mod drift;
 mod error;
-mod keyspace;
+pub(crate) mod keyspace;
 mod ownership;
 mod script;
 mod sink;
-mod topology;
+pub(crate) mod topology;
 mod view;
 
 pub use capability::RedisViewSchemaStatus;

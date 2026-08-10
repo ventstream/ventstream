@@ -169,9 +169,37 @@ impl EngineConfig {
                 "sink is required when the cdc role is enabled",
             ));
         }
-        if !self.roles.contains(&Role::Cdc) && (self.source.is_some() || self.sink.is_some()) {
+        if self.source.is_some() && !self.roles.contains(&Role::Cdc) {
+            return Err(ConfigError::InvalidField("source requires the cdc role"));
+        }
+        if self.sink.is_some()
+            && !self.roles.contains(&Role::Cdc)
+            && !self.roles.contains(&Role::Mcp)
+        {
             return Err(ConfigError::InvalidField(
-                "source and sink require the cdc role",
+                "sink requires the cdc or mcp role",
+            ));
+        }
+        // The mcp role reads the sink another deployment writes; it must
+        // never share a process with the singleton cdc writer, and the
+        // gateways have an unrelated lifecycle — keep it a solo role.
+        if self.roles.contains(&Role::Mcp) {
+            if self.roles.len() > 1 {
+                return Err(ConfigError::InvalidField("the mcp role must run alone"));
+            }
+            if self.sink.is_none() {
+                return Err(ConfigError::InvalidField(
+                    "sink is required when the mcp role is enabled",
+                ));
+            }
+            if self.runtime.mcp.is_none() {
+                return Err(ConfigError::InvalidField(
+                    "runtime.mcp is required when the mcp role is enabled",
+                ));
+            }
+        } else if self.runtime.mcp.is_some() {
+            return Err(ConfigError::InvalidField(
+                "runtime.mcp requires the mcp role",
             ));
         }
         if let Some(source) = &self.source {
@@ -207,9 +235,13 @@ impl EngineConfig {
                         "by_projection_target routing requires specs.joins",
                     ));
                 }
-                if !self.source.as_ref().is_some_and(|source| {
-                    matches!(source.kind, SourceKind::Postgres | SourceKind::Mysql)
-                }) {
+                // The read-only mcp role has no source; the writer-side
+                // source constraint applies to the cdc role only.
+                if self.roles.contains(&Role::Cdc)
+                    && !self.source.as_ref().is_some_and(|source| {
+                        matches!(source.kind, SourceKind::Postgres | SourceKind::Mysql)
+                    })
+                {
                     return Err(ConfigError::InvalidField(
                         "by_projection_target routing is supported only for postgres and mysql sources",
                     ));
@@ -239,6 +271,8 @@ pub enum Role {
     Ws,
     /// GraphQL subscription gateway.
     Graphql,
+    /// Read-only MCP server over sink-materialized state.
+    Mcp,
 }
 
 /// CDC source selector plus source-specific settings.
@@ -2158,6 +2192,9 @@ pub struct RuntimeConfig {
     /// Optional admin HTTP server settings.
     #[serde(default)]
     pub admin: AdminRuntimeConfig,
+    /// Read-only MCP server settings for the `mcp` role.
+    #[serde(default)]
+    pub mcp: Option<McpRuntimeConfig>,
     /// Single-tenant deployment guard used by realtime gateways.
     #[serde(default)]
     pub tenant: Option<String>,
@@ -2182,6 +2219,9 @@ impl RuntimeConfig {
         self.realtime.validate()?;
         self.ws.validate()?;
         self.graphql.validate()?;
+        if let Some(mcp) = &self.mcp {
+            mcp.validate()?;
+        }
         if let (Some(shared), Some(local)) = (self.realtime.provider, self.ws.provider) {
             if shared != local {
                 return Err(ConfigError::InvalidField(
@@ -2708,6 +2748,58 @@ impl AdminRuntimeConfig {
         }
         if let Some(token_ref) = &self.token_ref {
             token_ref.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Read-only MCP server settings for the `mcp` role.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpRuntimeConfig {
+    /// MCP HTTP listen address (`host:port`).
+    pub listen: String,
+    /// Value reference to one full-access bearer token.
+    #[serde(default)]
+    pub auth_token_ref: Option<String>,
+    /// Value reference to a per-token keys YAML document.
+    #[serde(default)]
+    pub keys_ref: Option<String>,
+    /// Server-level target allowlist. Empty = every target.
+    #[serde(default)]
+    pub allow_targets: Vec<String>,
+    /// Explicit target names for by_output_relation-routed sinks.
+    #[serde(default)]
+    pub targets: Vec<String>,
+}
+
+impl McpRuntimeConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        validate_nonempty("runtime.mcp.listen", &self.listen)?;
+        let listen: std::net::SocketAddr = self
+            .listen
+            .parse()
+            .map_err(|_| ConfigError::InvalidField("runtime.mcp.listen must be host:port"))?;
+        if self.auth_token_ref.is_some() && self.keys_ref.is_some() {
+            return Err(ConfigError::InvalidField(
+                "runtime.mcp.auth_token_ref and runtime.mcp.keys_ref are mutually exclusive",
+            ));
+        }
+        for reference in [&self.auth_token_ref, &self.keys_ref].into_iter().flatten() {
+            ValueRef::parse(reference)?;
+        }
+        // Mirror of the HTTP exposure rule: no auth is dev-only, loopback.
+        if self.auth_token_ref.is_none() && self.keys_ref.is_none() && !listen.ip().is_loopback() {
+            return Err(ConfigError::InvalidField(
+                "runtime.mcp requires auth_token_ref or keys_ref on a non-loopback listen",
+            ));
+        }
+        for target in self.allow_targets.iter().chain(&self.targets) {
+            if target.trim().is_empty() {
+                return Err(ConfigError::InvalidField(
+                    "runtime.mcp target names must be non-empty",
+                ));
+            }
         }
         Ok(())
     }
@@ -4130,5 +4222,73 @@ sink:
         ] {
             assert!(EngineConfig::from_yaml_str(yaml).is_err());
         }
+    }
+
+    const MCP_SINK_YAML: &str = "sink:\n  kind: opensearch\n  opensearch:\n    endpoint_ref: env:VS_OS_ENDPOINT\n    index_routing:\n      strategy: fixed\n      name: orders\n";
+
+    #[test]
+    fn parses_mcp_role_with_runtime_block() -> Result<(), ConfigError> {
+        let config = EngineConfig::from_yaml_str(&format!(
+            "schema_version: 1\nroles: [mcp]\n{MCP_SINK_YAML}runtime:\n  mcp:\n    listen: 127.0.0.1:8790\n    keys_ref: env:VS_MCP_KEYS\n    allow_targets: [orders]\n    targets: []\n"
+        ))?;
+        assert_eq!(config.roles, vec![Role::Mcp]);
+        let mcp = config.runtime.mcp.expect("mcp runtime");
+        assert_eq!(mcp.listen, "127.0.0.1:8790");
+        assert_eq!(mcp.keys_ref.as_deref(), Some("env:VS_MCP_KEYS"));
+        assert_eq!(mcp.allow_targets, ["orders"]);
+        // Loopback listen with no auth is dev-allowed.
+        assert!(EngineConfig::from_yaml_str(&format!(
+            "schema_version: 1\nroles: [mcp]\n{MCP_SINK_YAML}runtime:\n  mcp:\n    listen: 127.0.0.1:8790\n"
+        ))
+        .is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_role_coupling_is_validated() {
+        // mcp must run alone (never with the singleton cdc writer).
+        for roles in ["[mcp, cdc]", "[mcp, ws]", "[mcp, graphql]"] {
+            assert!(EngineConfig::from_yaml_str(&format!(
+                "schema_version: 1\nroles: {roles}\n{MCP_SINK_YAML}runtime:\n  mcp:\n    listen: 127.0.0.1:8790\n"
+            ))
+            .is_err());
+        }
+        // runtime.mcp without the role.
+        assert!(EngineConfig::from_yaml_str(
+            "schema_version: 1\nroles: [ws]\nruntime:\n  mcp:\n    listen: 127.0.0.1:8790\n"
+        )
+        .is_err());
+        // Role without runtime.mcp, and role without sink.
+        assert!(EngineConfig::from_yaml_str(&format!(
+            "schema_version: 1\nroles: [mcp]\n{MCP_SINK_YAML}"
+        ))
+        .is_err());
+        assert!(EngineConfig::from_yaml_str(
+            "schema_version: 1\nroles: [mcp]\nruntime:\n  mcp:\n    listen: 127.0.0.1:8790\n"
+        )
+        .is_err());
+        // Both auth refs are mutually exclusive.
+        assert!(EngineConfig::from_yaml_str(&format!(
+            "schema_version: 1\nroles: [mcp]\n{MCP_SINK_YAML}runtime:\n  mcp:\n    listen: 127.0.0.1:8790\n    auth_token_ref: env:VS_A\n    keys_ref: env:VS_B\n"
+        ))
+        .is_err());
+        // Non-loopback listen requires auth; with auth it passes.
+        assert!(EngineConfig::from_yaml_str(&format!(
+            "schema_version: 1\nroles: [mcp]\n{MCP_SINK_YAML}runtime:\n  mcp:\n    listen: 0.0.0.0:8790\n"
+        ))
+        .is_err());
+        assert!(EngineConfig::from_yaml_str(&format!(
+            "schema_version: 1\nroles: [mcp]\n{MCP_SINK_YAML}runtime:\n  mcp:\n    listen: 0.0.0.0:8790\n    auth_token_ref: env:VS_MCP_TOKEN\n"
+        ))
+        .is_ok());
+        // Bad ref syntax and empty target names are rejected.
+        assert!(EngineConfig::from_yaml_str(&format!(
+            "schema_version: 1\nroles: [mcp]\n{MCP_SINK_YAML}runtime:\n  mcp:\n    listen: 127.0.0.1:8790\n    keys_ref: notaref\n"
+        ))
+        .is_err());
+        assert!(EngineConfig::from_yaml_str(&format!(
+            "schema_version: 1\nroles: [mcp]\n{MCP_SINK_YAML}runtime:\n  mcp:\n    listen: 127.0.0.1:8790\n    allow_targets: [\" \"]\n"
+        ))
+        .is_err());
     }
 }

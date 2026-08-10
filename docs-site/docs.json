@@ -1,144 +1,145 @@
 {
- "$schema": "https://mintlify.com/docs.json",
- "theme": "mint",
- "name": "VentStream",
- "description": "Operational data streaming for change-data capture, joined projections, native WebSockets, GraphQL subscriptions, and managed engine fleets.",
- "colors": {
-  "primary": "#2FCF88",
-  "light": "#50DCA0",
-  "dark": "#24B978"
- },
- "logo": {
-  "light": "/images/ventstream-logo-light.svg",
-  "dark": "/images/ventstream-logo-dark.svg",
-  "href": "https://ventstream.dev"
- },
- "favicon": "/images/favicon.svg",
- "seo": {
-  "metatags": {
-   "canonical": "https://ventstream.dev/docs"
-  }
- },
- "navigation": {
-  "tabs": [
-   {
-    "tab": "Documentation",
-    "groups": [
-     {
-      "group": "Get started",
-      "pages": [
-       "introduction",
-       "quickstart",
-       "concepts/architecture"
-      ]
-     },
-     {
-      "group": "Concepts",
-      "pages": [
-       "concepts/cdc-and-projections",
-       "concepts/lifecycle-phases",
-       "concepts/pause-resume-drain",
-       "concepts/reconciliation",
-       "concepts/fan-out",
-       "concepts/performance",
-       "concepts/realtime-brokers",
-       "concepts/real-time-subscriptions"
-      ]
-     },
-     {
-      "group": "Connectors",
-      "pages": [
-       "connectors/overview",
-       {
-        "group": "Sources",
-        "pages": [
-         "connectors/sources/postgres",
-         "connectors/sources/neo4j",
-         "connectors/sources/mongodb",
-         "connectors/sources/mysql",
-         "connectors/sources/kafka"
-        ]
-       },
-       {
-        "group": "Sinks",
-        "pages": [
-         "connectors/sinks/opensearch",
-         "connectors/sinks/meilisearch",
-         "connectors/sinks/redis"
-        ]
-       }
-      ]
-     },
-     {
-      "group": "Guides",
-      "pages": [
-       "guides/database-tls",
-       "guides/realtime-demo",
-       "guides/reliable-apollo-subscriptions",
-       "guides/authoring-specs",
-       "guides/testing"
-      ]
-     },
-     {
-      "group": "Engineering",
-      "pages": [
-       "engineering/neo4j-hot-nodes"
-      ]
-     },
-     {
-      "group": "VentStream Cloud",
-      "pages": [
-       "fleet/overview",
-       "fleet/resource-model",
-       "fleet/authentication",
-       "fleet/cli",
-       "fleet/enrollment",
-       "fleet/configuration",
-       "fleet/security"
-      ]
-     },
-     {
-      "group": "Deploy",
-      "pages": [
-       "deploy/native-binary",
-       "deploy/local",
-       "deploy/kubernetes",
-       "deploy/kubernetes-standalone",
-       "deploy/kubernetes-managed-engine"
-      ]
-     },
-     {
-      "group": "Reference",
-      "pages": [
-       "reference/engine-env",
-       "reference/control-plane-api",
-       "reference/troubleshooting"
-      ]
-     }
-    ]
-   }
-  ]
- },
- "navbar": {
-  "links": [
-   {
-    "label": "Website",
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "VentStream",
+  "description": "Operational data streaming for change-data capture, joined projections, native WebSockets, GraphQL subscriptions, and managed engine fleets.",
+  "colors": {
+    "primary": "#2FCF88",
+    "light": "#50DCA0",
+    "dark": "#24B978"
+  },
+  "logo": {
+    "light": "/images/ventstream-logo-light.svg",
+    "dark": "/images/ventstream-logo-dark.svg",
     "href": "https://ventstream.dev"
-   },
-   {
-    "label": "GitHub",
-    "href": "https://github.com/ventstream/ventstream"
-   }
-  ],
-  "primary": {
-   "type": "button",
-   "label": "Quickstart",
-   "href": "/quickstart"
+  },
+  "favicon": "/images/favicon.svg",
+  "seo": {
+    "metatags": {
+      "canonical": "https://ventstream.dev/docs"
+    }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "concepts/architecture"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/cdc-and-projections",
+              "concepts/lifecycle-phases",
+              "concepts/pause-resume-drain",
+              "concepts/reconciliation",
+              "concepts/fan-out",
+              "concepts/performance",
+              "concepts/realtime-brokers",
+              "concepts/real-time-subscriptions"
+            ]
+          },
+          {
+            "group": "Connectors",
+            "pages": [
+              "connectors/overview",
+              {
+                "group": "Sources",
+                "pages": [
+                  "connectors/sources/postgres",
+                  "connectors/sources/neo4j",
+                  "connectors/sources/mongodb",
+                  "connectors/sources/mysql",
+                  "connectors/sources/kafka"
+                ]
+              },
+              {
+                "group": "Sinks",
+                "pages": [
+                  "connectors/sinks/opensearch",
+                  "connectors/sinks/meilisearch",
+                  "connectors/sinks/redis"
+                ]
+              }
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/mcp-server",
+              "guides/database-tls",
+              "guides/realtime-demo",
+              "guides/reliable-apollo-subscriptions",
+              "guides/authoring-specs",
+              "guides/testing"
+            ]
+          },
+          {
+            "group": "Engineering",
+            "pages": [
+              "engineering/neo4j-hot-nodes"
+            ]
+          },
+          {
+            "group": "VentStream Cloud",
+            "pages": [
+              "fleet/overview",
+              "fleet/resource-model",
+              "fleet/authentication",
+              "fleet/cli",
+              "fleet/enrollment",
+              "fleet/configuration",
+              "fleet/security"
+            ]
+          },
+          {
+            "group": "Deploy",
+            "pages": [
+              "deploy/native-binary",
+              "deploy/local",
+              "deploy/kubernetes",
+              "deploy/kubernetes-standalone",
+              "deploy/kubernetes-managed-engine"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/engine-env",
+              "reference/control-plane-api",
+              "reference/troubleshooting"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Website",
+        "href": "https://ventstream.dev"
+      },
+      {
+        "label": "GitHub",
+        "href": "https://github.com/ventstream/ventstream"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Quickstart",
+      "href": "/quickstart"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/ventstream/ventstream"
+    }
   }
- },
- "footer": {
-  "socials": {
-   "github": "https://github.com/ventstream/ventstream"
-  }
- }
 }

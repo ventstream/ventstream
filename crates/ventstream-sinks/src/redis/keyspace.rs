@@ -6,7 +6,7 @@ use super::config::{RedisConfig, RedisContract, RedisDocumentFormat, RedisKeyRou
 
 pub(super) const DOC_ID_HEADER: &str = "ventstream.doc.id";
 pub(super) const RELATION_HEADER: &str = "ventstream.cdc.relation";
-pub(super) const PROJECTION_TARGET_HEADER: &str = "ventstream.target.index";
+pub(crate) const PROJECTION_TARGET_HEADER: &str = "ventstream.target.index";
 pub(super) const TARGET_CLEAR_HEADER: &str = "ventstream.target.clear";
 
 pub(super) fn key_parts<'a>(
@@ -91,7 +91,7 @@ pub(super) fn truncate_target<'a>(
     }
 }
 
-pub(super) fn encoded_key_len(prefix: &str, target: &str, doc_id: &str) -> usize {
+pub(crate) fn encoded_key_len(prefix: &str, target: &str, doc_id: &str) -> usize {
     prefix
         .len()
         .saturating_add(4)
@@ -317,7 +317,7 @@ pub(super) fn uses_json_cache_staging(config: &RedisConfig) -> bool {
         && matches!(config.contract, RedisContract::Cache { .. })
 }
 
-pub(super) fn validate_target_segment(target: &str) -> Result<(), String> {
+pub(crate) fn validate_target_segment(target: &str) -> Result<(), String> {
     if target.trim().is_empty()
         || target.trim() != target
         || target.len() > 1024
@@ -360,7 +360,7 @@ fn encoded_segment_len(input: &str) -> usize {
     })
 }
 
-pub(super) fn key_from_parts(prefix: &str, target: &str, doc_id: &str, key_len: usize) -> String {
+pub(crate) fn key_from_parts(prefix: &str, target: &str, doc_id: &str, key_len: usize) -> String {
     let target = encode_key_segment(target);
     let doc_id = encode_key_segment(doc_id);
     let mut key = String::with_capacity(key_len);
@@ -411,7 +411,7 @@ pub(super) fn writer_lineage_key(prefix: &str, target: &str) -> String {
     key
 }
 
-fn encode_key_segment(input: &str) -> Cow<'_, str> {
+pub(crate) fn encode_key_segment(input: &str) -> Cow<'_, str> {
     if input
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))

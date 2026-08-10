@@ -42,6 +42,7 @@ use ventstream_telemetry::PrometheusHandle;
 pub(crate) struct ReadinessGate {
     ws: Option<ReadinessSignal>,
     graphql: Option<ReadinessSignal>,
+    mcp: Option<ReadinessSignal>,
     ws_capacity: Option<WsCapacityGate>,
     sink_health: Option<SinkHealth>,
     sink_failure_grace: Duration,
@@ -59,8 +60,21 @@ impl ReadinessGate {
         Self {
             ws,
             graphql,
+            mcp: None,
             ws_capacity: ws_capacity.map(|(active, max)| WsCapacityGate { active, max }),
             sink_health,
+            sink_failure_grace: Self::DEFAULT_SINK_FAILURE_GRACE,
+        }
+    }
+
+    /// Gate for the solo mcp role: ready once the target registry is built.
+    pub(crate) fn for_mcp(mcp: ReadinessSignal) -> Self {
+        Self {
+            ws: None,
+            graphql: None,
+            mcp: Some(mcp),
+            ws_capacity: None,
+            sink_health: None,
             sink_failure_grace: Self::DEFAULT_SINK_FAILURE_GRACE,
         }
     }
@@ -76,6 +90,9 @@ impl ReadinessGate {
             .is_some_and(|signal| !signal.is_ready())
         {
             waiting_for.push("graphql");
+        }
+        if self.mcp.as_ref().is_some_and(|signal| !signal.is_ready()) {
+            waiting_for.push("mcp");
         }
         if !waiting_for.is_empty() {
             return ReadinessStatus::Starting(waiting_for);
@@ -230,6 +247,15 @@ fn readyz(gate: &ReadinessGate) -> axum::response::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_gate_waits_for_the_registry() {
+        let signal = ReadinessSignal::new();
+        let gate = ReadinessGate::for_mcp(signal.clone());
+        assert_eq!(gate.status(), ReadinessStatus::Starting(vec!["mcp"]));
+        signal.mark_ready();
+        assert_eq!(gate.status(), ReadinessStatus::Ready);
+    }
 
     #[test]
     fn waits_for_every_enabled_gateway() {

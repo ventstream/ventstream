@@ -40,6 +40,7 @@ mod dlq;
 mod engine;
 mod fleet_config;
 mod health;
+mod mcp;
 mod memory_controller;
 mod mysql_sql_denormalize;
 mod sql_denormalize;
@@ -111,6 +112,7 @@ enum Role {
     Cdc,
     Ws,
     GraphQl,
+    Mcp,
 }
 
 impl Role {
@@ -119,8 +121,9 @@ impl Role {
             "cdc" => Ok(Self::Cdc),
             "ws" => Ok(Self::Ws),
             "graphql" => Ok(Self::GraphQl),
+            "mcp" => Ok(Self::Mcp),
             other => Err(anyhow!(
-                "unknown role '{other}' (expected 'cdc', 'ws', or 'graphql')"
+                "unknown role '{other}' (expected 'cdc', 'ws', 'graphql', or 'mcp')"
             )),
         }
     }
@@ -189,6 +192,19 @@ fn main() -> Result<()> {
             return Err(anyhow!("usage: ventstream --healthcheck ADDRESS /PATH"));
         }
         _ => {}
+    }
+
+    // `ventstream mcp` speaks JSON-RPC on stdout; logs must go to stderr,
+    // so this path installs its own subscriber and skips install_tracing.
+    if argv.get(1).map(String::as_str) == Some("mcp") {
+        install_stderr_tracing();
+        install_crypto_provider();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("ventstream-worker")
+            .build()
+            .context("building tokio runtime")?;
+        return runtime.block_on(mcp::run(&argv));
     }
 
     let early_engine_config = load_engine_config_from_env()?;
@@ -360,6 +376,7 @@ fn validate_startup_config(engine_config: Option<&EngineFileConfig>) -> Result<(
             Role::Cdc => "cdc",
             Role::Ws => "ws",
             Role::GraphQl => "graphql",
+            Role::Mcp => "mcp",
         })
         .collect();
     roles.sort_unstable();
@@ -562,6 +579,19 @@ async fn run(
     engine_config: Option<EngineFileConfig>,
 ) -> Result<()> {
     let fleet_config = fleet_config::load_from_env()?;
+    // Fleet supervisor contract: the engine child is spawned with NO argv.
+    // Role selection comes from the loaded config (VS_ENGINE_CONFIG, which
+    // the supervisor points at the staged ventstream.yaml of the applied
+    // fleet envelope), readiness is polled on /readyz of VS_HEALTH_LISTEN,
+    // and shutdown arrives as "shutdown\n" on stdin. Config validation
+    // guarantees mcp is a solo role, so this branch owns the process.
+    if load_runtime_roles(engine_config.as_ref())?.contains(&Role::Mcp) {
+        let shutdown = ShutdownToken::new();
+        let _signal_handle = spawn_signal_handler(shutdown.clone());
+        let _supervisor_handle = bool_env("VS_FLEET_SUPERVISED", false)
+            .then(|| spawn_supervisor_stdin_handler(shutdown.clone()));
+        return mcp::run_role(engine_config, shutdown).await;
+    }
     let mut cfg = PipelineEnv::load(fleet_config.as_ref(), engine_config.as_ref())?;
     info!(roles = ?cfg.roles, "pipeline roles configured");
 
@@ -635,30 +665,12 @@ async fn run(
     // A malformed VS_HEALTH_LISTEN must NOT take the pipeline down — the bind
     // is already soft-failure, and the *parse* must match that stance (M15).
     // Skip the health server with a warning instead of propagating `?`.
-    let health_listen: Option<SocketAddr> = if cfg.cdc.is_some()
-        || cfg.ws.is_some()
-        || cfg.graphql.is_some()
-    {
-        let listen_str = engine_config
-            .as_ref()
-            .and_then(|config| config.runtime.health_listen.clone())
-            .unwrap_or_else(|| {
-                std::env::var("VS_HEALTH_LISTEN").unwrap_or_else(|_| "0.0.0.0:4043".to_string())
-            });
-        match listen_str.parse::<SocketAddr>() {
-            Ok(addr) => Some(addr),
-            Err(err) => {
-                warn!(
-                    value = %listen_str,
-                    error = %err,
-                    "VS_HEALTH_LISTEN is not a valid host:port; health/metrics server disabled (pipeline continues)"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let health_listen: Option<SocketAddr> =
+        if cfg.cdc.is_some() || cfg.ws.is_some() || cfg.graphql.is_some() {
+            resolve_health_listen(engine_config.as_ref())
+        } else {
+            None
+        };
     if let Some(listen) = health_listen {
         // Install the Prometheus recorder so /metrics can render. A
         // failure here just disables /metrics — it must not stop the
@@ -771,6 +783,27 @@ async fn run(
     }
     info!("ventstream stopped");
     Ok(())
+}
+
+/// Resolve the shared health listener address. Parse failures disable
+/// the health server with a warning; they never stop the data path.
+fn resolve_health_listen(engine_config: Option<&EngineFileConfig>) -> Option<SocketAddr> {
+    let listen_str = engine_config
+        .and_then(|config| config.runtime.health_listen.clone())
+        .unwrap_or_else(|| {
+            std::env::var("VS_HEALTH_LISTEN").unwrap_or_else(|_| "0.0.0.0:4043".to_string())
+        });
+    match listen_str.parse::<SocketAddr>() {
+        Ok(addr) => Some(addr),
+        Err(err) => {
+            warn!(
+                value = %listen_str,
+                error = %err,
+                "VS_HEALTH_LISTEN is not a valid host:port; health/metrics server disabled (pipeline continues)"
+            );
+            None
+        }
+    }
 }
 
 /// Accept one private lifecycle command from the parent process.
@@ -3093,13 +3126,17 @@ fn load_engine_config_from_env() -> Result<Option<EngineFileConfig>> {
     let Some(path) = opt("VS_ENGINE_CONFIG")? else {
         return Ok(None);
     };
-    let text = std::fs::read_to_string(&path)
+    load_engine_config_from_path(&path).map(Some)
+}
+
+fn load_engine_config_from_path(path: &str) -> Result<EngineFileConfig> {
+    let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading engine config at {path}"))?;
     let mut config = EngineFileConfig::from_yaml_str(&text)
         .with_context(|| format!("validating engine config at {path}"))?;
-    resolve_relative_spec_paths(&mut config, Path::new(&path))?;
+    resolve_relative_spec_paths(&mut config, Path::new(path))?;
     info!(path = %path, schema_version = config.schema_version, "engine config loaded");
-    Ok(Some(config))
+    Ok(config)
 }
 
 fn resolve_relative_spec_paths(config: &mut EngineFileConfig, config_path: &Path) -> Result<()> {
@@ -3139,6 +3176,7 @@ fn roles_from_config(config: Option<&EngineFileConfig>) -> Option<HashSet<Role>>
                 ConfigRole::Cdc => Role::Cdc,
                 ConfigRole::Ws => Role::Ws,
                 ConfigRole::Graphql => Role::GraphQl,
+                ConfigRole::Mcp => Role::Mcp,
             })
             .collect()
     })
@@ -5910,6 +5948,21 @@ fn opt_duration_ms(key: &str, default: Duration) -> Result<Duration> {
 /// every `info!` / `debug!` call) as a top-level JSON property, so
 /// log-aggregator queries like `metric:"neo4j.tail.recomposed" AND
 /// recomposed:>1000` work directly without grep gymnastics.
+/// Stderr-only subscriber for the MCP server: stdout is reserved for
+/// protocol frames.
+fn install_stderr_tracing() {
+    use tracing_subscriber::prelude::*;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_writer(std::io::stderr),
+        )
+        .init();
+}
+
 fn install_tracing(
     telemetry_layer: Option<ventstream_telemetry::TelemetryTraceLayer>,
     log_format: Option<ConfigLogFormat>,
