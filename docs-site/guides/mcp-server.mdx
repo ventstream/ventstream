@@ -13,6 +13,82 @@ your pipeline config and read-only sink credentials, and it never touches
 the source database: agents read the sink documents the pipeline keeps in
 sync within milliseconds.
 
+## The config
+
+`ventstream mcp` takes the same pipeline config your engine already runs —
+usually the exact file, unchanged. From it the server learns three things:
+where the sink is (and its credentials), what the targets are, and what the
+documents look like (from the joins spec). A typical config:
+
+```yaml
+# pipeline.yaml — the same file the CDC engine runs
+schema_version: 1
+roles: [cdc]
+
+source:                    # ignored by the MCP server — it never reads the source
+  kind: postgres
+  postgres:
+    host_ref: env:VS_PG_HOST
+    port: 5432
+    user_ref: env:VS_PG_USER
+    password_ref: env:VS_PG_PASSWORD
+    database_ref: env:VS_PG_DATABASE
+    publication: shop_pub
+    slot: shop_slot
+    bootstrap: { mode: snapshot, chunk_size: 10000 }
+    denormalize_mode: sql
+
+sink:                      # what the MCP server reads
+  kind: meilisearch
+  meilisearch:
+    endpoint_ref: env:VS_MEILI_ENDPOINT
+    api_key_ref: env:VS_MEILI_API_KEY     # use a read-only key here
+    index_prefix: "shop_"
+    index_routing: { mode: by_projection_target }
+
+specs:
+  joins: joins.yaml        # defines the targets and document shapes
+
+runtime:
+  health_listen: 127.0.0.1:4043
+  dlq_path: ./state/dlq.jsonl
+```
+
+And the joins spec it references — this is where targets get their names
+and the documents get their shape:
+
+```yaml
+# joins.yaml
+joins:
+  - name: orders
+    primary:
+      table: public.orders
+      pk: id
+    related:
+      - id: customer
+        table: public.customers
+        pk: id
+        join_on: { from: customer_id, to: id }
+        embed_as: customer
+        cardinality: one
+      - id: items
+        table: public.order_items
+        pk: id
+        join_on: { from: id, to: order_id }
+        embed_as: items
+        cardinality: many
+    target:
+      index: orders        # ← this is the target name agents query
+```
+
+With this config the server exposes one target, `orders`, whose documents
+are orders with an embedded `customer` object and `items` array — and it
+serves that shape description to agents automatically.
+
+A complete runnable version of this setup — schema, seed data, configs,
+token flow, Claude wiring — lives in
+[`examples/mcp`](https://github.com/ventstream/ventstream/tree/main/examples/mcp).
+
 ## Run it
 
 ```bash
@@ -27,6 +103,10 @@ ventstream mcp \
   --config pg-search.yaml \
   --config mongo-cache.yaml
 ```
+
+The env vars referenced by the config (`VS_MEILI_ENDPOINT`, …) must be set
+for the MCP server too — give it read-only sink credentials rather than
+the writer's.
 
 ## Transports
 
