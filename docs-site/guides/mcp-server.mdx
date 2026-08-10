@@ -108,6 +108,45 @@ The env vars referenced by the config (`VS_MEILI_ENDPOINT`, …) must be set
 for the MCP server too — give it read-only sink credentials rather than
 the writer's.
 
+## Running as a role
+
+The subcommand above is the interactive way. For supervised deployments —
+systemd, Kubernetes, or Fleet-managed — the engine can run the MCP server
+as a **role**, dispatched from the config itself with no CLI arguments:
+
+```yaml
+schema_version: 1
+roles: [mcp]               # mcp runs alone — never beside the cdc writer
+sink:                      # required: what it reads
+  kind: meilisearch
+  meilisearch:
+    endpoint_ref: env:VS_MEILI_ENDPOINT
+    api_key_ref: env:VS_MEILI_API_KEY
+    index_prefix: "shop_"
+    index_routing: { mode: by_projection_target }
+specs:
+  joins: joins.yaml
+runtime:
+  health_listen: 0.0.0.0:4043     # /readyz for probes and supervisors
+  mcp:
+    listen: 0.0.0.0:8790
+    keys_ref: env:VS_MCP_KEYS     # or auth_token_ref — required off loopback
+```
+
+`VS_ENGINE_CONFIG=…  ventstream` (no arguments) boots the server, serves
+`/readyz` on the health listener, and shuts down cleanly on SIGTERM. An
+mcp-role config has no `source:` — it only ever reads the sink.
+
+**Fleet-managed:** apply the same YAML with
+`ventstreamctl configurations apply --engine-config …` — the control plane
+validates it and delivers it to the deployment like any pipeline config.
+The managed-agent chart supports `workload.roles: mcp` (under
+`kind: realtime`) with `service.mcpPort` exposing the listener, and
+`ventstreamctl mcp keys generate` mints tokens, printing the token once
+and the `token_hash` entry for your keys secret. Query traffic always
+goes straight from agents to the MCP deployment — never through the
+control plane.
+
 ## Transports
 
 **stdio** (default) — the MCP client spawns the process. A Claude Desktop
