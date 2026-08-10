@@ -95,19 +95,21 @@ impl SinkReader {
         }
     }
 
-    /// Full-text search over one target. Redis targets do not support search.
+    /// Search one target. `sort` is `(field, descending)`. Redis targets
+    /// do not support search.
     pub async fn search(
         &self,
         target: &str,
         query: &str,
         limit: usize,
+        sort: Option<(String, bool)>,
     ) -> Result<Vec<Value>, SinkError> {
         match self {
             Self::Redis(_) => Err(SinkError::Blocked(
                 "redis targets support scan, not search".to_owned(),
             )),
-            Self::OpenSearch(reader) => reader.search(target, query, limit).await,
-            Self::Meilisearch(reader) => reader.search(target, query, limit).await,
+            Self::OpenSearch(reader) => reader.search(target, query, limit, sort).await,
+            Self::Meilisearch(reader) => reader.search(target, query, limit, sort).await,
         }
     }
 
@@ -340,16 +342,25 @@ impl OpenSearchReader {
         target: &str,
         query: &str,
         limit: usize,
+        sort: Option<(String, bool)>,
     ) -> Result<Vec<Value>, SinkError> {
         let index = self.resolve_index(target)?;
         let url = format!(
             "{}/{index}/_search",
             self.config.endpoint.trim_end_matches('/')
         );
-        let body = json!({
+        let mut body = json!({
             "query": {"query_string": {"query": query}},
             "size": limit,
         });
+        if let (Some(map), Some((field, descending))) = (body.as_object_mut(), sort) {
+            let order = if descending { "desc" } else { "asc" };
+            // unmapped_type avoids a 400 when the field has no mapping.
+            map.insert(
+                "sort".to_owned(),
+                json!([{field: {"order": order, "unmapped_type": "keyword"}}]),
+            );
+        }
         let response = apply_auth(self.client.post(url), &self.config.auth)
             .json(&body)
             .send()
@@ -420,14 +431,32 @@ impl MeilisearchReader {
         target: &str,
         query: &str,
         limit: usize,
+        sort: Option<(String, bool)>,
     ) -> Result<Vec<Value>, SinkError> {
         let uid = self.index_uid(target)?;
+        let mut request_body = json!({"q": query, "limit": limit});
+        if let (Some(map), Some((field, descending))) = (request_body.as_object_mut(), sort) {
+            let order = if descending { "desc" } else { "asc" };
+            map.insert("sort".to_owned(), json!([format!("{field}:{order}")]));
+        }
         let response = self
             .request(reqwest::Method::POST, &format!("/indexes/{uid}/search"))
-            .json(&json!({"q": query, "limit": limit}))
+            .json(&request_body)
             .send()
             .await
             .map_err(|err| SinkError::Connection(format!("meilisearch search failed: {err}")))?;
+        // A 400 is a query/settings rejection (e.g. attribute not declared
+        // sortable) — surface Meilisearch's own message, not a transport error.
+        if response.status() == reqwest::StatusCode::BAD_REQUEST {
+            let detail: Value = response.json().await.unwrap_or(Value::Null);
+            let message = detail
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("invalid search request");
+            return Err(SinkError::Blocked(format!(
+                "meilisearch rejected search: {message}"
+            )));
+        }
         let body = read_success_json(response, "meilisearch search").await?;
         Ok(body
             .get("hits")
@@ -660,7 +689,10 @@ mod tests {
             .mount(&server)
             .await;
         let reader = opensearch_reader(&server).await;
-        let hits = reader.search("orders", "open", 5).await.expect("search");
+        let hits = reader
+            .search("orders", "open", 5, None)
+            .await
+            .expect("search");
         assert_eq!(
             hits,
             vec![json!({"status": "open", "_vs_id": r#"public.orders:["5"]"#})]
@@ -731,9 +763,80 @@ mod tests {
             .await;
         let reader = meilisearch_reader(&server).await;
         let hits = reader
-            .search("public.orders", "open", 3)
+            .search("public.orders", "open", 3, None)
             .await
             .expect("search");
         assert_eq!(hits, vec![json!({"id": 5, "status": "open"})]);
+    }
+
+    #[tokio::test]
+    async fn opensearch_search_sends_sort_clause_with_unmapped_type() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/orders/_search"))
+            .and(body_partial_json(json!({
+                "query": {"query_string": {"query": "updated_at:[now-15m TO *]"}},
+                "size": 10,
+                "sort": [{"updated_at": {"order": "desc", "unmapped_type": "keyword"}}],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "hits": {"hits": [{"_id": "a", "_source": {"id": 1}}]},
+            })))
+            .mount(&server)
+            .await;
+        let reader = opensearch_reader(&server).await;
+        let hits = reader
+            .search(
+                "orders",
+                "updated_at:[now-15m TO *]",
+                10,
+                Some(("updated_at".to_owned(), true)),
+            )
+            .await
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn meilisearch_sort_passes_through_and_rejection_is_surfaced() {
+        let server = MockServer::start().await;
+        let uid = format!(
+            "vs_{}",
+            crate::meilisearch::documents::encode_index_segment("public.orders")
+        );
+        Mock::given(method("POST"))
+            .and(path(format!("/indexes/{uid}/search")))
+            .and(body_partial_json(
+                json!({"q": "open", "sort": ["total:asc"]}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"hits": [{"id": 1}]})))
+            .mount(&server)
+            .await;
+        let reader = meilisearch_reader(&server).await;
+        let hits = reader
+            .search(
+                "public.orders",
+                "open",
+                3,
+                Some(("total".to_owned(), false)),
+            )
+            .await
+            .expect("search");
+        assert_eq!(hits, vec![json!({"id": 1})]);
+
+        let rejecting = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "message": "Attribute `total` is not sortable. This index does not have configured sortable attributes.",
+                "code": "invalid_search_sort",
+            })))
+            .mount(&rejecting)
+            .await;
+        let reader = meilisearch_reader(&rejecting).await;
+        let error = reader
+            .search("public.orders", "open", 3, Some(("total".to_owned(), true)))
+            .await
+            .expect_err("rejection");
+        assert!(matches!(&error, SinkError::Blocked(message) if message.contains("not sortable")));
     }
 }

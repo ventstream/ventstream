@@ -451,7 +451,13 @@ fn generate_token(with_hash: bool) -> Result<()> {
 #[async_trait::async_trait]
 trait TargetReader: Send + Sync {
     async fn get_document(&self, target: &str, doc_id: &str) -> Result<Option<Value>, String>;
-    async fn search(&self, target: &str, query: &str, limit: usize) -> Result<Vec<Value>, String>;
+    async fn search(
+        &self,
+        target: &str,
+        query: &str,
+        limit: usize,
+        sort: Option<(String, bool)>,
+    ) -> Result<Vec<Value>, String>;
     async fn scan(&self, target: &str, pattern: &str, limit: usize) -> Result<Vec<String>, String>;
 }
 
@@ -466,9 +472,15 @@ impl TargetReader for SinkReaderAdapter {
             .map_err(|err| err.to_string())
     }
 
-    async fn search(&self, target: &str, query: &str, limit: usize) -> Result<Vec<Value>, String> {
+    async fn search(
+        &self,
+        target: &str,
+        query: &str,
+        limit: usize,
+        sort: Option<(String, bool)>,
+    ) -> Result<Vec<Value>, String> {
         self.0
-            .search(target, query, limit)
+            .search(target, query, limit, sort)
             .await
             .map_err(|err| err.to_string())
     }
@@ -849,7 +861,7 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "target": {"type": "string"},
                     "pk": {
-                        "description": "Primary key: a string, or an array of scalar components for composite keys.",
+                        "description": "Primary key. Composite keys pass an array of scalar components in pk-column order. For targets without a joins spec, pass the full canonical doc id string (e.g. `public.orders:[\"5\"]`) as the pk.",
                         "anyOf": [
                             {"type": "string"},
                             {"type": "array", "items": {"type": ["string", "number", "boolean"]}},
@@ -862,13 +874,20 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "search",
-            "description": "Full-text search over one target (OpenSearch / Meilisearch).",
+            "description": "Search one target. OpenSearch/Elasticsearch targets accept the FULL Lucene query_string syntax — field matches (status:shipped), boolean operators (AND/OR/NOT), and ranges with date math (total_cents:>5000, updated_at:[now-15m TO *]) — so filtered questions like 'recently updated orders' are answerable directly. Meilisearch targets treat the query as plain full-text keywords. Optional `sort` orders results before `limit` truncates; without it results come back in index order.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "target": {"type": "string"},
-                    "query": {"type": "string"},
+                    "query": {
+                        "type": "string",
+                        "description": "OpenSearch/Elasticsearch: full Lucene query_string, e.g. `status:shipped AND total_cents:>5000` or `updated_at:[now-15m TO *]` (date math supported). Meilisearch: plain full-text keywords.",
+                    },
                     "limit": limit_schema,
+                    "sort": {
+                        "type": "string",
+                        "description": "`field`, `field:asc`, or `field:desc` (bare field = ascending). OpenSearch sorts any field (unknown fields are tolerated). Meilisearch requires the attribute to be declared sortable in the index settings.",
+                    },
                 },
                 "required": ["target", "query"],
                 "additionalProperties": false,
@@ -1024,11 +1043,41 @@ fn pk_components(pk: &Value) -> Result<Vec<String>, String> {
 async fn search(registry: &Registry, scope: &KeyScope, args: &Value) -> Result<Value, ToolError> {
     let target = required_str(args, "target")?;
     let query = required_str(args, "query")?;
+    let sort = args
+        .get("sort")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| "`sort` must be a string".to_owned())
+                .and_then(parse_sort)
+        })
+        .transpose()
+        .map_err(ToolError::Failed)?;
     let entry = registry.target(scope, target)?;
     let limit = registry.clamp_limit(args.get("limit").and_then(Value::as_u64));
     let reader = registry.reader(entry)?;
-    let hits = reader.search(&entry.name, query, limit).await?;
+    let hits = reader.search(&entry.name, query, limit, sort).await?;
     Ok(json!({"count": hits.len(), "hits": hits}))
+}
+
+/// Parse `field`, `field:asc`, or `field:desc` into `(field, descending)`.
+fn parse_sort(sort: &str) -> Result<(String, bool), String> {
+    let (field, descending) = match sort.rsplit_once(':') {
+        None => (sort, false),
+        Some((field, "asc")) => (field, false),
+        Some((field, "desc")) => (field, true),
+        Some(_) => {
+            return Err(format!(
+                "invalid sort `{sort}`: expected `field`, `field:asc`, or `field:desc`"
+            ))
+        }
+    };
+    if field.trim().is_empty() || field.trim() != field {
+        return Err(format!(
+            "invalid sort `{sort}`: field must be non-empty with no surrounding whitespace"
+        ));
+    }
+    Ok((field.to_owned(), descending))
 }
 
 async fn scan(registry: &Registry, scope: &KeyScope, args: &Value) -> Result<Value, ToolError> {
@@ -1553,8 +1602,10 @@ mod tests {
             _target: &str,
             _query: &str,
             limit: usize,
+            sort: Option<(String, bool)>,
         ) -> Result<Vec<Value>, String> {
-            Ok(vec![json!({"limit": limit})])
+            let sort = sort.map(|(field, descending)| json!([field, descending]));
+            Ok(vec![json!({"limit": limit, "sort": sort})])
         }
 
         async fn scan(
@@ -2034,5 +2085,71 @@ mod tests {
             targets: Vec::new(),
         };
         assert!(McpOptions::from_runtime(&runtime).is_err());
+    }
+
+    #[test]
+    fn sort_strings_parse_with_asc_default_and_reject_garbage() {
+        assert_eq!(
+            parse_sort("updated_at").expect("bare"),
+            ("updated_at".to_owned(), false)
+        );
+        assert_eq!(
+            parse_sort("updated_at:asc").expect("asc"),
+            ("updated_at".to_owned(), false)
+        );
+        assert_eq!(
+            parse_sort("updated_at:desc").expect("desc"),
+            ("updated_at".to_owned(), true)
+        );
+        assert!(parse_sort("updated_at:sideways").is_err());
+        assert!(parse_sort(":desc").is_err());
+        assert!(parse_sort(" spaced :asc").is_err());
+    }
+
+    #[tokio::test]
+    async fn search_tool_forwards_sort_and_rejects_bad_sort() {
+        let registry = stub_registry();
+        let call = |sort: Value| {
+            let registry = stub_registry();
+            async move {
+                dispatch(
+                    &registry,
+                    &OPEN_SCOPE,
+                    &json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                            "params": {"name": "search",
+                                       "arguments": {"target": "orders-view", "query": "x",
+                                                      "sort": sort}}}),
+                )
+                .await
+                .expect("response")
+            }
+        };
+        let ok = call(json!("updated_at:desc")).await;
+        let text = ok["result"]["content"][0]["text"].as_str().expect("text");
+        let payload: Value = serde_json::from_str(text).expect("payload");
+        assert_eq!(payload["hits"][0]["sort"], json!(["updated_at", true]));
+
+        let bad = call(json!("updated_at:sideways")).await;
+        assert_eq!(bad["result"]["isError"], true);
+        drop(registry);
+    }
+
+    #[tokio::test]
+    async fn search_tool_schema_advertises_lucene_query_string_and_sort() {
+        let registry = stub_registry();
+        let tools = dispatch(
+            &registry,
+            &OPEN_SCOPE,
+            &json!({"jsonrpc": "2.0", "id": 10, "method": "tools/list"}),
+        )
+        .await
+        .expect("response");
+        let text = tools["result"].to_string();
+        // Agents discover capability from these strings — keep them present.
+        assert!(text.contains("Lucene"));
+        assert!(text.contains("query_string"));
+        assert!(text.contains("now-15m"));
+        assert!(text.contains("sortable"));
+        assert!(text.contains("canonical doc id"));
     }
 }
