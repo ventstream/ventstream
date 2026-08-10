@@ -20,6 +20,9 @@ usually the exact file, unchanged. From it the server learns three things:
 where the sink is (and its credentials), what the targets are, and what the
 documents look like (from the joins spec). A typical config:
 
+<AccordionGroup>
+<Accordion title="pipeline.yaml — a typical pipeline config" icon="file-code" defaultOpen>
+
 ```yaml
 # pipeline.yaml — the same file the CDC engine runs
 schema_version: 1
@@ -54,8 +57,11 @@ runtime:
   dlq_path: ./state/dlq.jsonl
 ```
 
-And the joins spec it references — this is where targets get their names
-and the documents get their shape:
+</Accordion>
+<Accordion title="joins.yaml — targets and document shapes" icon="file-code">
+
+The joins spec is where targets get their names and the documents get
+their shape:
 
 ```yaml
 # joins.yaml
@@ -80,6 +86,9 @@ joins:
     target:
       index: orders        # ← this is the target name agents query
 ```
+
+</Accordion>
+</AccordionGroup>
 
 With this config the server exposes one target, `orders`, whose documents
 are orders with an embedded `customer` object and `items` array — and it
