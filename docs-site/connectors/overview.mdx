@@ -23,6 +23,7 @@ implemented connector surface for the current release.
 | **Source** | [MySQL / MariaDB](/connectors/sources/mysql) | row-based binlog replication |
 | **Source** | [Kafka / Redpanda](/connectors/sources/kafka) | Debezium envelopes or raw JSON topics |
 | **Sink** | [OpenSearch / Elasticsearch](/connectors/sinks/opensearch) | shared `_bulk` API |
+| **Sink** | [Meilisearch](/connectors/sinks/meilisearch) | task-based document sync with delete propagation |
 | **Sink** | [Redis](/connectors/sinks/redis) | deterministic materialized views or expiring cache entries |
 | **Real-time broker** | NATS Core / JetStream | live or replayable delivery |
 | **Real-time broker** | Redis Streams | replayable delivery with shared tenant tailers |
@@ -75,6 +76,10 @@ release test matrix.
   <Card title="OpenSearch / Elasticsearch" icon="magnifying-glass" href="/connectors/sinks/opensearch">
     Bulk upserts with deterministic document IDs. The same engine handles
     both (shared `_bulk` API).
+  </Card>
+  <Card title="Meilisearch" icon="magnifying-glass" href="/connectors/sinks/meilisearch">
+    Continuous search-index sync with joined documents, deterministic
+    primary keys, and delete propagation.
   </Card>
   <Card title="Redis" icon="database" href="/connectors/sinks/redis">
     Ordered, idempotent key materialization with string or RedisJSON values,
