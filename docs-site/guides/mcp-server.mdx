@@ -1,0 +1,163 @@
+---
+title: "MCP server"
+description: "Give AI agents read-only access to your sink data with ventstream mcp"
+---
+
+VentStream ships a read-only [MCP](https://modelcontextprotocol.io) server:
+`ventstream mcp`. It lets AI agents — Claude Desktop, IDE assistants, support
+bots — query the documents your pipelines materialize in the sinks, without
+holding any source-database credentials.
+
+The server is part of the open-source engine binary. It needs nothing but
+your pipeline config and read-only sink credentials, and it never touches
+the source database: agents read the sink documents the pipeline keeps in
+sync within milliseconds.
+
+## Run it
+
+```bash
+ventstream mcp --config pipeline.yaml
+```
+
+Serve several pipelines from one endpoint by repeating `--config`. Target
+names must be unique across the loaded configs:
+
+```bash
+ventstream mcp \
+  --config pg-search.yaml \
+  --config mongo-cache.yaml
+```
+
+## Transports
+
+**stdio** (default) — the MCP client spawns the process. A Claude Desktop
+entry looks like:
+
+```json
+{
+  "mcpServers": {
+    "ventstream": {
+      "command": "ventstream",
+      "args": ["mcp", "--config", "/etc/ventstream/pipeline.yaml"],
+      "env": { "VS_MEILI_API_KEY": "…" }
+    }
+  }
+}
+```
+
+**HTTP** (`--listen`) — a shared endpoint for remote agents. Run one
+instance per environment next to your sinks; agents connect over the
+network and no sink credentials leave that deployment:
+
+```bash
+ventstream mcp \
+  --config pipeline.yaml \
+  --listen 0.0.0.0:8790 \
+  --auth-token-ref env:VS_MCP_TOKEN
+```
+
+Clients POST MCP JSON-RPC to `/mcp` with `Authorization: Bearer <token>`;
+`/healthz` serves load-balancer checks. The server is stateless — no
+session ids — so replicas behind a plain load balancer need no session
+affinity.
+
+Security is enforced, not optional:
+
+- Binding a non-loopback address **requires** auth (`--auth-token-ref` or
+  `--keys-ref`) — the server refuses to start without it.
+- Browser-origin requests are rejected unless allow-listed with
+  `--allow-origin` (DNS-rebinding protection).
+- Request bodies cap at 1 MiB; tool dispatch times out at 30 s.
+- Run it behind TLS termination (your load balancer or reverse proxy).
+
+## Tokens and scoping
+
+Mint a token with the built-in generator:
+
+```bash
+ventstream mcp generate-token --hash
+# vsk_ubKSepNIb2…                ← give this to the agent
+# sha256:473fe34c1…              ← paste this into keys.yaml
+```
+
+The simplest setup is one full-access token via
+`--auth-token-ref env:VS_MCP_TOKEN`. For per-agent control, use a keys
+file — each key is a named token restricted to the targets it may query:
+
+```yaml
+keys:
+  - name: support-bot
+    token_hash: sha256:473fe34c1…   # hash at rest, plaintext never stored
+    targets: [orders]               # this agent sees ONLY the orders target
+  - name: ops-agent
+    token_hash: sha256:9c01d22ab…
+    targets: all
+```
+
+```bash
+ventstream mcp --config pipeline.yaml \
+  --listen 0.0.0.0:8790 --keys-ref file:/etc/ventstream/keys.yaml
+```
+
+A scoped key's world shrinks to its targets: `list_targets` and resources
+list only them, and querying anything else returns the same error as a
+target that does not exist — a scoped agent cannot discover what it is not
+allowed to see. Every request is logged with its key name for attribution.
+Revoke a key by removing it from the file and restarting (or rolling the
+deployment).
+
+## Tools
+
+| Tool | Arguments | What it does |
+| --- | --- | --- |
+| `list_targets` | — | Every target with its sink kind and document shape |
+| `get_entity` | `target`, `pk` | O(1) fetch of one document by primary key |
+| `search` | `target`, `query`, `limit?` | Full-text search (OpenSearch / Elasticsearch / Meilisearch targets) |
+| `scan` | `target`, `pattern`, `limit?` | Glob scan of doc ids (Redis targets) |
+
+`pk` accepts a scalar or an array for composite keys. Values are normalized
+exactly like the writer normalizes them, so `100` and `"100"` find the same
+document.
+
+```json
+{ "name": "get_entity", "arguments": { "target": "orders", "pk": 100 } }
+```
+
+returns the full joined document — parent row plus embedded relations —
+straight from the sink.
+
+Each target is also exposed as an MCP resource at `vs://targets/{name}`
+describing its document shape (primary table, key columns, embedded
+relations and their cardinality), derived from your joins spec. Agents read
+it to learn what the documents look like before querying.
+
+## How keys resolve
+
+Doc ids and sink keys are deterministic, and the server links the same
+encoder code the sinks use when writing — Redis keyspace, Meilisearch
+primary keys, OpenSearch ids. A read key is byte-identical to the written
+key by construction.
+
+Target enumeration follows your sink routing:
+
+- `fixed` — the configured target or index.
+- `views` (Redis) — one target per view.
+- `by_projection_target` — one target per join `target.index`.
+- `by_output_relation` — targets are not derivable from config; pass them
+  explicitly with `--target <name>` (repeated).
+
+## Guardrails
+
+- Use **read-only sink credentials** in the config you give the server —
+  it only ever issues reads, but the credential should enforce it too.
+- `--allow-target <name>` (repeated) restricts the served targets; anything
+  else behaves as unknown.
+- `--max-results <n>` caps `search`/`scan` result sizes (default 50,
+  hard max 500).
+
+## Notes
+
+- A degraded pipeline does not stop reads — agents see whatever the sink
+  currently holds. Watch pipeline health to know how fresh that is.
+- Server-initiated SSE streams are not offered: every tool is a short
+  single-shot read, answered as plain JSON.

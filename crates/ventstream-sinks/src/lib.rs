@@ -5,6 +5,7 @@
 pub mod error;
 pub mod meilisearch;
 pub mod opensearch;
+pub mod read;
 pub mod redis;
 mod util;
 

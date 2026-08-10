@@ -13,13 +13,13 @@ pub(super) const DOC_ID_HEADER: &str = "ventstream.doc.id";
 pub(super) const RELATION_HEADER: &str = "ventstream.cdc.relation";
 pub(super) const PROJECTION_TARGET_HEADER: &str = "ventstream.target.index";
 /// Canonical doc id retained on the document for debugging and filtering.
-pub(super) const CANONICAL_ID_FIELD: &str = "_vs_id";
+pub(crate) const CANONICAL_ID_FIELD: &str = "_vs_id";
 
 /// Meilisearch primary keys allow `[A-Za-z0-9_-]`, max 511 bytes. The
 /// canonical doc id (`table:["pk",...]`) is not representable, so keys are
 /// base64url (no padding) of the canonical id — injective and reversible.
 /// Ids whose encoding would exceed the cap fall back to a SHA-256 digest.
-pub(super) fn encode_primary_key(doc_id: &str) -> String {
+pub(crate) fn encode_primary_key(doc_id: &str) -> String {
     const MAX_KEY_BYTES: usize = 511;
     let encoded = URL_SAFE_NO_PAD.encode(doc_id.as_bytes());
     if encoded.len() <= MAX_KEY_BYTES {
@@ -31,7 +31,7 @@ pub(super) fn encode_primary_key(doc_id: &str) -> String {
 
 /// Encode one index-UID segment into `[A-Za-z0-9_-]`, injectively:
 /// `_` doubles to `__`; any other disallowed byte becomes `_HH` (hex).
-pub(super) fn encode_index_segment(input: &str) -> String {
+pub(crate) fn encode_index_segment(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for byte in input.bytes() {
         match byte {
@@ -203,8 +203,25 @@ fn resolve_index(config: &MeilisearchConfig, event: &Event) -> Result<String, St
         }
         MeilisearchIndexRouting::Fixed(index) => index,
     };
+    index_uid_for_target(config, target)
+        .map_err(|_| format!("event {} routed to an empty index name", event.id))
+}
+
+/// Encode one routed target into its full index UID. Fixed routing pins the
+/// UID to the configured index regardless of the target; the read path must
+/// resolve through here so read UIDs match write UIDs byte-for-byte.
+pub(crate) fn index_uid_for_target(
+    config: &MeilisearchConfig,
+    target: &str,
+) -> Result<String, String> {
+    let target = match &config.index_routing {
+        MeilisearchIndexRouting::Fixed(index) => index,
+        MeilisearchIndexRouting::ByOutputRelation | MeilisearchIndexRouting::ByProjectionTarget => {
+            target
+        }
+    };
     if target.is_empty() {
-        return Err(format!("event {} routed to an empty index name", event.id));
+        return Err("empty index name".to_owned());
     }
     Ok(format!(
         "{}{}",

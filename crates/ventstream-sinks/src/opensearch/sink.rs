@@ -154,52 +154,7 @@ impl OpenSearchSink {
     /// Construct a sink. Builds the HTTP client eagerly so connection
     /// pooling kicks in on the first call to [`write`](Self::write).
     pub fn new(config: OpenSearchConfig) -> Result<Self, OpenSearchSinkError> {
-        if !config.verify_tls && config.ca_file.is_some() {
-            return Err(OpenSearchSinkError::Internal(
-                "a custom CA cannot be combined with disabled TLS verification".into(),
-            ));
-        }
-        let mut builder = reqwest::Client::builder()
-            .timeout(config.request_timeout)
-            .connect_timeout(Duration::from_secs(10))
-            // Recycle idle keep-alive connections before a typical LB /
-            // proxy idle timeout (~60s) can kill them out from under us,
-            // and keep live ones warm with TCP keepalives. A stale-conn
-            // request still self-heals via retry, but this avoids the
-            // wasted attempt + backoff sleep.
-            .pool_idle_timeout(Duration::from_secs(30))
-            .tcp_keepalive(Duration::from_secs(30))
-            .gzip(true)
-            .user_agent(concat!("ventstream/", env!("CARGO_PKG_VERSION")));
-        if !config.verify_tls {
-            builder = builder.danger_accept_invalid_certs(true);
-        }
-        if let Some(path) = &config.ca_file {
-            let pem = std::fs::read(path).map_err(|err| {
-                OpenSearchSinkError::Internal(format!(
-                    "read TLS CA bundle {}: {err}",
-                    path.display()
-                ))
-            })?;
-            let certificates = reqwest::Certificate::from_pem_bundle(&pem).map_err(|err| {
-                OpenSearchSinkError::Internal(format!(
-                    "parse TLS CA bundle {}: {err}",
-                    path.display()
-                ))
-            })?;
-            if certificates.is_empty() {
-                return Err(OpenSearchSinkError::Internal(format!(
-                    "TLS CA bundle {} contains no certificates",
-                    path.display()
-                )));
-            }
-            for certificate in certificates {
-                builder = builder.add_root_certificate(certificate);
-            }
-        }
-        let client = builder
-            .build()
-            .map_err(|err| OpenSearchSinkError::Internal(format!("http client build: {err}")))?;
+        let client = build_http_client(&config)?;
 
         let bulk_url = format!("{}/_bulk", config.endpoint.trim_end_matches('/'));
         let adaptive = AdaptiveConcurrency::new(config.request_timeout);
@@ -688,8 +643,21 @@ fn is_permanent_document_failure(entry: &super::bulk::BulkResponseEntry) -> bool
     )
 }
 
+/// Build the pooled HTTP client from the sink's TLS and timeout settings.
+/// Shared with the read path so readers connect exactly like the writer.
+pub(crate) fn build_http_client(
+    config: &OpenSearchConfig,
+) -> Result<reqwest::Client, OpenSearchSinkError> {
+    crate::util::build_http_client(
+        config.request_timeout,
+        config.verify_tls,
+        config.ca_file.as_deref(),
+    )
+    .map_err(OpenSearchSinkError::Internal)
+}
+
 /// Apply the configured auth mode to a request builder.
-fn apply_auth(rb: reqwest::RequestBuilder, auth: &AuthMode) -> reqwest::RequestBuilder {
+pub(crate) fn apply_auth(rb: reqwest::RequestBuilder, auth: &AuthMode) -> reqwest::RequestBuilder {
     match auth {
         AuthMode::None => rb,
         AuthMode::Basic { username, password } => rb.basic_auth(username, Some(password)),

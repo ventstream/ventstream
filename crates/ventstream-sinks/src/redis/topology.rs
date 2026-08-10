@@ -12,13 +12,13 @@ use ventstream_core::SinkError;
 use super::config::{RedisConfig, RedisTlsConfig, RedisTopology};
 use super::error::map_connect_error;
 
-pub(super) enum RedisConnector {
+pub(crate) enum RedisConnector {
     Standalone(redis::Client),
     Sentinel(Mutex<redis::sentinel::SentinelClient>),
     Cluster(redis::cluster::ClusterClient),
 }
 
-pub(super) enum RedisConnection {
+pub(crate) enum RedisConnection {
     Standalone(ConnectionManager),
     Sentinel(MultiplexedConnection),
     Cluster(redis::cluster_async::ClusterConnection),
@@ -70,7 +70,7 @@ impl ConnectionLike for RedisConnection {
 }
 
 impl RedisConnection {
-    pub(super) async fn query_on_primary<T: FromRedisValue>(
+    pub(crate) async fn query_on_primary<T: FromRedisValue>(
         &mut self,
         command: Cmd,
         key: &str,
@@ -188,7 +188,7 @@ pub(super) fn cluster_slot_retry_error(reason: &'static str) -> redis::RedisErro
     redis::RedisError::from((ErrorKind::Server(ServerErrorKind::TryAgain), reason))
 }
 
-pub(super) async fn build_connector(config: &RedisConfig) -> Result<RedisConnector, SinkError> {
+pub(crate) async fn build_connector(config: &RedisConfig) -> Result<RedisConnector, SinkError> {
     build_connector_with_revision(config)
         .await
         .map(|(connector, _)| connector)
@@ -387,7 +387,7 @@ async fn resolve_credential(
     Ok(Some(value))
 }
 
-pub(super) async fn connect_raw(
+pub(crate) async fn connect_raw(
     connector: &RedisConnector,
     config: &RedisConfig,
 ) -> Result<RedisConnection, SinkError> {

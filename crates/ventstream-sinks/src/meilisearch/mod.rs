@@ -5,9 +5,9 @@
 //! API. Design notes: `docs/design/meilisearch-sink.md`.
 
 pub mod config;
-mod documents;
+pub(crate) mod documents;
 pub mod error;
-mod sink;
+pub(crate) mod sink;
 
 pub use config::{
     MeilisearchBatchConfig, MeilisearchConfig, MeilisearchIndexRouting, MeilisearchSettings,
