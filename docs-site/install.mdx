@@ -20,7 +20,7 @@ One line — detects your OS and architecture, verifies checksums, installs to
 `~/.local/bin`:
 
 ```bash
-curl -fsSL https://github.com/ventstream/ventstream/releases/latest/download/ventstream-installer.sh | sh
+curl -fsSL https://ventstream.dev/install.sh | sh
 ```
 
 Or grab a specific platform build from the
@@ -32,13 +32,13 @@ Pin a version or change the location with env vars:
 
 ```bash
 VENTSTREAM_VERSION=0.1.21 VENTSTREAM_INSTALL_DIR=/usr/local/bin \
-  curl -fsSL https://github.com/ventstream/ventstream/releases/latest/download/ventstream-installer.sh | sh
+  curl -fsSL https://ventstream.dev/install.sh | sh
 ```
 
 ## Fleet CLI (managed users)
 
 ```bash
-curl -fsSL https://github.com/ventstream/ventstream-releases/releases/latest/download/install-cli.sh | sh
+curl -fsSL https://ventstream.dev/install-cli.sh | sh
 ```
 
 **Windows:** download `ventstreamctl-<version>-windows-amd64.zip` from the
