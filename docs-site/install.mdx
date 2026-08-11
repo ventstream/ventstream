@@ -54,3 +54,27 @@ scripts verify checksums before installing.
 ventstream --version
 ventstreamctl version
 ```
+
+## Try it
+
+This is all it takes to stream CDC from MongoDB into Elasticsearch or
+OpenSearch — every insert, update, and delete, snapshot-bootstrapped and
+then live from the change stream:
+
+```bash
+VS_ROLES=cdc VS_CDC_SOURCE=mongodb \
+VS_MONGO_URI='mongodb+srv://user:pass@cluster.example.net/?retryWrites=true' \
+VS_MONGO_DATABASE=shop \
+VS_MONGO_STATE_DIR=./state \
+VS_MONGO_BOOTSTRAP_MODE=snapshot \
+VS_OS_ENDPOINT=http://localhost:9200 \
+VS_INDEX_TEMPLATE='${header:ventstream.cdc.relation}' \
+ventstream
+```
+
+One index per collection, deterministic document ids, deletes propagate.
+Swap the source for [Postgres](/connectors/sources/postgres),
+[MySQL](/connectors/sources/mysql), or [Neo4j](/connectors/sources/neo4j),
+or the sink for [Meilisearch](/connectors/sinks/meilisearch) or
+[Redis](/connectors/sinks/redis) — same binary. For a full guided run with
+seeded data, take the [Quickstart](/quickstart).
