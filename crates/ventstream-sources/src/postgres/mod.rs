@@ -32,7 +32,10 @@ pub mod snapshot;
 pub mod source;
 
 pub use config::{PostgresCdcConfig, SnapshotBootstrap, SnapshotTable};
-pub use connection::connect_client;
+pub use connection::{
+    connect_client, describe_db_error, is_credential_db_error, is_credential_sqlstate, sqlstate,
+};
 pub use fetcher::PostgresFetcher;
 pub use snapshot::{resync_tables, ResyncStats};
+pub use source::is_credential_message;
 pub use source::PostgresCdcSource;

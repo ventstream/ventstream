@@ -691,8 +691,15 @@ async fn run(
         }));
     }
 
+    // Terminal cdc failures (e.g. a credential error that exhausted its
+    // budget) must exit the process nonzero so the supervisor restarts
+    // the pod; the slot carries the error past the task join below.
+    let cdc_failure: std::sync::Arc<parking_lot::Mutex<Option<anyhow::Error>>> =
+        std::sync::Arc::default();
+
     if let Some(cdc) = cfg.cdc {
         let shutdown = shutdown.clone();
+        let cdc_failure = std::sync::Arc::clone(&cdc_failure);
         handles.push(tokio::spawn(async move {
             let result = match cdc.source {
                 CdcSourceConfig::Postgres(pg) => {
@@ -738,6 +745,7 @@ async fn run(
             };
             if let Err(err) = result {
                 error!(error = %format!("{err:#}"), "cdc pipeline failed");
+                *cdc_failure.lock() = Some(err);
                 shutdown.cancel();
             }
         }));
@@ -780,6 +788,9 @@ async fn run(
         if let Err(err) = handle.await {
             warn!(error = %err, "pipeline task join error");
         }
+    }
+    if let Some(err) = cdc_failure.lock().take() {
+        return Err(err.context("cdc pipeline failed"));
     }
     info!("ventstream stopped");
     Ok(())
@@ -911,8 +922,18 @@ trait CdcBackend: Send {
 /// source specifics are dispatched through [`CdcBackend`], so operators
 /// get one consistent pause/resume/drain UX across backends.
 async fn run_cdc_loop<B: CdcBackend>(mut backend: B, shutdown: ShutdownToken) -> Result<()> {
+    // Iteration-level retry discipline, matching the tail reconnect: an
+    // engine that cancels its own child token on an internal failure used
+    // to be indistinguishable from a pause and was retried instantly
+    // forever (observed at ~5 attempts/s on a stale MySQL password).
+    const ITERATION_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+    const ITERATION_MAX_BACKOFF: Duration = Duration::from_secs(30);
+    const ITERATION_HEALTHY_THRESHOLD: Duration = Duration::from_secs(30);
+
     let mut already_drained_locally = false;
     let mut last_iteration_error: Option<anyhow::Error> = None;
+    let mut iteration_backoff = ITERATION_INITIAL_BACKOFF;
+    let mut credential_budget = ventstream_sources::credential::CredentialFailureBudget::new();
 
     loop {
         if shutdown.is_cancelled() {
@@ -972,8 +993,9 @@ async fn run_cdc_loop<B: CdcBackend>(mut backend: B, shutdown: ShutdownToken) ->
         // touching the outer token, so the engine returns cleanly while
         // the orchestrator keeps running.
         let inner_shutdown = shutdown.child();
-        let pause_watcher = spawn_pause_watcher(inner_shutdown.clone());
+        let (pause_watcher, pause_requested) = spawn_pause_watcher(inner_shutdown.clone());
 
+        let iteration_started = std::time::Instant::now();
         let iteration_outcome = backend
             .run_iteration(inner_shutdown.clone(), shutdown.clone())
             .await;
@@ -984,7 +1006,44 @@ async fn run_cdc_loop<B: CdcBackend>(mut backend: B, shutdown: ShutdownToken) ->
             Ok(EngineIterationOutcome::Shutdown) => break,
             Ok(EngineIterationOutcome::Paused) => continue,
             Err(_) if shutdown.is_cancelled() => break,
-            Err(_) if inner_shutdown.is_cancelled() => continue,
+            // Graceful pause: the watcher cancelled the child token.
+            Err(_) if pause_requested.load(std::sync::atomic::Ordering::Acquire) => continue,
+            // The engine cancelled its own child token on an internal
+            // failure. Crash-fast texts and an exhausted credential
+            // budget are terminal; everything else retries with backoff.
+            Err(err) if inner_shutdown.is_cancelled() => {
+                if iteration_started.elapsed() >= ITERATION_HEALTHY_THRESHOLD {
+                    credential_budget.record_success();
+                    iteration_backoff = ITERATION_INITIAL_BACKOFF;
+                }
+                let text = format!("{err:#}");
+                if ventstream_sources::credential::is_crash_fast_text(&text) {
+                    last_iteration_error = Some(err);
+                    continue;
+                }
+                if ventstream_sources::credential::is_credential_error_text(&text)
+                    && credential_budget.record_credential_failure()
+                {
+                    error!(error = %text, "credential failure budget exhausted across engine iterations");
+                    last_iteration_error = Some(anyhow!(
+                        ventstream_sources::credential::exhausted_message(&text)
+                    ));
+                    continue;
+                }
+                let delay = jittered_iteration_backoff(iteration_backoff);
+                warn!(
+                    error = %text,
+                    backoff_ms = delay.as_millis() as u64,
+                    "engine iteration failed; retrying after backoff"
+                );
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(delay) => {}
+                }
+                iteration_backoff = iteration_backoff
+                    .saturating_mul(2)
+                    .min(ITERATION_MAX_BACKOFF);
+            }
             Err(err) => last_iteration_error = Some(err),
         }
     }
@@ -1629,8 +1688,25 @@ async fn drain_pg_local_state(
 ///
 /// Cancellation of the child token doesn't propagate to the outer
 /// token, so the process keeps running even after the watcher fires.
-fn spawn_pause_watcher(inner_shutdown: ShutdownToken) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+/// Randomize a backoff to 50-100% of the scheduled value, matching the
+/// tail reconnect's jitter.
+fn jittered_iteration_backoff(delay: Duration) -> Duration {
+    use rand::Rng as _;
+    delay.mul_f64(rand::thread_rng().gen_range(0.5..=1.0))
+}
+
+/// Watch for a pause command; the returned flag distinguishes a pause
+/// cancellation of the child token from an engine-internal failure that
+/// cancelled the same token.
+fn spawn_pause_watcher(
+    inner_shutdown: ShutdownToken,
+) -> (
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let pause_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&pause_requested);
+    let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 () = inner_shutdown.cancelled() => return,
@@ -1638,13 +1714,15 @@ fn spawn_pause_watcher(inner_shutdown: ShutdownToken) -> tokio::task::JoinHandle
                     let cmd = ventstream_telemetry::latest_command().unwrap_or_default();
                     if cmd.pause {
                         info!("pause command received — cancelling engine for graceful pause");
+                        flag.store(true, std::sync::atomic::Ordering::Release);
                         inner_shutdown.cancel();
                         return;
                     }
                 }
             }
         }
-    })
+    });
+    (handle, pause_requested)
 }
 
 /// Idle the orchestrator while the control plane's latest command
@@ -1933,8 +2011,23 @@ fn pg_sql_denormalize_enabled(engine_config: Option<&EngineFileConfig>) -> bool 
 /// *before* the SQL-join bootstrap means WAL retains any change made
 /// during the bootstrap window for the tail to replay.
 async fn ensure_replication_slot(pg: &PostgresCdcConfig, slot: &str) -> Result<()> {
+    // This connect authenticates with the same rotating credentials as the
+    // tail; a credential rejection here is terminal for the iteration, so
+    // classify it (SQLSTATE now visible via describe_db_error) instead of
+    // surfacing a bare "db error".
     let client = ventstream_sources::postgres::connect_client(pg, "create replication slot")
         .await
+        .map_err(|err| {
+            let text = err.to_string();
+            if ventstream_sources::postgres::is_credential_message(&text) {
+                anyhow!(
+                    "credential error; exiting so the supervisor can restart with fresh \
+                     credentials (last: {text})"
+                )
+            } else {
+                anyhow!(err)
+            }
+        })
         .context("connect to create replication slot")?;
     let exists: bool = client
         .query_one(
@@ -6601,5 +6694,90 @@ joins:
         let bundle = std::fs::read_to_string(path).expect("read materialized provider bundle");
         assert!(bundle.starts_with("-----BEGIN CERTIFICATE-----"));
         assert_eq!(bundle.matches("-----BEGIN CERTIFICATE-----").count(), 108);
+    }
+
+    /// Stub backend for [`run_cdc_loop`]: each iteration cancels its
+    /// child token (the engine's internal-failure signature) and yields
+    /// the scripted outcome.
+    struct ScriptedBackend {
+        outcomes: std::collections::VecDeque<std::result::Result<EngineIterationOutcome, String>>,
+        iterations: u32,
+    }
+
+    #[async_trait::async_trait]
+    impl CdcBackend for ScriptedBackend {
+        async fn validate_drain(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn drain_local(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn reconcile_orphans(&self) -> Result<()> {
+            Ok(())
+        }
+        fn prepare_bootstrap(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn run_iteration(
+            &mut self,
+            inner: ShutdownToken,
+            _outer: ShutdownToken,
+        ) -> Result<EngineIterationOutcome> {
+            self.iterations += 1;
+            match self.outcomes.pop_front().expect("scripted outcome") {
+                Ok(outcome) => Ok(outcome),
+                Err(message) => {
+                    inner.cancel();
+                    Err(anyhow!(message))
+                }
+            }
+        }
+    }
+
+    const REPRO_1045: &str = "mysql operation failed: Server error: `ERROR 28000 (1045): \
+         Access denied for user 'ventstream'@'10.2.14.7' (using password: YES)`";
+
+    #[tokio::test(start_paused = true)]
+    async fn credential_iteration_failures_exhaust_the_budget_and_exit() {
+        let backend = ScriptedBackend {
+            outcomes: (0..5).map(|_| Err(REPRO_1045.to_owned())).collect(),
+            iterations: 0,
+        };
+        let error = run_cdc_loop(backend, ShutdownToken::new())
+            .await
+            .expect_err("terminal");
+        let text = error.to_string();
+        assert!(text.starts_with("credential error persisted after 5 attempts"));
+        assert!(text.contains("supervisor can restart with fresh credentials"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_iteration_failures_retry_with_backoff_until_shutdown() {
+        let backend = ScriptedBackend {
+            outcomes: vec![
+                Err("mysql connection failed: Connection refused (os error 61)".to_owned()),
+                Err("mysql connection failed: connection timed out".to_owned()),
+                Ok(EngineIterationOutcome::Shutdown),
+            ]
+            .into(),
+            iterations: 0,
+        };
+        // Transient errors must keep retrying (bounded backoff, no budget)
+        // and reach the scripted clean shutdown.
+        assert!(run_cdc_loop(backend, ShutdownToken::new()).await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn crash_fast_source_errors_are_terminal_on_first_iteration() {
+        let message =
+            ventstream_sources::credential::exhausted_message(&"ERROR 28000 (1045): Access denied");
+        let backend = ScriptedBackend {
+            outcomes: vec![Err(message.clone())].into(),
+            iterations: 0,
+        };
+        let error = run_cdc_loop(backend, ShutdownToken::new())
+            .await
+            .expect_err("terminal");
+        assert_eq!(error.to_string(), message);
     }
 }

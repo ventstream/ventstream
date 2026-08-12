@@ -91,8 +91,10 @@ pub const LSN_HEADER: &str = "ventstream.cdc.lsn";
 const DEFAULT_LSN_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 const TRANSACTION_MEMORY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 static TRANSACTION_SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use ventstream_core::{Event, Source, SourceContext, SourceError};
+
+use crate::credential::{exhausted_message, CredentialFailureBudget};
 
 use super::config::PostgresCdcConfig;
 use super::event_mapper;
@@ -555,6 +557,7 @@ impl PostgresCdcSource {
 
         let mut consecutive_failures: u32 = 0;
         let mut backoff = INITIAL_BACKOFF;
+        let mut credential_budget = CredentialFailureBudget::new();
 
         loop {
             if ctx.shutdown.is_cancelled() {
@@ -576,6 +579,13 @@ impl PostgresCdcSource {
                 Ok(client) => client,
                 Err(err) => {
                     consecutive_failures += 1;
+                    if is_credential_message(&err.to_string())
+                        && credential_budget.record_credential_failure()
+                    {
+                        let message = exhausted_message(&err);
+                        error!(source = %self.config.id, error = %err, "{message}");
+                        return Err(PostgresCdcError::Connection(message));
+                    }
                     ventstream_telemetry::record_error(format!(
                         "postgres replication connect failed: {err}"
                     ));
@@ -599,8 +609,10 @@ impl PostgresCdcSource {
                 }
             };
 
-            // Stream is open. Transition to tail mode and clear any stale
-            // error captured by a prior connect attempt.
+            // Stream is open: this connect authenticated successfully.
+            credential_budget.record_success();
+            // Transition to tail mode and clear any stale error captured
+            // by a prior connect attempt.
             ventstream_telemetry::clear_error();
             ventstream_telemetry::set_phase(ventstream_telemetry::LifecyclePhase::Tailing);
 
@@ -911,6 +923,16 @@ impl Source for PostgresCdcSource {
             PostgresCdcError::Internal(msg) => SourceError::Internal(msg),
         })
     }
+}
+
+/// Postgres auth failures that cannot heal in-process, matched on the
+/// rendered error. Covers the replication client's server errors
+/// ("SQLSTATE 28000"/"SQLSTATE 28P01"), tokio-postgres db errors after
+/// [`super::connection::describe_db_error`] expansion (same SQLSTATE
+/// text), and pgwire's client-side credential rejection, which renders
+/// as "authentication error: ..." with no SQLSTATE.
+pub fn is_credential_message(message: &str) -> bool {
+    crate::credential::is_postgres_credential_text(message)
 }
 
 #[cfg(test)]
@@ -1301,5 +1323,49 @@ mod tests {
         drop(buffer);
         assert!(!spool_path.exists());
         let _ = std::fs::remove_dir(directory);
+    }
+
+    #[test]
+    fn sqlstate_28_class_is_credential_and_network_failures_are_transient() {
+        // Shape produced by pgwire-replication's error-response parser.
+        assert!(is_credential_message(
+            "server error: password authentication failed for user \"ventstream\" (SQLSTATE 28P01)"
+        ));
+        assert!(is_credential_message(
+            "server error: role \"ventstream\" is not permitted to log in (SQLSTATE 28000)"
+        ));
+        // pgwire's client-side rejection carries no SQLSTATE.
+        assert!(is_credential_message(
+            "authentication error: SCRAM authentication failed"
+        ));
+        assert!(!is_credential_message(
+            "io error: Connection refused (os error 61)"
+        ));
+        assert!(!is_credential_message(
+            "server error: canceling statement due to statement timeout (SQLSTATE 57014)"
+        ));
+    }
+
+    #[test]
+    fn slot_creation_arm_classifies_once_the_db_error_is_expanded() {
+        use super::super::connection::is_credential_sqlstate;
+
+        // The incident shape: tokio-postgres collapsed the auth failure to
+        // "db error", which can never classify...
+        assert!(!is_credential_message(
+            "connect to create replication slot: postgres connection failed: \
+             create replication slot: db error"
+        ));
+        // ...while the describe_db_error expansion of the same failure does.
+        assert!(is_credential_message(
+            "connect to create replication slot: postgres connection failed: \
+             create replication slot: db error (SQLSTATE 28P01): \
+             password authentication failed for user \"ventstream\""
+        ));
+        // Structured extraction: credential SQLSTATEs only.
+        assert!(is_credential_sqlstate("28P01"));
+        assert!(is_credential_sqlstate("28000"));
+        assert!(!is_credential_sqlstate("57014"));
+        assert!(!is_credential_sqlstate("28P02"));
     }
 }

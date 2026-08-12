@@ -13,6 +13,32 @@ use super::config::PostgresCdcConfig;
 use crate::error::PostgresCdcError;
 use crate::tls::{ensure_crypto_provider, DatabaseTlsMode};
 
+/// SQLSTATE of the underlying server error, when present. tokio-postgres
+/// collapses server errors to a bare "db error" in Display, hiding it.
+pub fn sqlstate(error: &tokio_postgres::Error) -> Option<&str> {
+    error.as_db_error().map(|db| db.code().code())
+}
+
+/// Credential SQLSTATEs that cannot heal in-process: 28000
+/// invalid_authorization_specification, 28P01 invalid_password.
+pub fn is_credential_sqlstate(code: &str) -> bool {
+    matches!(code, "28000" | "28P01")
+}
+
+/// True when the structured error carries a credential SQLSTATE.
+pub fn is_credential_db_error(error: &tokio_postgres::Error) -> bool {
+    sqlstate(error).is_some_and(is_credential_sqlstate)
+}
+
+/// Expand the collapsed "db error" Display with SQLSTATE and message so
+/// downstream string classifiers and operators see the real cause.
+pub fn describe_db_error(error: &tokio_postgres::Error) -> String {
+    match error.as_db_error() {
+        Some(db) => format!("db error (SQLSTATE {}): {}", db.code().code(), db.message()),
+        None => error.to_string(),
+    }
+}
+
 /// Open and drive a PostgreSQL client using the source's transport policy.
 pub async fn connect_client(
     source: &PostgresCdcConfig,
@@ -25,10 +51,9 @@ pub async fn connect_client(
     match source.tls.as_ref().map(|tls| tls.mode) {
         None | Some(DatabaseTlsMode::Disabled) => {
             config.ssl_mode(SslMode::Disable);
-            let (client, connection) = config
-                .connect(NoTls)
-                .await
-                .map_err(|err| PostgresCdcError::Connection(format!("{purpose}: {err}")))?;
+            let (client, connection) = config.connect(NoTls).await.map_err(|err| {
+                PostgresCdcError::Connection(format!("{purpose}: {}", describe_db_error(&err)))
+            })?;
             tokio::spawn(async move {
                 if let Err(err) = connection.await {
                     warn!(error = %err, purpose, "postgres connection ended");
@@ -39,10 +64,9 @@ pub async fn connect_client(
         Some(DatabaseTlsMode::VerifyFull) => {
             config.ssl_mode(SslMode::Require);
             let connector = strict_tls_connector(source, purpose)?;
-            let (client, connection) = config
-                .connect(connector)
-                .await
-                .map_err(|err| PostgresCdcError::Connection(format!("{purpose}: {err}")))?;
+            let (client, connection) = config.connect(connector).await.map_err(|err| {
+                PostgresCdcError::Connection(format!("{purpose}: {}", describe_db_error(&err)))
+            })?;
             tokio::spawn(async move {
                 if let Err(err) = connection.await {
                     warn!(error = %err, purpose, "postgres TLS connection ended");
