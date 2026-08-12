@@ -13,7 +13,7 @@ use mysql_async::prelude::Queryable;
 use mysql_async::{BinlogStreamRequest, Conn, Opts, Pool, Row, Value};
 use rand::Rng;
 use serde_json::{Map, Value as Json};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use ventstream_core::{
     doc_id, ContentType, Event, Headers, Payload, Source, SourceContext, SourceError, SourceUri,
     Subject,
@@ -24,6 +24,7 @@ use super::cursor::{BinlogPos, CursorFile, IncompleteKind};
 use super::event_mapper::{self, Op};
 use super::schema::SchemaCache;
 use super::value::value_to_json;
+use crate::credential::{exhausted_message, CredentialFailureBudget};
 use crate::error::MySqlCdcError;
 
 const ACK_SEQUENCE_HEADER: &str = "ventstream.cdc.ack_seq";
@@ -193,6 +194,7 @@ impl MySqlCdcSource {
         let mut resume = start;
         let mut consecutive_failures = 0u32;
         let mut backoff = INITIAL_BACKOFF;
+        let mut credential_budget = CredentialFailureBudget::new();
 
         loop {
             if ctx.shutdown.is_cancelled() {
@@ -208,8 +210,17 @@ impl MySqlCdcSource {
                     if connected_at.elapsed() >= HEALTHY_THRESHOLD {
                         consecutive_failures = 0;
                         backoff = INITIAL_BACKOFF;
+                        // A sustained healthy stream proves the current
+                        // credentials worked — reset the credential streak.
+                        credential_budget.record_success();
                     }
                     consecutive_failures = consecutive_failures.saturating_add(1);
+                    if is_credential_error(&error) && credential_budget.record_credential_failure()
+                    {
+                        let message = exhausted_message(&error);
+                        error!(source = %self.config.id, error = %error, "{message}");
+                        return Err(MySqlCdcError::Connection(message));
+                    }
                     ventstream_telemetry::record_error(format!(
                         "mysql binlog connection dropped: {error}"
                     ));
@@ -866,6 +877,16 @@ fn jittered_delay(delay: Duration) -> Duration {
     delay.mul_f64(rand::thread_rng().gen_range(0.5..=1.0))
 }
 
+/// MySQL auth failures that cannot heal in-process, on the connection
+/// errors the reconnect loop sees. Shares the code list with the
+/// supervisory text classifier.
+fn is_credential_error(error: &MySqlCdcError) -> bool {
+    let MySqlCdcError::Connection(message) = error else {
+        return false;
+    };
+    crate::credential::is_mysql_credential_text(message)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -996,5 +1017,41 @@ mod tests {
             document,
             serde_json::json!({"id": "item-1", "order_id": "order-7"})
         );
+    }
+
+    #[test]
+    fn access_denied_is_credential_and_network_failures_are_transient() {
+        use super::is_credential_error;
+        use crate::error::MySqlCdcError;
+
+        // Exact shape observed in production from mysql_async.
+        let denied = MySqlCdcError::Connection(
+            "mysql connection failed: Server error: `ERROR 28000 (1045): Access denied for \
+             user 'ventstream'@'10.2.14.7' (using password: YES)`"
+                .to_owned(),
+        );
+        assert!(is_credential_error(&denied));
+        let db_denied = MySqlCdcError::Connection(
+            "Server error: `ERROR 42000 (1044): Access denied for user 'vs'@'%' to database `app``"
+                .to_owned(),
+        );
+        assert!(is_credential_error(&db_denied));
+        let plugin = MySqlCdcError::Connection(
+            "Server error: `ERROR 28000 (1698): Access denied for user 'root'@'localhost'`"
+                .to_owned(),
+        );
+        assert!(is_credential_error(&plugin));
+
+        let refused = MySqlCdcError::Connection(
+            "mysql connection failed: Connection refused (os error 61)".to_owned(),
+        );
+        assert!(!is_credential_error(&refused));
+        let timeout =
+            MySqlCdcError::Connection("mysql connection failed: connection timed out".to_owned());
+        assert!(!is_credential_error(&timeout));
+        // Non-connection variants never classify.
+        assert!(!is_credential_error(&MySqlCdcError::Operation(
+            "ERROR 28000 (1045)".to_owned()
+        )));
     }
 }

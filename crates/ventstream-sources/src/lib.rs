@@ -17,6 +17,7 @@
 //! - [`neo4j::source`]: polling-loop implementation against the
 //!   `db.cdc.query` Cypher procedure.
 
+pub mod credential;
 pub mod error;
 pub mod kafka;
 pub mod mongodb;

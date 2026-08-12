@@ -40,13 +40,14 @@ use mongodb::change_stream::event::{ChangeStreamEvent, OperationType, ResumeToke
 use mongodb::options::{ClientOptions, FullDocumentType, Tls, TlsOptions};
 use mongodb::{Client, Database};
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use ventstream_core::{Source, SourceContext, SourceError};
 
 use super::bson::{bson_to_json, document_to_json};
 use super::config::{FullDocument, MongoCdcConfig};
 use super::cursor::CursorFile;
 use super::event_mapper::{self, Op};
+use crate::credential::immediate_message;
 use crate::error::MongoCdcError;
 use crate::tls::DatabaseTlsMode;
 
@@ -132,6 +133,11 @@ impl MongoCdcSource {
                     "resume token rejected (will re-bootstrap on restart): {e}"
                 )));
             }
+            Err(e) if is_credential_error(&e) => {
+                let message = immediate_message(&e);
+                error!(source = %self.config.id, error = %e, "{message}");
+                return Err(MongoCdcError::Connection(message));
+            }
             Err(e) => {
                 return Err(MongoCdcError::Connection(format!(
                     "opening change stream: {e}"
@@ -172,10 +178,17 @@ impl MongoCdcSource {
     /// Scan every in-scope collection, emitting one insert event per
     /// document. Returns `false` if shutdown fired mid-scan.
     async fn bootstrap(&self, db: &Database, ctx: &SourceContext) -> Result<bool, MongoCdcError> {
-        let names = db
-            .list_collection_names()
-            .await
-            .map_err(|e| MongoCdcError::Operation(format!("listing collections: {e}")))?;
+        // First authenticated server operation of the bootstrap: a
+        // credential rejection here is terminal, not a scan hiccup.
+        let names = db.list_collection_names().await.map_err(|e| {
+            if is_credential_error(&e) {
+                let message = immediate_message(&e);
+                error!(source = %self.config.id, error = %e, "{message}");
+                MongoCdcError::Connection(message)
+            } else {
+                MongoCdcError::Operation(format!("listing collections: {e}"))
+            }
+        })?;
         for name in names {
             // Skip internal collections and anything out of scope.
             if name.starts_with("system.") || !self.config.collection_allowed(&name) {
@@ -251,6 +264,11 @@ impl MongoCdcSource {
                             return Ok(());
                         }
                         Some(Err(e)) => {
+                            if is_credential_error(&e) {
+                                let message = immediate_message(&e);
+                                error!(source = %self.config.id, error = %e, "{message}");
+                                return Err(MongoCdcError::Connection(message));
+                            }
                             if looks_like_resume_failure(&e) {
                                 warn!(source = %self.config.id, error = %e,
                                     "change stream resume failure; wiping cursor to re-bootstrap");
@@ -396,6 +414,17 @@ fn looks_like_resume_failure(e: &mongodb::error::Error) -> bool {
         || msg.contains("oplog")
 }
 
+/// Mongo auth failures that cannot heal in-process: server error code 18
+/// (AuthenticationFailed), surfaced by the driver either as a command
+/// error carrying code 18 or as its authentication error kind.
+fn is_credential_error(error: &mongodb::error::Error) -> bool {
+    match error.kind.as_ref() {
+        mongodb::error::ErrorKind::Authentication { .. } => true,
+        mongodb::error::ErrorKind::Command(command) => command.code == 18,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -492,5 +521,32 @@ mod tests {
             .run_command(doc! { "ping": 1 })
             .await;
         assert!(result.is_err(), "an unrelated CA must be rejected");
+    }
+
+    #[test]
+    fn command_code_18_is_credential_and_other_codes_are_not() {
+        let auth_failed: mongodb::error::CommandError = serde_json::from_value(serde_json::json!({
+            "code": 18,
+            "codeName": "AuthenticationFailed",
+            "errmsg": "Authentication failed.",
+        }))
+        .expect("command error");
+        let error = mongodb::error::Error::from(mongodb::error::ErrorKind::Command(auth_failed));
+        assert!(is_credential_error(&error));
+
+        let cursor_gone: mongodb::error::CommandError = serde_json::from_value(serde_json::json!({
+            "code": 286,
+            "codeName": "ChangeStreamHistoryLost",
+            "errmsg": "Resume of change stream was not possible",
+        }))
+        .expect("command error");
+        let error = mongodb::error::Error::from(mongodb::error::ErrorKind::Command(cursor_gone));
+        assert!(!is_credential_error(&error));
+
+        let io = mongodb::error::Error::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ));
+        assert!(!is_credential_error(&io));
     }
 }
