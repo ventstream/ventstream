@@ -140,6 +140,18 @@ pub(super) fn translate_batch(config: &MeilisearchConfig, events: &[Event]) -> T
             continue;
         }
 
+        // A key-changing update relocated the doc: enqueue a delete for the
+        // previous key first (runs execute in order) so no stale copy stays.
+        if let Some(old_id) = event.headers.get("ventstream.doc.old_id") {
+            let old_key = encode_primary_key(old_id);
+            let bytes = old_key.len() + 4;
+            runs.push(Run {
+                index_uid: index_uid.clone(),
+                kind: RunKind::Delete(vec![old_key]),
+                offsets: vec![offset],
+                bytes,
+            });
+        }
         let document = match build_document(config, event, &primary_key, doc_id) {
             Ok(doc) => doc,
             Err(error) => {
@@ -252,8 +264,15 @@ fn build_document(
     primary_key: &str,
     doc_id: &str,
 ) -> Result<Value, String> {
-    let parsed: Value = serde_json::from_slice(event.payload.as_slice())
+    let mut parsed: Value = serde_json::from_slice(event.payload.as_slice())
         .map_err(|err| format!("event {} payload is not valid JSON: {err}", event.id))?;
+    // Flat CDC updates carry the `{"new":…, "old":…}` transition envelope;
+    // the document to materialize is the `new` row.
+    if event.subject.as_str().ends_with(".update") {
+        if let Some(row) = parsed.get("new").filter(|row| row.is_object()) {
+            parsed = row.clone();
+        }
+    }
     let Value::Object(mut map) = parsed else {
         return Err(format!(
             "event {} payload is not a JSON object; Meilisearch documents must be objects",

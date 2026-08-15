@@ -143,12 +143,11 @@ pub fn insert_to_event(
     let payload_json =
         serde_json::to_vec(&tuple_as_json_value(relation, &insert.tuple.columns)?)
             .map_err(|err| PostgresCdcError::Internal(format!("JSON encode failed: {err}")))?;
-    Ok(build_event(
-        source,
-        subject,
-        payload_json,
-        default_headers(relation),
-    ))
+    let mut headers = default_headers(relation);
+    if let Some(doc_id) = tuple_doc_id(relation, &insert.tuple.columns)? {
+        headers = headers.with_header(DOC_ID_HEADER.to_owned(), doc_id);
+    }
+    Ok(build_event(source, subject, payload_json, headers))
 }
 
 /// Map an `UPDATE` pgoutput message into an [`Event`].
@@ -179,12 +178,21 @@ pub fn update_to_event(
 
     let payload_json = serde_json::to_vec(&serde_json::Value::Object(envelope))
         .map_err(|err| PostgresCdcError::Internal(format!("JSON encode failed: {err}")))?;
-    Ok(build_event(
-        source,
-        subject,
-        payload_json,
-        default_headers(relation),
-    ))
+    let mut headers = default_headers(relation);
+    if let Some(doc_id) = tuple_doc_id(relation, &update.new.columns)? {
+        // pgoutput only ships an old tuple when the key changed (or under
+        // REPLICA IDENTITY FULL); a differing old key means the doc moved
+        // and the previous doc must be removed by the sink.
+        if let Some(old) = update.old.as_ref() {
+            if let Some(old_id) = tuple_doc_id(relation, &old.tuple.columns)? {
+                if old_id != doc_id {
+                    headers = headers.with_header(OLD_DOC_ID_HEADER.to_owned(), old_id);
+                }
+            }
+        }
+        headers = headers.with_header(DOC_ID_HEADER.to_owned(), doc_id);
+    }
+    Ok(build_event(source, subject, payload_json, headers))
 }
 
 /// Map a `DELETE` pgoutput message into an [`Event`].
@@ -205,12 +213,11 @@ pub fn delete_to_event(
 
     let payload_json = serde_json::to_vec(&serde_json::Value::Object(envelope))
         .map_err(|err| PostgresCdcError::Internal(format!("JSON encode failed: {err}")))?;
-    Ok(build_event(
-        source,
-        subject,
-        payload_json,
-        default_headers(relation),
-    ))
+    let mut headers = default_headers(relation);
+    if let Some(doc_id) = tuple_doc_id(relation, &delete.old.tuple.columns)? {
+        headers = headers.with_header(DOC_ID_HEADER.to_owned(), doc_id);
+    }
+    Ok(build_event(source, subject, payload_json, headers))
 }
 
 /// Map a `TRUNCATE` of one specific relation into an [`Event`]. The
@@ -316,6 +323,45 @@ fn column_to_json(
     })
 }
 
+const DOC_ID_HEADER: &str = "ventstream.doc.id";
+const OLD_DOC_ID_HEADER: &str = "ventstream.doc.old_id";
+
+/// Key components from a tuple using the replica-identity column flags.
+///
+/// `None` when the relation advertises no key columns (PK-less table) or a
+/// key value is unavailable — the event then ships without a stable doc id
+/// and sinks apply their own policy.
+fn key_components(
+    relation: &Relation,
+    columns: &[TupleColumn],
+) -> Result<Option<Vec<String>>, PostgresCdcError> {
+    let mut components = Vec::new();
+    let mut any_key = false;
+    for (schema, value) in relation.columns.iter().zip(columns.iter()) {
+        if schema.flags.is_key_part() {
+            any_key = true;
+            match column_to_json(schema.name.as_str(), value)? {
+                Some(value) if !value.is_null() => {
+                    components.push(ventstream_core::doc_id::component_text(&value));
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+    Ok(any_key.then_some(components))
+}
+
+/// Stable doc id for a tuple: `{namespace}.{name}:["pk",...]`, matching the
+/// SQL-denormalize path byte for byte.
+fn tuple_doc_id(
+    relation: &Relation,
+    columns: &[TupleColumn],
+) -> Result<Option<String>, PostgresCdcError> {
+    let table = format!("{}.{}", relation.namespace, relation.name);
+    Ok(key_components(relation, columns)?
+        .map(|components| ventstream_core::doc_id::doc_id(&table, &components)))
+}
+
 /// Headers attached to every CDC event.
 ///
 /// We keep the **raw** identifiers here — never sanitized — so downstream
@@ -362,7 +408,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 )]
 mod tests {
     use super::*;
-    use crate::postgres::pgoutput::{Column, ColumnFlags, ReplicaIdentity, Tuple};
+    use crate::postgres::pgoutput::{
+        Column, ColumnFlags, OldTuple, OldTupleKind, ReplicaIdentity, Tuple,
+    };
 
     fn users_relation() -> Relation {
         Relation {
@@ -385,6 +433,105 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn flat_events_carry_the_canonical_doc_id() {
+        let rel = users_relation();
+        let insert = Insert {
+            relation_id: rel.id,
+            tuple: Tuple {
+                columns: vec![
+                    TupleColumn::Text(b"42".to_vec()),
+                    TupleColumn::Text(b"alice@example.com".to_vec()),
+                ],
+            },
+        };
+        let event = insert_to_event("p", &rel, &insert).expect("insert");
+        assert_eq!(
+            event.headers.get("ventstream.doc.id"),
+            Some("public.users:[\"42\"]")
+        );
+
+        let update = Update {
+            relation_id: rel.id,
+            old: None,
+            new: Tuple {
+                columns: vec![
+                    TupleColumn::Text(b"42".to_vec()),
+                    TupleColumn::Text(b"new@example.com".to_vec()),
+                ],
+            },
+        };
+        let event = update_to_event("p", &rel, &update).expect("update");
+        assert_eq!(
+            event.headers.get("ventstream.doc.id"),
+            Some("public.users:[\"42\"]")
+        );
+        assert_eq!(event.headers.get("ventstream.doc.old_id"), None);
+
+        let delete = Delete {
+            relation_id: rel.id,
+            old: OldTuple {
+                kind: OldTupleKind::Key,
+                tuple: Tuple {
+                    columns: vec![TupleColumn::Text(b"42".to_vec()), TupleColumn::Null],
+                },
+            },
+        };
+        let event = delete_to_event("p", &rel, &delete).expect("delete");
+        assert_eq!(
+            event.headers.get("ventstream.doc.id"),
+            Some("public.users:[\"42\"]")
+        );
+    }
+
+    #[test]
+    fn key_changing_update_carries_the_previous_doc_id() {
+        let rel = users_relation();
+        let update = Update {
+            relation_id: rel.id,
+            old: Some(OldTuple {
+                kind: OldTupleKind::Key,
+                tuple: Tuple {
+                    columns: vec![TupleColumn::Text(b"42".to_vec()), TupleColumn::Null],
+                },
+            }),
+            new: Tuple {
+                columns: vec![
+                    TupleColumn::Text(b"43".to_vec()),
+                    TupleColumn::Text(b"alice@example.com".to_vec()),
+                ],
+            },
+        };
+        let event = update_to_event("p", &rel, &update).expect("update");
+        assert_eq!(
+            event.headers.get("ventstream.doc.id"),
+            Some("public.users:[\"43\"]")
+        );
+        assert_eq!(
+            event.headers.get("ventstream.doc.old_id"),
+            Some("public.users:[\"42\"]")
+        );
+    }
+
+    #[test]
+    fn keyless_relations_ship_without_a_doc_id() {
+        let mut rel = users_relation();
+        for column in &mut rel.columns {
+            column.flags = ColumnFlags(0x00);
+        }
+        let insert = Insert {
+            relation_id: rel.id,
+            tuple: Tuple {
+                columns: vec![
+                    TupleColumn::Text(b"42".to_vec()),
+                    TupleColumn::Text(b"alice@example.com".to_vec()),
+                ],
+            },
+        };
+        let event = insert_to_event("p", &rel, &insert).expect("insert");
+        assert_eq!(event.headers.get("ventstream.doc.id"), None);
     }
 
     #[test]

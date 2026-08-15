@@ -739,6 +739,10 @@ async fn write_one_batch(
 fn is_internal_barrier(event: &Event) -> bool {
     event.headers.get(ACK_BARRIER_HEADER) == Some("true")
         || event.headers.get(JOIN_BARRIER_HEADER) == Some("true")
+        // The snapshot-complete sentinel is a signal for the join engine;
+        // without joins it would otherwise reach sinks and be materialized
+        // as a document.
+        || event.headers.get("ventstream.cdc.bootstrap") == Some("snapshot-complete")
 }
 
 fn max_transform_watermark_in(events: &[Event]) -> u64 {

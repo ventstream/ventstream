@@ -130,10 +130,14 @@ fn main() {
                     })
                     .body
             }
-            "body" => bulk::build_bulk_body(&events, &template, now).unwrap_or_else(|error| {
-                eprintln!("body build failed: {error}");
-                std::process::exit(2);
-            }),
+            "body" => {
+                bulk::build_bulk_body(&events, &template, now)
+                    .unwrap_or_else(|error| {
+                        eprintln!("body build failed: {error}");
+                        std::process::exit(2);
+                    })
+                    .0
+            }
             other => {
                 eprintln!("unknown mode '{other}'; expected legacy, request, or body");
                 std::process::exit(2);

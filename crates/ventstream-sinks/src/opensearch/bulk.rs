@@ -114,6 +114,10 @@ pub struct BulkRequest {
     /// Index name resolved for each event, in batch order. Used by the
     /// partial-failure handler to construct a smaller retry batch.
     pub indices: Vec<String>,
+    /// Event offset behind each bulk action, in action order. A key-changing
+    /// update contributes two actions (delete old id + index) that map back
+    /// to the same event.
+    pub item_event_offsets: Vec<usize>,
 }
 
 /// Build a bulk request from a slice of events and a template.
@@ -134,8 +138,9 @@ pub fn build_bulk_body(
     events: &[Event],
     template: &str,
     now: DateTime<Utc>,
-) -> Result<Vec<u8>, OpenSearchSinkError> {
-    build_bulk_request_inner(events, template, now, false).map(|request| request.body)
+) -> Result<(Vec<u8>, Vec<usize>), OpenSearchSinkError> {
+    build_bulk_request_inner(events, template, now, false)
+        .map(|request| (request.body, request.item_event_offsets))
 }
 
 fn build_bulk_request_inner(
@@ -145,6 +150,7 @@ fn build_bulk_request_inner(
     collect_indices: bool,
 ) -> Result<BulkRequest, OpenSearchSinkError> {
     let mut body = Vec::with_capacity(events.len() * 256);
+    let mut item_event_offsets = Vec::with_capacity(events.len());
     let mut indices = if collect_indices {
         Vec::with_capacity(events.len())
     } else {
@@ -163,7 +169,7 @@ fn build_bulk_request_inner(
         None
     };
 
-    for event in events {
+    for (event_offset, event) in events.iter().enumerate() {
         let index = match static_index.as_deref() {
             Some(index) => Cow::Borrowed(index),
             None => Cow::Owned(index_template::render(template, event, now)?),
@@ -201,7 +207,20 @@ fn build_bulk_request_inner(
                 OpenSearchSinkError::Internal(format!("serializing bulk action: {err}"))
             })?;
             body.push(b'\n');
+            item_event_offsets.push(event_offset);
         } else {
+            // A key-changing update relocated the doc: remove the previous
+            // doc first so the old id does not linger as a stale copy.
+            if let Some(old_id) = event.headers.get("ventstream.doc.old_id") {
+                let action = DeleteAction {
+                    delete: ActionMeta::new(index.as_ref(), old_id, version),
+                };
+                serde_json::to_writer(&mut body, &action).map_err(|err| {
+                    OpenSearchSinkError::Internal(format!("serializing bulk action: {err}"))
+                })?;
+                body.push(b'\n');
+                item_event_offsets.push(event_offset);
+            }
             // Upsert. Use the stable id when present; otherwise fall back to
             // the per-event id — which makes each event its own doc (no upsert
             // dedup, so re-emits duplicate). Surface the fallback so a
@@ -225,12 +244,16 @@ fn build_bulk_request_inner(
                 OpenSearchSinkError::Internal(format!("serializing bulk action: {err}"))
             })?;
             body.push(b'\n');
+            item_event_offsets.push(event_offset);
 
             // Must be a single line of JSON. Source produces compact
             // JSON; we still fold any stray '\n' to a space so a
             // misbehaving source can't corrupt NDJSON framing for the
             // rest of the batch.
-            append_payload_line(&mut body, event.payload.as_slice());
+            match update_row_body(event) {
+                Some(row) => append_payload_line(&mut body, &row),
+                None => append_payload_line(&mut body, event.payload.as_slice()),
+            }
             body.push(b'\n');
         }
 
@@ -239,7 +262,26 @@ fn build_bulk_request_inner(
         }
     }
 
-    Ok(BulkRequest { body, indices })
+    Ok(BulkRequest {
+        body,
+        indices,
+        item_event_offsets,
+    })
+}
+
+/// For flat CDC updates the payload is the `{"new":…, "old":…}` transition
+/// envelope; the document to materialize is the `new` row. Denormalized
+/// paths re-emit plain documents and pass through untouched.
+fn update_row_body(event: &Event) -> Option<Vec<u8>> {
+    if !event.subject.as_str().ends_with(".update") {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(event.payload.as_slice()).ok()?;
+    let row = parsed.get("new")?;
+    if !row.is_object() {
+        return None;
+    }
+    serde_json::to_vec(row).ok()
 }
 
 /// Detect whether an event is a deletion based on the CDC source's

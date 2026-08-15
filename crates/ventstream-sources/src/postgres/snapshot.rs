@@ -520,6 +520,31 @@ fn build_synthetic_insert(
         config.publication.clone(),
     );
     headers.insert("ventstream.cdc.bootstrap".to_owned(), "snapshot".to_owned());
+    // Stable doc id from the discovered primary key, matching the WAL path
+    // and the SQL-denormalize path byte for byte. Values were text-normalized
+    // above, so snapshot and WAL ids for the same row agree.
+    if !table.primary_key.is_empty() {
+        let mut components = Vec::with_capacity(table.primary_key.len());
+        let mut complete = true;
+        for column in &table.primary_key {
+            match payload_value.get(column) {
+                Some(value) if !value.is_null() => {
+                    components.push(ventstream_core::doc_id::component_text(value));
+                }
+                _ => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if complete {
+            let table_name = format!("{}.{}", table.namespace, table.name);
+            headers.insert(
+                "ventstream.doc.id".to_owned(),
+                ventstream_core::doc_id::doc_id(&table_name, &components),
+            );
+        }
+    }
 
     Ok(Event::builder(source, subject)
         .payload(Payload::from_vec(payload_bytes))
