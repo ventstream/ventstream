@@ -263,7 +263,7 @@ impl OpenSearchSink {
         let mut subset: Vec<ventstream_core::Event> = Vec::new();
         let mut use_subset = false;
         let rendered_at = Utc::now();
-        let mut encoded: Option<Bytes> = None;
+        let mut encoded: Option<(Bytes, Vec<usize>)> = None;
         let mut transient_failure: Option<SinkFailureGuard> = None;
 
         loop {
@@ -275,13 +275,13 @@ impl OpenSearchSink {
             if encoded.is_none() {
                 encoded = Some(self.encode_attempt(attempt, rendered_at)?);
             }
-            let Some(body) = encoded.as_ref().cloned() else {
+            let Some((body, item_event_offsets)) = encoded.as_ref().cloned() else {
                 return Err(OpenSearchSinkError::Internal(
                     "bulk request body was not prepared".into(),
                 ));
             };
             let request_started = Instant::now();
-            match self.send_once(body, attempt.len()).await {
+            match self.send_once(body, &item_event_offsets).await {
                 Ok(SendOutcome::AllOk) => {
                     self.adaptive.on_success(request_started.elapsed());
                     self.finish_transient_failure(&mut transient_failure);
@@ -462,15 +462,16 @@ impl OpenSearchSink {
         &self,
         events: &[ventstream_core::Event],
         rendered_at: chrono::DateTime<Utc>,
-    ) -> Result<Bytes, OpenSearchSinkError> {
-        let body = bulk::build_bulk_body(events, &self.config.index_template, rendered_at)?;
+    ) -> Result<(Bytes, Vec<usize>), OpenSearchSinkError> {
+        let (body, item_event_offsets) =
+            bulk::build_bulk_body(events, &self.config.index_template, rendered_at)?;
         if body.len() > self.config.bulk.max_bytes {
             return Err(OpenSearchSinkError::RequestTooLarge {
                 actual_bytes: body.len(),
                 max_bytes: self.config.bulk.max_bytes,
             });
         }
-        Ok(Bytes::from(body))
+        Ok((Bytes::from(body), item_event_offsets))
     }
 
     /// Single prepared attempt — POST immutable NDJSON, parse response, and
@@ -479,7 +480,7 @@ impl OpenSearchSink {
     async fn send_once(
         &self,
         body: Bytes,
-        expected_items: usize,
+        item_event_offsets: &[usize],
     ) -> Result<SendOutcome, OpenSearchSinkError> {
         let mut http = self
             .client
@@ -494,7 +495,7 @@ impl OpenSearchSink {
             .await
             .map_err(|err| OpenSearchSinkError::Transport(err.to_string()))?;
 
-        classify_response(response, expected_items).await
+        classify_response(response, item_event_offsets).await
     }
 }
 
@@ -539,11 +540,17 @@ enum SendOutcome {
 /// Pure (no I/O) so the transient/permanent split is unit-testable without a
 /// live HTTP server. Only known document-level errors are permanent. Unknown
 /// item failures fail closed instead of being misclassified into the DLQ.
-fn partition_bulk_items(parsed: &BulkResponse) -> SendOutcome {
+fn partition_bulk_items(parsed: &BulkResponse, item_event_offsets: &[usize]) -> SendOutcome {
     let mut transient: Vec<ventstream_core::FailedItem> = Vec::new();
     let mut permanent: Vec<ventstream_core::FailedItem> = Vec::new();
     let mut blocked: Vec<ventstream_core::FailedItem> = Vec::new();
-    for (offset, item) in parsed.items.iter().enumerate() {
+    for (item_index, item) in parsed.items.iter().enumerate() {
+        // Map the bulk action back to its batch event; a key-changing update
+        // contributes two actions for one event.
+        let offset = item_event_offsets
+            .get(item_index)
+            .copied()
+            .unwrap_or(item_index);
         let entry = item.action.entry();
         if entry.is_success() {
             continue;
@@ -669,7 +676,7 @@ pub(crate) fn apply_auth(rb: reqwest::RequestBuilder, auth: &AuthMode) -> reqwes
 /// bulk body and surface per-item failures.
 async fn classify_response(
     response: reqwest::Response,
-    expected_items: usize,
+    item_event_offsets: &[usize],
 ) -> Result<SendOutcome, OpenSearchSinkError> {
     let status = response.status();
     let retry_after = response
@@ -687,13 +694,14 @@ async fn classify_response(
             .map_err(|err| OpenSearchSinkError::Transport(err.to_string()))?;
         let parsed: BulkResponse = serde_json::from_slice(&bytes)
             .map_err(|err| OpenSearchSinkError::MalformedResponse(err.to_string()))?;
-        if parsed.items.len() != expected_items {
+        if parsed.items.len() != item_event_offsets.len() {
             return Err(OpenSearchSinkError::MalformedResponse(format!(
-                "bulk response item count {} does not match request item count {expected_items}",
-                parsed.items.len()
+                "bulk response item count {} does not match request item count {}",
+                parsed.items.len(),
+                item_event_offsets.len()
             )));
         }
-        return Ok(partition_bulk_items(&parsed));
+        return Ok(partition_bulk_items(&parsed, item_event_offsets));
     }
 
     // Non-2xx — read at most 1 KiB of the body for the error message so a
@@ -920,6 +928,14 @@ mod tests {
         assert!(OpenSearchSink::new(config).is_err());
     }
 
+    fn bulk_body_len(
+        events: &[ventstream_core::Event],
+        template: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Vec<u8>, OpenSearchSinkError> {
+        bulk::build_bulk_body(events, template, now).map(|(body, _)| body)
+    }
+
     fn make_event(subject: &str, payload: &str) -> Event {
         let source = SourceUri::new("test://x").expect("uri");
         let subject = Subject::new(subject).expect("subject");
@@ -1050,14 +1066,14 @@ mod tests {
             make_event("a.b", &format!(r#"{{"value":"{}"}}"#, "a".repeat(256))),
             make_event("a.b", &format!(r#"{{"value":"{}"}}"#, "b".repeat(256))),
         ];
-        let single_bytes = bulk::build_bulk_body(
+        let single_bytes = bulk_body_len(
             events.get(..1).expect("single event slice"),
             "static-index",
             Utc::now(),
         )
         .expect("single body")
         .len();
-        let both_bytes = bulk::build_bulk_body(&events, "static-index", Utc::now())
+        let both_bytes = bulk_body_len(&events, "static-index", Utc::now())
             .expect("combined body")
             .len();
         assert!(both_bytes > single_bytes + 1);
@@ -1075,10 +1091,9 @@ mod tests {
     async fn single_oversized_event_is_reported_as_one_failed_item() {
         let server = MockServer::start().await;
         let event = make_event("a.b", &format!(r#"{{"value":"{}"}}"#, "x".repeat(256)));
-        let encoded_bytes =
-            bulk::build_bulk_body(std::slice::from_ref(&event), "static-index", Utc::now())
-                .expect("body")
-                .len();
+        let encoded_bytes = bulk_body_len(std::slice::from_ref(&event), "static-index", Utc::now())
+            .expect("body")
+            .len();
         let mut cfg = OpenSearchConfig::new("test-sink", server.uri(), "static-index");
         cfg.bulk.max_bytes = encoded_bytes.saturating_sub(1);
         cfg.retry.max_attempts = 1;
@@ -1257,7 +1272,7 @@ mod tests {
         let response = reqwest::get(format!("{}/retry", server.uri()))
             .await
             .expect("response");
-        let error = classify_response(response, 0)
+        let error = classify_response(response, &[])
             .await
             .expect_err("429 must be retryable");
         assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
@@ -1421,7 +1436,7 @@ mod tests {
             ]
         });
         let parsed: BulkResponse = serde_json::from_value(json).unwrap();
-        match partition_bulk_items(&parsed) {
+        match partition_bulk_items(&parsed, &[]) {
             SendOutcome::PerItem {
                 transient,
                 permanent,
@@ -1457,7 +1472,10 @@ mod tests {
             ]
         });
         let parsed: BulkResponse = serde_json::from_value(json).unwrap();
-        assert!(matches!(partition_bulk_items(&parsed), SendOutcome::AllOk));
+        assert!(matches!(
+            partition_bulk_items(&parsed, &[]),
+            SendOutcome::AllOk
+        ));
     }
 
     #[tokio::test]
@@ -1509,7 +1527,7 @@ mod tests {
         });
         let parsed: BulkResponse = serde_json::from_value(json).unwrap();
         assert!(
-            matches!(partition_bulk_items(&parsed), SendOutcome::AllOk),
+            matches!(partition_bulk_items(&parsed, &[]), SendOutcome::AllOk),
             "a batch whose only non-2xx item is a version conflict is fully applied"
         );
     }
@@ -1560,7 +1578,7 @@ mod tests {
             ]
         });
         let parsed: BulkResponse = serde_json::from_value(json).unwrap();
-        match partition_bulk_items(&parsed) {
+        match partition_bulk_items(&parsed, &[]) {
             SendOutcome::PerItem {
                 transient,
                 permanent,
@@ -1617,7 +1635,10 @@ mod tests {
             "items": [{ "index": { "_id": "x", "status": 201 } }]
         });
         let parsed: BulkResponse = serde_json::from_value(json).unwrap();
-        assert!(matches!(partition_bulk_items(&parsed), SendOutcome::AllOk));
+        assert!(matches!(
+            partition_bulk_items(&parsed, &[]),
+            SendOutcome::AllOk
+        ));
     }
 
     #[tokio::test]

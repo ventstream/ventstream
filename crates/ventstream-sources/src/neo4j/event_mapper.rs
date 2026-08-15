@@ -84,6 +84,18 @@ fn base_headers(config: &Neo4jCdcConfig, table: &str) -> HashMap<String, String>
     h
 }
 
+/// Stamp the stable doc id for a raw graph entity: `{table}:["<elementId>"]`.
+/// Element ids are unique per entity, so raw-mode docs upsert and delete
+/// deterministically in search sinks without a denormalize spec.
+fn stamp_doc_id(headers: &mut HashMap<String, String>, table: &str, element_id: &str) {
+    if !element_id.is_empty() {
+        headers.insert(
+            "ventstream.doc.id".to_owned(),
+            ventstream_core::doc_id::doc_id(table, &[element_id.to_owned()]),
+        );
+    }
+}
+
 fn build_subject(config: &Neo4jCdcConfig, table: &str, op: Op) -> Result<Subject, Neo4jCdcError> {
     Subject::new(format!(
         "neo4j.{namespace}.{table}.{op}",
@@ -116,6 +128,9 @@ pub fn synth_node_insert(
     let mut headers = base_headers(config, label_table);
     headers.insert("ventstream.cdc.bootstrap".to_owned(), "snapshot".to_owned());
     headers.insert("ventstream.cdc.event_type".to_owned(), "n".to_owned());
+    if let Some(element_id) = payload.get("elementId").and_then(Value::as_str) {
+        stamp_doc_id(&mut headers, label_table, element_id);
+    }
 
     let event = Event::builder(
         build_source_uri(config, label_table)?,
@@ -143,6 +158,9 @@ pub fn synth_rel_insert(
     let mut headers = base_headers(config, reltype_table);
     headers.insert("ventstream.cdc.bootstrap".to_owned(), "snapshot".to_owned());
     headers.insert("ventstream.cdc.event_type".to_owned(), "r".to_owned());
+    if let Some(element_id) = payload.get("elementId").and_then(Value::as_str) {
+        stamp_doc_id(&mut headers, reltype_table, element_id);
+    }
     headers.insert("ventstream.cdc.start_eid".to_owned(), start_eid.to_owned());
     headers.insert("ventstream.cdc.end_eid".to_owned(), end_eid.to_owned());
 
@@ -307,6 +325,7 @@ fn build_node_live(
         "ventstream.cdc.element_id".to_owned(),
         element_id.to_owned(),
     );
+    stamp_doc_id(&mut headers, &table, element_id);
 
     let event = Event::builder(
         build_source_uri(config, &table)?,
@@ -361,6 +380,7 @@ fn build_rel_live(
         "ventstream.cdc.element_id".to_owned(),
         element_id.to_owned(),
     );
+    stamp_doc_id(&mut headers, &table, element_id);
     headers.insert("ventstream.cdc.start_eid".to_owned(), start_eid.to_owned());
     headers.insert("ventstream.cdc.end_eid".to_owned(), end_eid.to_owned());
 

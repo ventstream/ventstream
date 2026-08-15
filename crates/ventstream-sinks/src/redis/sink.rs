@@ -1246,6 +1246,31 @@ fn prepare_batch_with_limits(
                 payload: Bytes::new(),
             });
         } else {
+            // A key-changing update relocated the doc: delete the previous
+            // key in the same pipeline so no stale copy stays behind.
+            if let Some(old_id) = event.headers.get("ventstream.doc.old_id") {
+                let old_key_len = encoded_key_len(&config.key_prefix, target, old_id);
+                if old_key_len <= config.max_key_bytes {
+                    if let Ok(old_version_key) =
+                        super::keyspace::version_key(config, target, old_id)
+                    {
+                        let old_key =
+                            key_from_parts(&config.key_prefix, target, old_id, old_key_len);
+                        builder.deletes = builder.deletes.saturating_add(1);
+                        builder.commands.push(PreparedCommand {
+                            event_offset: offset,
+                            kind: PreparedCommandKind::Delete,
+                            target: target.to_owned(),
+                            key: old_key,
+                            version_key: old_version_key,
+                            source_version: source_version.clone(),
+                            staging_key: None,
+                            payload: Bytes::new(),
+                        });
+                        builder.command_count = builder.command_count.saturating_add(1);
+                    }
+                }
+            }
             builder.upserts = builder.upserts.saturating_add(1);
             builder.commands.push(PreparedCommand {
                 event_offset: offset,
@@ -1255,7 +1280,7 @@ fn prepare_batch_with_limits(
                 version_key,
                 source_version,
                 staging_key,
-                payload: event.payload.as_bytes(),
+                payload: upsert_payload(event),
             });
         }
         builder.command_count = builder.command_count.saturating_add(1);
@@ -1268,6 +1293,21 @@ fn prepare_batch_with_limits(
         operations,
         rejected,
     })
+}
+
+/// Flat CDC updates carry the `{"new":…, "old":…}` transition envelope; the
+/// value to materialize is the `new` row. Other events pass through untouched.
+fn upsert_payload(event: &Event) -> Bytes {
+    if event.subject.as_str().ends_with(".update") {
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(event.payload.as_slice()) {
+            if let Some(row) = parsed.get("new").filter(|row| row.is_object()) {
+                if let Ok(bytes) = serde_json::to_vec(row) {
+                    return Bytes::from(bytes);
+                }
+            }
+        }
+    }
+    event.payload.as_bytes()
 }
 
 fn prepare_view_batch_with_limits(
