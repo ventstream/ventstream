@@ -286,44 +286,53 @@ impl MySqlCdcSource {
                 .join(",");
             let qualified = format!("`{}`.`{}`", esc(&self.config.database), esc(&table));
             let limit = self.config.bootstrap_chunk_size.max(1);
-            let mut last_pk: Option<Vec<Value>> = None;
 
+            // Prefetch double-buffer: the next chunk's SELECT runs on its own
+            // pooled connection while the current chunk emits to the bus, so
+            // fetch round-trips leave the critical path (same shape as the
+            // Postgres SQL-denormalize bootstrap).
+            let mut rows =
+                fetch_bootstrap_chunk(pool, &qualified, &order, limit, None).await?;
             loop {
-                let sql = match &last_pk {
-                    None => format!("SELECT * FROM {qualified} ORDER BY {order} LIMIT {limit}"),
-                    Some(vals) => {
-                        let ph = vec!["?"; vals.len()].join(",");
-                        format!("SELECT * FROM {qualified} WHERE ({order}) > ({ph}) ORDER BY {order} LIMIT {limit}")
-                    }
-                };
-                let mut conn = pool.get_conn().await.map_err(op_err)?;
-                // Always the binary protocol so column types (and thus JSON
-                // shapes) match the re-SELECT path; the text protocol returns
-                // every value as a string.
-                let rows: Vec<Row> = match &last_pk {
-                    None => conn.exec(sql, ()).await.map_err(op_err)?,
-                    Some(vals) => conn.exec(sql, vals.clone()).await.map_err(op_err)?,
-                };
-                drop(conn);
                 if rows.is_empty() {
                     break;
                 }
-                let n = rows.len();
-                for row in &rows {
-                    if ctx.shutdown.is_cancelled() {
-                        return Ok(false);
+                let full_page = rows.len() >= limit;
+                let page_last = rows
+                    .last()
+                    .map(|row| pk_values_from_row(row, &schema.pk_names));
+                let fetch_next = async {
+                    match (&page_last, full_page) {
+                        (Some(last), true) => Some(
+                            fetch_bootstrap_chunk(pool, &qualified, &order, limit, Some(last))
+                                .await,
+                        ),
+                        _ => None,
                     }
-                    let pk_vals = pk_values_from_row(row, &schema.pk_names);
-                    let pk = pk_components(&pk_vals);
-                    let doc = row_to_json(row, &schema.json_columns);
-                    let ev = event_mapper::snapshot_insert(&self.config, &table, &pk, doc)?;
-                    if !self.publish(ctx, ev).await? {
-                        return Ok(false);
+                };
+                let emit_chunk = async {
+                    for row in &rows {
+                        if ctx.shutdown.is_cancelled() {
+                            return Ok::<bool, MySqlCdcError>(false);
+                        }
+                        let pk_vals = pk_values_from_row(row, &schema.pk_names);
+                        let pk = pk_components(&pk_vals);
+                        let doc = row_to_json(row, &schema.json_columns);
+                        let ev =
+                            event_mapper::snapshot_insert(&self.config, &table, &pk, doc)?;
+                        if !self.publish(ctx, ev).await? {
+                            return Ok(false);
+                        }
                     }
-                    last_pk = Some(pk_vals);
+                    Ok(true)
+                };
+                let (emit_result, next) = tokio::join!(emit_chunk, fetch_next);
+                if !emit_result? {
+                    return Ok(false);
                 }
-                if n < limit {
-                    break;
+                match next {
+                    Some(fetched) => rows = fetched?,
+                    None => break,
                 }
             }
         }
@@ -671,6 +680,34 @@ fn decode_rows(
         op,
         rows: out,
     }))
+}
+
+/// One keyset-paginated bootstrap chunk on its own pooled connection.
+/// Always the binary protocol so column types (and thus JSON shapes) match
+/// the re-SELECT path; the text protocol returns every value as a string.
+async fn fetch_bootstrap_chunk(
+    pool: &Pool,
+    qualified: &str,
+    order: &str,
+    limit: usize,
+    last: Option<&Vec<Value>>,
+) -> Result<Vec<Row>, MySqlCdcError> {
+    let sql = match last {
+        None => format!("SELECT * FROM {qualified} ORDER BY {order} LIMIT {limit}"),
+        Some(vals) => {
+            let ph = vec!["?"; vals.len()].join(",");
+            format!(
+                "SELECT * FROM {qualified} WHERE ({order}) > ({ph}) ORDER BY {order} LIMIT {limit}"
+            )
+        }
+    };
+    let mut conn = pool.get_conn().await.map_err(op_err)?;
+    let rows: Vec<Row> = match last {
+        None => conn.exec(sql, ()).await.map_err(op_err)?,
+        Some(vals) => conn.exec(sql, vals.clone()).await.map_err(op_err)?,
+    };
+    drop(conn);
+    Ok(rows)
 }
 
 fn pk_values_from_row(row: &Row, pk_names: &[String]) -> Vec<Value> {
