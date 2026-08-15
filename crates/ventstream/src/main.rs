@@ -77,7 +77,7 @@ use ventstream_config::{
 use ventstream_core::{MemoryAdmission, ReadinessSignal, ShutdownToken};
 use ventstream_graphql::GraphQlConfig;
 use ventstream_joins::{JoinDefinition, JoinEngine, JoinState, PersistentBackend};
-use ventstream_sinks::opensearch::{AuthMode, OpenSearchConfig, OpenSearchSink};
+use ventstream_sinks::opensearch::{AuthMode, OpenSearchConfig, OpenSearchSink, OsReverseLookup};
 use ventstream_sinks::{
     MeilisearchConfig, MeilisearchIndexRouting, MeilisearchSettings, MeilisearchSink,
     RedisAcknowledgement, RedisConfig, RedisContract, RedisDocumentFormat, RedisKeyRouting,
@@ -2079,20 +2079,21 @@ async fn build_and_run_pg_sql_denormalize_engine(
     if matches!(runtime.sink.kind(), "redis" | "meilisearch") {
         denorm = denorm.with_target_clears();
     }
-    // OpenSearch can serve as a reverse index when the WAL delete pre-image
-    // lacks the parent key. Other sinks require complete replica identity.
+    // Search sinks can serve as a reverse index when the WAL delete
+    // pre-image lacks the parent key. Redis cannot; it requires complete
+    // replica identity on child tables.
     if postgres_sink_reverse_lookup_enabled(
         runtime.engine_file_config.as_ref(),
-        runtime.sink.kind() == "opensearch",
+        matches!(runtime.sink.kind(), "opensearch" | "meilisearch"),
     ) {
-        let os = runtime.sink.open_search().ok_or_else(|| {
+        let lookup = runtime.sink.build_reverse_lookup()?.ok_or_else(|| {
             anyhow!(
-                "Postgres sink reverse lookup requires OpenSearch; set \
-                 source.postgres.sink_reverse_lookup=false after configuring child tables \
-                 with a complete replica identity"
+                "Postgres sink reverse lookup requires a search sink (OpenSearch or \
+                 Meilisearch); set source.postgres.sink_reverse_lookup=false after \
+                 configuring child tables with a complete replica identity"
             )
         })?;
-        denorm = denorm.with_reverse_lookup(os.clone());
+        denorm = denorm.with_reverse_lookup(lookup);
     }
 
     let sink_progress = Arc::new(AtomicU64::new(0));
@@ -2705,20 +2706,20 @@ async fn build_and_run_mysql_sql_denormalize_engine(
             .await
             .context("validating MySQL joined-delete pre-images")?;
     }
-    // OpenSearch remains a fallback for reduced delete images. Other sinks
-    // consume the MySQL before-image and require binlog_row_image=FULL.
+    // Search sinks remain a fallback for reduced delete images. Redis
+    // consumes the MySQL before-image and requires binlog_row_image=FULL.
     if mysql_sink_reverse_lookup_enabled(
         runtime.engine_file_config.as_ref(),
-        runtime.sink.kind() == "opensearch",
+        matches!(runtime.sink.kind(), "opensearch" | "meilisearch"),
     ) {
-        let os = runtime.sink.open_search().ok_or_else(|| {
+        let lookup = runtime.sink.build_reverse_lookup()?.ok_or_else(|| {
             anyhow!(
-                "MySQL sink reverse lookup requires OpenSearch; set \
-                 source.mysql.sink_reverse_lookup=false only when child deletes carry the \
-                 parent key"
+                "MySQL sink reverse lookup requires a search sink (OpenSearch or \
+                 Meilisearch); set source.mysql.sink_reverse_lookup=false only when \
+                 child deletes carry the parent key"
             )
         })?;
-        denorm = denorm.with_reverse_lookup(os.clone());
+        denorm = denorm.with_reverse_lookup(lookup);
     }
 
     let sink_progress = Arc::new(AtomicU64::new(0));
@@ -2971,6 +2972,34 @@ impl SinkRuntimeConfig {
             Self::OpenSearch(config) => Some(config),
             Self::Redis(_) | Self::Meilisearch(_) => None,
         }
+    }
+
+    fn meilisearch(&self) -> Option<&MeilisearchConfig> {
+        match self {
+            Self::Meilisearch(config) => Some(config),
+            Self::OpenSearch(_) | Self::Redis(_) => None,
+        }
+    }
+
+    /// Reverse-lookup client for sinks that can answer "which parents embed
+    /// this child?" — OpenSearch and Meilisearch. None for Redis.
+    fn build_reverse_lookup(&self) -> Result<Option<ventstream_sinks::ReverseLookup>> {
+        Ok(match self {
+            Self::OpenSearch(config) => Some(ventstream_sinks::ReverseLookup::OpenSearch(
+                Box::new(OsReverseLookup::new((**config).clone()).map_err(|err| {
+                    anyhow!("building OpenSearch reverse-lookup client: {err}")
+                })?),
+            )),
+            Self::Meilisearch(config) => Some(ventstream_sinks::ReverseLookup::Meilisearch(
+                Box::new(
+                    ventstream_sinks::meilisearch::MeiliReverseLookup::new((**config).clone())
+                        .map_err(|err| {
+                            anyhow!("building Meilisearch reverse-lookup client: {err}")
+                        })?,
+                ),
+            )),
+            Self::Redis(_) => None,
+        })
     }
 
     fn redis(&self) -> Option<&RedisConfig> {
@@ -4792,7 +4821,9 @@ fn load_engine_runtime_config(
     dlq_path: PathBuf,
 ) -> Result<EngineConfig> {
     let runtime = engine_config.map(|config| &config.runtime);
-    let bus_capacity = match runtime.and_then(|runtime| runtime.bus_capacity) {
+    let bus_explicit = runtime.and_then(|runtime| runtime.bus_capacity).is_some()
+        || std::env::var_os("VS_BUS_CAPACITY").is_some();
+    let mut bus_capacity = match runtime.and_then(|runtime| runtime.bus_capacity) {
         Some(value) => value,
         None => opt_usize("VS_BUS_CAPACITY", 1024)?,
     };
@@ -4801,6 +4832,29 @@ fn load_engine_runtime_config(
         Some(value) => value,
         None => opt_usize("VS_DISPATCH_MAX_EVENTS", 2_000)?,
     };
+    // The bus caps how many events can sit between source and dispatcher,
+    // so a bus smaller than one dispatch batch silently shrinks every sink
+    // request to bus_capacity events — a large, invisible throughput tax
+    // (measured 100x on Meilisearch bulk loads). The default bus grows to
+    // hold one full batch; an explicit bus is honored but called out.
+    if bus_capacity < max_events {
+        if bus_explicit {
+            warn!(
+                bus_capacity,
+                dispatch_max_events = max_events,
+                "bus_capacity is smaller than dispatch.max_events; sink batches are \
+                 capped at bus_capacity events — raise runtime.bus_capacity to reach \
+                 the configured batch size"
+            );
+        } else {
+            info!(
+                from = bus_capacity,
+                to = max_events,
+                "raising default bus_capacity to hold one full dispatch batch"
+            );
+            bus_capacity = max_events;
+        }
+    }
     let max_batch_bytes = match dispatch.and_then(|dispatch| dispatch.max_batch_bytes) {
         Some(value) => value,
         None => opt_usize("VS_DISPATCH_MAX_BATCH_BYTES", 4 * 1024 * 1024)?,

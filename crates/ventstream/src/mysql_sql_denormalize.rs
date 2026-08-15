@@ -34,7 +34,9 @@ use ventstream_core::{
     Subject,
 };
 use ventstream_joins::{Cardinality, JoinDefinition, RelatedDefinition};
-use ventstream_sinks::opensearch::{index_template, OpenSearchConfig, OsReverseLookup};
+use ventstream_sinks::ReverseLookup;
+#[cfg(test)]
+use ventstream_sinks::opensearch::index_template;
 use ventstream_sources::mysql::MySqlCdcConfig;
 
 /// Greedy-drain ceiling for the tail loop (matches the PG denormalizer).
@@ -207,7 +209,7 @@ pub struct MySqlDenormalizer {
     chunk_size: u64,
     recompose_key_chunk: usize,
     recompose_query_concurrency: usize,
-    sink_lookup: Option<OsReverseLookup>,
+    sink_lookup: Option<ReverseLookup>,
 }
 
 impl MySqlDenormalizer {
@@ -268,13 +270,8 @@ impl MySqlDenormalizer {
 
     /// Enable the sink reverse-lookup fallback for 1:many child deletes.
     #[must_use]
-    pub fn with_reverse_lookup(mut self, os: OpenSearchConfig) -> Self {
-        match OsReverseLookup::new(os) {
-            Ok(lookup) => self.sink_lookup = Some(lookup),
-            Err(err) => {
-                warn!(error = %err, "mysql sql-denormalize: reverse-lookup disabled (1:many child deletes won't propagate)")
-            }
-        }
+    pub fn with_reverse_lookup(mut self, lookup: ReverseLookup) -> Self {
+        self.sink_lookup = Some(lookup);
         self
     }
 
@@ -726,7 +723,7 @@ impl MySqlDenormalizer {
             .collect())
     }
 
-    fn resolve_sink_index(&self, pd: &PreparedDef, lookup: &OsReverseLookup) -> Option<String> {
+    fn resolve_sink_index(&self, pd: &PreparedDef, lookup: &ReverseLookup) -> Option<String> {
         let probe = build_doc_event(
             &pd.primary_table,
             pd.def.target_index(),
@@ -735,7 +732,7 @@ impl MySqlDenormalizer {
             false,
         )
         .ok()?;
-        index_template::render(lookup.index_template(), &probe, chrono::Utc::now()).ok()
+        lookup.resolve_index_for(&probe)
     }
 
     /// Run: bootstrap, then drain the tail receiver until shutdown.

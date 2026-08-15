@@ -183,7 +183,7 @@ pub(super) fn translate_batch(config: &MeilisearchConfig, events: &[Event]) -> T
     Translated { runs, rejects }
 }
 
-fn resolve_index(config: &MeilisearchConfig, event: &Event) -> Result<String, String> {
+pub(crate) fn resolve_index(config: &MeilisearchConfig, event: &Event) -> Result<String, String> {
     let target = match &config.index_routing {
         MeilisearchIndexRouting::ByOutputRelation => {
             event.headers.get(RELATION_HEADER).ok_or_else(|| {

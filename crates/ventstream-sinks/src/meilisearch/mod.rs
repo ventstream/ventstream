@@ -7,6 +7,7 @@
 pub mod config;
 pub(crate) mod documents;
 pub mod error;
+pub mod reverse_lookup;
 pub(crate) mod sink;
 
 pub use config::{
@@ -14,4 +15,5 @@ pub use config::{
     MeilisearchTaskConfig,
 };
 pub use error::MeilisearchSinkError;
+pub use reverse_lookup::MeiliReverseLookup;
 pub use sink::MeilisearchSink;
