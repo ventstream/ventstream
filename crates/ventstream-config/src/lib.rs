@@ -108,12 +108,37 @@ pub enum TlsMode {
     Disabled,
 }
 
+/// Managed-mode attachment. An agent key switches the engine into managed
+/// mode: pipeline configuration comes from the control plane, keyed by the
+/// deployment the key identifies.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedConfig {
+    /// Agent key reference, e.g. `env:VS_AGENT_KEY`. Reference form only —
+    /// the file never carries the raw key.
+    pub agent_key_ref: ValueRef,
+    /// Control gateway URL override.
+    #[serde(default)]
+    pub gateway_url: Option<String>,
+    /// Enrollment gateway URL override.
+    #[serde(default)]
+    pub enrollment_url: Option<String>,
+    /// Directory holding the bound agent identity.
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
+}
+
 /// Parsed canonical engine configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EngineConfig {
     /// Schema version. V1 is the only supported version.
     pub schema_version: u64,
+    /// Managed-mode attachment. Mutually exclusive with local pipeline
+    /// sections: a managed engine's pipeline config comes from the
+    /// control plane.
+    #[serde(default)]
+    pub managed: Option<ManagedConfig>,
     /// Roles enabled in this engine process.
     #[serde(default = "default_roles")]
     pub roles: Vec<Role>,
@@ -143,6 +168,32 @@ impl EngineConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.schema_version != SUPPORTED_SCHEMA_VERSION {
             return Err(ConfigError::UnsupportedSchemaVersion(self.schema_version));
+        }
+        if let Some(managed) = &self.managed {
+            // A managed engine's pipeline config comes from the control
+            // plane; local pipeline sections make ownership ambiguous.
+            if self.source.is_some() {
+                return Err(ConfigError::InvalidField(
+                    "managed engines receive pipeline configuration from the \
+                     control plane; remove the local source section",
+                ));
+            }
+            if self.sink.is_some() {
+                return Err(ConfigError::InvalidField(
+                    "managed engines receive pipeline configuration from the \
+                     control plane; remove the local sink section",
+                ));
+            }
+            if self.specs.any_set() {
+                return Err(ConfigError::InvalidField(
+                    "managed engines receive pipeline configuration from the \
+                     control plane; remove the local specs section",
+                ));
+            }
+            managed.validate()?;
+            // Roles and pipeline coupling come from the applied control-plane
+            // configuration, not this file.
+            return Ok(());
         }
         if self.roles.is_empty() {
             return Err(ConfigError::InvalidField("roles must not be empty"));
@@ -2137,7 +2188,35 @@ pub struct SpecFiles {
     pub graphql_manifest: Option<PathBuf>,
 }
 
+impl ManagedConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (field, value) in [
+            ("gateway_url", self.gateway_url.as_deref()),
+            ("enrollment_url", self.enrollment_url.as_deref()),
+        ] {
+            if let Some(url) = value {
+                if !url.starts_with("https://") && !url.starts_with("wss://") {
+                    let _ = field;
+                    return Err(ConfigError::InvalidField(
+                        "managed gateway URLs must use https:// or wss://",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl SpecFiles {
+    /// Whether any spec path is configured.
+    pub fn any_set(&self) -> bool {
+        self.joins.is_some()
+            || self.neo4j_denormalize.is_some()
+            || self.graphql_schema.is_some()
+            || self.graphql_subscriptions.is_some()
+            || self.graphql_manifest.is_some()
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         if [
             self.joins.as_ref(),
@@ -2954,6 +3033,35 @@ fn validate_env_name(name: &str) -> Result<(), ConfigError> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    #[test]
+    fn managed_block_alone_is_valid() {
+        let config = EngineConfig::from_yaml_str(
+            "schema_version: 1\nmanaged:\n  agent_key_ref: env:VS_AGENT_KEY\n",
+        )
+        .expect("managed-only config is valid");
+        assert!(config.managed.is_some());
+    }
+
+    #[test]
+    fn managed_with_local_pipeline_sections_is_rejected() {
+        let with_source = "schema_version: 1\nmanaged:\n  agent_key_ref: env:VS_AGENT_KEY\nroles: [cdc]\nsource:\n  kind: postgres\n  postgres:\n    host: localhost\nsink:\n  kind: opensearch\n  opensearch:\n    endpoint_ref: env:VS_OS_ENDPOINT\n";
+        let err = EngineConfig::from_yaml_str(with_source).expect_err("must reject");
+        assert!(err.to_string().contains("control plane"), "got {err}");
+
+        let with_specs = "schema_version: 1\nmanaged:\n  agent_key_ref: env:VS_AGENT_KEY\nspecs:\n  joins: joins.yaml\n";
+        let err = EngineConfig::from_yaml_str(with_specs).expect_err("must reject");
+        assert!(err.to_string().contains("specs"), "got {err}");
+    }
+
+    #[test]
+    fn managed_gateway_urls_must_be_tls() {
+        let err = EngineConfig::from_yaml_str(
+            "schema_version: 1\nmanaged:\n  agent_key_ref: env:VS_AGENT_KEY\n  gateway_url: http://gateway.example.com\n",
+        )
+        .expect_err("must reject plain http");
+        assert!(err.to_string().contains("https"), "got {err}");
+    }
+
     use super::*;
 
     #[test]

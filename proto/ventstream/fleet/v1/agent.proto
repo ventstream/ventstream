@@ -1,0 +1,252 @@
+syntax = "proto3";
+
+package ventstream.fleet.v1;
+
+import "google/protobuf/timestamp.proto";
+
+service EnrollmentService {
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+  rpc Renew(RenewRequest) returns (RenewResponse);
+}
+
+service AgentControlService {
+  rpc OpenControlStream(stream AgentToServer) returns (stream ServerToAgent);
+}
+
+message EnrollRequest {
+  string enrollment_grant = 1;
+  bytes certificate_signing_request_der = 2;
+  string engine_version = 3;
+  uint32 protocol_major = 4;
+  uint32 protocol_minor = 5;
+}
+
+message EnrollResponse {
+  bytes certificate_chain_pem = 1;
+  bytes trust_bundle_pem = 2;
+  google.protobuf.Timestamp certificate_expires_at = 3;
+  string deployment_id = 4;
+  string certificate_serial = 5;
+}
+
+message RenewRequest {
+  bytes certificate_signing_request_der = 1;
+  string current_certificate_serial = 2;
+}
+
+message RenewResponse {
+  bytes certificate_chain_pem = 1;
+  bytes trust_bundle_pem = 2;
+  google.protobuf.Timestamp certificate_expires_at = 3;
+  string certificate_serial = 4;
+}
+
+message AgentToServer {
+  uint64 sequence = 1;
+  google.protobuf.Timestamp sent_at = 2;
+  string correlation_id = 3;
+  string connection_id = 4;
+  uint32 protocol_major = 5;
+  uint32 protocol_minor = 6;
+  oneof payload {
+    AgentHello hello = 10;
+    AgentStatus status = 11;
+    DesiredStateAcknowledgement desired_state_ack = 12;
+    OperationUpdate operation_update = 13;
+  }
+}
+
+message ServerToAgent {
+  uint64 sequence = 1;
+  google.protobuf.Timestamp sent_at = 2;
+  string correlation_id = 3;
+  string connection_id = 4;
+  uint32 protocol_major = 5;
+  uint32 protocol_minor = 6;
+  oneof payload {
+    ServerHello hello = 10;
+    DesiredState desired_state = 11;
+    Operation operation = 12;
+    CancelOperation cancel_operation = 13;
+  }
+}
+
+message AgentHello {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  uint32 minimum_protocol_minor = 3;
+  string engine_version = 4;
+  string build_digest = 5;
+  string instance_id = 6;
+  string boot_id = 7;
+  repeated string roles = 8;
+  repeated string capabilities = 9;
+  uint64 last_desired_state_revision = 10;
+  uint64 last_configuration_revision = 11;
+  uint64 last_operation_sequence = 12;
+  ObservedRunState observed_run_state = 13;
+  bool local_state_healthy = 14;
+}
+
+message ServerHello {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  google.protobuf.Timestamp server_time = 3;
+  uint32 heartbeat_interval_seconds = 4;
+  uint64 deployment_generation = 5;
+  DesiredState desired_state = 6;
+  repeated string required_capabilities = 7;
+  google.protobuf.Timestamp certificate_rotation_deadline = 8;
+}
+
+enum DesiredRunState {
+  DESIRED_RUN_STATE_UNSPECIFIED = 0;
+  DESIRED_RUN_STATE_RUNNING = 1;
+  DESIRED_RUN_STATE_PAUSED = 2;
+  DESIRED_RUN_STATE_DRAINED = 3;
+}
+
+enum ObservedRunState {
+  OBSERVED_RUN_STATE_UNSPECIFIED = 0;
+  OBSERVED_RUN_STATE_STARTING = 1;
+  OBSERVED_RUN_STATE_BOOTSTRAPPING = 2;
+  OBSERVED_RUN_STATE_RUNNING = 3;
+  OBSERVED_RUN_STATE_PAUSED = 4;
+  OBSERVED_RUN_STATE_DRAINED = 5;
+  OBSERVED_RUN_STATE_ERROR = 6;
+  OBSERVED_RUN_STATE_STOPPED = 7;
+}
+
+message DesiredState {
+  string pipeline_id = 1;
+  string deployment_id = 2;
+  uint64 revision = 3;
+  DesiredRunState run_state = 4;
+  uint64 configuration_revision = 5;
+  google.protobuf.Timestamp changed_at = 6;
+  string changed_by = 7;
+  string reason = 8;
+}
+
+message DesiredStateAcknowledgement {
+  uint64 revision = 1;
+  AcknowledgementResult result = 2;
+  string error_code = 3;
+  string safe_message = 4;
+}
+
+enum AcknowledgementResult {
+  ACKNOWLEDGEMENT_RESULT_UNSPECIFIED = 0;
+  ACKNOWLEDGEMENT_RESULT_ACCEPTED = 1;
+  ACKNOWLEDGEMENT_RESULT_APPLIED = 2;
+  ACKNOWLEDGEMENT_RESULT_STALE = 3;
+  ACKNOWLEDGEMENT_RESULT_REJECTED = 4;
+}
+
+enum OperationKind {
+  OPERATION_KIND_UNSPECIFIED = 0;
+  OPERATION_KIND_CONVERGE_STATE = 1;
+  OPERATION_KIND_VALIDATE_CONFIGURATION = 2;
+  OPERATION_KIND_APPLY_CONFIGURATION = 3;
+  OPERATION_KIND_RECONCILE = 4;
+  OPERATION_KIND_REBOOTSTRAP = 5;
+  OPERATION_KIND_ROTATE_IDENTITY = 6;
+  OPERATION_KIND_COLLECT_DIAGNOSTICS = 7;
+}
+
+enum OperationState {
+  OPERATION_STATE_UNSPECIFIED = 0;
+  OPERATION_STATE_QUEUED = 1;
+  OPERATION_STATE_DELIVERED = 2;
+  OPERATION_STATE_ACKNOWLEDGED = 3;
+  OPERATION_STATE_RUNNING = 4;
+  OPERATION_STATE_SUCCEEDED = 5;
+  OPERATION_STATE_FAILED = 6;
+  OPERATION_STATE_CANCELED = 7;
+  OPERATION_STATE_EXPIRED = 8;
+}
+
+message Operation {
+  string operation_id = 1;
+  OperationKind kind = 2;
+  uint64 operation_sequence = 3;
+  uint64 expected_desired_state_revision = 4;
+  uint64 expected_configuration_revision = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp expires_at = 7;
+  string reason = 8;
+  oneof parameters {
+    ReconcileParameters reconcile = 20;
+    RebootstrapParameters rebootstrap = 21;
+    DiagnosticsParameters diagnostics = 22;
+    ApplyConfigurationParameters apply_configuration = 23;
+  }
+}
+
+message ApplyConfigurationParameters {
+  uint64 configuration_revision = 1;
+  uint64 schema_version = 2;
+  string content_digest = 3;
+  string document_json = 4;
+}
+
+message ReconcileParameters {
+  bool delete_orphans = 1;
+}
+
+message RebootstrapParameters {
+  bool destructive_action_confirmed = 1;
+}
+
+message DiagnosticsParameters {
+  repeated string allowlisted_sections = 1;
+  uint64 maximum_output_bytes = 2;
+}
+
+message OperationUpdate {
+  string operation_id = 1;
+  OperationState state = 2;
+  uint32 progress_percent = 3;
+  string result_code = 4;
+  string safe_message = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message CancelOperation {
+  string operation_id = 1;
+  string reason = 2;
+}
+
+message AgentStatus {
+  string instance_id = 1;
+  string boot_id = 2;
+  ObservedRunState run_state = 3;
+  uint64 desired_state_revision = 4;
+  uint64 configuration_revision = 5;
+  string source_kind = 6;
+  string sink_kind = 7;
+  optional uint64 cursor_age_milliseconds = 8;
+  optional double events_per_second = 9;
+  optional uint64 dlq_writes_total = 10;
+  optional uint64 dlq_write_failures_total = 11;
+  optional uint64 backpressure_total = 12;
+  optional uint64 sink_latency_p95_milliseconds = 13;
+  string active_operation_id = 14;
+  string error_code = 15;
+  string safe_error_message = 16;
+  optional uint64 events_received_total = 17;
+  optional uint64 events_delivered_total = 18;
+  optional double events_delivered_per_second = 19;
+  optional uint64 events_failed_total = 20;
+  optional uint64 sink_retries_total = 21;
+  optional uint64 queue_depth = 22;
+  optional uint64 queue_capacity = 23;
+  optional uint64 active_connections = 24;
+  optional uint64 active_subscriptions = 25;
+  optional uint64 realtime_dropped_total = 26;
+  optional uint64 realtime_terminal_failures_total = 27;
+  optional uint64 last_input_at_unix_milliseconds = 28;
+  optional uint64 last_output_at_unix_milliseconds = 29;
+  optional uint64 realtime_broker_observations_total = 30;
+  optional double realtime_broker_observations_per_second = 31;
+}

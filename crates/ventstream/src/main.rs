@@ -286,8 +286,64 @@ fn main() -> Result<()> {
     } else if fleet_rebootstrap {
         runtime.block_on(run_fleet_rebootstrap())
     } else {
-        runtime.block_on(run(telemetry_handle, early_engine_config))
+        match resolve_managed_mode(early_engine_config.as_ref())? {
+            Some(options) => runtime.block_on(ventstream_managed::run_managed(options)),
+            None => runtime.block_on(run(telemetry_handle, early_engine_config)),
+        }
     }
+}
+
+/// Decides whether this process runs managed. An agent key — from the config
+/// `managed` block or bare `VS_AGENT_KEY` — attaches the engine to the control
+/// plane; no key means standalone with zero platform connections.
+fn resolve_managed_mode(
+    engine_config: Option<&EngineFileConfig>,
+) -> Result<Option<ventstream_managed::ManagedOptions>> {
+    let managed_block = engine_config.and_then(|config| config.managed.as_ref());
+    let env_key = std::env::var("VS_AGENT_KEY")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if managed_block.is_none() && env_key.is_none() {
+        return Ok(None);
+    }
+    if std::env::var("VS_FLEET_SUPERVISED").ok().as_deref() == Some("1") {
+        // The pipeline child of a managed supervisor must never re-enter
+        // managed mode; its staged config carries no key by construction.
+        return Err(anyhow!(
+            "a supervised engine must not carry an agent key; unset VS_AGENT_KEY"
+        ));
+    }
+    let (key, gateway_url, enrollment_url, state_dir) = match managed_block {
+        Some(managed) => (
+            resolve_value_ref(&managed.agent_key_ref).context("resolving managed.agent_key_ref")?,
+            managed.gateway_url.clone(),
+            managed.enrollment_url.clone(),
+            managed.state_dir.clone(),
+        ),
+        // A bare key must not sit beside a local pipeline config file.
+        None => match engine_config {
+            Some(_) => {
+                return Err(anyhow!(
+                    "VS_AGENT_KEY is set but the engine config has no managed section; \
+                     a managed engine's pipeline config comes from the control plane"
+                ));
+            }
+            None => (env_key.unwrap_or_default(), None, None, None),
+        },
+    };
+    let key = key.trim().to_owned();
+    if !key.starts_with("vsa_") {
+        return Err(anyhow!(
+            "the agent key must be a vsa_ key minted from the dashboard or CLI"
+        ));
+    }
+    Ok(Some(ventstream_managed::ManagedOptions {
+        agent_key: key,
+        gateway_url,
+        enrollment_url,
+        state_dir,
+    }))
 }
 
 fn repeated_argument_values(argv: &[String], flag: &str) -> Result<Vec<String>> {
