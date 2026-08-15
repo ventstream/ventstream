@@ -4847,12 +4847,18 @@ fn load_engine_runtime_config(
                  the configured batch size"
             );
         } else {
+            // Cap the automatic raise: bus memory is roughly
+            // capacity x average event size, and a very large configured
+            // batch should not silently commit hundreds of MB. Operators
+            // wanting bigger buffers set runtime.bus_capacity explicitly.
+            const AUTO_RAISE_CAP: usize = 32_768;
+            let raised = max_events.min(AUTO_RAISE_CAP);
             info!(
                 from = bus_capacity,
-                to = max_events,
-                "raising default bus_capacity to hold one full dispatch batch"
+                to = raised,
+                "raising default bus_capacity to hold one dispatch batch (capped)"
             );
-            bus_capacity = max_events;
+            bus_capacity = raised;
         }
     }
     let max_batch_bytes = match dispatch.and_then(|dispatch| dispatch.max_batch_bytes) {
