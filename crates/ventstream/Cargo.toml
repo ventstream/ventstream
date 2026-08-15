@@ -34,6 +34,7 @@ ventstream-graphql = { workspace = true }
 ventstream-joins = { workspace = true }
 ventstream-ws = { workspace = true }
 ventstream-config = { workspace = true }
+ventstream-managed = { workspace = true }
 ventstream-telemetry = { workspace = true }
 serde_yaml = { workspace = true }
 rustls = { workspace = true }

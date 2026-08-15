@@ -1,0 +1,72 @@
+---
+title: "Managed mode"
+description: "One public engine, two modes: an agent key attaches the engine to VentStream Cloud; without one it never talks to the platform."
+---
+
+VentStream ships one public engine artifact for every mode of operation.
+Whether an engine is managed is decided at runtime by the presence of a single
+credential — an agent key minted from the dashboard or CLI — not by which image
+or binary you installed.
+
+## Two modes, one artifact
+
+**Agent key present → managed.** Supply the key either as the `VS_AGENT_KEY`
+environment variable, or in the engine config file by reference:
+
+```yaml
+schema_version: 1
+managed:
+  agent_key_ref: env:VS_AGENT_KEY
+```
+
+The config file never carries the raw key — reference form only, consistent
+with every other credential in `ventstream.yaml`. The engine connects out to
+the Cloud gateway, identifies itself with the key, and from then on fetches the
+selected configuration revision for its deployment, reports health, and
+executes operations.
+
+**No key → standalone.** The engine reads its local `ventstream.yaml` and never
+opens a connection to the platform. This is an invariant, not a default: no
+telemetry, no version checks, nothing.
+
+## The chain of authority
+
+The key identifies a deployment; the deployment belongs to a pipeline; the
+pipeline has a selected configuration revision authored with `ventstreamctl`.
+The key answers "who am I"; the control plane answers "then this is your
+config". Your data never transits the platform in either mode.
+
+## Mode rules
+
+- A managed key alongside local pipeline sections (`source`, `sink`, `specs`)
+  is a hard error at startup that names exactly what to remove. Config
+  ownership is never ambiguous.
+- Key set but the control plane unreachable, or the key revoked: the engine
+  exits nonzero with the reason. It never falls back to local configuration.
+- Key absent: no network path to the platform exists in any code path.
+
+## Keys, not enrollment tokens
+
+Agent keys (`vsa1.` prefix) are minted per deployment, shown once, and
+revocable at any time:
+
+```bash
+ventstreamctl agents key create <deployment> --pipeline <pipeline>
+ventstreamctl agents key list <deployment> --pipeline <pipeline>
+ventstreamctl agents key revoke <deployment> --pipeline <pipeline> --key <id> --confirm
+```
+
+The old one-time enrollment token is retired as a user-facing step. The
+cryptographic enrollment still happens — as an invisible first-connect
+handshake driven by the key: the engine generates a keypair, the gateway binds
+that identity to the key's deployment, and later connects use the bound
+identity over mutual TLS. If the engine loses its state (a pod rescheduled
+without its volume), the key simply re-binds a fresh identity and the dashboard
+records the rotation for audit. Minting a new key revokes the previous one, so
+rotation is one command plus a secret update.
+
+## Migration
+
+Existing managed agents that enrolled with a one-time token keep working
+through the deprecation window. To move a deployment to the key flow, see
+[Managed agent on Kubernetes](/deploy/kubernetes-managed-engine#migrating-from-enrollment-tokens).

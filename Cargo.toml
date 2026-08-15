@@ -14,6 +14,9 @@ members = [
     "crates/ventstream-config",
     "crates/ventstream-telemetry",
     "crates/ventstream",
+    "crates/ventstream-fleet-protocol",
+    "crates/ventstream-fleet-client",
+    "crates/ventstream-managed",
 ]
 
 [workspace.package]
@@ -30,7 +33,7 @@ readme = "README.md"
 # workspace and Renovate/Dependabot only has one place to bump.
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.41", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "io-util", "net", "fs"] }
+tokio = { version = "1.41", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "io-util", "net", "fs", "process"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = "0.29"
 
@@ -178,6 +181,23 @@ ventstream-telemetry = { version = "0.1.19", path = "crates/ventstream-telemetry
 
 # YAML config parsing (will land alongside the join engine)
 serde_yaml = "0.9"
+
+# Fleet managed-mode client (gRPC control channel to the platform gateway)
+ventstream-fleet-protocol = { version = "0.1.22", path = "crates/ventstream-fleet-protocol" }
+ventstream-fleet-client = { version = "0.1.22", path = "crates/ventstream-fleet-client" }
+ventstream-managed = { version = "0.1.22", path = "crates/ventstream-managed" }
+tonic = { version = "0.14", features = ["transport", "tls-ring", "tls-webpki-roots"] }
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+tokio-stream = { version = "0.1", features = ["net"] }
+rustls-pki-types = "1.14"
+x509-parser = "0.18.1"
+rcgen = { version = "0.14.8", features = ["x509-parser"] }
+rand = "0.8"
+uuid = { version = "1.23", features = ["serde", "v7"] }
+zeroize = { version = "1.8", features = ["derive"] }
+
 
 # Lints applied to every crate in the workspace. Per-crate Cargo.toml files
 # inherit these via `[lints] workspace = true`.

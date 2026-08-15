@@ -1,0 +1,31 @@
+[package]
+name = "ventstream-managed"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+ventstream-fleet-protocol.workspace = true
+ventstream-fleet-client.workspace = true
+prost-types.workspace = true
+rcgen.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+x509-parser.workspace = true
+
+[lints]
+workspace = true
