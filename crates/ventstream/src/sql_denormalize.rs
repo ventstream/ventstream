@@ -269,11 +269,8 @@ struct PreparedDef {
 }
 
 impl PreparedDef {
-    /// `SELECT <pk::text>…, (<doc>)::text AS doc FROM <primary> p`
-    ///
-    /// The doc is selected as text: the engine never inspects the composed
-    /// document, so the bytes go straight into the event payload without a
-    /// serde_json parse + reserialize per row (a measured bootstrap tax).
+    /// `SELECT <pk::text>…, (<doc>)::text AS doc FROM <primary> p` — text
+    /// so the bytes go straight into the payload, no parse/reserialize.
     fn select_head(&self) -> String {
         format!(
             "SELECT {pk}, ({doc})::text AS doc FROM {table} p",
@@ -463,10 +460,8 @@ impl SqlDenormalizer {
             let page_last: Vec<String> =
                 (0..n_pk).map(|i| last_row.get::<_, String>(i)).collect();
 
-            // Prefetch: the next chunk's query runs on the connection while
-            // this chunk's rows emit to the bus — the tokio_postgres driver
-            // task makes IO progress independently, so join! overlaps the
-            // fetch round-trip with emit instead of alternating them.
+            // Prefetch: the next chunk's query overlaps this chunk's emit
+            // (the tokio_postgres driver task progresses IO independently).
             let fetch_next = async {
                 if full_page {
                     Some(self.fetch_chunk(pd, Some(&page_last)).await)
@@ -506,10 +501,8 @@ impl SqlDenormalizer {
         }
     }
 
-    /// One keyset-paginated projection chunk: rows after `last` (exclusive)
-    /// in PK order, at most `chunk_size`. The `doc` column arrives as text so
-    /// emit can move the bytes straight into the payload without a JSON
-    /// parse/serialize round-trip.
+    /// One keyset-paginated projection chunk after `last`, PK order. The
+    /// doc column arrives as text and moves straight into the payload.
     async fn fetch_chunk(
         &self,
         pd: &PreparedDef,

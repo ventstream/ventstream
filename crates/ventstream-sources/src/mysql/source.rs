@@ -287,10 +287,8 @@ impl MySqlCdcSource {
             let qualified = format!("`{}`.`{}`", esc(&self.config.database), esc(&table));
             let limit = self.config.bootstrap_chunk_size.max(1);
 
-            // Prefetch double-buffer: the next chunk's SELECT runs on its own
-            // pooled connection while the current chunk emits to the bus, so
-            // fetch round-trips leave the critical path (same shape as the
-            // Postgres SQL-denormalize bootstrap).
+            // Prefetch: the next chunk's SELECT runs on its own pooled
+            // connection while the current chunk emits.
             let mut rows =
                 fetch_bootstrap_chunk(pool, &qualified, &order, limit, None).await?;
             loop {

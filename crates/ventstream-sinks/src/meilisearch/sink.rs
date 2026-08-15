@@ -1,14 +1,9 @@
 //! The Meilisearch sink: pipelined runs, asynchronous task confirmation.
 //!
-//! Meilisearch acknowledges writes with a `taskUid` and indexes later, so
-//! delivery is only durable once the task reaches a terminal status. A
-//! batch's runs are enqueued sequentially without waiting on each task —
-//! Meilisearch's task queue is FIFO and auto-batches consecutive
-//! compatible tasks, so enqueue order alone preserves per-document order
-//! while indexing pipelines — then confirmed oldest-first. Meilisearch
-//! has no external document versioning, so the sink still pins write
-//! concurrency to 1 across dispatcher batches; the pipelining lives
-//! *inside* one batch, where run order is under this sink's control.
+//! Delivery is durable once a task reaches terminal status. Runs are
+//! enqueued sequentially without waiting (Meilisearch's task queue is
+//! FIFO, so enqueue order preserves per-document order), then confirmed
+//! oldest-first. Cross-batch concurrency stays pinned to 1.
 
 use std::time::{Duration, Instant};
 
@@ -330,10 +325,8 @@ impl MeilisearchSink {
         }
     }
 
-    /// Enqueue one run's API call, retrying transport-level failures with
-    /// backoff. Order-safe by construction: callers only invoke this before
-    /// any *later* run has been enqueued, so a retried POST cannot leapfrog
-    /// newer work for the same document.
+    /// Enqueue one run with backoff on transport failures. Only called
+    /// before any later run is enqueued, so retries cannot reorder.
     async fn enqueue_run(&self, run: &Run) -> Result<u64, MeilisearchSinkError> {
         let (method, path, body) = match &run.kind {
             RunKind::Upsert(documents) => (
@@ -381,20 +374,11 @@ impl MeilisearchSink {
         }
     }
 
-    /// Pipelined execution of a batch's runs.
-    ///
-    /// Phase 1 enqueues every outstanding run in order without waiting for
-    /// task completion — Meilisearch's task queue is FIFO and auto-batches
-    /// consecutive compatible tasks, so sequential enqueue preserves
-    /// per-document ordering while indexing pipelines. Phase 2 confirms
-    /// tasks oldest-first; once the head task is terminal the later ones
-    /// usually are too, so confirmation degenerates to one poll wait plus
-    /// cheap single GETs.
-    ///
-    /// On a retryable failure at run K the whole ordered tail K.. is
-    /// re-enqueued. Replaying later runs that already succeeded is safe
-    /// (identical idempotent operations, relative order preserved), whereas
-    /// re-posting only K would reorder it past K+1 for shared documents.
+    /// Pipelined runs: enqueue all in order (FIFO queue preserves
+    /// per-document order), then confirm oldest-first. On a retryable
+    /// failure at run K the ordered tail K.. is re-enqueued — replaying
+    /// succeeded runs is idempotent; re-posting only K would reorder it
+    /// past K+1 for shared documents.
     async fn execute_runs(&self, runs: &[Run]) -> Result<(), MeilisearchSinkError> {
         if runs.is_empty() {
             return Ok(());

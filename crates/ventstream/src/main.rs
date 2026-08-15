@@ -4832,11 +4832,9 @@ fn load_engine_runtime_config(
         Some(value) => value,
         None => opt_usize("VS_DISPATCH_MAX_EVENTS", 2_000)?,
     };
-    // The bus caps how many events can sit between source and dispatcher,
-    // so a bus smaller than one dispatch batch silently shrinks every sink
-    // request to bus_capacity events — a large, invisible throughput tax
-    // (measured 100x on Meilisearch bulk loads). The default bus grows to
-    // hold one full batch; an explicit bus is honored but called out.
+    // A bus smaller than one dispatch batch silently caps every sink
+    // request at bus_capacity events. The default grows to one batch;
+    // an explicit bus is honored but warned about.
     if bus_capacity < max_events {
         if bus_explicit {
             warn!(
@@ -4847,10 +4845,8 @@ fn load_engine_runtime_config(
                  the configured batch size"
             );
         } else {
-            // Cap the automatic raise: bus memory is roughly
-            // capacity x average event size, and a very large configured
-            // batch should not silently commit hundreds of MB. Operators
-            // wanting bigger buffers set runtime.bus_capacity explicitly.
+            // Bus memory ~ capacity x event size; cap the automatic raise
+            // so large batches don't silently commit hundreds of MB.
             const AUTO_RAISE_CAP: usize = 32_768;
             let raised = max_events.min(AUTO_RAISE_CAP);
             info!(
