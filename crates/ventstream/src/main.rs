@@ -293,6 +293,20 @@ fn main() -> Result<()> {
     }
 }
 
+fn managed_url_env(name: &str) -> Result<Option<String>> {
+    let Some(value) = std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if !value.starts_with("https://") && !value.starts_with("wss://") {
+        return Err(anyhow!("{name} must use https:// or wss://"));
+    }
+    Ok(Some(value))
+}
+
 /// Decides whether this process runs managed. An agent key — from the config
 /// `managed` block or bare `VS_AGENT_KEY` — attaches the engine to the control
 /// plane; no key means standalone with zero platform connections.
@@ -329,7 +343,15 @@ fn resolve_managed_mode(
                      a managed engine's pipeline config comes from the control plane"
                 ));
             }
-            None => (env_key.unwrap_or_default(), None, None, None),
+            None => (
+                env_key.unwrap_or_default(),
+                managed_url_env("VS_MANAGED_GATEWAY_URL")?,
+                managed_url_env("VS_MANAGED_ENROLLMENT_URL")?,
+                std::env::var("VS_MANAGED_STATE_DIR")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(PathBuf::from),
+            ),
         },
     };
     let key = key.trim().to_owned();

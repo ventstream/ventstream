@@ -103,7 +103,7 @@ The selected revision becomes the pipeline's active desired configuration. A new
 agent receives it when enrollment completes; no configuration file is baked into
 the container image.
 
-## 3. Create connector and enrollment Secrets
+## 3. Create connector and agent-key Secrets
 
 Create a namespace and a Secret containing only the environment variables
 referenced by the managed configuration:
@@ -115,51 +115,44 @@ kubectl -n ventstream-workloads create secret generic orders-engine-secrets \
   --from-env-file=./orders-engine.env
 ```
 
-Generate a short-lived, single-use enrollment grant directly into Kubernetes:
+Mint the deployment's agent key directly into Kubernetes. The key is shown
+once; minting a new key revokes the previous one:
 
 ```bash
-ventstreamctl agents enroll-token create orders-primary \
+ventstreamctl agents key create orders-primary \
   --pipeline orders-cdc | \
-kubectl -n ventstream-workloads create secret generic orders-enrollment \
-  --from-file=grant=/dev/stdin
+kubectl -n ventstream-workloads create secret generic orders-agent-key \
+  --from-file=key=/dev/stdin
 ```
 
-Do not store the grant in source control, CI logs, or a Helm values file.
+Do not store the key in source control, CI logs, or a Helm values file. If the
+key leaks, revoke it (`ventstreamctl agents key revoke`) and mint a new one —
+the running agent picks up the replacement through the mounted Secret.
 
-## 4. Generate the deployment values
+## 4. Install the public engine with the key
 
-Ask VentStream Cloud for the approved chart, managed image digest, gateway
-addresses, trust mode, pipeline ID, and deployment ID:
-
-```bash
-ventstreamctl agents manifest orders-primary \
-  --pipeline orders-cdc \
-  --target helm \
-  --engine-secret orders-engine-secrets \
-  --enrollment-secret orders-enrollment \
-  --output orders-primary.values.yaml
-```
-
-The generated file contains no credentials or enrollment grant. It pins the
-managed image by digest and names the existing Kubernetes Secrets. Its header
-contains the chart URL, chart version, and suggested Helm release name.
-
-Review the file in deployment automation, then install it using those header
-values:
+A managed engine is the same public image everyone runs — the agent key is what
+attaches it to VentStream Cloud. Install the chart with the key Secret:
 
 ```bash
 helm upgrade --install orders-primary \
-  <chart-url-from-generated-header> \
-  --version <chart-version-from-generated-header> \
+  oci://ghcr.io/ventstream/charts/ventstream-managed-agent \
   --namespace ventstream-workloads \
   --create-namespace \
-  --values orders-primary.values.yaml
+  --set image.repository=ghcr.io/ventstream/ventstream \
+  --set image.tag=<engine-version> \
+  --set fleet.agentKey.secret=orders-agent-key \
+  --set engine.envFromSecret=orders-engine-secrets
 ```
 
+The key identifies the deployment, so no pipeline ID, deployment ID, or gateway
+URL values are required. On first start the engine performs an invisible
+enrollment handshake with the key and from then on follows the pipeline's
+selected configuration revision. If the pod loses its state volume, the key
+simply re-binds a fresh identity; the dashboard records the rotation.
+
 Cloud gateways use public WebPKI trust by default, so customers do not need to
-exchange a CA file. If a workspace is intentionally configured with private
-gateway trust, `ventstreamctl agents manifest` requires the corresponding
-Kubernetes trust Secret explicitly.
+exchange a CA file.
 
 ## 5. Verify and start
 
@@ -222,3 +215,25 @@ ventstreamctl pipelines drain orders-cdc \
 Do not delete the workload PVC during routine upgrades. It contains managed
 identity, cached desired state, applied configuration, connector cursors, and
 join state.
+
+## Migrating from enrollment tokens
+
+Existing deployments installed with a one-time enrollment grant keep working
+through the deprecation window. To migrate, mint an agent key for the
+deployment, replace the enrollment Secret with the key Secret, and switch the
+release to the public image in one upgrade:
+
+```bash
+ventstreamctl agents key create orders-primary --pipeline orders-cdc | \
+kubectl -n ventstream-workloads create secret generic orders-agent-key \
+  --from-file=key=/dev/stdin
+
+helm upgrade orders-primary \
+  oci://ghcr.io/ventstream/charts/ventstream-managed-agent \
+  --namespace ventstream-workloads \
+  --reuse-values \
+  --set image.repository=ghcr.io/ventstream/ventstream \
+  --set image.tag=<engine-version> \
+  --set fleet.agentKey.secret=orders-agent-key \
+  --set fleet.enrollment.enabled=false
+```
