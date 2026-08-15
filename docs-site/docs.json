@@ -36,6 +36,7 @@
           {
             "group": "Concepts",
             "pages": [
+              "concepts/managed-mode",
               "concepts/cdc-and-projections",
               "concepts/lifecycle-phases",
               "concepts/pause-resume-drain",
