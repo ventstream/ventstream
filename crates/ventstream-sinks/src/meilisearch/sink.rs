@@ -1,10 +1,9 @@
-//! The Meilisearch sink: sequential runs, asynchronous task confirmation.
+//! The Meilisearch sink: pipelined runs, asynchronous task confirmation.
 //!
-//! Meilisearch acknowledges writes with a `taskUid` and indexes later, so
-//! delivery is only durable once the task reaches a terminal status. Every
-//! run therefore enqueues, then polls its task to `succeeded` before the
-//! next run starts. Meilisearch has no external document versioning, so
-//! the sink pins write concurrency to 1 to preserve per-document order.
+//! Delivery is durable once a task reaches terminal status. Runs are
+//! enqueued sequentially without waiting (Meilisearch's task queue is
+//! FIFO, so enqueue order preserves per-document order), then confirmed
+//! oldest-first. Cross-batch concurrency stays pinned to 1.
 
 use std::time::{Duration, Instant};
 
@@ -326,27 +325,34 @@ impl MeilisearchSink {
         }
     }
 
-    /// Execute one run to task completion, retrying transient failures.
-    async fn execute_run(&self, run: &Run) -> Result<(), MeilisearchSinkError> {
+    /// Enqueue one run with backoff on transport failures. Only called
+    /// before any later run is enqueued, so retries cannot reorder.
+    async fn enqueue_run(&self, run: &Run) -> Result<u64, MeilisearchSinkError> {
+        let (method, path, body) = match &run.kind {
+            RunKind::Upsert(documents) => (
+                reqwest::Method::POST,
+                format!(
+                    "/indexes/{}/documents?primaryKey={}",
+                    run.index_uid, self.config.primary_key_field
+                ),
+                Some(serde_json::json!(documents)),
+            ),
+            RunKind::Delete(primary_keys) => (
+                reqwest::Method::POST,
+                format!("/indexes/{}/documents/delete-batch", run.index_uid),
+                Some(serde_json::json!(primary_keys)),
+            ),
+            RunKind::Truncate => (
+                reqwest::Method::DELETE,
+                format!("/indexes/{}/documents", run.index_uid),
+                None,
+            ),
+        };
         let mut schedule = BackoffSchedule::new(self.config.retry);
-        let mut transient_failure: Option<SinkFailureGuard> = None;
         loop {
-            let attempt = self.execute_run_once(run).await;
-            match attempt {
-                Ok(()) => {
-                    if transient_failure.take().is_some() {
-                        ventstream_telemetry::mark_sink_available();
-                    }
-                    return Ok(());
-                }
+            match self.enqueue(method.clone(), &path, body.clone()).await {
+                Ok(task_uid) => return Ok(task_uid),
                 Err(err) if err.is_retryable() => {
-                    if transient_failure.is_none() {
-                        transient_failure = Some(
-                            self.delivery_health
-                                .begin_transient_failure(err.to_string()),
-                        );
-                        ventstream_telemetry::mark_sink_unavailable();
-                    }
                     let Some(base_delay) = schedule.next() else {
                         return Err(err);
                     };
@@ -354,15 +360,12 @@ impl MeilisearchSink {
                         .retry_after()
                         .unwrap_or_else(|| jittered_delay(base_delay))
                         .min(self.config.retry.max_backoff);
-                    ventstream_telemetry::bump_sink_retries(
-                        u64::try_from(run.offsets.len()).unwrap_or(u64::MAX),
-                    );
                     debug!(
                         sink_id = %self.config.id,
                         attempt = schedule.attempts_so_far(),
                         ?delay,
                         error = %err,
-                        "meilisearch run failed; retrying after backoff"
+                        "meilisearch enqueue failed; retrying after backoff"
                     );
                     tokio::time::sleep(delay).await;
                 }
@@ -371,40 +374,85 @@ impl MeilisearchSink {
         }
     }
 
-    async fn execute_run_once(&self, run: &Run) -> Result<(), MeilisearchSinkError> {
-        let (task_uid, tolerate_missing_index) = match &run.kind {
-            RunKind::Upsert(documents) => {
-                let path = format!(
-                    "/indexes/{}/documents?primaryKey={}",
-                    run.index_uid, self.config.primary_key_field
+    /// Pipelined runs: enqueue all in order (FIFO queue preserves
+    /// per-document order), then confirm oldest-first. On a retryable
+    /// failure at run K the ordered tail K.. is re-enqueued — replaying
+    /// succeeded runs is idempotent; re-posting only K would reorder it
+    /// past K+1 for shared documents.
+    async fn execute_runs(&self, runs: &[Run]) -> Result<(), MeilisearchSinkError> {
+        if runs.is_empty() {
+            return Ok(());
+        }
+        let mut restart_schedule = BackoffSchedule::new(self.config.retry);
+        let mut transient_failure: Option<SinkFailureGuard> = None;
+        let mut from = 0usize;
+        loop {
+            // Phase 1: enqueue runs[from..] sequentially.
+            let mut enqueued: Vec<(usize, u64)> = Vec::with_capacity(runs.len() - from);
+            let mut enqueue_failure: Option<(usize, MeilisearchSinkError)> = None;
+            for (idx, run) in runs.iter().enumerate().skip(from) {
+                match self.enqueue_run(run).await {
+                    Ok(task_uid) => enqueued.push((idx, task_uid)),
+                    Err(err) => {
+                        enqueue_failure = Some((idx, err));
+                        break;
+                    }
+                }
+            }
+            // Phase 2: confirm in enqueue order. A confirmation failure is
+            // always earlier in run order than any enqueue failure, so it
+            // wins the restart point.
+            let mut confirm_failure: Option<(usize, MeilisearchSinkError)> = None;
+            for (idx, task_uid) in &enqueued {
+                let tolerate_missing_index = runs
+                    .get(*idx)
+                    .is_some_and(|run| !matches!(run.kind, RunKind::Upsert(_)));
+                if let Err(err) = self.await_task(*task_uid, tolerate_missing_index).await {
+                    confirm_failure = Some((*idx, err));
+                    break;
+                }
+            }
+            let (idx, err) = match confirm_failure.or(enqueue_failure) {
+                None => {
+                    if transient_failure.take().is_some() {
+                        ventstream_telemetry::mark_sink_available();
+                    }
+                    return Ok(());
+                }
+                Some(found) => found,
+            };
+            if !err.is_retryable() {
+                return Err(err);
+            }
+            if transient_failure.is_none() {
+                transient_failure = Some(
+                    self.delivery_health
+                        .begin_transient_failure(err.to_string()),
                 );
-                let task = self
-                    .enqueue(
-                        reqwest::Method::POST,
-                        &path,
-                        Some(serde_json::json!(documents)),
-                    )
-                    .await?;
-                (task, false)
+                ventstream_telemetry::mark_sink_unavailable();
             }
-            RunKind::Delete(primary_keys) => {
-                let path = format!("/indexes/{}/documents/delete-batch", run.index_uid);
-                let task = self
-                    .enqueue(
-                        reqwest::Method::POST,
-                        &path,
-                        Some(serde_json::json!(primary_keys)),
-                    )
-                    .await?;
-                (task, true)
-            }
-            RunKind::Truncate => {
-                let path = format!("/indexes/{}/documents", run.index_uid);
-                let task = self.enqueue(reqwest::Method::DELETE, &path, None).await?;
-                (task, true)
-            }
-        };
-        self.await_task(task_uid, tolerate_missing_index).await
+            let Some(base_delay) = restart_schedule.next() else {
+                return Err(err);
+            };
+            let delay = err
+                .retry_after()
+                .unwrap_or_else(|| jittered_delay(base_delay))
+                .min(self.config.retry.max_backoff);
+            let retried_events: usize = runs.iter().skip(idx).map(|run| run.offsets.len()).sum();
+            ventstream_telemetry::bump_sink_retries(
+                u64::try_from(retried_events).unwrap_or(u64::MAX),
+            );
+            debug!(
+                sink_id = %self.config.id,
+                restart_from = idx,
+                attempt = restart_schedule.attempts_so_far(),
+                ?delay,
+                error = %err,
+                "meilisearch run failed; re-enqueueing ordered tail after backoff"
+            );
+            tokio::time::sleep(delay).await;
+            from = idx;
+        }
     }
 
     fn mark_blocked(&self, error: &MeilisearchSinkError) {
@@ -487,8 +535,8 @@ impl Sink for MeilisearchSink {
         }
         let translated = translate_batch(&self.config, events);
 
-        for run in &translated.runs {
-            if let Err(err) = self.execute_run(run).await {
+        {
+            if let Err(err) = self.execute_runs(&translated.runs).await {
                 if matches!(
                     err,
                     MeilisearchSinkError::Auth { .. }
@@ -735,6 +783,55 @@ mod tests {
         )]);
         let err = sink.write(batch).await.expect_err("must fail");
         assert!(matches!(err, SinkError::Connection(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn transient_failure_re_enqueues_ordered_tail() {
+        // Two runs (max_docs=1). Run 0's task fails transiently once; the
+        // pipelined executor must re-enqueue BOTH runs in order — replaying
+        // the already-enqueued run 1 rather than re-posting run 0 behind it.
+        let server = MockServer::start().await;
+        for uid in [21u64, 22, 23, 24] {
+            Mock::given(method("POST"))
+                .and(path("/indexes/vs_orders/documents"))
+                .respond_with(enqueue_response(uid))
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/tasks/21"))
+            .respond_with(failed_task_response(21, "task_queue_full"))
+            .mount(&server)
+            .await;
+        for uid in [23u64, 24] {
+            Mock::given(method("GET"))
+                .and(path(format!("/tasks/{uid}")))
+                .respond_with(task_response(uid, "succeeded"))
+                .mount(&server)
+                .await;
+        }
+
+        let mut config = MeilisearchConfig::new("test-meili", server.uri());
+        config.batching.max_docs = 1;
+        config.retry = RetryConfig {
+            max_attempts: 3,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(5),
+            backoff_factor: 2.0,
+        };
+        config.task = MeilisearchTaskConfig {
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(5),
+            deadline: Duration::from_secs(5),
+        };
+        let sink = MeilisearchSink::new(config).expect("sink");
+        let batch = SinkBatch::new(vec![
+            upsert_event("orders", r#"orders:["1"]"#, r#"{"id":1}"#),
+            upsert_event("orders", r#"orders:["2"]"#, r#"{"id":2}"#),
+        ]);
+        sink.write(batch).await.expect("tail restart succeeds");
     }
 
     #[tokio::test]

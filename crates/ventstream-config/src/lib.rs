@@ -1047,7 +1047,7 @@ pub struct MeilisearchSinkConfig {
 
 impl MeilisearchSinkConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        const MAX_BATCH_DOCS: usize = 50_000;
+        const MAX_BATCH_DOCS: usize = 250_000;
         const MAX_BATCH_BYTES: usize = 96 * 1024 * 1024;
         const MAX_TASK_DEADLINE_MS: u64 = 3_600_000;
         const MAX_REQUEST_TIMEOUT_MS: u64 = 600_000;
@@ -1075,7 +1075,7 @@ impl MeilisearchSinkConfig {
         }
         if matches!(self.max_batch_docs, Some(v) if v == 0 || v > MAX_BATCH_DOCS) {
             return Err(ConfigError::InvalidField(
-                "sink.meilisearch.max_batch_docs must be between 1 and 50000",
+                "sink.meilisearch.max_batch_docs must be between 1 and 250000",
             ));
         }
         if matches!(self.max_batch_bytes, Some(v) if v == 0 || v > MAX_BATCH_BYTES) {

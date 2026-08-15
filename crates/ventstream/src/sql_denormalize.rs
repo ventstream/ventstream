@@ -34,7 +34,9 @@ use ventstream_core::{
 };
 use ventstream_joins::config::{BackfillConfig, StateConfig, TargetConfig};
 use ventstream_joins::{Cardinality, JoinDefinition, PkSpec, PrimaryRef, RelatedDefinition};
-use ventstream_sinks::opensearch::{index_template, OpenSearchConfig, OsReverseLookup};
+#[cfg(test)]
+use ventstream_sinks::opensearch::index_template;
+use ventstream_sinks::ReverseLookup;
 use ventstream_sources::postgres::{connect_client, PostgresCdcConfig};
 
 /// Greedy-drain ceiling for the tail loop. `recv_batch` returns one event
@@ -268,10 +270,11 @@ struct PreparedDef {
 }
 
 impl PreparedDef {
-    /// `SELECT <pk::text>…, (<doc>) AS doc FROM <primary> p`
+    /// `SELECT <pk::text>…, (<doc>)::text AS doc FROM <primary> p` — text
+    /// so the bytes go straight into the payload, no parse/reserialize.
     fn select_head(&self) -> String {
         format!(
-            "SELECT {pk}, ({doc}) AS doc FROM {table} p",
+            "SELECT {pk}, ({doc})::text AS doc FROM {table} p",
             pk = self.pk_text_select,
             doc = self.doc,
             table = quote_qualified(&self.primary_table),
@@ -294,7 +297,7 @@ pub struct SqlDenormalizer {
     /// instead set `REPLICA IDENTITY FULL`/`USING INDEX` on the child table).
     /// Holds a pooled HTTP client so a stream of child deletes reuses
     /// connections rather than handshaking per lookup.
-    sink_lookup: Option<OsReverseLookup>,
+    sink_lookup: Option<ReverseLookup>,
 }
 
 impl SqlDenormalizer {
@@ -416,15 +419,8 @@ impl SqlDenormalizer {
     /// — there's no resident FK cache, just an on-demand query, and the HTTP
     /// client is pooled across lookups.
     #[must_use]
-    pub fn with_reverse_lookup(mut self, os: OpenSearchConfig) -> Self {
-        match OsReverseLookup::new(os) {
-            Ok(lookup) => self.sink_lookup = Some(lookup),
-            Err(err) => warn!(
-                error = %err,
-                "reverse-lookup disabled: failed to build OpenSearch client; \
-                 1:many child deletes will need REPLICA IDENTITY FULL/USING INDEX"
-            ),
-        }
+    pub fn with_reverse_lookup(mut self, lookup: ReverseLookup) -> Self {
+        self.sink_lookup = Some(lookup);
         self
     }
 
@@ -452,72 +448,93 @@ impl SqlDenormalizer {
         shutdown: &ShutdownToken,
     ) -> Result<u64> {
         let mut emitted = 0u64;
-        let mut last: Option<Vec<String>> = None;
+        let mut rows = self.fetch_chunk(pd, None).await?;
         loop {
-            if shutdown.is_cancelled() {
-                return Ok(emitted);
-            }
-            let order = pd.pk_cols.join(", ");
-            let (where_clause, params): (String, Vec<String>) = match &last {
-                None => (String::new(), Vec::new()),
-                Some(vals) => {
-                    let lhs = pd.pk_cols.join(", ");
-                    let rhs = pd
-                        .pk_types
-                        .iter()
-                        .enumerate()
-                        .map(|(i, t)| format!("${}::text::{}", i + 1, t))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    (format!("WHERE ({lhs}) > ({rhs}) "), vals.clone())
-                }
-            };
-            let sql = format!(
-                "{head} {where_clause}ORDER BY {order} LIMIT {limit}",
-                head = pd.select_head(),
-                limit = self.chunk_size,
-            );
-            let bind: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-                .iter()
-                .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
-                .collect();
-            let rows = self
-                .client
-                .query(&sql, &bind)
-                .await
-                .with_context(|| format!("full projection select for {}", pd.primary_table))?;
-            if rows.is_empty() {
+            if shutdown.is_cancelled() || rows.is_empty() {
                 return Ok(emitted);
             }
             let n_pk = pd.def.primary.pk.columns().len();
-            let mut page_last: Option<Vec<String>> = None;
-            for row in &rows {
-                let pk_text: Vec<String> = (0..n_pk).map(|i| row.get::<_, String>(i)).collect();
-                let doc: Value = row.get(n_pk);
-                let event = build_doc_event(
-                    &pd.primary_table,
-                    pd.def.target_index(),
-                    &pk_text,
-                    &doc,
-                    false,
-                    lsn,
-                )?;
-                sender
-                    .send(event, shutdown)
-                    .await
-                    .map_err(|err| anyhow::anyhow!("emitting full projection row: {err}"))?;
-                ventstream_telemetry::bump_events_emitted(1);
-                emitted = emitted.saturating_add(1);
-                page_last = Some(pk_text);
-            }
-            if (rows.len() as i64) < self.chunk_size {
+            let full_page = rows.len() as i64 >= self.chunk_size;
+            let Some(last_row) = rows.last() else {
                 return Ok(emitted);
-            }
-            match page_last {
-                Some(page_last) => last = Some(page_last),
+            };
+            let page_last: Vec<String> = (0..n_pk).map(|i| last_row.get::<_, String>(i)).collect();
+
+            // Prefetch: the next chunk's query overlaps this chunk's emit
+            // (the tokio_postgres driver task progresses IO independently).
+            let fetch_next = async {
+                if full_page {
+                    Some(self.fetch_chunk(pd, Some(&page_last)).await)
+                } else {
+                    None
+                }
+            };
+            let emit_chunk = async {
+                let mut sent = 0u64;
+                for row in &rows {
+                    let pk_text: Vec<String> = (0..n_pk).map(|i| row.get::<_, String>(i)).collect();
+                    let doc: String = row.get(n_pk);
+                    let event = build_doc_event(
+                        &pd.primary_table,
+                        pd.def.target_index(),
+                        &pk_text,
+                        Some(&doc),
+                        false,
+                        lsn,
+                    )?;
+                    sender
+                        .send(event, shutdown)
+                        .await
+                        .map_err(|err| anyhow::anyhow!("emitting full projection row: {err}"))?;
+                    ventstream_telemetry::bump_events_emitted(1);
+                    sent = sent.saturating_add(1);
+                }
+                Ok::<u64, anyhow::Error>(sent)
+            };
+            let (emit_result, next) = tokio::join!(emit_chunk, fetch_next);
+            emitted = emitted.saturating_add(emit_result?);
+            match next {
+                Some(fetched) => rows = fetched?,
                 None => return Ok(emitted),
             }
         }
+    }
+
+    /// One keyset-paginated projection chunk after `last`, PK order. The
+    /// doc column arrives as text and moves straight into the payload.
+    async fn fetch_chunk(
+        &self,
+        pd: &PreparedDef,
+        last: Option<&[String]>,
+    ) -> Result<Vec<tokio_postgres::Row>> {
+        let order = pd.pk_cols.join(", ");
+        let (where_clause, params): (String, Vec<String>) = match last {
+            None => (String::new(), Vec::new()),
+            Some(vals) => {
+                let lhs = pd.pk_cols.join(", ");
+                let rhs = pd
+                    .pk_types
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| format!("${}::text::{}", i + 1, t))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (format!("WHERE ({lhs}) > ({rhs}) "), vals.to_vec())
+            }
+        };
+        let sql = format!(
+            "{head} {where_clause}ORDER BY {order} LIMIT {limit}",
+            head = pd.select_head(),
+            limit = self.chunk_size,
+        );
+        let bind: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        self.client
+            .query(&sql, &bind)
+            .await
+            .with_context(|| format!("full projection select for {}", pd.primary_table))
     }
 
     /// Recompose a set of primary keys for one definition and emit docs.
@@ -559,12 +576,12 @@ impl SqlDenormalizer {
                 .with_context(|| format!("recompose for {}", pd.primary_table))?;
             for row in &rows {
                 let pk_text: Vec<String> = (0..n_pk).map(|i| row.get::<_, String>(i)).collect();
-                let doc: Value = row.get(n_pk);
+                let doc: String = row.get(n_pk);
                 let event = build_doc_event(
                     &pd.primary_table,
                     pd.def.target_index(),
                     &pk_text,
-                    &doc,
+                    Some(&doc),
                     false,
                     lsn,
                 )?;
@@ -593,12 +610,12 @@ impl SqlDenormalizer {
                 let rows = self.client.query(&sql, &bind).await?;
                 for row in &rows {
                     let pk_text: Vec<String> = (0..n_pk).map(|i| row.get::<_, String>(i)).collect();
-                    let doc: Value = row.get(n_pk);
+                    let doc: String = row.get(n_pk);
                     let event = build_doc_event(
                         &pd.primary_table,
                         pd.def.target_index(),
                         &pk_text,
-                        &doc,
+                        Some(&doc),
                         false,
                         lsn,
                     )?;
@@ -828,7 +845,7 @@ impl SqlDenormalizer {
                     &pd.primary_table,
                     pd.def.target_index(),
                     pk,
-                    &Value::Null,
+                    None,
                     true,
                     batch_lsn,
                 )?;
@@ -990,17 +1007,17 @@ impl SqlDenormalizer {
     /// queries the same index the dispatcher writes. Uses a probe event
     /// carrying this primary's relation/namespace headers — enough for the
     /// literal and `${header:...}` templates that denormalize upserts use.
-    fn resolve_sink_index(&self, pd: &PreparedDef, lookup: &OsReverseLookup) -> Option<String> {
+    fn resolve_sink_index(&self, pd: &PreparedDef, lookup: &ReverseLookup) -> Option<String> {
         let probe = build_doc_event(
             &pd.primary_table,
             pd.def.target_index(),
             &["__vs_probe__".to_owned()],
-            &Value::Null,
+            None,
             false,
             None,
         )
         .ok()?;
-        index_template::render(lookup.index_template(), &probe, chrono::Utc::now()).ok()
+        lookup.resolve_index_for(&probe)
     }
 
     /// Run: bootstrap, then drain the tail receiver until shutdown.
@@ -1325,7 +1342,7 @@ fn build_doc_event(
     primary_table: &str,
     target_index: Option<&str>,
     pk_text: &[String],
-    doc: &Value,
+    doc_json: Option<&str>,
     delete: bool,
     lsn: Option<&str>,
 ) -> Result<Event> {
@@ -1342,10 +1359,9 @@ fn build_doc_event(
         .map_err(|e| anyhow::anyhow!("invalid subject: {e}"))?;
     let source = SourceUri::new(format!("postgres-sqljoin://{primary_table}"))
         .map_err(|e| anyhow::anyhow!("invalid source uri: {e}"))?;
-    let payload = if delete {
-        Payload::from_vec(b"{}".to_vec())
-    } else {
-        Payload::from_vec(serde_json::to_vec(doc).unwrap_or_else(|_| b"{}".to_vec()))
+    let payload = match doc_json {
+        Some(doc) if !delete => Payload::from_vec(doc.as_bytes().to_vec()),
+        _ => Payload::from_vec(b"{}".to_vec()),
     };
     let mut headers = HashMap::new();
     headers.insert("ventstream.cdc.relation".to_owned(), rel.to_owned());
@@ -1691,7 +1707,7 @@ mod tests {
             "shop.orders",
             Some("tenant-orders"),
             &["5".into()],
-            &serde_json::json!({ "id": "5" }),
+            Some(r#"{"id":"5"}"#),
             false,
             Some("4242"),
         )
@@ -1719,7 +1735,7 @@ mod tests {
             "t.show_buyer",
             None,
             &["a".into(), "b".into()],
-            &serde_json::json!({}),
+            Some("{}"),
             false,
             None,
         )
@@ -1735,7 +1751,7 @@ mod tests {
             "shop.orders",
             Some("tenant-orders"),
             &["5".into()],
-            &Value::Null,
+            None,
             true,
             None,
         )

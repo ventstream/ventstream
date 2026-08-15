@@ -280,12 +280,21 @@ impl Dispatcher {
                     }
                     return Ok(());
                 }
-                // Reap any completed bulks — frees a concurrency slot and
-                // commits the result in order.
+                // Reap a completed bulk, commit in order, and flush what
+                // accumulated meanwhile — batches grow to full size under
+                // load instead of being carved up by the timer.
                 Some(joined) = in_flight.join_next(), if !in_flight.is_empty() => {
                     committer.on_joined(joined);
+                    if !batch.is_empty() {
+                        let seq = next_seq;
+                        next_seq += 1;
+                        self.spawn_flush(&mut in_flight, &mut committer, seq, std::mem::take(&mut batch)).await;
+                        batch_bytes = 0;
+                    }
                 }
-                _ = flush_timer.tick(), if !batch.is_empty() => {
+                // Timer flush covers the idle tail only; under load the
+                // reap branch above delivers batches.
+                _ = flush_timer.tick(), if !batch.is_empty() && in_flight.is_empty() => {
                     let seq = next_seq;
                     next_seq += 1;
                     self.spawn_flush(&mut in_flight, &mut committer, seq, std::mem::take(&mut batch)).await;
