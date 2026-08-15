@@ -6,12 +6,11 @@ pub mod error;
 pub mod meilisearch;
 pub mod opensearch;
 pub mod read;
-pub mod reverse_lookup;
 pub mod redis;
+pub mod reverse_lookup;
 mod util;
 
 pub use error::OpenSearchSinkError;
-pub use reverse_lookup::ReverseLookup;
 pub use meilisearch::{
     MeilisearchBatchConfig, MeilisearchConfig, MeilisearchIndexRouting, MeilisearchSettings,
     MeilisearchSink, MeilisearchSinkError, MeilisearchTaskConfig,
@@ -24,3 +23,4 @@ pub use redis::{
     RedisViewConditionOperator, RedisViewFilter, RedisViewFilterMode, RedisViewKey,
     RedisViewMissingBehavior, RedisViewSchemaStatus, RedisViewSource, RedisViewValue,
 };
+pub use reverse_lookup::ReverseLookup;

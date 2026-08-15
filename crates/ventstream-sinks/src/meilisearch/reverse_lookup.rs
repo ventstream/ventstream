@@ -128,7 +128,10 @@ impl MeiliReverseLookup {
             .unwrap_or_default();
         let mut ids = Vec::with_capacity(hits.len());
         for hit in &hits {
-            if let Some(id) = hit.get(CANONICAL_ID_FIELD).and_then(serde_json::Value::as_str) {
+            if let Some(id) = hit
+                .get(CANONICAL_ID_FIELD)
+                .and_then(serde_json::Value::as_str)
+            {
                 ids.push(id.to_owned());
             }
         }
@@ -197,10 +200,11 @@ impl MeiliReverseLookup {
             if !response.status().is_success() {
                 let status = response.status();
                 let text = response.text().await.unwrap_or_default();
-                return Err(format!("update filterable attributes HTTP {status}: {text}"));
+                return Err(format!(
+                    "update filterable attributes HTTP {status}: {text}"
+                ));
             }
-            let parsed: serde_json::Value =
-                response.json().await.map_err(|err| err.to_string())?;
+            let parsed: serde_json::Value = response.json().await.map_err(|err| err.to_string())?;
             if let Some(task_uid) = parsed.get("taskUid").and_then(serde_json::Value::as_u64) {
                 self.wait_task(task_uid).await?;
             }

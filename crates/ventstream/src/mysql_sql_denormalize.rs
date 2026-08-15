@@ -34,9 +34,9 @@ use ventstream_core::{
     Subject,
 };
 use ventstream_joins::{Cardinality, JoinDefinition, RelatedDefinition};
-use ventstream_sinks::ReverseLookup;
 #[cfg(test)]
 use ventstream_sinks::opensearch::index_template;
+use ventstream_sinks::ReverseLookup;
 use ventstream_sources::mysql::MySqlCdcConfig;
 
 /// Greedy-drain ceiling for the tail loop (matches the PG denormalizer).

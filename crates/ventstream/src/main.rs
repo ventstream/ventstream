@@ -2974,30 +2974,25 @@ impl SinkRuntimeConfig {
         }
     }
 
-    fn meilisearch(&self) -> Option<&MeilisearchConfig> {
-        match self {
-            Self::Meilisearch(config) => Some(config),
-            Self::OpenSearch(_) | Self::Redis(_) => None,
-        }
-    }
-
     /// Reverse-lookup client for sinks that can answer "which parents embed
     /// this child?" — OpenSearch and Meilisearch. None for Redis.
     fn build_reverse_lookup(&self) -> Result<Option<ventstream_sinks::ReverseLookup>> {
         Ok(match self {
-            Self::OpenSearch(config) => Some(ventstream_sinks::ReverseLookup::OpenSearch(
-                Box::new(OsReverseLookup::new((**config).clone()).map_err(|err| {
-                    anyhow!("building OpenSearch reverse-lookup client: {err}")
-                })?),
-            )),
-            Self::Meilisearch(config) => Some(ventstream_sinks::ReverseLookup::Meilisearch(
-                Box::new(
+            Self::OpenSearch(config) => {
+                Some(ventstream_sinks::ReverseLookup::OpenSearch(Box::new(
+                    OsReverseLookup::new((**config).clone()).map_err(|err| {
+                        anyhow!("building OpenSearch reverse-lookup client: {err}")
+                    })?,
+                )))
+            }
+            Self::Meilisearch(config) => {
+                Some(ventstream_sinks::ReverseLookup::Meilisearch(Box::new(
                     ventstream_sinks::meilisearch::MeiliReverseLookup::new((**config).clone())
                         .map_err(|err| {
                             anyhow!("building Meilisearch reverse-lookup client: {err}")
                         })?,
-                ),
-            )),
+                )))
+            }
             Self::Redis(_) => None,
         })
     }

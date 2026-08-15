@@ -438,8 +438,7 @@ impl MeilisearchSink {
                 .retry_after()
                 .unwrap_or_else(|| jittered_delay(base_delay))
                 .min(self.config.retry.max_backoff);
-            let retried_events: usize =
-                runs.iter().skip(idx).map(|run| run.offsets.len()).sum();
+            let retried_events: usize = runs.iter().skip(idx).map(|run| run.offsets.len()).sum();
             ventstream_telemetry::bump_sink_retries(
                 u64::try_from(retried_events).unwrap_or(u64::MAX),
             );

@@ -289,8 +289,7 @@ impl MySqlCdcSource {
 
             // Prefetch: the next chunk's SELECT runs on its own pooled
             // connection while the current chunk emits.
-            let mut rows =
-                fetch_bootstrap_chunk(pool, &qualified, &order, limit, None).await?;
+            let mut rows = fetch_bootstrap_chunk(pool, &qualified, &order, limit, None).await?;
             loop {
                 if rows.is_empty() {
                     break;
@@ -316,8 +315,7 @@ impl MySqlCdcSource {
                         let pk_vals = pk_values_from_row(row, &schema.pk_names);
                         let pk = pk_components(&pk_vals);
                         let doc = row_to_json(row, &schema.json_columns);
-                        let ev =
-                            event_mapper::snapshot_insert(&self.config, &table, &pk, doc)?;
+                        let ev = event_mapper::snapshot_insert(&self.config, &table, &pk, doc)?;
                         if !self.publish(ctx, ev).await? {
                             return Ok(false);
                         }

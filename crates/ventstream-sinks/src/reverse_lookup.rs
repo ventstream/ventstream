@@ -59,9 +59,7 @@ impl ReverseLookup {
                 .doc_ids_by_term_tuples(index, fields, tuples)
                 .await
                 .map_err(|err| err.to_string()),
-            Self::Meilisearch(lookup) => {
-                lookup.doc_ids_by_term_tuples(index, fields, tuples).await
-            }
+            Self::Meilisearch(lookup) => lookup.doc_ids_by_term_tuples(index, fields, tuples).await,
         }
     }
 }

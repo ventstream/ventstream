@@ -34,6 +34,7 @@ use ventstream_core::{
 };
 use ventstream_joins::config::{BackfillConfig, StateConfig, TargetConfig};
 use ventstream_joins::{Cardinality, JoinDefinition, PkSpec, PrimaryRef, RelatedDefinition};
+#[cfg(test)]
 use ventstream_sinks::opensearch::index_template;
 use ventstream_sinks::ReverseLookup;
 use ventstream_sources::postgres::{connect_client, PostgresCdcConfig};
@@ -457,8 +458,7 @@ impl SqlDenormalizer {
             let Some(last_row) = rows.last() else {
                 return Ok(emitted);
             };
-            let page_last: Vec<String> =
-                (0..n_pk).map(|i| last_row.get::<_, String>(i)).collect();
+            let page_last: Vec<String> = (0..n_pk).map(|i| last_row.get::<_, String>(i)).collect();
 
             // Prefetch: the next chunk's query overlaps this chunk's emit
             // (the tokio_postgres driver task progresses IO independently).
@@ -472,8 +472,7 @@ impl SqlDenormalizer {
             let emit_chunk = async {
                 let mut sent = 0u64;
                 for row in &rows {
-                    let pk_text: Vec<String> =
-                        (0..n_pk).map(|i| row.get::<_, String>(i)).collect();
+                    let pk_text: Vec<String> = (0..n_pk).map(|i| row.get::<_, String>(i)).collect();
                     let doc: String = row.get(n_pk);
                     let event = build_doc_event(
                         &pd.primary_table,
