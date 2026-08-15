@@ -183,9 +183,9 @@ ventstream-telemetry = { version = "0.1.19", path = "crates/ventstream-telemetry
 serde_yaml = "0.9"
 
 # Fleet managed-mode client (gRPC control channel to the platform gateway)
-ventstream-fleet-protocol = { path = "crates/ventstream-fleet-protocol" }
-ventstream-fleet-client = { path = "crates/ventstream-fleet-client" }
-ventstream-managed = { path = "crates/ventstream-managed" }
+ventstream-fleet-protocol = { version = "0.1.22", path = "crates/ventstream-fleet-protocol" }
+ventstream-fleet-client = { version = "0.1.22", path = "crates/ventstream-fleet-client" }
+ventstream-managed = { version = "0.1.22", path = "crates/ventstream-managed" }
 tonic = { version = "0.14", features = ["transport", "tls-ring", "tls-webpki-roots"] }
 tonic-prost = "0.14"
 prost = "0.14"
