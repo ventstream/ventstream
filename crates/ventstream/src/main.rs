@@ -333,9 +333,9 @@ fn resolve_managed_mode(
         },
     };
     let key = key.trim().to_owned();
-    if !key.starts_with("vsa_") {
+    if !key.starts_with("vsa1.") {
         return Err(anyhow!(
-            "the agent key must be a vsa_ key minted from the dashboard or CLI"
+            "the agent key must be a vsa1 key minted from the dashboard or CLI"
         ));
     }
     Ok(Some(ventstream_managed::ManagedOptions {
