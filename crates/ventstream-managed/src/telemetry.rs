@@ -133,6 +133,10 @@ impl EngineTelemetrySampler {
                 &metrics,
                 "vs_realtime_terminal_failures_total",
             ),
+            schema_drift_total: metric_u64(&metrics, "vs_schema_drift_total"),
+            schema_casualties_total: metric_u64(&metrics, "vs_schema_casualties_total"),
+            truncate_events_total: metric_u64(&metrics, "vs_truncate_events_total"),
+            schema_drift_detail: drift_detail(&metrics),
             last_input_at_unix_milliseconds: metric_u64(&metrics, "vs_last_input_at_unixtime_ms"),
             last_output_at_unix_milliseconds: metric_u64(&metrics, "vs_last_output_at_unixtime_ms"),
             engine_ready: Some(!pipeline_error),
@@ -211,6 +215,54 @@ fn observe_rate(
         samples.pop_front();
     }
     Some(event_rate(samples))
+}
+
+/// Bounded per-table drift summary from the labeled
+/// `vs_schema_drift_total{table=…,kind=…}` samples, e.g.
+/// `shop.orders added=1 type_change=2`. Empty when no drift observed.
+fn drift_detail(exposition: &str) -> String {
+    let mut per_table: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for line in exposition.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("vs_schema_drift_total{") else {
+            continue;
+        };
+        let Some((labels, value)) = rest.split_once('}') else {
+            continue;
+        };
+        let value = value.trim();
+        let mut table = None;
+        let mut kind = None;
+        for pair in labels.split(',') {
+            match pair.split_once('=') {
+                Some(("table", v)) => table = Some(v.trim_matches('"')),
+                Some(("kind", v)) => kind = Some(v.trim_matches('"')),
+                _ => {}
+            }
+        }
+        if let (Some(table), Some(kind)) = (table, kind) {
+            per_table
+                .entry(table.to_owned())
+                .or_default()
+                .push(format!("{kind}={value}"));
+        }
+    }
+    let mut out = String::new();
+    for (table, kinds) in per_table {
+        let entry = format!("{table} {}", kinds.join(" "));
+        if out.is_empty() {
+            out = entry;
+        } else if out.len() + entry.len() + 2 <= 240 {
+            out.push_str("; ");
+            out.push_str(&entry);
+        } else {
+            out.push_str("; …");
+            break;
+        }
+    }
+    out.truncate(256);
+    out
 }
 
 fn metric_u64(exposition: &str, name: &str) -> Option<u64> {
