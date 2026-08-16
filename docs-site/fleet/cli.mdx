@@ -54,12 +54,12 @@ Rerun the installer to upgrade to the latest release. For a reproducible
 installation, pin both the installer and binary version:
 
 ```bash
-VERSION=0.2.24
+VERSION=0.2.25
 curl -fsSL "https://ventstream.dev/install-cli/v${VERSION}.sh" |
   VENTSTREAMCTL_VERSION="$VERSION" sh
 ```
 
-Replace `0.2.24` with the release selected for your environment.
+Replace `0.2.25` with the release selected for your environment.
 
 ### Windows
 
@@ -73,7 +73,7 @@ The installer performs checksum verification automatically. For manual
 checksum, immutable-release, attestation, and SBOM verification, follow the
 [verification guide](https://github.com/ventstream/ventstream-releases/blob/main/docs/verification.md).
 
-The CLI requires a VentStream Cloud workspace, its control-plane URL, and an
+The CLI requires a VentStream Cloud workspace and an
 authorized user account.
 
 ## Authenticate
@@ -85,7 +85,6 @@ and environment when more than one is available:
 
 ```bash
 ventstreamctl auth login \
-  --control-plane <control-plane-url> \
   --profile production
 
 ventstreamctl auth status

@@ -19,13 +19,15 @@ accept an invitation from an existing organization, before starting CLI login.
 
 ## Sign in from the CLI
 
-Use the control-plane URL supplied for your VentStream Cloud workspace:
+The CLI targets the hosted VentStream Cloud control plane by default, so
+signing in needs no URL:
 
 ```bash
-ventstreamctl auth login \
-  --control-plane <control-plane-url> \
-  --profile production
+ventstreamctl auth login --profile production
 ```
+
+Self-hosted installations pass `--control-plane <url>` (or set it on the
+profile) to point at their own control plane.
 
 The CLI opens the VentStream authorization page in your system browser. Sign in
 with your existing account, complete any required MFA or SSO checks, and approve
@@ -40,7 +42,6 @@ automatic launch and open that URL manually on the same workstation:
 
 ```bash
 ventstreamctl auth login \
-  --control-plane <control-plane-url> \
   --profile production \
   --no-browser
 ```
@@ -62,7 +63,6 @@ unambiguous UUID prefix of at least eight characters, or a slug:
 
 ```bash
 ventstreamctl auth login \
-  --control-plane <control-plane-url> \
   --profile production \
   --organization acme \
   --environment production
@@ -89,7 +89,6 @@ An identity provider using a private PKI can be trusted with:
 
 ```bash
 ventstreamctl auth login \
-  --control-plane <control-plane-url> \
   --profile enterprise \
   --oidc-trust-bundle <ca.pem>
 ```
