@@ -1,6 +1,6 @@
 ---
 title: "Troubleshooting"
-description: "Diagnose engine, VentStream Cloud, authentication, enrollment, and local development failures."
+description: "Diagnose engine, VentStream Cloud, authentication, agent-key, and local development failures."
 ---
 
 ## Agents
@@ -24,9 +24,9 @@ description: "Diagnose engine, VentStream Cloud, authentication, enrollment, and
 | Commands target the wrong organization or environment | Run `ventstreamctl config show`, then use `config set-org` and `config set-env` with the intended context. |
 | A lifecycle command returns `queued` | The control plane accepted durable work but the agent has not completed it. Use `--wait` or inspect `ventstreamctl operations describe <operation-id> --attempts`. |
 | A selected revision is not running | Selection activates and delivers configuration, but it does not resume a paused pipeline. Check the apply operation, then run `ventstreamctl pipelines resume <pipeline> --wait`. |
-| Configuration delivery waits with no agent | Confirm the deployment is enrolled and connected with `ventstreamctl agents status`. The pending operation is delivered after a matching agent connects, subject to its expiry. |
-| Agent enrollment fails immediately | The grant expired, was already consumed or replaced, or targets another deployment. Create a new single-use grant. For private gateway trust, also verify the configured CA Secret; public Cloud gateways use WebPKI trust. |
-| Agent enrolled but cannot open the control stream | Check outbound gateway reachability, system time, certificate validity, deployment identity revocation, and the supervisor's persisted identity state. |
+| Configuration delivery waits with no agent | Confirm the deployment is connected with `ventstreamctl agents status`. The pending operation is delivered after a matching agent connects, subject to its expiry. |
+| Managed engine exits at startup with an agent-key error | The `vsa1.` key was revoked, mistyped, or belongs to another deployment, or the control plane is unreachable — the engine fails closed rather than falling back to local config. Mint a fresh key (`ventstreamctl agents key create <deployment> --pipeline <pipeline>`; it revokes the previous one) and update the secret. See [Managed mode](/concepts/managed-mode). |
+| Agent has a key but cannot open the control stream | Check outbound gateway reachability, system time, certificate validity, and key revocation. For private gateway trust, also verify the configured CA Secret; public Cloud gateways use WebPKI trust. An engine that lost its persisted identity state (pod rescheduled without its volume) re-binds a fresh identity from the key automatically. |
 
 ## Build / local
 

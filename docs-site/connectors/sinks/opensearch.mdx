@@ -26,6 +26,28 @@ For a private CA, mount its PEM bundle and set
 `VS_OS_TLS_MODE=verify_full` with `VS_OS_TLS_CA_FILE`. Publicly issued
 certificates need strict mode but no CA file.
 
+The canonical config-file form (`VS_ENGINE_CONFIG=./ventstream.yaml`):
+
+```yaml
+sink:
+  kind: opensearch
+  opensearch:
+    endpoint_ref: env:VS_OS_ENDPOINT
+    auth:                    # optional — omit entirely for an open endpoint
+      mode: basic            # none (default) | basic | api_key
+      username_ref: env:VS_OS_USERNAME
+      password_ref: env:VS_OS_PASSWORD
+    index_routing:
+      strategy: fixed        # by_output_relation (default) | by_projection_target | fixed | template
+      name: orders
+```
+
+Auth defaults to `mode: none`, so the whole `auth` block may be left out for a
+local or network-protected open endpoint; `basic` and `api_key`
+(`api_key_ref`) are the authenticated modes. Note the OpenSearch routing keys
+are `strategy:` / `name:` — the [Meilisearch sink](/connectors/sinks/meilisearch)
+spells the same idea `mode:` / `index:`.
+
 ## Index naming
 
 `VS_INDEX_TEMPLATE` is expanded **per document** at write time. A literal
@@ -71,7 +93,9 @@ so each write is an **upsert** that targets exactly one document:
 Because the ID is a pure function of the key, bootstrap, live updates,
 re-syncs, and reconciliation all converge on the same state no matter how
 many times a record is re-emitted. A source delete becomes a document
-**tombstone** (delete by `_id`).
+**tombstone** (delete by `_id`). This holds for flat pipelines with no joins
+spec too — every source stamps the id natively — and an update that changes a
+row's primary key deletes the old document and indexes the new one.
 
 ## Reliability
 

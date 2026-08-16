@@ -24,9 +24,9 @@ every delete.
   the target indexes. Use a scoped key, never the master key, for
   production.
 - Every event needs a stable document id (the `ventstream.doc.id` header).
-  Postgres pipelines get this from a joins projection — see
-  [Postgres quickstart](#quickstart-postgres-to-meilisearch) below.
-  MongoDB, MySQL, Neo4j, and Kafka sources stamp it natively.
+  Every source stamps it natively — Postgres from the replica-identity key
+  columns, MySQL from the binlog PK, MongoDB from `_id`, Neo4j from
+  `elementId`, Kafka from the message key — so no joins spec is required.
 
 ## How documents are shaped
 
@@ -147,20 +147,10 @@ documents. A missing API key or bad endpoint fails fast at boot.
 
 ## Quickstart: Postgres to Meilisearch
 
-Postgres events need a joins projection to carry a stable document id —
-even a single table with no joins:
-
-```yaml
-# joins.yaml
-joins:
-  - name: products
-    primary:
-      table: public.products
-      pk: id
-    related: []
-    state:
-      backend: memory
-```
+No joins spec is needed — a flat pipeline carries stable document ids on its
+own. Each row upserts in place, deletes remove the document, and a
+primary-key-changing update removes the old document and writes the new one,
+all under the default replica identity:
 
 ```yaml
 # ventstream.yaml
@@ -173,40 +163,38 @@ source:
     user_ref: env:VS_PG_USER
     password_ref: env:VS_PG_PASSWORD
     database_ref: env:VS_PG_DATABASE
-    publication: vs_pub
-    slot: vs_slot
+    publication_ref: env:VS_PG_PUBLICATION
+    slot_ref: env:VS_PG_SLOT
     bootstrap:
       mode: snapshot
-    denormalize_mode: sql
-    sink_reverse_lookup: false
 sink:
   kind: meilisearch
   meilisearch:
     endpoint_ref: env:VS_MEILI_ENDPOINT
     api_key_ref: env:VS_MEILI_API_KEY
-specs:
-  joins: joins.yaml
 runtime:
   dlq_path: ./data/dlq.jsonl
 ```
 
-Set `VS_JOINS_STATE_DIR` to a durable directory, create the publication and
-slot, and start the engine:
+Create the publication (the table scope of the pipeline) and start the engine —
+it creates its own slot and runs the snapshot bootstrap:
 
 ```sql
 CREATE PUBLICATION vs_pub FOR TABLE public.products;
-SELECT pg_create_logical_replication_slot('vs_slot', 'pgoutput');
 ```
 
 ```bash
-VS_ENGINE_CONFIG=./ventstream.yaml VS_JOINS_STATE_DIR=./joins-state ventstream
+export VS_PG_PUBLICATION=vs_pub VS_PG_SLOT=vs_slot
+VS_ENGINE_CONFIG=./ventstream.yaml ventstream
 ```
 
 The snapshot bootstrap materializes existing rows; from then on inserts,
 updates, and deletes stream continuously. Delete a row and watch the
 document leave your search results in well under a second.
 
-Multi-table projections (embedded one-to-one objects and one-to-many
-arrays, with child changes recomposing parent documents) work exactly as
-they do for the [OpenSearch sink](/connectors/sinks/opensearch) — the same
-joins spec drives both.
+For **composed** documents, add a joins spec: multi-table projections
+(embedded one-to-one objects and one-to-many arrays, with child changes
+recomposing parent documents) work exactly as they do for the
+[OpenSearch sink](/connectors/sinks/opensearch) — the same joins spec drives
+both, and reverse-lookup child deletes work under
+`REPLICA IDENTITY DEFAULT` (no `FULL` needed).

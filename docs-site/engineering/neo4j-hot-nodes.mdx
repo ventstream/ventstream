@@ -20,8 +20,8 @@ edges; it wants documents: a `Product` plus its `Category`, its
 flattened into one JSON object, kept current as *any* of those nodes
 change. That's why VentStream's Neo4j source exists: it consumes Neo4j
 Enterprise CDC, walks projection paths declared in YAML, and streams
-denormalized documents into OpenSearch or Redis — snapshot bootstrap
-included, deletes handled, crash-safe resume.
+denormalized documents into OpenSearch / Elasticsearch, Meilisearch, or
+Redis — snapshot bootstrap included, deletes handled, crash-safe resume.
 
 ```yaml
 # projection spec (abridged)

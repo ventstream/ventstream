@@ -19,13 +19,11 @@ flowchart LR
   CLI[ventstreamctl] -->|HTTPS| API
   API --> OP[Desired state and operations]
   subgraph Customer environment
-    A[Managed agent]
-    E[VentStream engine]
+    E[Managed engine<br/>fleet client + pipeline]
     D[Sources, brokers, and sinks]
   end
-  A -->|outbound mTLS| G[Cloud agent gateway]
-  G -->|desired state and operations| A
-  A --> E
+  E -->|outbound mTLS| G[Cloud agent gateway]
+  G -->|desired state and operations| E
   E -->|CDC / realtime data| D
 ```
 
@@ -36,15 +34,19 @@ flowchart LR
   settings.
 - `ventstreamctl` provides repeatable pipeline, deployment, configuration,
   lifecycle, identity, status, and operation workflows.
-- Kubernetes, Docker Compose, or your scheduler creates the managed-agent
-  workload in your infrastructure. Cloud administers it after enrollment; it
-  does not deploy directly into your cluster.
+- Kubernetes, Docker Compose, or your scheduler creates the managed engine
+  workload in your infrastructure. Cloud administers it after the agent-key
+  handshake; it does not deploy directly into your cluster.
 
 ## Managed and standalone modes
 
-The VentStream engine can run standalone from local configuration with no Cloud
-dependency. Managed deployments run the Fleet supervisor as PID 1, which starts
-and stops the engine child according to persisted desired state.
+There is one public engine artifact — the same binary and image
+(`ghcr.io/ventstream/ventstream`) runs standalone or managed. Standalone
+engines run from local configuration with no Cloud dependency; without an agent
+key the engine makes zero platform connections. Presenting a deployment-scoped
+[agent key](/fleet/enrollment) at startup makes the engine managed: its
+built-in fleet client connects outbound to Cloud and runs the pipeline
+according to persisted desired state.
 
 Standalone engines are operated through their process manager, Kubernetes, or
 another scheduler. They cannot be paused, resumed, configured, or inspected with

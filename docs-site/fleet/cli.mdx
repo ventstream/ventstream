@@ -13,8 +13,8 @@ agent gateway.
 
 <Note>
 A standalone engine has no Cloud management connection and cannot be
-administered with `ventstreamctl`. Use the CLI for engines enrolled as managed
-agents in VentStream Cloud.
+administered with `ventstreamctl`. Use the CLI for engines attached to
+VentStream Cloud with a deployment [agent key](/fleet/enrollment).
 </Note>
 
 ## Install
@@ -58,13 +58,13 @@ Rerun the installer to upgrade to the latest release. For a reproducible
 installation, pin both the installer and binary version:
 
 ```bash
-VERSION=0.2.8
+VERSION=0.2.24
 curl -fsSL \
   "https://raw.githubusercontent.com/ventstream/ventstream-releases/v${VERSION}/install.sh" |
   VENTSTREAMCTL_VERSION="$VERSION" sh
 ```
 
-Replace `0.2.8` with the release selected for your environment.
+Replace `0.2.24` with the release selected for your environment.
 
 ### Windows
 
@@ -242,7 +242,7 @@ ventstreamctl pipelines configurations rollback orders-cdc <previous-revision> \
 See [Managed configuration](/fleet/configuration) for the bundle and secret
 boundary.
 
-## Deployments and enrollment
+## Deployments and agent keys
 
 The CLI calls engine installations *deployments* under the `agents` command
 group. VentStream Cloud stores desired state and identity, while Kubernetes,
@@ -255,33 +255,33 @@ ventstreamctl agents list --pipeline orders-cdc
 ventstreamctl agents describe <deployment-id> --pipeline orders-cdc
 ```
 
-Generate a non-secret, version-pinned deployment manifest from the Cloud
-installation profile:
+Mint the deployment's agent key. The key attaches the public engine to this
+deployment; on first connect the engine performs the
+[enrollment handshake](/fleet/enrollment) and binds an mTLS identity:
 
 ```bash
-ventstreamctl agents manifest orders-primary \
-  --pipeline orders-cdc \
-  --target helm \
-  --engine-secret orders-engine-secrets \
-  --enrollment-secret orders-enrollment \
-  --output orders-primary.values.yaml
+ventstreamctl agents key create orders-primary --pipeline orders-cdc
 ```
 
-Use `--target docker-compose` for a Docker Compose deployment. See
-[Managed agent on Kubernetes](/deploy/kubernetes-managed-engine) for the complete
-customer-side installation workflow.
+The key command prints only the secret to stdout and deliberately has no table
+or JSON wrapper. Pipe it directly into a secret-management workflow — for
+example `| kubectl create secret generic orders-agent-key
+--from-file=key=/dev/stdin` — and do not log it. The key is shown once and is
+reusable; minting a new key revokes the previous one, so rotation is a single
+`key create`.
 
-Generate one short-lived, single-use enrollment grant:
+List key metadata or revoke a key explicitly:
 
 ```bash
-ventstreamctl agents enroll-token create <deployment-id> \
-  --pipeline orders-cdc
+ventstreamctl agents key list orders-primary --pipeline orders-cdc
+ventstreamctl agents key revoke orders-primary --pipeline orders-cdc \
+  --key <key-id> --confirm
 ```
 
-The token command prints only the secret to stdout and deliberately has no table
-or JSON wrapper. Send it directly to a secret-management workflow; do not log it.
+See [Managed agent on Kubernetes](/deploy/kubernetes-managed-engine) for the
+complete customer-side installation workflow.
 
-After the workload enrolls, inspect aggregate and per-instance health:
+After the workload connects, inspect aggregate and per-instance health:
 
 ```bash
 ventstreamctl agents status \
@@ -299,8 +299,31 @@ ventstreamctl agents identity revoke <deployment-id> \
   --confirm
 ```
 
-Revocation requires re-enrollment before that deployment can reconnect. See
-[Agent enrollment](/fleet/enrollment).
+After identity revocation, the next engine start re-binds through the
+deployment's agent key; revoke the key as well to keep the deployment offline.
+See [Agent keys and the enrollment handshake](/fleet/enrollment).
+
+### Legacy: enrollment tokens
+
+Deployments bootstrapped before agent keys used a short-lived, single-use
+enrollment grant and a rendered installation manifest. Both remain available
+through the deprecation window:
+
+```bash
+ventstreamctl agents enroll-token create <deployment-id> \
+  --pipeline orders-cdc
+
+ventstreamctl agents manifest orders-primary \
+  --pipeline orders-cdc \
+  --target helm \
+  --engine-secret orders-engine-secrets \
+  --enrollment-secret orders-enrollment \
+  --output orders-primary.values.yaml
+```
+
+New installations should use agent keys instead. To migrate an existing
+token-enrolled deployment, see
+[Migrating from enrollment tokens](/deploy/kubernetes-managed-engine#migrating-from-enrollment-tokens).
 
 ## Operations
 

@@ -1,49 +1,107 @@
 ---
-title: "Agent enrollment"
-description: "Bootstrap a managed engine with a one-time grant, then use renewable mTLS workload identity."
+title: "Agent keys and the enrollment handshake"
+description: "Attach a public engine to VentStream Cloud with a deployment-scoped agent key and renewable mTLS workload identity."
 ---
 
-Enrollment converts a short-lived, one-time grant into a deployment-bound X.509
-workload identity. The grant is only for bootstrap. Restarts use persisted identity
-state, and the supervisor renews certificates before expiry.
+A managed engine is the same public binary or image everyone runs. What makes it
+managed is an **agent key**: a deployment-scoped secret with the `vsa1.` prefix
+that the engine presents on first connect. The gateway converts that first
+connect into a deployment-bound X.509 workload identity; later connects use the
+bound mTLS identity, and the engine renews certificates before expiry.
 
-## Flow
+An engine started without an agent key makes provably zero platform
+connections.
 
-1. Create a pipeline and deployment in the selected environment.
-2. Request an enrollment grant for that deployment.
-3. Put the returned token in a short-lived Kubernetes Secret or equivalent secret
-   injection mechanism.
-4. Start the managed-agent enrollment init container using the trust mode in the
-   Cloud installation profile.
-5. The init container verifies server TLS, redeems the grant, and persists identity
-   state. The main engine container never mounts the enrollment token.
-6. The supervisor opens an outbound mTLS control stream and reports its instance.
+## Mint a key
+
+Mint one key per deployment, from the dashboard's deployment guide or the CLI:
 
 ```bash
 ventstreamctl agents create orders-primary --pipeline orders-cdc
-ventstreamctl agents enroll-token create <deployment-id> --pipeline orders-cdc
+
+ventstreamctl agents key create orders-primary --pipeline orders-cdc
+ventstreamctl agents key list orders-primary --pipeline orders-cdc
+ventstreamctl agents key revoke orders-primary --pipeline orders-cdc \
+  --key <key-id> --confirm
 ```
 
+The key is shown once, is revocable, and is reusable across restarts of the
+same deployment. Minting a new key revokes the previous one, so rotation is a
+single `key create`. The dashboard shows key metadata (never the secret again)
+in the deployment's Agent keys panel.
+
 <Warning>
-The grant is displayed once, expires after ten minutes, and is invalidated after
-successful redemption. Do not place it in a configuration revision, shell history,
-log, image, or GitOps file.
+Do not place the key in a configuration revision, shell history, log, image, or
+GitOps file. Pipe it directly into your secret store, for example
+`ventstreamctl agents key create ... | kubectl create secret generic <name>
+--from-file=key=/dev/stdin`.
 </Warning>
 
-Cloud gateways use public WebPKI trust by default. Private gateway deployments
-use a customer-provided CA Secret. After the first successful enrollment, the
-chart detects persisted identity before reading the bootstrap files, so the
-consumed grant Secret and optional private CA Secret can be removed.
+## Give the key to the engine
 
-The agent persists its private key and management state on its own volume. If the
-pod restarts, it reconnects with the existing identity. If the workload identity is
-revoked, reconnects are rejected and re-enrollment requires a new deployment grant.
+Provide the key through the `VS_AGENT_KEY` environment variable, or through a
+`managed:` block in `ventstream.yaml`:
 
-Managed first boot fails closed: without a trusted desired-state snapshot, the
-supervisor does not start CDC. A temporary Fleet outage does not stop an engine
-that already has trusted running state.
+```yaml
+schema_version: 1
 
-One enrollment grant bootstraps one credential state. Do not use one grant Secret
-to start multiple new replicas. Automatic chart enrollment currently supports one
-replica; replicated realtime requires separately provisioned managed identities
-or the standalone realtime gateway chart.
+managed:
+  agent_key_ref: env:VS_AGENT_KEY
+  # Optional overrides; defaults come from the key itself:
+  # gateway_url: https://gateway.ventstream.dev:8445
+  # enrollment_url: https://gateway.ventstream.dev:8444
+  # state_dir: /var/lib/ventstream/managed
+```
+
+A managed engine takes its source, sink, and spec configuration from the
+pipeline's selected configuration revision. An agent key alongside local
+`source`, `sink`, or `specs` sections is a hard startup error — an engine is
+either managed or standalone, never both.
+
+## What the handshake does
+
+1. On first connect the engine generates a keypair locally. The private key
+   never leaves the workload environment.
+2. The engine presents the agent key to the enrollment endpoint over verified
+   server TLS. Cloud gateways use public WebPKI trust by default.
+3. The gateway binds the new public key to the key's deployment and issues a
+   deployment-bound X.509 identity.
+4. The engine persists identity and management state in its managed state
+   directory and opens the outbound mTLS control stream.
+
+Restarts skip the handshake: the engine reconnects with its persisted
+identity. If the state volume is lost, the same key simply re-binds a fresh
+identity on the next start; the rotation is recorded as an audited identity
+event in the dashboard.
+
+## Failure semantics
+
+- **Key revoked, or gateway unreachable at startup:** the engine exits
+  nonzero. It never falls back to local configuration.
+- **First boot fails closed:** without a trusted desired-state snapshot the
+  engine does not start CDC.
+- **Transient control-plane outage:** an engine that already holds trusted
+  running state keeps processing; management downtime does not interrupt the
+  data path.
+- **Identity revoked** (`ventstreamctl agents identity revoke`): reconnects
+  with the old identity are rejected. The next start re-binds through the
+  deployment's agent key — revoke the key as well to keep the deployment
+  offline.
+
+CDC deployments remain singleton: one active identity per deployment, fenced by
+the gateway. Replicated realtime instances each need their own deployment and
+key.
+
+## Legacy: enrollment tokens
+
+Before agent keys, bootstrap used a one-time enrollment grant (`vse1.` prefix)
+created with `ventstreamctl agents enroll-token create`, delivered via
+`VS_FLEET_ENROLLMENT_TOKEN_PATH`, and redeemed by a dedicated enroll init
+container in the chart, with rendered values from `ventstreamctl agents
+manifest`. Grants expire after ten minutes and are invalidated on redemption.
+
+Token-enrolled deployments keep working through the deprecation window, and
+their persisted identities remain valid. To migrate, mint an agent key for the
+deployment, replace the enrollment Secret with the key Secret, and switch the
+release to the public image in one upgrade — see
+[Migrating from enrollment tokens](/deploy/kubernetes-managed-engine#migrating-from-enrollment-tokens).

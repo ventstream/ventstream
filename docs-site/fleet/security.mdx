@@ -11,7 +11,14 @@ authenticated, authorized, revision-protected, and auditable.
 - Humans authenticate with short-lived built-in or enterprise OIDC tokens.
 - Automation uses explicitly configured OIDC workload providers and scoped service
   accounts; the current Cloud API does not issue long-lived personal API keys.
-- Agents use deployment-bound X.509 identities over mTLS after one-time enrollment.
+- Engines attach with per-deployment [agent keys](/fleet/enrollment) (`vsa1.`
+  prefix) minted from the dashboard or CLI. A key is shown once, is revocable,
+  and minting a replacement revokes its predecessor.
+- Agents use deployment-bound X.509 identities over mTLS after the first-connect
+  agent-key handshake. A key re-binds a fresh identity after state loss, and the
+  rotation is recorded as an audit event.
+- A revoked key or unreachable gateway makes the engine exit nonzero at startup;
+  it never falls back to local configuration.
 - Agent private keys remain in the workload environment and are never returned to
   the control API.
 
@@ -29,13 +36,14 @@ migrations. A separate one-shot migrator uses a schema-owning role.
 - Durable operations distinguish accepted, delivered, running, and terminal work.
 - Identity revocation, role changes, lifecycle actions, and configuration changes
   produce organization-scoped audit events.
-- Enrollment tokens, access tokens, private keys, and connector secrets are
-  redacted and excluded from generic replay storage.
+- Agent keys, legacy enrollment tokens, access tokens, private keys, and
+  connector secrets are redacted and excluded from generic replay storage.
 
 VentStream Cloud uses HTTPS, workload mTLS, managed secrets, immutable release
 artifacts, and monitored audit and operation streams. Customer workloads should
 keep connector credentials in their own secret manager, restrict inbound
-exposure, and use the image digest supplied by the Cloud installation profile.
+exposure, and pin the public engine image (`ghcr.io/ventstream/ventstream`) by
+release digest.
 
 ## Built-in account controls
 

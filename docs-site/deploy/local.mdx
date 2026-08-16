@@ -42,6 +42,14 @@ The commands below use `ventstream`. When building from source, replace it with
 A standalone engine needs no control plane. Lifecycle is restart-based: stop
 the process to pause it, then start it again to resume from retained state.
 
+<Note>
+The same binary can also run **managed** by VentStream Cloud — mint a
+deployment [agent key](/fleet/enrollment) and start it with
+`VS_AGENT_KEY=vsa1.… VS_MANAGED_STATE_DIR=$HOME/.ventstream/managed ventstream`
+(no local source/sink config; the pipeline's selected revision is delivered on
+connect). The modes below run standalone.
+</Note>
+
 Pick a mode:
 
 ## Mode A — Postgres CDC → OpenSearch

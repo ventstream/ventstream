@@ -3,17 +3,69 @@ title: "Postgres source"
 description: "Stream a Postgres table and its related rows into your target."
 ---
 
-The Postgres source reads logical replication and embeds related rows
-into each primary's document. This guide uses the same `shop.orders`
-example as the [quickstart](/quickstart): each order document carries its
-customer (1:1) and its line items (1:many).
+The Postgres source reads logical replication and streams each change into the
+sink — as flat per-row documents by default, or with related rows embedded into
+each primary's document when you add a joins spec. This guide uses the same
+`shop.orders` example as the [quickstart](/quickstart): each order document
+carries its customer (1:1) and its line items (1:many).
 
 <Note>
-VentStream writes to a **target**. **OpenSearch and Elasticsearch** are
-the supported targets today — they share the `_bulk` API, so the same
-engine handles both. The examples here use OpenSearch; set the endpoint
-with `VS_OS_ENDPOINT`.
+VentStream writes to a **target**:
+[OpenSearch / Elasticsearch](/connectors/sinks/opensearch) (one connector —
+they share the `_bulk` API),
+[Meilisearch](/connectors/sinks/meilisearch), or
+[Redis](/connectors/sinks/redis). The examples here use OpenSearch; set the
+endpoint with `VS_OS_ENDPOINT`.
 </Note>
+
+## Flat sync — no spec required
+
+With no joins spec, every published table streams as-is: each row becomes one
+document with a deterministic id built from the fully-qualified table name and
+the replica-identity key columns (the primary key by default) —
+`shop.orders:["ord-0001"]`. The snapshot bootstrap derives the same id from the
+discovered primary key. Updates overwrite the document in place, deletes always
+find and remove it, and an update that changes the primary key removes the old
+document and writes the new one. This holds across all sinks. A minimal,
+complete config:
+
+```yaml
+# ventstream.yaml
+schema_version: 1
+roles: [cdc]
+source:
+  kind: postgres
+  postgres:
+    host_ref: env:VS_PG_HOST
+    user_ref: env:VS_PG_USER
+    password_ref: env:VS_PG_PASSWORD
+    database_ref: env:VS_PG_DATABASE
+    publication_ref: env:VS_PG_PUBLICATION
+    slot_ref: env:VS_PG_SLOT
+    bootstrap:
+      mode: snapshot
+sink:
+  kind: opensearch
+  opensearch:
+    endpoint_ref: env:VS_OS_ENDPOINT
+    index_routing:
+      strategy: by_output_relation
+```
+
+The table scope is the Postgres **publication** — whatever it lists is what
+streams. Add a `joins:` spec (below) only when you want **composed** documents:
+a parent with embedded children.
+
+<Warning>
+Two replica-identity edge cases:
+
+- `REPLICA IDENTITY NOTHING` blocks `UPDATE`/`DELETE` **at the database
+  level** on a published table — Postgres rejects the statement itself, so
+  don't set it. The default replica identity is all the engine needs.
+- A **PK-less** table streams inserts without a stable id — documents won't
+  upsert (each insert is a new document) — and the snapshot **skips** it with
+  a warning. Give tables a primary key (or a replica-identity unique index).
+</Warning>
 
 ## Production prerequisites
 
@@ -357,7 +409,9 @@ update the projection if needed, and use the resync procedure above.
 
 Deleting a row from a **child/embedded table** (e.g. one line item out of
 an order) propagates on the **default replica identity** — no special table
-configuration needed.
+configuration needed. (`REPLICA IDENTITY FULL` is **not** required — this
+applies to flat deletes, memory-mode joins, and SQL-mode reverse-lookup child
+deletes alike.)
 
 This is worth understanding, because Postgres makes it non-obvious. The
 default replica identity logs **only the primary key** in a `DELETE`'s old

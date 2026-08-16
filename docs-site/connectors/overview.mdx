@@ -34,6 +34,16 @@ is pluggable, but a connector is supported only when it appears here and in the
 release test matrix.
 </Info>
 
+<Note>
+**Flat CDC works with no spec at all.** Every source stamps a deterministic
+document id (`{schema.table}:["pk",…]` — Postgres from the replica-identity key,
+MySQL from the binlog PK, Mongo from `_id`, Neo4j from `elementId`, Kafka from
+the message key), so per-row sync into any sink upserts in place and propagates
+deletes — including primary-key-changing updates. Joins and denormalize specs
+are for **composed** parent+children documents, not a correctness requirement.
+See [CDC & projections](/concepts/cdc-and-projections).
+</Note>
+
 ## Source connectors
 
 <CardGroup cols={2}>

@@ -8,9 +8,11 @@ sink. The current connector maps each MongoDB document to one sink document
 (raw 1:1), which fits collections that are already denormalized.
 
 <Note>
-VentStream writes to a **target**. **OpenSearch and Elasticsearch** are the
-supported targets today — they share the `_bulk` API, so the same engine
-handles both. Set the endpoint with `VS_OS_ENDPOINT`.
+VentStream writes to a **target**:
+[OpenSearch / Elasticsearch](/connectors/sinks/opensearch) (one connector —
+they share the `_bulk` API), [Meilisearch](/connectors/sinks/meilisearch), or
+[Redis](/connectors/sinks/redis). The examples here use OpenSearch; set the
+endpoint with `VS_OS_ENDPOINT`.
 </Note>
 
 ## Source requirements
@@ -81,6 +83,27 @@ VS_INDEX_TEMPLATE='${header:ventstream.cdc.relation}' \
 `VS_MONGO_COLLECTIONS` is optional — omit it to watch **every** collection in
 the database. The index template renders one index per collection
 (`orders`, `customers`, …).
+
+The equivalent canonical config file (`VS_ENGINE_CONFIG=./ventstream.yaml`):
+
+```yaml
+schema_version: 1
+roles: [cdc]
+source:
+  kind: mongodb
+  mongodb:
+    uri_ref: env:VS_MONGO_URI
+    database_ref: env:VS_MONGO_DATABASE
+    collections: [orders, customers]   # empty list = every collection
+    bootstrap:
+      mode: snapshot
+sink:
+  kind: opensearch
+  opensearch:
+    endpoint_ref: env:VS_OS_ENDPOINT
+    index_routing:
+      strategy: by_output_relation
+```
 
 ## TLS
 
