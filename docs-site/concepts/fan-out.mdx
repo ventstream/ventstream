@@ -30,20 +30,18 @@ A node whose label the spec never traverses produces **zero**
 recomputations — the change event is read and discarded. This is what
 keeps a single change from rippling across the whole graph.
 
-Changing a shared lookup node must recompute every primary document that embeds
-that value. This can be expensive, but it is required for the target documents
-to converge.
-
 ## The hot-endpoint problem
 
 Now consider a **shared lookup node** — like a `Category` that thousands
-of products point at. In the validation graph there was a single shared
-status node referenced by ~99,000 documents through one relationship type.
+of products point at. In our benchmark dataset (see the
+[hot-nodes deep dive](/engineering/neo4j-hot-nodes)), a single shared
+status node in a 100,000-Author graph was referenced by 59,498 documents
+through one relationship type.
 
 When a single document's edge to that shared node *changes*, the naive
 fan-out anchors on the relationship's endpoints — including the shared
 node — and asks "which documents reach this node?" The answer is *all
-99,000*, even though only one document's edge actually changed.
+59,498*, even though only one document's edge actually changed.
 
 Without handling, a single edge change triggered a **59,498-document
 recompute** in testing. A 1,000-operation burst queued ~5,800 such
@@ -61,9 +59,9 @@ At event time, relationship events involving a hot endpoint have that
 endpoint filtered out of the fan-out anchor set — so only the
 **primary-side** key reaches the recompute path:
 
-```
+```text
 shared-node edge change
-  naive anchors:   [edge, primary-eid, shared-node-eid]  → 99,498 recompute
+  naive anchors:   [edge, primary-eid, shared-node-eid]  → 59,498 recompute
   hot-filtered:    [edge, primary-eid]                    → 1 recompute
 ```
 
@@ -74,13 +72,13 @@ primary-side anchor and recomputes the document whose edge changed.
 
 The filter applies to **relationship** events only. A **node-property
 change on a hot node** — say, renaming that shared status node from
-"Published" to "Live" — still cascades to all ~99,000 documents, because
+"Published" to "Live" — still cascades to all 59,498 documents, because
 the embedded value genuinely changed for all of them. That's correct:
 
 | Event | Recomputes | Correct because |
 |---|---|---|
 | One document's edge to the shared node added/removed | 1 (that document) | only that document's membership changed |
-| The shared node's label property renamed | ~99,000 | the embedded value changed everywhere |
+| The shared node's label property renamed | 59,498 | the embedded value changed everywhere |
 
 The filter removes *spurious* fan-out (an edge change masquerading as a
 graph-wide change), never *legitimate* fan-out (a shared value actually
@@ -92,6 +90,8 @@ changing).
 - **Memory:** a set of detected endpoint IDs, keyed by relationship type.
 - **Per event:** relationship-type and endpoint membership lookups.
 
-Set `VS_NEO4J_HOT_NODE_THRESHOLD=0` to disable detection entirely (the
-old behavior). Raise it if a genuine fan-out target sits just above the
+Set `VS_NEO4J_HOT_NODE_THRESHOLD=0` to disable detection entirely — every
+relationship event then keeps both endpoints in the fan-out anchor set,
+so a shared-endpoint edge change recomputes every referencing document.
+Raise it if a genuine fan-out target sits just above the
 default and you'd rather treat it as hot.

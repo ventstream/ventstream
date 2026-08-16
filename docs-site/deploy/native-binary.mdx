@@ -1,6 +1,6 @@
 ---
 title: "Install the engine binary"
-description: "Install and run the standalone VentStream engine on Linux or macOS without Docker or Fleet."
+description: "Install and run the standalone VentStream engine on Linux or macOS without Docker or VentStream Cloud."
 ---
 
 VentStream is distributed as one native engine binary for:
@@ -9,14 +9,15 @@ VentStream is distributed as one native engine binary for:
 - macOS AMD64 and Apple silicon
 
 Linux archives target the Ubuntu 22.04 runtime baseline (glibc 2.35 or newer),
-and macOS archives target macOS 12 or newer. Windows users should run the OCI
-image until a native Windows build is qualified.
+and macOS archives target macOS 12 or newer. Native Windows is not supported —
+run the engine inside WSL2 (the Linux installer works there as-is) or use the
+container image.
 
 Without an agent key, the binary runs in standalone mode. It reads
 `ventstream.yaml`, resolves secret references from the local environment, and
 connects directly to the configured source, sink, and optional NATS
-infrastructure. It does not require the Fleet control plane, and with no agent
-key it makes zero platform connections.
+infrastructure. It does not require the VentStream Cloud control plane, and
+with no agent key it makes zero platform connections.
 
 ## Install with curl
 
@@ -25,9 +26,7 @@ matching release archive, verifies it against the release `SHA256SUMS`, checks
 the binary version, and installs it under `~/.local/bin`.
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL \
-  https://github.com/ventstream/ventstream/releases/latest/download/ventstream-installer.sh \
-  | sh
+curl -fsSL https://ventstream.dev/install.sh | sh
 ```
 
 It also installs a non-secret example at
@@ -37,8 +36,7 @@ are never overwritten.
 Install a specific version or directory:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL \
-  https://github.com/ventstream/ventstream/releases/latest/download/ventstream-installer.sh \
+curl -fsSL https://ventstream.dev/install.sh \
   | VENTSTREAM_VERSION=0.1.24 \
     VENTSTREAM_INSTALL_DIR="$HOME/bin" \
     sh
@@ -130,9 +128,9 @@ archive was produced by this repository's release workflow.
 ## Standalone boundary
 
 The standalone process retains cursor and projection state locally. Stop the
-process to pause it and restart it to resume. Fleet-wide CLI inventory, remote
-configuration, centralized pause/resume, and agent health require a
-[Fleet-managed deployment](/fleet/overview).
+process to pause it and restart it to resume. Organization-wide CLI inventory,
+remote configuration, centralized pause/resume, and agent health require a
+[managed deployment](/fleet/overview).
 
 The same binary becomes managed when started with a deployment's
 [agent key](/fleet/enrollment). Try it locally:

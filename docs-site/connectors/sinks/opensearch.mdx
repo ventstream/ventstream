@@ -144,7 +144,8 @@ zones hold a copy. Enable Auto-Tune and software updates, then alarm on:
 - `JVMMemoryPressure` and `OldGenJVMMemoryPressure`
 - missing nodes, high CPU, and snapshot failures
 
-The `infra/aws` example accepts `opensearch_topology = "ha"` to exercise this
+The [`infra/aws`](https://github.com/ventstream/ventstream/tree/main/infra/aws)
+example accepts `opensearch_topology = "ha"` to exercise this
 topology. Size its node types, storage, shard count, and alarm actions from
 measured indexing and query load before using it for customer traffic.
 

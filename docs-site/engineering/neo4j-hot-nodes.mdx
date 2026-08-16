@@ -24,12 +24,15 @@ denormalized documents into OpenSearch / Elasticsearch, Meilisearch, or
 Redis — snapshot bootstrap included, deletes handled, crash-safe resume.
 
 ```yaml
-# projection spec (abridged)
-primary: Product
-paths:
-  - [BELONGS_TO, Category]
-  - [SUPPLIED_BY, Supplier, LOCATED_IN, Region]
-fan_out_max_hops: 2
+# projection spec (abridged — the paths live in the projection Cypher)
+denormalize:
+  - primary_label: Product
+    output_table: products_denormalized
+    fan_out_max_hops: 2
+    cypher: |
+      OPTIONAL MATCH (p)-[:BELONGS_TO]->(cat:Category)
+      OPTIONAL MATCH (p)-[:SUPPLIED_BY]->(sup:Supplier)-[:LOCATED_IN]->(reg:Region)
+      # …RETURN elementId(p) AS primaryEid, {…} AS doc
 ```
 
 ## Fan-out inversion

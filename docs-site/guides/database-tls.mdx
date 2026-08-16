@@ -16,9 +16,9 @@ the configured database hostname.
 | Signed by a private or self-managed CA | Set `ca_file` to a mounted PEM bundle. |
 | Unencrypted local development database | Set `mode: disabled`. Do not use this for remote or production traffic. |
 
-## What developers provide
+## What the operator provides
 
-| Deployment | Developer action |
+| Deployment | Operator action |
 |---|---|
 | Amazon RDS PostgreSQL or MySQL | Supply the database endpoint and credentials through environment variables or Secrets. Select `trust.provider: aws_rds` in the engine configuration. |
 | Managed database with a publicly trusted certificate | Supply the endpoint and credentials. Set `mode: verify_full`; no CA file is required. |
@@ -54,8 +54,8 @@ source:
     user_ref: env:VS_PG_USER
     password_ref: env:VS_PG_PASSWORD
     database_ref: env:VS_PG_DATABASE
-    publication: ventstream_app
-    slot: ventstream_app_slot
+    publication_ref: env:VS_PG_PUBLICATION
+    slot_ref: env:VS_PG_SLOT
     tls:
       mode: verify_full
       trust:

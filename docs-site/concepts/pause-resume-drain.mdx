@@ -8,7 +8,7 @@ and a durable convergence operation.
 
 ## Pause
 
-Pause gracefully stops the supervised engine and retains resumable state. The
+Pause gracefully stops the managed engine's pipeline and retains resumable state. The
 deployment stays paused across gateway outages and pod restarts.
 
 ```bash
@@ -18,7 +18,7 @@ ventstreamctl pipelines pause orders-cdc \
 
 ## Resume
 
-Resume selects `running`. The supervisor starts the engine with the selected
+Resume selects `running`. The engine starts its pipeline with the selected
 configuration and waits for local readiness. After a pause, the connector resumes
 from retained state, subject to the source's own retention window.
 
@@ -57,7 +57,7 @@ resume. Confirm source-specific behavior before using it in production.
 Reconcile removes destination documents no longer represented by the source for
 connectors that advertise the capability. Rebootstrap clears supported local
 cursor/join state and forces a fresh snapshot. Kafka is the exception: its cursor
-is the broker-side consumer-group offset, so Fleet reports the limitation and the
+is the broker-side consumer-group offset, so VentStream Cloud reports the limitation and the
 operator must reset that group externally. These are explicit, auditable
 operations and never generic remote shell commands.
 

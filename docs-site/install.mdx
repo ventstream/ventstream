@@ -1,11 +1,11 @@
 ---
 title: "Install"
-description: "Download the VentStream engine and the fleet CLI"
+description: "Download the VentStream engine and the VentStream Cloud CLI"
 ---
 
 ## Supported platforms
 
-| Platform | Engine (`ventstream`) | Fleet CLI (`ventstreamctl`) |
+| Platform | Engine (`ventstream`) | Cloud CLI (`ventstreamctl`) |
 | --- | --- | --- |
 | macOS (Apple Silicon / Intel) | ✅ | ✅ |
 | Linux (arm64 / amd64) | ✅ | ✅ |
@@ -37,7 +37,7 @@ VENTSTREAM_VERSION=0.1.24 VENTSTREAM_INSTALL_DIR=/usr/local/bin \
   curl -fsSL https://ventstream.dev/install.sh | sh
 ```
 
-## Fleet CLI (managed users)
+## VentStream Cloud CLI (managed users)
 
 ```bash
 curl -fsSL https://ventstream.dev/install-cli.sh | sh
@@ -56,6 +56,10 @@ scripts verify checksums before installing.
 ventstream --version
 ventstreamctl version
 ```
+
+The engine and `ventstreamctl` version independently — the engine follows the
+0.1.x release train and the CLI the 0.2.x train, so their versions are not
+expected to match.
 
 ## Try it
 

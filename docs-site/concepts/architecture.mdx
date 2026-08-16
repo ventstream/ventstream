@@ -1,6 +1,6 @@
 ---
 title: "Architecture"
-description: "How VentStream separates engine data paths from optional Fleet management."
+description: "How VentStream separates engine data paths from optional VentStream Cloud management."
 ---
 
 VentStream has an open-source data plane and an optional Cloud management plane.
@@ -8,14 +8,14 @@ The separation is operational, security-sensitive, and deliberate.
 
 <img
   src="/images/architecture.svg"
-  alt="VentStream architecture showing the optional Fleet management plane above a customer-hosted data plane. Fleet administers managed agents over outbound mTLS while CDC records and realtime broker events flow only through the VentStream engine inside the workload environment."
+  alt="VentStream architecture showing the optional VentStream Cloud management plane above a customer-hosted data plane. Cloud administers managed agents over outbound mTLS while CDC records and realtime broker events flow only through the VentStream engine inside the workload environment."
   className="rounded-lg"
 />
 
 The purple path is management traffic. Teal and green show the CDC path from
 source connectors through projection and sink acknowledgement. Orange shows the
 independent broker-to-WebSocket/GraphQL delivery path. Neither data path enters
-Fleet. The same engine binary can also run standalone without a supervisor or
+VentStream Cloud. The same engine binary can also run standalone without a
 control-plane dependency.
 
 ## Data plane
@@ -26,6 +26,7 @@ An engine process runs one or more explicit roles:
   writes destinations: OpenSearch / Elasticsearch, Meilisearch, or Redis.
 - `ws` and `graphql` consume NATS subjects or Redis Streams and serve realtime
   clients.
+- `mcp` serves the MCP server role; it must run alone, without the other roles.
 
 Connector credentials, source data, destination documents, broker messages, and
 client traffic remain in the workload environment. Cursor and join state are
@@ -67,9 +68,9 @@ enough for the engine to catch up.
 
 ## Management plane
 
-Fleet stores tenant inventory, authorization, desired state, immutable
+VentStream Cloud stores tenant inventory, authorization, desired state, immutable
 configuration metadata, operations, agent status, and audit events. Managed agents
-initiate outbound mTLS connections to the gateway. Fleet never connects to source
+initiate outbound mTLS connections to the gateway. Cloud never connects to source
 databases and never proxies engine traffic.
 
 ## Managed mode boundary
@@ -84,12 +85,12 @@ and invokes connector-specific state cleanup. See
 
 ## Outage behavior
 
-- A standalone engine has no Fleet dependency.
+- A standalone engine has no VentStream Cloud dependency.
 - A managed first boot without trusted desired state fails closed.
-- A running managed deployment continues its cached state during a temporary Fleet
+- A running managed deployment continues its cached state during a temporary Cloud
   outage.
 - A deployment cached as paused or drained remains stopped across restarts.
 - API acceptance never implies agent completion; durable operation state records
   delivery and execution.
 
-See [Fleet overview](/fleet/overview) and [Resource model](/fleet/resource-model).
+See [VentStream Cloud overview](/fleet/overview) and [Resource model](/fleet/resource-model).

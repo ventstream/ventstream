@@ -9,7 +9,7 @@ deep to fan out, and how to keep changes cheap.
 
 ## Start from the document you want
 
-Write the target OpenSearch document first, then work backwards to the
+Write the target document first, then work backwards to the
 spec. If a search result needs an order's customer name and its line
 items, those are what you embed — nothing more. Every embedded field is a
 path the engine must watch for changes, so embedding less means less
@@ -83,7 +83,7 @@ make sure any edges you create carry `fromDate`. An edge missing
 
 A spec change means existing documents have the old shape. Options:
 
-- **Postgres:** set `VS_PG_AUTO_RESYNC_ON_YAML_CHANGE=true`. The agent
+- **Postgres/MySQL:** set `VS_PG_AUTO_RESYNC_ON_YAML_CHANGE=true`. The agent
   fingerprints the spec, and on a change drops the slot, wipes join
   state, and re-bootstraps — every doc rewritten with the new shape.
 - **Manual:** restart and let new changes use the new spec while old

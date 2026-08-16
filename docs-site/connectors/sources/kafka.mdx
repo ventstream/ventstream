@@ -51,7 +51,7 @@ key** (Debezium keys by PK); namespace/relation come from the envelope `source`
 block (`schema`/`db` + `table`/`collection`), or from the topic name as a
 fallback. Composite keys honor the key's schema field order.
 
-## Run the agent
+## Run the engine
 
 ```bash
 VS_ROLES=cdc VS_CDC_SOURCE=kafka \
@@ -61,7 +61,7 @@ VS_KAFKA_GROUP_ID=ventstream-shop \
 VS_KAFKA_AUTO_OFFSET_RESET=earliest \
 VS_OS_ENDPOINT=http://localhost:9200 \
 VS_INDEX_TEMPLATE='${header:ventstream.cdc.relation}' \
-./target/release/ventstream
+ventstream
 ```
 
 The index template renders one index per relation (`orders`, `order_items`, …).

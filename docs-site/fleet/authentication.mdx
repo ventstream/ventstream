@@ -30,8 +30,8 @@ Self-hosted installations pass `--control-plane <url>` (or set it on the
 profile) to point at their own control plane.
 
 The CLI opens the VentStream authorization page in your system browser. Sign in
-with your existing account, complete any required MFA or SSO checks, and approve
-the CLI session.
+with your existing account, complete any MFA or SSO checks your identity
+provider requires (enterprise OIDC), and approve the CLI session.
 
 The authorization flow uses PKCE, a one-time state value, and a loopback callback
 on `127.0.0.1`. Your password is entered only in the browser and is never exposed
@@ -56,8 +56,8 @@ your account can access:
 - An account with no organization remains authenticated until it accepts an
   invitation or creates an organization in the dashboard.
 
-For a non-interactive terminal, or to select explicitly, pass a UUID, an
-unambiguous UUID prefix of at least eight characters, or a slug:
+For a non-interactive terminal, or to select explicitly, pass a UUID, a unique
+UUID prefix (8+ characters), or the slug/name:
 
 ```bash
 ventstreamctl auth login --profile production \

@@ -100,9 +100,9 @@ Two planes, deployed independently:
   **roles**: `cdc` (capture & denormalize), `ws` / `graphql` (live
   fan-out). An engine reads its input stream and does its work entirely
   in the customer data plane.
-- **Fleet management plane** — an API, CLI, gateway, and metadata
-  store. Managed supervisors connect outbound with renewable mTLS identity,
-  reconcile revisioned desired state, and report bounded status. Fleet never
+- **VentStream Cloud management plane** — an API, CLI, gateway, and metadata
+  store. Managed engines connect outbound with renewable mTLS identity,
+  reconcile revisioned desired state, and report bounded status. Cloud never
   touches source systems or data traffic.
 
 ```mermaid
@@ -114,7 +114,7 @@ flowchart LR
     bus --> fan["engine · ws / graphql"]
     fan -- "WebSocket / GraphQL" --> sub["Subscribers"]
 
-    cp["Fleet"] -. "outbound mTLS desired state" .-> cdc
+    cp["VentStream Cloud"] -. "outbound mTLS desired state" .-> cdc
     cp -. "outbound mTLS desired state" .-> fan
 
     classDef n fill:#0b1220,stroke:#2563eb,color:#e6edf3;

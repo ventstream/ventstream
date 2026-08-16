@@ -20,15 +20,14 @@ ventstreamctl pipelines configurations select orders-cdc <revision> --wait
 ventstreamctl pipelines resume orders-cdc --wait
 ```
 
-The managed engine stages files atomically in a private configuration directory
-and starts its pipeline child with `VS_ENGINE_CONFIG` pointing at the generated
-`ventstream.yaml`.
+The managed engine stages files atomically in a private configuration
+directory, then loads the staged `ventstream.yaml` and starts the pipeline.
 For a new pipeline, the first selection creates its initial desired state as
 `paused`; an explicit `resume` performs the first start. Later selections
 preserve the pipeline's current run state.
 
 After a restart, the pipeline remains stopped until the engine's fleet client
-has acquired a current Fleet control session and converged the deployment.
+has acquired a current control session and converged the deployment.
 Persisted desired state is retained, but it is not treated as fresh permission
 to start before admission. An engine that is already running can continue
 during a temporary control-plane outage, so transient management downtime does
@@ -52,8 +51,8 @@ ventstreamctl pipelines configurations rollback orders-cdc <revision> --wait
 Configuration documents contain references such as `env:VS_OS_ENDPOINT`, not
 credential values. Inject database passwords, API keys, client certificates,
 TLS private keys, and other secrets through Kubernetes Secrets or the
-customer's secret manager. Fleet validates and distributes configuration
-without becoming a credential vault or data-plane dependency.
+customer's secret manager. VentStream Cloud validates and distributes
+configuration without becoming a credential vault or data-plane dependency.
 
 Redis sink revisions use the same boundary:
 
@@ -75,7 +74,7 @@ sink:
       lease_ms: 30000
 ```
 
-Fleet stores the references, TLS file paths, and key-routing policy. The
+VentStream Cloud stores the references, TLS file paths, and key-routing policy. The
 deployment provides the endpoint, credentials, and mounted trust material to
 the managed engine. The engine supplies `VS_FLEET_DEPLOYMENT_ID`, which is the
 default Redis writer identity; a managed revision does not need to duplicate
@@ -108,7 +107,7 @@ sink:
       ownership: exclusive
 ```
 
-Fleet validates the topology shape before activation. The engine resolves the
+VentStream Cloud validates the topology shape before activation. The engine resolves the
 references in the workload environment, verifies the discovered primary or
 Cluster slot map, and blocks startup when the runtime topology does not match
 the revision. See the [Redis sink guide](/connectors/sinks/redis#endpoint-topology)
@@ -123,7 +122,7 @@ writer remains backpressured. Most replacements can omit this setting and wait
 for the 30-second default lease to expire.
 
 Use `ownership: exclusive` only when the pipeline is the sole writer for its
-routed targets. Fleet and the engine reject destructive Redis drain or
+routed targets. VentStream Cloud and the engine reject destructive Redis drain or
 rebootstrap operations under shared ownership. Exclusive rebuilds also require
 snapshot bootstrap and a finite target set; validation completes before any
 source cursor or Redis key is removed.

@@ -21,7 +21,7 @@ the bottom of this page.
 
 ## Current sustainability matrix
 
-The July 2026 container matrix exercised the final adaptive-memory engine with
+The July 2026 container matrix exercised the current release with
 two vCPUs per engine case. CDC workloads ran under a 512 MiB hard limit and
 realtime workloads under a 1 GiB hard limit. A case passed only when the
 expected sink documents or client deliveries were present; realtime cases also
@@ -31,11 +31,15 @@ required zero gaps and zero duplicates.
 
 | Source | Verified records | Throughput | RSS high-water mark |
 |---|---:|---:|---:|
-| PostgreSQL, SQL mode | 1,000,000 | 29,551/s | 256.5 MiB |
+| PostgreSQL, SQL mode (flat CDC) | 1,000,000 | 29,551/s | 256.5 MiB |
 | MySQL, SQL mode | 500,000 | 6,435/s | 28.2 MiB |
 | MongoDB | 1,000,000 | 56,815/s | 248.5 MiB |
 | Kafka / Redpanda | 2,000,000 | 62,950/s | 406.4 MiB |
 | Neo4j | 100,000 | 3,237/s | 59.8 MiB |
+
+The PostgreSQL row is flat (unjoined) CDC — SQL-mode *joined* recompose
+runs at the ~3–5k events/s shown in the denormalize-mode table further
+down this page.
 
 ### Realtime fan-out at 200 clients
 
@@ -186,7 +190,9 @@ above. Index the FK side of every relation, e.g. for an order projection:
 The engine ships with jemalloc + background decay
 (`_RJEM_MALLOC_CONF`, baked into the image), so RSS tracks the live
 working set rather than the high-water mark after a spike — no tuning
-needed. Full list in the [engine env reference](/reference/engine-env).
+needed (Linux; the container image bakes these defaults — set
+`_RJEM_MALLOC_CONF` yourself for the native binary). Full list in the
+[engine env reference](/reference/engine-env).
 
 ## WebSocket fan-out (the `ws` role)
 
@@ -195,7 +201,7 @@ pushed to every connected WebSocket whose subscription matches. The cost
 that matters here is **fan-out width** — how many connections one event
 is delivered to.
 
-Final engine, local Docker, single node. 2,000 connections, a
+Current engine build, local Docker, single node. 2,000 connections, a
 mixed-realistic shape (15% subscribed to a hot `orders.>`, the rest to a
 narrow per-entity pattern), 256-byte payloads, **Core mode**:
 
@@ -242,8 +248,7 @@ The numbers above come from a burst-and-poll method you can run against
 your own deployment:
 
 1. Bootstrap your projection and let the agent reach the `tailing` phase.
-2. Issue a bounded burst of mutations in one transaction (e.g. `UPDATE …
-   WHERE id BETWEEN … ` for 10k rows), noting the commit time.
+2. Issue a bounded burst of mutations in one transaction (e.g. `UPDATE … WHERE id BETWEEN …` for 10k rows), noting the commit time.
 3. Poll the **last** document in the range until it reflects the change —
    that's the drain time for the whole burst.
 4. `events ÷ drain_time` is your end-to-end throughput (CDC decode →

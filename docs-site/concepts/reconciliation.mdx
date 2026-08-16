@@ -51,7 +51,7 @@ internals and runs once per drain-resume:
   </Step>
   <Step title="Diff + bulk-delete">
     Any document whose key isn't in the source key-set is an orphan.
-    Bulk-delete them (1000 per request).
+    Bulk-delete them (1,000 per request).
   </Step>
 </Steps>
 
@@ -62,7 +62,7 @@ doc ID, check it against the source set.
 ## Cost characteristics
 
 The scan cost is proportional to the number of documents in the target index,
-not the number of orphans. Deletes are issued in batches of 1,000. The
+not the number of orphans. The
 source-key set is held in memory for the duration of the pass, so measure both
 runtime and peak memory with production-like data before scheduling
 reconciliation for a large index. Run it during a lower-traffic window when the
@@ -77,12 +77,9 @@ multi-column key. The live key set the source returns is folded into the
 regardless of key arity:
 
 - a **single** column keys the set by the bare value
-  (`shop.orders:["uuid"]`),
+  (`shop.orders:["uuid"]`);
 - a **composite** key serializes every key column, in declared order, as
   a JSON array (`shop.cart_items:["cart-42","prod-9"]`).
-
-The source-side live set and the document-ID parser use the same canonical key
-encoder, so a single pass handles single- and composite-key tables.
 
 <Tip>
 The deterministic doc-ID format differs per source — a JSON array for

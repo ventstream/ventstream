@@ -1,6 +1,6 @@
 ---
 title: "Kubernetes deployment"
-description: "Choose standalone engine workloads or Fleet-managed engines, then follow the matching Kubernetes runbook."
+description: "Choose standalone engine workloads or Cloud-managed engines, then follow the matching Kubernetes runbook."
 ---
 
 VentStream has two Kubernetes operating modes. Both run the same public engine
@@ -11,8 +11,8 @@ alongside local source/sink configuration is a hard startup error.
 
 | Mode | Engine process | Configuration owner | Operations | Control plane |
 | --- | --- | --- | --- | --- |
-| Standalone | `ventstream` is PID 1, no agent key | ConfigMap and Secret | Helm/Kubernetes restart and rollout | None |
-| Cloud-managed | The same `ventstream` binary is PID 1; its built-in fleet client re-executes the binary as the pipeline child | Immutable Cloud revision plus workload-local Secret | Dashboard and `ventstreamctl` | VentStream Cloud |
+| Standalone | The same `ventstream` process reading a local `ventstream.yaml`; no agent key | ConfigMap and Secret | Helm/Kubernetes restart and rollout | None |
+| Cloud-managed | The same `ventstream` process started with an agent key; configuration comes from VentStream Cloud | Immutable Cloud revision plus workload-local Secret | Dashboard and `ventstreamctl` | VentStream Cloud |
 
 ## Standalone
 
@@ -48,7 +48,7 @@ inside the workload environment.
 
 - Pin container images by digest and promote the same digest between environments.
 - Keep connector credentials and private keys in a managed secret provider.
-- Persist source cursors, join state, Fleet identity, and applied configuration.
+- Persist source cursors, join state, managed identity, and applied configuration.
 - Give every CDC pipeline its own replication slot or cursor and exactly one
   active engine instance.
 - Run `helm lint` and `helm template` against production values in CI.

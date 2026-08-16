@@ -44,6 +44,7 @@ runtime:
     mailbox: 256
   graphql:
     listen: 0.0.0.0:4041
+    # role-level value overrides the shared realtime.broadcast_capacity
     broadcast_capacity: 1024
 ```
 
@@ -60,7 +61,7 @@ separate processes.
 
 <Warning>
 Do not put a credential-bearing Redis URL directly in `ventstream.yaml` or a
-Fleet configuration. The schema accepts `url_ref: env:...`, and the secret is
+VentStream Cloud configuration. The schema accepts `url_ref: env:...`, and the secret is
 resolved only inside the customer workload.
 </Warning>
 
@@ -129,8 +130,8 @@ The equivalent Redis command is:
 
 ```bash
 XADD ventstream:{acme}:events MAXLEN ~ 1000000 * \
-  subject vs.t.acme.orders.order.updated.order_1 \
-  event '{"id":"01...","event":"orders.order.updated",...}'
+  subject vs.t.acme.orderStatusChanged.order_1 \
+  event '{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","event":"orderStatusChanged","tenant":"acme","entity_id":"order_1","occurred_at":"2026-01-01T00:00:00Z","received_at":"2026-01-01T00:00:01Z","schema_version":2,"data":{"status":"ready"},"metadata":{}}'
 ```
 
 `MAXLEN` bounds growth atomically with `XADD`. The gateway also applies the

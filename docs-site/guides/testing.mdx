@@ -91,8 +91,8 @@ curl -s --user "$NEO4J_AUTH" \
   -H 'Content-Type: application/json' \
   -d '{"statements":[{"statement":"MATCH (p:Product) RETURN count(p)"}]}'
 
-# OpenSearch
-curl -s 'http://localhost:9200/products_denormalized/_count'
+# OpenSearch (index name depends on your VS_INDEX_TEMPLATE)
+curl -s 'http://localhost:9200/products/_count'
 ```
 
 They should be equal once the engine has drained its queue. Check source lag and

@@ -18,9 +18,7 @@ your local services.
 Install the release binary without a Rust toolchain:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL \
-  https://github.com/ventstream/ventstream/releases/latest/download/ventstream-installer.sh \
-  | sh
+curl -fsSL https://ventstream.dev/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
@@ -148,7 +146,7 @@ ventstream
 
 ```graphql
 subscription {
-  orderStatusChanged(orderId: "order_1") { id status changedAt seq }
+  orderStatusChanged(orderId: "order_1") { id status changedAt cursor }
 }
 ```
 
@@ -161,10 +159,10 @@ nats pub vs.t.acme.orderStatusChanged.order_1 \
   '{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","event":"orderStatusChanged","tenant":"acme","entity_id":"order_1","occurred_at":"2026-01-01T00:00:00Z","received_at":"2026-01-01T00:00:00Z","schema_version":2,"data":{"status":"confirmed"}}'
 ```
 
-GraphiQL updates live. The typed subscription exposes `seq` (the resume
+GraphiQL updates live. The typed subscription exposes `cursor` (the resume
 cursor) and the playground tracks it, so reloading and reconnecting replays
 what you missed. For the Apollo Client wiring (`graphql-transport-ws` link +
-`resume_from_seq`), see
+`resume_from_cursor`), see
 [Real-time subscriptions](/concepts/real-time-subscriptions) and the
 [real-time demo](/guides/realtime-demo).
 
