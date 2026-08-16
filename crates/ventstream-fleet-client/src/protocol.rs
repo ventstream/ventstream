@@ -86,6 +86,15 @@ pub struct AgentRuntimeStatus {
     pub last_input_at_unix_milliseconds: Option<u64>,
     /// Latest successful output time as Unix milliseconds.
     pub last_output_at_unix_milliseconds: Option<u64>,
+    /// Source schema drift events observed since process start.
+    pub schema_drift_total: Option<u64>,
+    /// Schema-classified DLQ routings since process start.
+    pub schema_casualties_total: Option<u64>,
+    /// TRUNCATE statements observed in the source change stream.
+    pub truncate_events_total: Option<u64>,
+    /// Bounded operator-safe summary of observed drift per table
+    /// (e.g. `orders added=1 type_change=1`). Empty when no drift.
+    pub schema_drift_detail: String,
     /// Latest engine readiness result. `None` means no sample is available.
     pub engine_ready: Option<bool>,
     /// Stable machine-readable runtime failure code.
@@ -345,6 +354,10 @@ impl ControlSession {
                 cursor_age_milliseconds: runtime.cursor_age_milliseconds,
                 events_per_second: runtime.events_per_second,
                 dlq_writes_total: runtime.dlq_writes_total,
+                schema_drift_total: runtime.schema_drift_total,
+                schema_casualties_total: runtime.schema_casualties_total,
+                truncate_events_total: runtime.truncate_events_total,
+                schema_drift_detail: runtime.schema_drift_detail.clone(),
                 dlq_write_failures_total: runtime.dlq_write_failures_total,
                 backpressure_total: runtime.backpressure_total,
                 sink_latency_p95_milliseconds: runtime.sink_latency_p95_milliseconds,
