@@ -1,289 +1,323 @@
-# VentStream
-
 <p align="center">
   <img src="docs-site/images/ventstream-logo.svg" alt="VentStream" width="440">
+</p>
+
+<p align="center">
+  <b>Sync your database into search indexes and caches — joined, current, one binary.</b>
+</p>
+
+<p align="center">
+  <a href="https://github.com/ventstream/ventstream/releases"><img src="https://img.shields.io/github/v/release/ventstream/ventstream" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
+  <a href="https://ventstream.dev/docs"><img src="https://img.shields.io/badge/docs-ventstream.dev-2FCF88" alt="Docs"></a>
 </p>
 
 <p align="center">
   <img src="docs-site/images/ventstream-architecture.svg" alt="VentStream architecture — one Rust binary with a change-streaming pipeline and a real-time socket-delivery pipeline" width="860">
 </p>
 
-**Sync your database into search indexes and caches — joined, current,
-one binary.** VentStream captures changes from PostgreSQL, MySQL,
-MongoDB, Neo4j, or Kafka, runs stateful denormalizing joins, and
-materializes documents into OpenSearch/Elasticsearch or Redis —
-idempotent, crash-safe, and typically current within a couple of
-seconds. The same engine also fans events out to browsers over native
-WebSockets and Apollo-compatible GraphQL subscriptions.
+VentStream captures changes from PostgreSQL, MySQL/MariaDB, MongoDB, Neo4j, or
+Kafka, optionally runs stateful denormalizing joins, and materializes documents
+into OpenSearch/Elasticsearch, Meilisearch, or Redis — idempotent, crash-safe,
+and typically current within a couple of seconds. The same engine fans events
+out to browsers over native WebSockets and Apollo-compatible GraphQL
+subscriptions.
 
-Benchmarked end to end on 2 vCPUs / 1 GiB: **58k events/s from
-PostgreSQL, 73k/s from MongoDB, 88k/s from Kafka** — every run verified
-for exact document counts, zero gaps, zero duplicates
-(`benchmarks/container-matrix/`).
+One public artifact runs everywhere: standalone against a local config file,
+or attached to [VentStream Cloud](https://ventstream.dev) with a single agent
+key.
 
-Two pipelines off one event core, run together or apart:
+---
 
-1. **Change streaming → any target.** Capture changes from PostgreSQL, Neo4j,
-   MongoDB, MySQL/MariaDB, or Kafka/Redpanda and stream them continuously into a
-   downstream target — idempotent, bounded, crash-safe. OpenSearch,
-   Elasticsearch, Meilisearch, and Redis sinks are implemented today. Projections are declared
-   in YAML and can run standalone or under the optional Fleet control plane.
-2. **Real-time socket delivery → clients.** Publishers emit events to
-   NATS or Redis Streams; VentStream pushes them to subscribed clients over a native
-   WebSocket protocol **and** GraphQL subscriptions (`graphql-transport-ws`,
-   Apollo-compatible). Typed subscriptions are authored in GraphQL SDL.
+## Contents
 
-Either way the job is the same — **move data, as it changes, to where it's
-needed.** Select the pipelines per process with `VS_ROLES=cdc,ws,graphql`.
+- [Why VentStream](#why-ventstream)
+- [Sources and targets](#sources-and-targets)
+- [Quickstart](#quickstart)
+- [A minimal pipeline](#a-minimal-pipeline)
+- [Joined documents](#joined-documents)
+- [Managed mode](#managed-mode)
+- [Real-time delivery](#real-time-delivery)
+- [Performance](#performance)
+- [Deploy](#deploy)
+- [Configuration reference](#configuration-reference)
+- [Repository layout](#repository-layout)
+- [Engineering bar](#engineering-bar)
+- [Development](#development)
+- [License](#license)
 
-**Implemented today** (the engine is source/sink-pluggable — this is the
-matrix that's built and tested; more backends are planned)
-- **Sources:** PostgreSQL logical replication, Neo4j 5.17+ Enterprise CDC,
-  MongoDB change streams, MySQL/MariaDB row binlog, and Kafka/Redpanda
-  Debezium or raw topics
-- **Targets (sinks):** OpenSearch / Elasticsearch and Redis
-- **Real-time:** native WebSocket + GraphQL subscriptions over NATS or Redis Streams
+---
 
-**Docs:** the full docs live in `docs-site/` (Mintlify) — concepts, guides,
-deploy, and reference. Read them locally with no account or hosting:
+## Why VentStream
 
-```bash
-npm i -g mint        # one-time
-cd docs-site
-mint dev             # → http://localhost:3000 (hot-reloads on edits)
-```
+Two pipelines off one event core, run together or apart
+(`roles: [cdc, ws, graphql]`):
 
-## Try it in 5 minutes
+1. **Change streaming → any target.** Capture inserts, updates, and deletes at
+   the source and stream them continuously into search indexes and caches.
+   Every document carries a deterministic id, so re-emits overwrite instead of
+   duplicating and deletes always find their target. The cursor only advances
+   after the sink confirms a durable write — crash anywhere, resume exactly
+   where you left off, no gaps, no duplicates.
+2. **Real-time socket delivery → clients.** Publishers emit events to NATS or
+   Redis Streams; VentStream pushes them to subscribed clients over a native
+   WebSocket protocol and GraphQL subscriptions (`graphql-transport-ws`,
+   Apollo-compatible), with typed subscriptions authored in GraphQL SDL.
 
-The self-contained demo brings up Postgres and Neo4j sources plus
-OpenSearch with seeded e-commerce data, and streams joined documents end
-to end. It pulls the published engine image — no Rust toolchain, no
-source build:
+What that buys you in practice:
+
+- **Joined, not just mirrored.** Declare parent + children in a YAML spec and
+  the sink receives one composed document per logical row — orders with their
+  items and customer embedded — kept current as any side changes, including
+  child deletes and fan-out updates.
+- **Exactly-the-right-rows.** Postgres publications, MySQL binlog filters,
+  Mongo collection scopes: the database owner decides what leaves the
+  database.
+- **Bootstrap + tail, one motion.** A keyset-paginated snapshot seeds the
+  target, then the live tail takes over from the exact watermark — same
+  document shapes, same ids.
+- **Fail closed.** Undeliverable events block the cursor rather than being
+  silently dropped; poison events go to a JSONL dead-letter queue with the
+  reason attached.
+
+## Sources and targets
+
+| | Source | Mechanism |
+|---|---|---|
+| ✅ | PostgreSQL | logical replication (pgoutput) |
+| ✅ | MySQL / MariaDB | row-based binlog |
+| ✅ | MongoDB | change streams |
+| ✅ | Neo4j 5.17+ Enterprise | CDC log with `txLogEnrichment` |
+| ✅ | Kafka / Redpanda | Debezium envelopes or raw topics |
+
+| | Target | Notes |
+|---|---|---|
+| ✅ | OpenSearch / Elasticsearch | bulk API, external versioning |
+| ✅ | Meilisearch | task-confirmed writes, FIFO ordering |
+| ✅ | Redis | keyspace or view materialization, cluster-aware |
+| ✅ | Browsers | native WebSocket + GraphQL subscriptions |
+
+The engine is source/sink-pluggable; this is the matrix that is built and
+tested end to end today.
+
+## Quickstart
+
+**Self-contained demo** — Postgres and Neo4j sources, OpenSearch target,
+seeded e-commerce data, joined documents streaming end to end. No Rust
+toolchain needed; it pulls the published image:
 
 ```bash
 git clone https://github.com/ventstream/ventstream
 cd ventstream/demo/stack && docker compose up -d
-# then follow demo/stack/README.md — insert an order, watch the joined
+# follow demo/stack/README.md — insert an order, watch the joined
 # document appear in OpenSearch in real time
 ```
 
-To build the engine from source instead:
-`docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build`
+**Install the binary** — checksum-verified Linux and macOS builds:
+
+```bash
+curl -fsSL https://ventstream.dev/install.sh | sh
+```
+
+**Or pull the image**:
+
+```bash
+docker pull ghcr.io/ventstream/ventstream:<version>
+```
+
+## A minimal pipeline
+
+Point the engine at a Postgres publication and an OpenSearch endpoint —
+nothing else. Table selection lives in the publication
+(`CREATE PUBLICATION vs_pub FOR TABLE orders`), and every document gets a
+deterministic id derived from its primary key:
+
+```yaml
+# ventstream.yaml — non-secret; credentials are env: references
+schema_version: 1
+roles: [cdc]
+
+source:
+  kind: postgres
+  postgres:
+    host_ref: env:VS_PG_HOST
+    user_ref: env:VS_PG_USER
+    password_ref: env:VS_PG_PASSWORD
+    database_ref: env:VS_PG_DATABASE
+    publication_ref: env:VS_PG_PUBLICATION
+    slot_ref: env:VS_PG_SLOT
+    bootstrap:
+      mode: snapshot
+
+sink:
+  kind: opensearch
+  opensearch:
+    endpoint_ref: env:VS_OS_ENDPOINT
+    index_routing:
+      strategy: fixed
+      name: orders
+```
+
+```bash
+VS_ENGINE_CONFIG=./ventstream.yaml ventstream
+```
+
+Inserts, updates, deletes — even primary-key changes — stay in exact lockstep
+with the table. Swap the sink block for `meilisearch` or `redis` and the same
+pipeline targets those instead.
+
+## Joined documents
+
+When flat rows aren't enough, declare the shape you want in a joins spec and
+pick a denormalize mode. The sink then receives composed documents that are
+recomputed whenever any contributing row changes:
+
+```yaml
+# joins.yaml
+joins:
+  - name: orders
+    primary: { table: public.orders, pk: id }
+    related:
+      - id: customer
+        table: public.customers
+        pk: id
+        join_on: { from: customer_id, to: id }
+        embed_as: customer
+        cardinality: one
+      - id: items
+        table: public.order_items
+        pk: id
+        join_on: { from: id, to: order_id }
+        embed_as: items
+        cardinality: many
+    target: { index: orders }
+```
+
+Two engines are available: in-memory joins with redb-persisted state, or
+SQL-recomposition (`denormalize_mode: sql`) that rebuilds documents with a
+query against the source — the right default for large tables.
+
+## Managed mode
+
+The binary above is the whole product — there is no separate "managed engine".
+Whether an engine is managed is decided at runtime by one credential: an agent
+key minted from the [VentStream Cloud](https://ventstream.dev) dashboard or
+`ventstreamctl`.
+
+- **Key present** (`VS_AGENT_KEY`, or `managed.agent_key_ref` in the config
+  file): the engine performs an invisible first-connect handshake, then fetches
+  its pipeline's selected configuration revision from the control plane,
+  reports health, and executes operations. Lost state simply re-binds on the
+  same key.
+- **Key absent**: the engine reads its local `ventstream.yaml` and **never
+  opens a connection to the platform** — no telemetry, no version checks,
+  nothing. This is an invariant, not a default.
+
+```bash
+# the same binary, attached to the control plane
+VS_AGENT_KEY=vsa1.… ventstream
+```
+
+Config authorship stays with you either way: managed pipelines are authored as
+immutable revisions with `ventstreamctl`, and credentials never transit the
+platform — config documents carry `env:` references only. See
+[Managed mode](docs-site/concepts/managed-mode.mdx) and the
+[Kubernetes deploy guide](docs-site/deploy/kubernetes-managed-engine.mdx).
+
+## Real-time delivery
+
+Run the `ws` and `graphql` roles (standalone or alongside `cdc`) to push
+events to browsers:
+
+- Native WebSocket protocol with per-connection mailboxes, slow-consumer
+  eviction, and optional JetStream-backed replay
+- GraphQL subscriptions over `graphql-transport-ws`, typed via SDL
+  (`@vsSubscribe` / `@source`), Apollo-compatible
+- NATS Core, NATS JetStream, or Redis Streams as the broker
+
+A TypeScript SDK and example apps live in [`packages/`](packages/).
+
+## Performance
+
+Benchmarked end to end on 2 vCPUs / 1 GiB — every run verified for exact
+document counts, zero gaps, zero duplicates
+([`benchmarks/container-matrix/`](benchmarks/container-matrix/)):
+
+| Path | Throughput |
+|---|---|
+| PostgreSQL → OpenSearch | 58k events/s |
+| MongoDB → OpenSearch | 73k events/s |
+| Kafka → OpenSearch | 88k events/s |
+
+Four-million-document bootstrap runs land in minutes on commodity hardware,
+with engine CPU staying in the low double digits and memory bounded by
+explicit knobs — see [performance](docs-site/concepts/performance.mdx) for the
+sizing math.
 
 ## Deploy
 
-Choose a deployment mode in the
-[Kubernetes guide](docs-site/deploy/kubernetes.mdx):
+| Mode | How |
+|---|---|
+| Native binary | `install.sh`, systemd or anything else — [guide](docs-site/deploy/native-binary.mdx) |
+| Docker / Compose | `ghcr.io/ventstream/ventstream:<version>` |
+| Kubernetes, standalone | manifests in the [standalone guide](docs-site/deploy/kubernetes-standalone.mdx) |
+| Kubernetes, managed | `oci://ghcr.io/ventstream/charts/ventstream-managed-agent` with an agent-key Secret — [guide](docs-site/deploy/kubernetes-managed-engine.mdx) |
+| Realtime gateway | `oci://ghcr.io/ventstream/charts/ventstream-gateway` |
 
-- **Standalone native binary:** install a checksum-verified Linux or macOS
-  release with `ventstream-installer.sh`, provide `ventstream.yaml` plus local
-  environment-backed secrets, and run without Fleet. See the
-  [native binary guide](docs-site/deploy/native-binary.mdx).
-- **Standalone CDC:** deploy the open-core image with canonical
-  `ventstream.yaml`, workload-local Secrets, and a persistent StatefulSet. The
-  current `ventstream-agent` chart predates Fleet and is deprecated for new
-  installations; use the maintained standalone manifest in the guide.
-- **Standalone realtime:** use `infra/helm/ventstream-gateway` for replicated
-  native WebSocket and GraphQL roles.
-- **Fleet-managed:** use the separately distributed VentStream Fleet control
-  plane and supervisor, then administer enrolled engines with `ventstreamctl`.
-  The CLI executable is available without GitHub authentication from the
-  [public VentStream releases repository](https://github.com/ventstream/ventstream-releases).
+Tagged releases publish multi-architecture images; production values should
+pin `image.digest=sha256:…`. Per-platform SPDX SBOMs, vulnerability reports,
+and checksums are attached to each GitHub release — see
+[`docs/releasing.md`](docs/releasing.md) for the verification policy.
 
-Tagged releases publish the multi-architecture engine image at
-`ghcr.io/ventstream/ventstream:<version>` and the standalone realtime
-chart at `oci://ghcr.io/ventstream/charts/ventstream-gateway`. The
-workflow does not publish a floating `latest` tag. Install a chart release with:
+## Configuration reference
+
+Everything is driven by one non-secret `ventstream.yaml`
+(`VS_ENGINE_CONFIG=…`); credentials are always `env:` or `file:` references,
+never inline. The complete, authoritative reference — every source, sink,
+joins, realtime, TLS, and performance knob — lives in the docs:
+
+- [Engine configuration contract](docs/engine-config-contract.md)
+- [Full variable reference](docs-site/reference/engine-env.mdx)
+- [Connector guides](docs-site/connectors/overview.mdx)
+
+Read the docs locally with no account or hosting:
 
 ```bash
-helm upgrade --install realtime \
-  oci://ghcr.io/ventstream/charts/ventstream-gateway \
-  --version <version>
+npm i -g mint && cd docs-site && mint dev   # → http://localhost:3000
 ```
 
-Production values should set `image.digest=sha256:...`; the digest takes
-precedence over `image.tag`. Release image digests, per-platform SPDX SBOMs,
-vulnerability reports, and checksums are attached to the corresponding GitHub
-release. See [`docs/releasing.md`](docs/releasing.md) for publication and
-verification policy.
-
-### Fleet-managed mode
-
-VentStream Fleet is distributed separately from this open-core repository. Its
-`ventstream-fleet-agent` supervisor runs as PID 1, owns the outbound mTLS
-control stream and durable management state, and starts this open-core binary
-as a child. Pause, resume, and drain are process lifecycle operations performed
-by that supervisor; the engine does not receive Fleet credentials or connect
-directly to the Fleet API.
-
-The legacy `VS_CONTROL_PLANE_URL` and `VS_CONTROL_PLANE_KEY` telemetry channel
-is not the Fleet protocol. The managed supervisor removes those variables from
-the child environment.
-
-When the supervisor sets `VS_FLEET_APPLIED_CONFIG_PATH`, the engine reads the
-Fleet-staged non-secret configuration envelope before starting any role. The
-envelope must pass its SHA-256 digest check and must not contain top-level
-`secrets`. In schema version 1, the engine can consume these control-plane
-managed inline specs from `document.specs`, with legacy env file paths as
-fallbacks:
-
-- `joins_yaml` replaces `VS_JOINS_YAML` for Postgres/MySQL join projections.
-- `neo4j_denormalize_yaml` replaces `VS_NEO4J_DENORMALIZE_YAML`.
-- `graphql_schema` replaces `VS_GRAPHQL_SCHEMA`.
-- `graphql_subscriptions_yaml` replaces `VS_GRAPHQL_SUBSCRIPTIONS`.
-- `graphql_manifest_yaml` replaces `VS_GRAPHQL_MANIFEST`.
-
-Connection strings, passwords, API keys, client certificates, and private keys
-remain local environment or Secret configuration. Public provider trust bundles
-can be selected in the engine config, including `trust.provider: aws_rds`.
-
-The numbered CDC manifests under `infra/k8s/` and the deprecated
-`ventstream-agent` chart document the retired telemetry integration and are kept
-only as migration references. Do not use them as the current Fleet deployment
-path.
-
-## Workspace layout
+## Repository layout
 
 ```
-ventstream/
-├── crates/
-│   ├── ventstream-core/        Core event type, bus, shutdown, traits, errors
-│   ├── ventstream-protocol/    Wire schema: event envelope + subject grammar (WS/GraphQL contract)
-│   ├── ventstream-config/      Pipeline/spec YAML parsing & validation
-│   ├── ventstream-sources/     Source adapters — Postgres, Neo4j, MongoDB, MySQL, Kafka
-│   ├── ventstream-joins/       Stateful in-memory joins / denormalization (redb-persisted)
-│   ├── ventstream-sinks/       Sink adapters — OpenSearch / Elasticsearch and Redis
-│   ├── ventstream-jetstream/   Shared JetStream consumer lifecycle (naming, RAII handle, reaper)
-│   ├── ventstream-realtime/    Provider-neutral broker, session, capability, and cursor contract
-│   ├── ventstream-redis/       Redis Streams shared tailer, replay, retention, and cursor adapter
-│   ├── ventstream-ws/          Native WebSocket delivery gateway
-│   ├── ventstream-graphql/     GraphQL subscription gateway (graphql-transport-ws, Apollo)
-│   ├── ventstream-telemetry/   Outbound heartbeats to the control plane + tracing
-│   └── ventstream/             Binary — CLI, role wiring (cdc/ws/graphql), lifecycle
-├── packages/                   TypeScript SDK, client, and example apps
-├── demo/                       Runnable demos — stack (CDC), realtime (WS/GraphQL), webapp
-├── examples/                   Example specs / projects
-├── infra/                      Deploy — helm/ charts, docker/ images, k8s/ manifests
-├── docs-site/                  Published docs (Mintlify)
-├── docs/                       Internal notes (testing, debugging, pre-prod checklist)
-└── .github/workflows/          CI
+crates/
+├── ventstream/             Binary — CLI, role wiring, lifecycle, managed-mode dispatch
+├── ventstream-core/        Event type, bus, shutdown, canonical doc ids
+├── ventstream-config/      ventstream.yaml parsing & validation
+├── ventstream-sources/     Postgres, MySQL, MongoDB, Neo4j, Kafka
+├── ventstream-sinks/       OpenSearch/Elasticsearch, Meilisearch, Redis
+├── ventstream-joins/       Stateful joins / denormalization (redb-persisted)
+├── ventstream-ws/          Native WebSocket gateway
+├── ventstream-graphql/     GraphQL subscription gateway
+├── ventstream-realtime/    Broker-neutral session/cursor contract
+├── ventstream-managed/     Agent-key managed-mode harness
+└── …                       protocol, redis, jetstream, telemetry
+packages/                   TypeScript SDK, client, example apps
+demo/                       Runnable demos — CDC stack, realtime, webapp
+docs-site/                  Published docs (Mintlify)
+infra/                      Helm charts, Docker images, k8s manifests
 ```
 
 ## Engineering bar
 
 - `unsafe_code = "forbid"` across the workspace
-- Clippy `pedantic` + `nursery` enabled, with `unwrap` / `panic` / `todo` denied
-- No memory leaks: every spawned task is owned and cancellable via `tokio_util::sync::CancellationToken`
-- No race conditions: message-passing via channels is the primary concurrency model; shared mutable state requires explicit justification
-- Release profile uses `lto = "fat"` + `panic = "abort"` for tightest binary
+- Clippy `pedantic` + `nursery`, with `unwrap` / `panic` / `todo` denied
+- Every spawned task is owned and cancellable; message passing is the primary
+  concurrency model
+- Correctness is verified live, not assumed: bootstrap parity, delete
+  topologies, crash-resume, and memory limits are exercised against real
+  databases in CI and release gates
 
-## Configuration
-
-VentStream supports legacy environment-variable configuration and a canonical
-non-secret `ventstream.yaml` via `VS_ENGINE_CONFIG`. Required variables are bare
-names; optional ones list their default in parentheses.
-The complete, authoritative list lives in
-[`docs-site/reference/engine-env.mdx`](docs-site/reference/engine-env.mdx) —
-this section is the common subset. Without `VS_ENGINE_CONFIG`, pick roles with
-`VS_ROLES` (`cdc`,`ws`,`graphql`) and the CDC source with `VS_CDC_SOURCE`.
-
-Minimal canonical config:
-
-```yaml
-schema_version: 1
-roles: [cdc]
-source: { kind: postgres }
-sink:
-  kind: opensearch
-  opensearch:
-    endpoint_ref: env:VS_OS_ENDPOINT
-    index_routing: { strategy: by_output_relation }
-specs:
-  joins: ./joins.yaml
-```
-
-### CDC source
-
-`VS_CDC_SOURCE` selects `postgres`, `neo4j`, `mongodb`, `mysql` (`mariadb`
-alias), or `kafka` (`redpanda` alias). The complete variable reference and
-connector-specific guides cover all five source families; the common examples
-below show Postgres and Neo4j.
-
-**Postgres** (`VS_CDC_SOURCE=postgres`)
-- `VS_PG_HOST`, `VS_PG_PORT` (5432), `VS_PG_USER`, `VS_PG_PASSWORD`, `VS_PG_DATABASE` — connection.
-- `VS_PG_TLS_MODE=verify_full` enforces certificate and hostname verification. Set `VS_PG_TLS_TRUST_PROVIDER=aws_rds` for Amazon RDS, or use `VS_PG_TLS_CA_FILE` for a private CA.
-- `VS_PG_PUBLICATION`, `VS_PG_SLOT` — logical-replication publication + slot to consume.
-- `VS_PG_BOOTSTRAP_MODE` — `snapshot` to seed state from existing rows on cold start.
-- `VS_PG_BOOTSTRAP_CHUNK_SIZE` (10000) — rows per keyset-paginated chunk during bootstrap.
-- `VS_JOINS_YAML` — projection spec; `VS_PG_AUTO_RESYNC_ON_YAML_CHANGE` — re-bootstrap when it changes.
-
-**Neo4j** (`VS_CDC_SOURCE=neo4j`)
-- `VS_NEO4J_URI` (e.g. `neo4j+s://host:7687`), `VS_NEO4J_USER`, `VS_NEO4J_PASSWORD`, `VS_NEO4J_DATABASE` (`neo4j`).
-- `VS_NEO4J_TLS_MODE=verify_full`, with optional `VS_NEO4J_TLS_CA_FILE`, selects strict encrypted Bolt.
-- `VS_NEO4J_DENORMALIZE_YAML` — denormalize spec; `VS_NEO4J_STATE_DIR` — cursor directory.
-- `VS_NEO4J_BOOTSTRAP_BATCH_SIZE` (2000), `VS_NEO4J_POLL_INTERVAL_MS` (500), `VS_NEO4J_HOT_NODE_THRESHOLD` (100).
-- `VS_NEO4J_RECOMPOSE_CHUNK` (128), `VS_NEO4J_RECOMPOSE_CONCURRENCY` (8) — live multi-hop recompose tuning.
-
-### Sink
-- `VS_SINK` — `opensearch` (default), `elasticsearch`, or `redis`.
-- `VS_OS_ENDPOINT` — OpenSearch or Elasticsearch URL.
-- `VS_OS_TLS_MODE=verify_full`, with optional `VS_OS_TLS_CA_FILE`, enforces HTTPS certificate and hostname verification.
-- `VS_INDEX_TEMPLATE` — destination index pattern; supports `${header:…}` and `%Y/%m/%d`.
-- `VS_REDIS_SINK_TOPOLOGY`, `VS_REDIS_SINK_URL`, `VS_REDIS_SINK_KEY_PREFIX` — Redis materialization topology and key namespace. Standalone, Sentinel, and Cluster modes support strict TLS, optional custom trust, mutual TLS, and renewable per-target writer leases.
-
-### Joins
-- `VS_JOINS_YAML` — path to the joins manifest.
-- `VS_JOINS_STATE_DIR` — directory for redb-backed join state. Required when
-  PostgreSQL or MySQL uses memory-mode joins; mount it on durable storage.
-
-### Performance knobs (defaults validated under 50k-mutation bursts; 100k+ state rows)
-| Var | Default | Purpose |
-|---|---|---|
-| `VS_PERSIST_BATCH_OPS` | `5000` | redb commit threshold. Smaller = faster crash-durability, more fsyncs. |
-| `VS_LSN_FLUSH_MS` | `200` | How often the CDC source pushes acked-LSN back to Postgres. |
-| `VS_JOIN_IDLE_FLUSH_MS` | `1000` | How often the join engine flushes pending persistence during idle. |
-| `VS_BUS_CAPACITY` | `1024` | In-memory channel size between source → join → dispatcher. Larger absorbs bursts at memory cost. |
-| `VS_DISPATCH_MAX_EVENTS` | `2000` | Events per sink batch. |
-| `VS_DISPATCH_MAX_BATCH_BYTES` | `4194304` | Bytes per sink batch (4 MiB). Keep well below the sink's request-size limit. |
-| `VS_DISPATCH_FLUSH_MS` | `500` | How long a non-empty batch may wait before being flushed. |
-| `VS_DISPATCH_PARALLEL_BULKS` | `4` | Max sink bulk writes in flight at once. 1 = serial (legacy). 4 ≈ 2.2× resync throughput on a single-node OS; diminishing returns past 8. |
-
-### WebSocket gateway (role: `ws`)
-- `VS_WS_LISTEN` (`0.0.0.0:4040`) — bind address; serves `/ws`. (Health lives on the shared `VS_HEALTH_LISTEN` port, not here.)
-- `VS_REALTIME_PROVIDER` — `nats_core`, `nats_jetstream`, or `redis_streams` for the enabled realtime roles.
-- `VS_REDIS_URL` — Redis connection URL when the provider is `redis_streams`; use `rediss://` in production.
-- `VS_WS_NATS_URL` (`nats://127.0.0.1:4222`) — NATS connection.
-- `VS_WS_SUBJECTS` (`vs.t.>`) — comma-separated subject filters the gateway accepts.
-- `VS_WS_MAILBOX` (`256`) — per-connection outbound mailbox depth. Larger absorbs bursts; smaller surfaces slow-consumer eviction faster.
-- `VS_WS_PING_INTERVAL_MS` (`10000`) — server pings the client every tick; keeps TCP/NAT alive.
-- `VS_WS_PONG_TIMEOUT_MS` (`30000`) — max wait for a client pong before the connection is reaped.
-
-#### JetStream durable mode (per-connection consumer)
-Opt in with `VS_WS_JETSTREAM=1`. Off by default; without it the gateway runs in Core mode (single shared bus subscription, in-process dispatch — much higher density, no replay).
-
-- `VS_WS_JS_STREAM` (`ventstream`) — JetStream stream name.
-- `VS_WS_JS_STORAGE` (`file`) — `file` (durable) or `memory` (faster; cleared on NATS restart).
-- `VS_WS_JS_MAX_AGE_SECS` (`600`), `VS_WS_JS_MAX_BYTES` (`536870912`, 512 MiB) — self-bounding live-buffer limits (`discard: old`).
-- `VS_WS_JS_POD_ID` (auto-ULID) — stable identifier for this pod. Set in production so a restarted pod can find and reap its previous consumers.
-- `VS_WS_JS_INACTIVE_THRESHOLD_MS` (`300000`) — JetStream auto-deletes consumers inactive this long. Pull-loop long-polling keeps the consumer "active" during normal operation; this only fires when the pump dies (kill -9, OOM).
-- `VS_WS_JS_REAPER_INTERVAL_MS` (`60000`) — how often the in-pod reaper sweeps for orphaned consumers.
-
-### GraphQL gateway (role: `graphql`)
-- `VS_GRAPHQL_LISTEN` (`0.0.0.0:4041`) — serves `/graphql`, `/graphql/ws`. (Health lives on the shared `VS_HEALTH_LISTEN` port, not here.)
-- `VS_GRAPHQL_NATS_URL` (`nats://127.0.0.1:4222`), `VS_GRAPHQL_STREAM` (`ventstream`) — must consume the stream the `ws` role bootstraps.
-- `VS_GRAPHQL_POD_ID` (auto-ULID), `VS_GRAPHQL_INACTIVE_THRESHOLD_MS` (`300000`), `VS_GRAPHQL_REAPER_INTERVAL_MS` (`60000`) — per-subscription consumer lifecycle.
-- `VS_GRAPHQL_SCHEMA` — typed subscriptions as **GraphQL SDL** (`@vsSubscribe` / `@source`). The recommended way.
-- `VS_GRAPHQL_SUBSCRIPTIONS` — the same model as a YAML manifest (legacy alternative to `VS_GRAPHQL_SCHEMA`).
-- `VS_GRAPHQL_MANIFEST` — discoverable-subjects manifest backing the `availableSubjects` query.
-- `VS_GRAPHQL_PLAYGROUND` (`1` to enable) — serve the in-browser GraphiQL at `/graphiql` (leave off in prod).
-
-### Operations
-- `VS_HEALTH_LISTEN` (`0.0.0.0:4043`) — the single, always-on health server shared by every role; serves `/healthz` (process liveness) + `/readyz`. For `ws` / `graphql`, readiness stays `503` until every enabled gateway has initialized its dependencies and bound its listener; it also returns `503` when WS reaches its capacity threshold. This is the canonical k8s probe target regardless of which roles run. A bind failure is logged and does not take the pipeline down.
-- `VS_DLQ_PATH` — JSONL file for dead-lettered events.
-- `VS_ADMIN_LISTEN` — bind address for the *optional* admin HTTP server (`/admin/resync`, plus `/admin/healthz`); off unless set. Distinct from the always-on health server above.
-- `VS_ROLES` (`cdc`) — comma-separated roles for this binary: any of `cdc`, `graphql`, `ws`. A single binary can run multiple roles in one process.
-
-## Local development
+## Development
 
 ```bash
 cargo fmt --all
@@ -291,6 +325,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) and
+[SECURITY.md](SECURITY.md).
+
 ## License
 
-Apache-2.0. See `LICENSE`.
+Apache-2.0. See [LICENSE](LICENSE).
