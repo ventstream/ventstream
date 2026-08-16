@@ -73,10 +73,10 @@ The installer performs checksum verification automatically. For manual
 checksum, immutable-release, attestation, and SBOM verification, follow the
 [verification guide](https://github.com/ventstream/ventstream-releases/blob/main/docs/verification.md).
 
-The CLI requires a VentStream Cloud workspace and an
-authorized user account.
-
 ## Authenticate
+
+The CLI requires a VentStream Cloud organization and an authorized user
+account.
 
 Create an account at [ventstream.dev/signup](https://ventstream.dev/signup), or
 accept an organization invitation. Then sign in through the browser. The CLI
@@ -84,8 +84,7 @@ stores the resulting session in a named profile and prompts for an organization
 and environment when more than one is available:
 
 ```bash
-ventstreamctl auth login \
-  --profile production
+ventstreamctl auth login --profile production
 
 ventstreamctl auth status
 ventstreamctl auth whoami
@@ -134,12 +133,12 @@ ventstreamctl operations list --status running
 Use `--profile <name>` for a one-command profile override. Use
 `--organization` and `--environment` only for a one-command context override.
 
-## Organizations and environments
+## Organization context and environments
 
-Create organizations, accept invitations, and manage members from the
-[VentStream Cloud dashboard](https://ventstream.dev/dashboard). The CLI lists
-the organizations available to the authenticated account and stores one as its
-working context.
+The CLI lists the organizations available to the authenticated account and
+stores one as its working context. Creating organizations, accepting
+invitations, and managing members happen in the
+[VentStream Cloud dashboard](https://ventstream.dev/dashboard), not the CLI.
 
 Organization owners can create another environment from the CLI:
 
@@ -167,8 +166,8 @@ ventstreamctl pipelines list
 ventstreamctl pipelines describe orders-cdc
 ```
 
-Pipeline arguments accept an exact name, full UUID, or unambiguous UUID prefix of
-at least eight characters within the selected environment.
+Pipeline arguments accept a UUID, a unique UUID prefix (8+ characters), or the
+slug/name within the selected environment.
 
 ### Lifecycle
 
@@ -200,31 +199,28 @@ value.
 
 ## Managed configuration
 
-Create an immutable configuration revision from a canonical `ventstream.yaml` and
-its referenced non-secret files:
+Create an immutable configuration revision from a canonical `ventstream.yaml`
+(plus any referenced non-secret files via `--file`), then validate and select
+it:
 
 ```bash
 ventstreamctl pipelines configurations create orders-cdc \
-  --engine-config ./ventstream.yaml \
-  --file projections/orders.yaml=./orders.yaml \
-  --file graphql/schema.graphql=./schema.graphql
-```
-
-Then validate and select it:
-
-```bash
-ventstreamctl pipelines configurations list orders-cdc
+  --engine-config ./ventstream.yaml
 ventstreamctl pipelines configurations validate orders-cdc <revision> \
   --reason "pre-deployment validation"
 ventstreamctl pipelines configurations select orders-cdc <revision> \
   --reason "release 2026-07" --wait
-ventstreamctl pipelines resume orders-cdc --wait
 ```
 
 Selecting a valid revision activates it and delivers it to connected
 deployments. It does not implicitly resume a paused pipeline. Use `apply` only
 when the active revision must be delivered again without creating or selecting a
-new revision.
+new revision:
+
+```bash
+ventstreamctl pipelines configurations apply orders-cdc <revision> \
+  --reason "redeliver after deployment replacement" --wait
+```
 
 Roll back to an earlier valid revision:
 
@@ -233,8 +229,8 @@ ventstreamctl pipelines configurations rollback orders-cdc <previous-revision> \
   --reason "rollback failed release" --wait
 ```
 
-See [Managed configuration](/fleet/configuration) for the bundle and secret
-boundary.
+See [Managed configuration](/fleet/configuration) for the full worked example,
+the bundle format, and the secret boundary.
 
 ## Deployments and agent keys
 
@@ -260,9 +256,9 @@ ventstreamctl agents key create orders-primary --pipeline orders-cdc
 The key command prints only the secret to stdout and deliberately has no table
 or JSON wrapper. Pipe it directly into a secret-management workflow — for
 example `| kubectl create secret generic orders-agent-key
---from-file=key=/dev/stdin` — and do not log it. The key is shown once and is
-reusable; minting a new key revokes the previous one, so rotation is a single
-`key create`.
+--from-file=key=/dev/stdin` — and do not log it. The key is shown once at mint
+time; the same key keeps working across restarts until revoked. Minting a new
+key revokes the previous one, so rotation is a single `key create`.
 
 List key metadata or revoke a key explicitly:
 
@@ -343,6 +339,12 @@ state; issue a new lifecycle action when desired state must change.
 ventstreamctl operations cancel <operation-id> \
   --reason "request withdrawn"
 ```
+
+## MCP keys
+
+`ventstreamctl mcp keys generate --name <agent>` mints an MCP access token and
+its hash locally for a keys file — it never contacts the control plane. See
+[MCP server](/guides/mcp-server#tokens-and-scoping).
 
 ## Automation
 

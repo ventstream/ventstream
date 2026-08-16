@@ -28,8 +28,8 @@ endpoint with `VS_OS_ENDPOINT`.
 - The login user needs **`REPLICATION SLAVE`** and **`REPLICATION CLIENT`** plus
   `SELECT` on the watched tables.
 
-```sql
--- my.cnf
+```ini
+# my.cnf
 [mysqld]
 server-id        = 1
 log-bin          = mysql-bin
@@ -44,7 +44,8 @@ binlog-row-image = FULL
   always reflects the latest committed state — the binlog value images are never
   decoded directly. This keeps column types correct and avoids JSON/blob
   internals.
-- **Bootstrap.** On cold start the source reads `SHOW MASTER STATUS` to pin the
+- **Bootstrap.** On cold start the source reads `SHOW BINARY LOG STATUS`
+  (falling back to `SHOW MASTER STATUS` on older servers) to pin the
   current binlog position, keyset-paginates every in-scope table by primary key
   (`WHERE (pk) > (?) ORDER BY pk LIMIT n`), emits each row as an insert, then
   tails the binlog from the pinned position. A row mutated during the scan is
@@ -81,7 +82,7 @@ source's shape. `JSON`-typed columns are parsed into nested JSON; `DATETIME`
 renders as ISO-8601, and `DECIMAL` as its exact decimal string (precision
 preserved).
 
-## Run the agent
+## Run the engine
 
 ```bash
 VS_ROLES=cdc VS_CDC_SOURCE=mysql \
@@ -94,7 +95,7 @@ VS_MYSQL_STATE_DIR=/var/lib/ventstream/state \
 VS_MYSQL_BOOTSTRAP_MODE=snapshot \
 VS_OS_ENDPOINT=http://localhost:9200 \
 VS_INDEX_TEMPLATE='${header:ventstream.cdc.relation}' \
-./target/release/ventstream
+ventstream
 ```
 
 `VS_MYSQL_TABLES` is optional — omit it to watch **every** table in the
@@ -141,7 +142,7 @@ guide.
 | `VS_MYSQL_TABLES` | unset (all) | CSV of tables to watch; empty = every table in the database. |
 | `VS_MYSQL_SERVER_ID` | `4000000000` | Replica `server_id` the agent registers as; must be unique in the topology. |
 | `VS_MYSQL_BOOTSTRAP_MODE` | `snapshot` | `snapshot` (scan then tail) or `none`. |
-| `VS_MYSQL_BOOTSTRAP_CHUNK_SIZE` | `1000` | Rows per keyset-paginated snapshot batch. |
+| `VS_MYSQL_BOOTSTRAP_CHUNK_SIZE` | `1000` (`5000` in SQL mode) | Rows per keyset-paginated snapshot batch; in SQL denormalize mode it also bounds each denormalizing bootstrap query. |
 | `VS_MYSQL_POS_FLUSH_MS` | `1000` | How often sink-confirmed binlog positions are flushed to disk (batched, not per-event). |
 | `VS_MYSQL_STATE_DIR` | `./data/mysql-state` | Binlog-position cursor-file directory (a PVC in Kubernetes). |
 
@@ -197,10 +198,11 @@ mount persistent storage and set the value explicitly, for example
 `VS_MYSQL_STATE_DIR=/var/lib/ventstream/mysql-state`.
 </Warning>
 
-The spec format and semantics (`cardinality`, `embed_as`, `on_missing`,
-composite keys) are shared with the [Postgres connector](/connectors/sources/postgres).
+The spec format and semantics (`cardinality`, `embed_as`, `backfill`,
+`on_missing`, composite keys) are shared with the
+[Postgres connector](/connectors/sources/postgres).
 
-### Memory modes: in-memory vs SQL
+### Denormalize modes: in-memory vs SQL
 
 The join can run in two modes (same `joins:` spec):
 

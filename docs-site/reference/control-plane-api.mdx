@@ -3,9 +3,17 @@ title: "VentStream Cloud API"
 description: "Versioned API conventions for managed VentStream resources and operations."
 ---
 
-VentStream Cloud exposes a REST/JSON API under `/v1`. `ventstreamctl`, the
+VentStream Cloud exposes a REST/JSON API under `/v1`. The hosted control
+plane's base URL is `https://api.ventstream.dev`. `ventstreamctl`, the
 dashboard, and approved automation use the same organization-scoped resource and
 operation model.
+
+For example, listing an organization's environments:
+
+```bash
+curl -s "https://api.ventstream.dev/v1/organizations/$ORG_ID/environments" \
+  -H "Authorization: Bearer $VENTSTREAM_TOKEN"
+```
 
 ## Contract rules
 
@@ -52,9 +60,11 @@ isolation, `If-Match`, idempotency, pagination, and safe error envelope describe
 above. Do not build automation from undocumented database access.
 
 <Warning>
-Enrollment grants are returned once with `Cache-Control: no-store`. They are not
-generic API keys and must never be written to logs or an idempotency response
-ledger.
+**Legacy: enrollment grants.** Enrollment grants are returned once with
+`Cache-Control: no-store`. They are not generic API keys and must never be
+written to logs or an idempotency response ledger. Agent keys (`vsa1.`) are the
+current mechanism for attaching engines — see
+[Managed mode](/concepts/managed-mode).
 </Warning>
 
 See [CLI administration](/fleet/cli) for the supported operator workflow.

@@ -17,9 +17,10 @@ every delete.
 
 ## Requirements
 
-- Meilisearch v1.x (validated against v1.52). The instance's task queue and
-  payload limits apply; the sink's default 16 MiB request ceiling stays
-  well under Meilisearch's default 100 MB payload cap.
+- Meilisearch v1.x (validated against the current 1.x releases). The
+  instance's task queue and payload limits apply; the sink's default 16 MiB
+  request ceiling stays well under Meilisearch's default payload cap of
+  ≈100 MB.
 - An API key with documents, indexes, tasks, and settings permissions on
   the target indexes. Use a scoped key, never the master key, for
   production.
@@ -31,7 +32,7 @@ every delete.
 ## How documents are shaped
 
 Meilisearch primary keys only allow `[A-Za-z0-9_-]`, so the sink stores the
-canonical VentStream document id (`orders:["123"]`) base64url-encoded in the
+canonical VentStream document id (`shop.orders:["123"]`) base64url-encoded in the
 primary-key attribute (default `_vs_pk`), and keeps the readable original
 as a `_vs_id` field on the document:
 
@@ -89,8 +90,8 @@ sink:
     max_batch_bytes: 16777216
     task_deadline_ms: 120000     # give up polling a task after this long
     request_timeout_ms: 30000
-    settings:                    # fixed routing only; only declared
-      filterable_attributes: []  # attributes are ever touched
+    settings:                    # fixed routing only; only declared attributes are ever touched
+      filterable_attributes: []
       sortable_attributes: []
     tls: {}                      # shared database TLS policy block
     insecure_tls: false

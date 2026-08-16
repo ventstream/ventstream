@@ -10,7 +10,7 @@ observed.
 
 | State | Meaning |
 | --- | --- |
-| `running` | The supervisor should run the engine with the selected configuration |
+| `running` | The engine runs the pipeline with the selected configuration revision |
 | `paused` | Stop the engine while retaining resumable connector and join state |
 | `drained` | Stop the engine and release or invalidate resumable state where supported |
 
@@ -23,6 +23,11 @@ ignores stale revisions, and treats redelivery of the same revision idempotently
 Agents report `starting`, `bootstrapping`, `running`, `paused`, `drained`,
 `degraded`, or `failed` together with the desired revision they are reconciling.
 Cloud does not infer successful pause or drain from heartbeat freshness.
+
+Locally, the engine's own telemetry uses a finer phase vocabulary —
+`starting`, `bootstrapping`, `tailing`, `erroring`, `stopped`, `paused`,
+`drained`. The steady tail state (`tailing`) is what Cloud reports as
+`running`.
 
 ## Operation state
 

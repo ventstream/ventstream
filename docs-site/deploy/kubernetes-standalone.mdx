@@ -217,27 +217,27 @@ kubectl -n ventstream rollout restart statefulset/orders-engine
 
 ## Standalone realtime gateways
 
-The engine repository's `ventstream-gateway` chart runs the horizontally scalable
-`ws`, `graphql`, or combined roles without Fleet:
+The published `ventstream-gateway` chart runs the horizontally scalable
+`ws`, `graphql`, or combined roles without VentStream Cloud:
 
 ```bash
-cd ventstream
-IMAGE_DIGEST=$(curl --proto '=https' --tlsv1.2 -fsSL \
-  https://github.com/ventstream/ventstream/releases/latest/download/image-digests.txt \
-  | sed -n 's|^ghcr.io/ventstream/ventstream@||p')
-
-helm upgrade --install realtime ./infra/helm/ventstream-gateway \
+helm upgrade --install realtime \
+  oci://ghcr.io/ventstream/charts/ventstream-gateway \
+  --version 0.1.24 \
   --namespace ventstream --create-namespace \
-  --set image.repository=ghcr.io/ventstream/ventstream \
-  --set-string image.digest="$IMAGE_DIGEST" \
   --set-string 'roles=ws\,graphql' \
   --set replicas=3 \
+  --set ws.jetstream.enabled=true \
   --set nats.url=nats://nats.ventstream.svc:4222 \
   --set graphql.schema.existingConfigMap=ventstream-graphql-schema
 ```
 
-This chart currently configures NATS; enable JetStream for GraphQL subscriptions
-and resumable native WebSocket delivery. The engine also supports Redis Streams
+The same chart also ships in the engine repository at
+`infra/helm/ventstream-gateway` for local installs. This chart currently
+configures NATS. JetStream (`--set ws.jetstream.enabled=true`, the chart
+default) is required for GraphQL subscriptions and resumable native WebSocket
+delivery; the stream name is `ws.jetstream.stream` (default `ventstream`). The
+engine also supports Redis Streams
 through canonical configuration when you deploy it without this chart. Use a
 Service or ingress appropriate for long-lived WebSocket connections, and
 validate client authorization before exposing either listener outside a trusted

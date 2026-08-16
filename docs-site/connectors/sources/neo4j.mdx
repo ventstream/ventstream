@@ -61,7 +61,7 @@ denormalize/projection mode (this connector) does not need that.
 
 ## Production prerequisites
 
-In the [demo](/quickstart) the agent connects as `neo4j` — the default
+In the [demo](/quickstart) the engine connects as `neo4j` — the default
 **admin** user — so it can enable CDC and read everything. A real
 production user usually isn't an admin, so split the setup:
 
@@ -108,11 +108,11 @@ user (the demo does exactly that) — but in production, don't.
 
 <Note>
 **No server-side resource to clean up.** Unlike a Postgres slot, the
-Neo4j CDC cursor lives on the **agent's PVC**, not the server — retiring
-an agent leaves nothing behind on Neo4j. The flip side: if an agent is
+Neo4j CDC cursor lives on the **engine's PVC**, not the server — retiring
+an engine leaves nothing behind on Neo4j. The flip side: if an engine is
 down longer than the database's transaction-log **retention**
 (`db.tx_log.rotation.retention_policy`), its cursor expires and it must
-re-bootstrap. Size retention to cover your worst-case agent downtime.
+re-bootstrap. Size retention to cover your worst-case engine downtime.
 </Note>
 
 <Note>
@@ -136,6 +136,8 @@ VS_NEO4J_TLS_CA_FILE=/run/secrets/neo4j-ca.pem
 
 Aura certificates use public roots, so no CA file is normally needed. Mount a
 private CA from a Secret when operating a self-managed encrypted Bolt endpoint.
+`VS_NEO4J_TRUST_CERT_FILE` is an older alias for the same CA bundle — configure
+only one of the two; setting both is a startup error.
 
 ## The projection
 
@@ -172,7 +174,7 @@ that Product's document — covering Category (1 hop), Supplier (1 hop),
 and the Supplier→Region chain (2 hops). The full version is in
 [`demo/stack/specs/products.yaml`](https://github.com/ventstream/ventstream/blob/main/demo/stack/specs/products.yaml).
 
-## Run the agent
+## Run the engine
 
 ```bash
 VS_AGENT_NAME=products-cdc \
@@ -180,13 +182,13 @@ VS_ROLES=cdc VS_CDC_SOURCE=neo4j \
 VS_NEO4J_URI=neo4j+s://…:7687 \
 VS_NEO4J_USER=neo4j VS_NEO4J_PASSWORD=… \
 VS_NEO4J_DATABASE=neo4j VS_NEO4J_NAMESPACE=neo4j \
-VS_NEO4J_TRUST_CERT_FILE=/etc/ventstream/neo4j-ca.crt \
+VS_NEO4J_TLS_CA_FILE=/etc/ventstream/neo4j-ca.crt \
 VS_NEO4J_DENORMALIZE_YAML=demo/stack/specs/products.yaml \
 VS_NEO4J_STATE_DIR=/var/lib/ventstream/state \
 VS_NEO4J_BOOTSTRAP_MODE=snapshot \
 VS_OS_ENDPOINT=http://localhost:9200 \
 VS_INDEX_TEMPLATE='${header:ventstream.cdc.relation}' \
-./target/release/ventstream
+ventstream
 ```
 
 At startup you'll see **hot-endpoint detection** log lines — the engine

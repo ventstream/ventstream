@@ -4,9 +4,9 @@ description: "Operate managed VentStream pipelines without putting the control p
 ---
 
 VentStream Cloud is the managed control plane for CDC and realtime engine
-workloads. It inventories deployments, enrolls agents, distributes desired state
-and configuration, records durable operations, and provides organization-scoped
-visibility.
+workloads. It inventories deployments, attaches engines with agent keys,
+distributes desired state and configuration, records durable operations, and
+provides organization-scoped visibility.
 
 The management plane is hosted by VentStream. Managed agents run in your
 infrastructure and connect outbound to Cloud. Source records, sink writes, broker
@@ -50,7 +50,7 @@ according to persisted desired state.
 
 Standalone engines are operated through their process manager, Kubernetes, or
 another scheduler. They cannot be paused, resumed, configured, or inspected with
-`ventstreamctl` because they are not enrolled in VentStream Cloud.
+`ventstreamctl` because they are not attached to VentStream Cloud.
 
 Choose VentStream Cloud when you need centralized inventory, configuration
 history, runtime visibility, controlled pause/resume/drain operations, agent
@@ -61,6 +61,6 @@ identity, or administration across organizations and environments.
     Start an organization or accept an invitation.
   </Card>
   <Card title="Administer with the CLI" icon="terminal" href="/fleet/cli">
-    Install `ventstreamctl` and manage enrolled pipelines.
+    Install `ventstreamctl` and manage attached pipelines.
   </Card>
 </CardGroup>

@@ -13,7 +13,7 @@ Validation fails when a required reference is missing.
 | Variable | Meaning |
 |---|---|
 | `VS_ENGINE_CONFIG` | Optional path to canonical `ventstream.yaml`. When set, roles, source kind, sink endpoint/auth references, sink index routing, spec file paths, and DLQ path are read from the file with legacy env fallback for connector details. |
-| `VS_ROLES` | `cdc` (and/or `ws`, `graphql`). The CDC role is the pipeline. |
+| `VS_ROLES` | `cdc` (and/or `ws`, `graphql`), or `mcp` (which must run alone). The CDC role is the pipeline. |
 | `VS_CDC_SOURCE` | `postgres`, `neo4j`, `mongodb`, `mysql` (`mariadb` alias), or `kafka` (`redpanda` alias). |
 | `VS_SINK` | Sink kind: `opensearch` (default), `elasticsearch`, `meilisearch`, or `redis`. |
 | `VS_AGENT_NAME` | Standalone process identifier and default Kafka consumer-group ID. Managed identity comes from the Cloud deployment certificate. |
@@ -170,9 +170,23 @@ canonical-YAML-only because their selectors, key templates, filters, and value
 mappings form one versioned contract. See the
 [Redis sink guide](/connectors/sinks/redis) for the complete schema.
 
-## Fleet-managed configuration
+## Managed mode
 
-`VS_FLEET_APPLIED_CONFIG_PATH` is set by the Fleet supervisor in managed mode.
+An engine started with an agent key runs managed: it connects outbound to the
+gateway, fetches its selected configuration revision, reports status, and
+executes operations. Without a key, no code path opens a connection to the
+platform. See [Managed mode](/concepts/managed-mode).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `VS_AGENT_KEY` | unset | Agent key (`vsa1.` prefix) minted from the dashboard or CLI. Its presence switches the engine to managed mode. Must not be combined with a local `VS_ENGINE_CONFIG` pipeline config — a managed engine's pipeline config comes from the control plane. |
+| `VS_MANAGED_STATE_DIR` | `/var/lib/ventstream/managed` | Absolute directory for persisted managed identity and configuration state. |
+| `VS_MANAGED_GATEWAY_URL` | `https://gateway.ventstream.dev:8445` | Control-stream gateway. Must use `https://` or `wss://`. |
+| `VS_MANAGED_ENROLLMENT_URL` | `https://gateway.ventstream.dev:8444` | Enrollment endpoint. Must use `https://` or `wss://`. |
+
+## Cloud-managed configuration
+
+`VS_FLEET_APPLIED_CONFIG_PATH` is set by the engine's fleet client in managed mode.
 When present, the engine reads the staged non-secret configuration envelope,
 verifies its SHA-256 content digest, rejects top-level `secrets`, and fails
 closed before starting data-path roles if the envelope is invalid.
@@ -188,7 +202,7 @@ the matching legacy file-path environment variables when supplied:
 | `graphql_subscriptions_yaml` | `VS_GRAPHQL_SUBSCRIPTIONS` |
 | `graphql_manifest_yaml` | `VS_GRAPHQL_MANIFEST` |
 
-Fleet config is for topology, projection, and runtime-safe settings. Keep
+Cloud-managed config is for topology, projection, and runtime-safe settings. Keep
 database passwords, sink credentials, NATS credentials, API keys, and
 certificates in Kubernetes Secrets or a local secret provider.
 
@@ -205,7 +219,7 @@ certificates in Kubernetes Secrets or a local secret provider.
 | `VS_PG_PUBLICATION` | Logical-replication publication to consume. |
 | `VS_PG_SLOT` | Replication slot name — **unique per agent**. |
 | `VS_PG_BOOTSTRAP_MODE` | `snapshot` (scan then tail) or `none`. |
-| `VS_PG_BOOTSTRAP_CHUNK_SIZE` | Rows per snapshot chunk (default 10000). |
+| `VS_PG_BOOTSTRAP_CHUNK_SIZE` | Rows per snapshot chunk (default 10000; 5000 in SQL denormalize mode, where the chunk also bounds each denormalizing bootstrap query). |
 | `VS_JOINS_YAML` | Path to the join spec. |
 | `VS_PG_DENORMALIZE_MODE` | `memory` (default — in-memory join engine, lowest-latency tail, RSS scales with the working set) or `sql` (push the join into Postgres; bounded ~O(chunk) memory at any scale; needs indexes on the join/FK columns). Same `joins:` spec. See the [Postgres connector](/connectors/sources/postgres#denormalize-modes-in-memory-vs-sql). |
 | `VS_JOINS_STATE_DIR` | redb state directory on durable storage. **Required when a PostgreSQL or MySQL pipeline uses memory-mode joins**; the engine refuses to start without it. State commits occur only after the preceding sink boundary is durable, and the source checkpoint advances only after that state commit. Distinct from the spec's `state.backend`, which does not control redb persistence. (`sql` mode holds no join state.) |
@@ -227,7 +241,7 @@ certificates in Kubernetes Secrets or a local secret provider.
 | `VS_NEO4J_NAMESPACE` | Namespace prefix for emitted subjects. |
 | `VS_NEO4J_TLS_MODE` | `verify_full` selects `neo4j+s://`/`bolt+s://`; `disabled` selects an unencrypted URI. |
 | `VS_NEO4J_TLS_CA_FILE` | Optional PEM CA bundle for a privately issued Bolt certificate. |
-| `VS_NEO4J_TRUST_CERT_FILE` | Bolt CA cert path (mounted from a Secret). |
+| `VS_NEO4J_TRUST_CERT_FILE` | Older alias for `VS_NEO4J_TLS_CA_FILE`; setting both is a startup error. |
 | `VS_NEO4J_DENORMALIZE_YAML` | Path to the denormalize spec. |
 | `VS_NEO4J_STATE_DIR` | Cursor-file directory (on the PVC). |
 | `VS_NEO4J_BOOTSTRAP_MODE` | `snapshot` or `none`. |
@@ -282,14 +296,14 @@ images.
 | `VS_MYSQL_TABLES` | CSV of tables to watch; empty = all tables in the database. |
 | `VS_MYSQL_SERVER_ID` | Replica `server_id` this agent registers as (default 4000000000); must be unique. |
 | `VS_MYSQL_BOOTSTRAP_MODE` | `snapshot` (scan then tail) or `none`. |
-| `VS_MYSQL_BOOTSTRAP_CHUNK_SIZE` | Rows per keyset-paginated snapshot batch (default 1000). |
+| `VS_MYSQL_BOOTSTRAP_CHUNK_SIZE` | Rows per keyset-paginated snapshot batch (default 1000; 5000 in SQL denormalize mode, where the chunk also bounds each denormalizing bootstrap query). |
 | `VS_MYSQL_POS_FLUSH_MS` | Binlog-position flush cadence (default 1000; batched, not per-event). |
 | `VS_MYSQL_STATE_DIR` | Binlog-position cursor-file directory (on the PVC). |
-| `VS_JOINS_YAML` | Optional denormalization join spec (same format as Postgres). When set, related tables are embedded into one document and `VS_JOINS_STATE_DIR` persists join state. See the [MySQL connector](/connectors/sources/mysql#denormalization-joins). |
+| `VS_JOINS_YAML` | Optional denormalization join spec (same format as Postgres). When set, related tables are embedded into one document and `VS_JOINS_STATE_DIR` persists join state. See the [MySQL connector](/connectors/sources/mysql#denormalize-modes-in-memory-vs-sql). |
 | `VS_MYSQL_DENORMALIZE_MODE` | `memory` (default — in-memory join engine, RSS scales with the working set) or `sql` (push the join into MySQL; bounded ~O(chunk) memory at any scale; needs indexes on the join/FK columns). Same `joins:` spec. See [Memory modes](/connectors/sources/mysql#memory-modes-in-memory-vs-sql). |
 | `VS_MYSQL_SINK_REVERSE_LOOKUP` | `true` (default) → SQL mode resolves 1:many child deletes to their parent via an OpenSearch reverse-lookup. |
-| `VS_MYSQL_RECOMPOSE_CHUNK` | Maximum primary keys in one SQL recomposition query (default 128). Canonical config: `source.mysql.recompose_chunk`. |
-| `VS_MYSQL_RECOMPOSE_CONCURRENCY` | Maximum concurrent SQL recomposition queries (default 6). Canonical config: `source.mysql.recompose_concurrency`. |
+| `VS_MYSQL_RECOMPOSE_CHUNK` | Maximum primary keys in one SQL recomposition query (default 256). Canonical config: `source.mysql.recompose_chunk`. |
+| `VS_MYSQL_RECOMPOSE_CONCURRENCY` | Maximum concurrent SQL recomposition queries (default 4). Canonical config: `source.mysql.recompose_concurrency`. |
 | `VS_LSN_FLUSH_MS` | Sink-gated source checkpoint flush cadence in milliseconds (default 200). Shared with PostgreSQL join pipelines. |
 
 ## Kafka / Redpanda source
@@ -315,13 +329,13 @@ gated on sink durability — no state dir.
 
 ## Dispatcher / throughput
 
-| Variable | Meaning |
-|---|---|
-| `VS_DISPATCH_PARALLEL_BULKS` | Concurrent OpenSearch bulk requests (default 4). |
-| `VS_DISPATCH_MAX_EVENTS` | Max events per bulk batch. |
-| `VS_DISPATCH_MAX_BATCH_BYTES` | Max bulk body size. |
-| `VS_DISPATCH_FLUSH_MS` | Max time a batch waits before flushing. |
-| `VS_BUS_CAPACITY` | Internal event bus capacity. |
+| Variable | Default | Meaning |
+|---|---|---|
+| `VS_DISPATCH_PARALLEL_BULKS` | `4` | Concurrent OpenSearch bulk requests. |
+| `VS_DISPATCH_MAX_EVENTS` | `2000` | Max events per bulk batch. |
+| `VS_DISPATCH_MAX_BATCH_BYTES` | `4194304` | Max bulk body size (4 MiB). |
+| `VS_DISPATCH_FLUSH_MS` | `500` | Max time a batch waits before flushing. |
+| `VS_BUS_CAPACITY` | `1024` | Internal event bus capacity. The default is auto-raised to hold one dispatch batch (capped at 32768); an explicit value is honored but caps sink batches at the bus size. |
 
 ## Adaptive memory
 

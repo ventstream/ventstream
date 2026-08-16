@@ -181,7 +181,7 @@ The document ID is derived from the source key and remains stable across
 snapshots, updates, retries, and process restarts. For example:
 
 ```text
-ventstream:orders:production:{orders}:public.orders%3A%5B%22ord-42%22%5D
+ventstream:orders:production:{orders}:shop.orders%3A%5B%22ord-42%22%5D
 ```
 
 VentStream stores two internal writer keys per target:
@@ -371,9 +371,7 @@ The TTL starts again whenever an insert or update is materialized. VentStream
 does not refresh unchanged entries in the background, so a record with no later
 source event expires after the configured interval. Use `materialized_view`
 when Redis must retain every current source record until an explicit delete,
-truncate, or rebuild.
-
-Each upsert refreshes the TTL. Deletes remove the key immediately.
+truncate, or rebuild. Deletes remove the key immediately.
 
 ## Acknowledgement
 
@@ -555,7 +553,7 @@ lasts longer than the lease, a process may recreate its lease only if no newer
 writer has changed that lineage. This allows automatic failover recovery
 without allowing a superseded process to reclaim a target.
 
-Give each deployment revision a stable writer identity. Fleet deployments use
+Give each deployment revision a stable writer identity. Managed deployments use
 their deployment ID automatically. A standalone deployment should set
 `writer.id_ref` or `VS_REDIS_SINK_WRITER_ID`.
 
@@ -581,11 +579,11 @@ It does not prevent an application, script, or another Redis client from
 changing those keys directly. A prefix declared `exclusive` must not have
 external writers.
 
-In Fleet-managed mode, a restarted supervisor also keeps the engine stopped
-until it acquires the current control session and receives convergence work.
+In managed mode, a restarted managed engine keeps its pipeline stopped until
+it acquires the current control session and receives convergence work.
 An already-running engine may continue through a temporary control-plane
-outage; if Fleet later admits a replacement, Redis fencing prevents the older
-process from overwriting the replacement.
+outage; if VentStream Cloud later admits a replacement, Redis fencing prevents
+the older process from overwriting the replacement.
 
 ## ACL permissions
 
@@ -643,7 +641,7 @@ source progress behind the truncate.
   writes in one Lua invocation without interleaving from other Redis clients.
 - Dispatcher batches are issued serially because Redis values do not carry a
   source-version guard. This prevents a slower, older batch from overwriting a
-  newer value while still allowing up to 1,000 ordered commands per Lua call.
+  newer value.
 - RedisJSON cache replacements become visible only after the staged value has
   its TTL.
 - Batches are split at the configured byte boundary without changing event

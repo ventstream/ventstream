@@ -69,7 +69,7 @@ Two replica-identity edge cases:
 
 ## Production prerequisites
 
-In the [demo](/quickstart) the agent appears to "just work" with zero
+In the [demo](/quickstart) the engine appears to "just work" with zero
 setup — but only because the demo's `ventstream` user is the container's
 **bootstrap superuser**. It owns every table and has `REPLICATION`
 implicitly, so it can create the publication *and* the slot itself. A
@@ -186,7 +186,7 @@ if you want the one-shot snapshot of existing rows.
     Point the engine at the writer endpoint, not a read-only endpoint.
     Logical-slot behavior during failover depends on the Aurora PostgreSQL
     version and configuration. Rehearse a writer failover and verify that the
-    agent either resumes from its slot or performs the expected controlled
+    engine either resumes from its slot or performs the expected controlled
     re-bootstrap before using the deployment in production.
     </Warning>
 
@@ -206,9 +206,9 @@ if you want the one-shot snapshot of existing rows.
 </AccordionGroup>
 
 <Note>
-**Decommissioning an agent:** a slot the engine created keeps pinning WAL
+**Decommissioning an engine:** a slot the engine created keeps pinning WAL
 until it's dropped — Postgres won't recycle that WAL, and the disk
-eventually fills. When you retire an agent, drop its slot:
+eventually fills. When you retire an engine, drop its slot:
 `SELECT pg_drop_replication_slot('ventstream_orders_slot');`
 </Note>
 
@@ -247,6 +247,8 @@ joins:
 ```
 
 - `cardinality: one` embeds a single object; `many` embeds an array.
+- `on_missing` controls what is embedded while a related row is absent:
+  `null` (default) or `empty_object`.
 - `select` projects only the columns you want; omit it to embed the
   whole row.
 - Reserved-word column names (e.g. `from`, `to`, `order`) are fine — the
@@ -281,7 +283,7 @@ mode stays the default for the lowest-latency tail when the working set
 fits RAM. Both consume the identical `joins:` spec.
 </Note>
 
-## Run the agent
+## Run the engine
 
 ```bash
 VS_AGENT_NAME=orders-cdc \
@@ -295,7 +297,7 @@ VS_JOINS_STATE_DIR=/var/lib/ventstream/state \
 VS_PG_BOOTSTRAP_MODE=snapshot \
 VS_OS_ENDPOINT=http://localhost:9200 \
 VS_INDEX_TEMPLATE='${header:ventstream.cdc.relation}' \
-./target/release/ventstream
+ventstream
 ```
 
 ## TLS
@@ -342,7 +344,7 @@ place.
 
 ## Bootstrap then tail
 
-With `VS_PG_BOOTSTRAP_MODE=snapshot` and no existing slot, the agent
+With `VS_PG_BOOTSTRAP_MODE=snapshot` and no existing slot, the engine
 snapshots every published table before opening the stream, so the index
 is fully populated before live changes flow. The snapshot and the live
 stream share a slot created *before* the scan, so changes during the
@@ -352,7 +354,7 @@ both ways.
 ## Changing the projection
 
 Edit the YAML and restart. With `VS_PG_AUTO_RESYNC_ON_YAML_CHANGE=true`,
-the agent fingerprints the spec; if it changed, it drops the slot,
+the engine fingerprints the spec; if it changed, it drops the slot,
 wipes its join state, and re-bootstraps so every document is rewritten
 with the new shape. Without that flag, it warns and keeps running —
 new changes use the new spec, existing docs update as their rows are
@@ -371,7 +373,7 @@ The section above is about changing **your spec**. This is about the
 **source schema** changing underneath you — a column added, dropped,
 renamed, or retyped in Postgres.
 
-The agent notices on the next `RELATION` message and emits a structured
+The engine notices on the next `RELATION` message and emits a structured
 signal: a `metric=schema.drift` log (`table`, `column`, `kind`, plus
 `from_type_oid`/`to_type_oid` for a type change) and the
 `vs_schema_drift_total{table,kind}` counter on
@@ -393,12 +395,13 @@ projection compatible and re-emit — the same resync path as above:
 1. Edit the joins YAML to match the new source schema (map the renamed
    column, drop the removed one, adjust the field).
 2. Restart with `VS_PG_AUTO_RESYNC_ON_YAML_CHANGE=true` (or
-   `VS_PG_FORCE_RESYNC=true`). The fingerprint changes, so the agent drops
+   `VS_PG_FORCE_RESYNC=true`). The fingerprint changes, so the engine drops
    the slot, wipes join state, and **re-bootstraps every row against the
    new schema** — see [Changing the projection](#changing-the-projection).
 
 If the change was purely additive and the YAML didn't need editing, a
-`POST /admin/resync` re-scans the tables without a restart.
+`POST /admin/resync` re-scans the tables without a restart when
+[`VS_ADMIN_LISTEN`](/reference/engine-env) is configured.
 
 <Note>
 Schema-drift handling is currently warn-only. Review the emitted drift event,
@@ -425,7 +428,7 @@ document without the removed item. Inserts and updates were never affected
 
 <Note>
 The one residual case is a child row the engine **never indexed** — e.g. it
-was inserted and deleted entirely while the agent was down and didn't
+was inserted and deleted entirely while the engine was down and didn't
 re-bootstrap that row. With nothing cached, the FK can't be recovered from
 state. If your workload can produce that and you need the delete to still
 propagate, set `REPLICA IDENTITY FULL` on the child table so the FK rides

@@ -1,5 +1,5 @@
 ---
-title: "Fleet resource model"
+title: "VentStream Cloud resource model"
 description: "How organizations, environments, pipelines, deployments, and instances relate."
 ---
 
@@ -26,8 +26,8 @@ prefix). The key binds engine instances to the deployment at first connect;
 minting a new key revokes the previous one.
 
 CDC deployments are singleton because a source cursor or replication slot has one
-active consumer. Realtime deployments can have multiple instances when the role
-and transport support replication.
+active consumer. Realtime roles can be replicated, but each realtime instance
+needs its own deployment and its own agent key.
 
 Operators normally target pipelines. The gateway fences concurrent CDC sessions
 for a deployment while allowing independently identified realtime instances.

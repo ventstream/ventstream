@@ -30,8 +30,8 @@ Self-hosted installations pass `--control-plane <url>` (or set it on the
 profile) to point at their own control plane.
 
 The CLI opens the VentStream authorization page in your system browser. Sign in
-with your existing account, complete any required MFA or SSO checks, and approve
-the CLI session.
+with your existing account, complete any MFA or SSO checks your identity
+provider requires (enterprise OIDC), and approve the CLI session.
 
 The authorization flow uses PKCE, a one-time state value, and a loopback callback
 on `127.0.0.1`. Your password is entered only in the browser and is never exposed
@@ -41,9 +41,7 @@ The command also prints the authorization URL. Use `--no-browser` to suppress
 automatic launch and open that URL manually on the same workstation:
 
 ```bash
-ventstreamctl auth login \
-  --profile production \
-  --no-browser
+ventstreamctl auth login --profile production --no-browser
 ```
 
 The browser callback expires after five minutes.
@@ -58,14 +56,12 @@ your account can access:
 - An account with no organization remains authenticated until it accepts an
   invitation or creates an organization in the dashboard.
 
-For a non-interactive terminal, or to select explicitly, pass a UUID, an
-unambiguous UUID prefix of at least eight characters, or a slug:
+For a non-interactive terminal, or to select explicitly, pass a UUID, a unique
+UUID prefix (8+ characters), or the slug/name:
 
 ```bash
-ventstreamctl auth login \
-  --profile production \
-  --organization acme \
-  --environment production
+ventstreamctl auth login --profile production \
+  --organization acme --environment production
 ```
 
 Change the saved context later without signing in again:
@@ -88,9 +84,7 @@ device-code URL and code.
 An identity provider using a private PKI can be trusted with:
 
 ```bash
-ventstreamctl auth login \
-  --profile enterprise \
-  --oidc-trust-bundle <ca.pem>
+ventstreamctl auth login --profile enterprise --oidc-trust-bundle <ca.pem>
 ```
 
 ## Check the session

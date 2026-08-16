@@ -38,7 +38,7 @@ the `docker-compose.yml`, the seed data, and the two projection specs.
 
 - Docker + Docker Compose v2 (`docker compose version`)
 - ~4 GB free RAM for the containers
-- Free ports: `5544` (pg), `7474`/`7687` (neo4j), `9200` (opensearch), `5601` (dashboards, optional)
+- Free ports: `5544` (pg, host-mapped from the container's 5432), `7474`/`7687` (neo4j), `9200` (opensearch), `5601` (dashboards, optional)
 
 ```bash
 cd ventstream/demo/stack
@@ -69,8 +69,11 @@ lsof -nP -iTCP:9200 -sTCP:LISTEN   # macOS and most developer workstations
 Both checks should return no listener before you start the demo.
 On Docker Desktop, the demo container can sometimes appear to start even when
 a host process already owns `localhost:9200`. In that state, the verification
-`curl` commands may reach the wrong OpenSearch cluster. Stop the process shown
-by the checks above before continuing. For a Homebrew-managed OpenSearch, use
+`curl` commands may reach the wrong OpenSearch cluster. The easiest fix is to
+move the demo to another host port — set `VENTSTREAM_DEMO_OS_PORT` (and
+`VENTSTREAM_DEMO_PG_PORT` for Postgres) before `docker compose up`, then adjust
+the `localhost:9200` URLs in this guide accordingly. Alternatively, stop the
+process shown by the checks above. For a Homebrew-managed OpenSearch, use
 `brew services stop opensearch`. For another Compose stack, run `docker compose
 down` from that stack's directory. Do not kill an unrelated process without
 first identifying it.
@@ -140,6 +143,10 @@ Each engine moves through its lifecycle:
   <Step title="BOOTSTRAPPING">Snapshot scan — existing rows/nodes stream into OpenSearch.</Step>
   <Step title="TAILING">Steady state — live CDC changes flow as they happen.</Step>
 </Steps>
+
+These are the engine's local lifecycle phases. In managed mode, VentStream
+Cloud reports the `tailing` steady state as `running` — see
+[Lifecycle state](/concepts/lifecycle-phases).
 
 ## 4. Verify the initial load
 
@@ -303,7 +310,7 @@ spread updates across all 200 orders.
     docker compose --profile dashboards up -d dashboards
     ```
     Open **http://localhost:5601** → *Dev Tools*:
-    ```
+    ```json
     GET orders/_search
     GET products/_search
     ```

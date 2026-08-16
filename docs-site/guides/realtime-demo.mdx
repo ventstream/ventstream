@@ -17,7 +17,7 @@ See [Real-time subscriptions](/concepts/real-time-subscriptions) for how
 ## Prerequisites
 
 - Docker + Docker Compose v2
-- Free ports: `4041` (GraphQL), `4222` (NATS), `4043` (health)
+- Free ports: `4040` (WebSocket), `4041` (GraphQL), `4222` (NATS), `4043` (health)
 
 ## 1. Start the stack
 
@@ -27,8 +27,9 @@ docker compose up -d --build
 ```
 
 This starts NATS (JetStream) and the engine in `ws,graphql` mode — the
-`ws` role bootstraps the `vsws` stream, the `graphql` role serves
-subscriptions from it. Confirm it's up:
+`ws` role bootstraps the `vsws` stream (the demo compose sets
+`VS_WS_JS_STREAM=vsws`; the default stream name is `ventstream`), and the
+`graphql` role serves subscriptions from it. Confirm it's up:
 
 ```bash
 docker compose ps   # engine → "healthy"

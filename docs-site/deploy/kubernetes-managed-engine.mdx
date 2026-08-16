@@ -20,8 +20,8 @@ the Cloud gateway.
 - Connector credentials stored in your secret manager
 - Outbound network access to the Cloud enrollment and control gateways
 
-CDC deployments use one active replica. Realtime workloads can use multiple
-deployments when each instance has its own managed identity.
+CDC deployments use one active replica. Realtime roles can be replicated, but
+each realtime instance needs its own deployment and its own agent key.
 
 ## 1. Create the pipeline and deployment
 
@@ -140,7 +140,7 @@ helm upgrade --install orders-primary \
   --namespace ventstream-workloads \
   --create-namespace \
   --set image.repository=ghcr.io/ventstream/ventstream \
-  --set image.tag=<engine-version> \
+  --set image.tag=0.1.24 \
   --set fleet.agentKey.secret=orders-agent-key \
   --set engine.envFromSecret=orders-engine-secrets
 ```
@@ -233,7 +233,7 @@ helm upgrade orders-primary \
   --namespace ventstream-workloads \
   --reuse-values \
   --set image.repository=ghcr.io/ventstream/ventstream \
-  --set image.tag=<engine-version> \
+  --set image.tag=0.1.24 \
   --set fleet.agentKey.secret=orders-agent-key \
   --set fleet.enrollment.enabled=false
 ```
