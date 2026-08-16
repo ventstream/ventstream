@@ -12,10 +12,11 @@ Linux archives target the Ubuntu 22.04 runtime baseline (glibc 2.35 or newer),
 and macOS archives target macOS 12 or newer. Windows users should run the OCI
 image until a native Windows build is qualified.
 
-The native binary runs in standalone mode. It reads `ventstream.yaml`, resolves
-secret references from the local environment, and connects directly to the
-configured source, sink, and optional NATS infrastructure. It does not require
-the Fleet control plane or an enrollment token.
+Without an agent key, the binary runs in standalone mode. It reads
+`ventstream.yaml`, resolves secret references from the local environment, and
+connects directly to the configured source, sink, and optional NATS
+infrastructure. It does not require the Fleet control plane, and with no agent
+key it makes zero platform connections.
 
 ## Install with curl
 
@@ -38,7 +39,7 @@ Install a specific version or directory:
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://github.com/ventstream/ventstream/releases/latest/download/ventstream-installer.sh \
-  | VENTSTREAM_VERSION=0.1.12 \
+  | VENTSTREAM_VERSION=0.1.24 \
     VENTSTREAM_INSTALL_DIR="$HOME/bin" \
     sh
 ```
@@ -88,7 +89,7 @@ use the same binary and are covered by the
 Release archives are also available as ordinary HTTPS downloads:
 
 ```bash
-VERSION=0.1.12
+VERSION=0.1.24
 ARTIFACT="ventstream-$VERSION-linux-amd64.tar.gz"
 BASE="https://github.com/ventstream/ventstream/releases/download/v$VERSION"
 curl --proto '=https' --tlsv1.2 -fLO "$BASE/$ARTIFACT"
@@ -107,7 +108,7 @@ provenance verification before execution can download and verify it instead of
 piping it directly to the shell:
 
 ```bash
-gh release download v0.1.12 \
+gh release download v0.1.24 \
   --repo ventstream/ventstream \
   --pattern ventstream-installer.sh
 gh attestation verify ventstream-installer.sh \
@@ -130,6 +131,19 @@ archive was produced by this repository's release workflow.
 
 The standalone process retains cursor and projection state locally. Stop the
 process to pause it and restart it to resume. Fleet-wide CLI inventory, remote
-configuration, centralized pause/resume, and agent health require a separate
-[Fleet-managed deployment](/fleet/overview); a running standalone process
-cannot be enrolled in place.
+configuration, centralized pause/resume, and agent health require a
+[Fleet-managed deployment](/fleet/overview).
+
+The same binary becomes managed when started with a deployment's
+[agent key](/fleet/enrollment). Try it locally:
+
+```bash
+VS_AGENT_KEY=vsa1.… \
+VS_MANAGED_STATE_DIR="$HOME/.ventstream/managed" \
+ventstream
+```
+
+A managed engine takes configuration from the pipeline's selected revision — an
+agent key alongside local `source`, `sink`, or `specs` sections is a hard
+startup error, so a running standalone workload must be restarted with a key
+and without its local pipeline configuration to become managed.

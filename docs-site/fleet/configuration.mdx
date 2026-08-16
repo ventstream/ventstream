@@ -20,13 +20,14 @@ ventstreamctl pipelines configurations select orders-cdc <revision> --wait
 ventstreamctl pipelines resume orders-cdc --wait
 ```
 
-The agent stages files atomically in a private configuration directory and starts
-the engine with `VS_ENGINE_CONFIG` pointing at the generated `ventstream.yaml`.
+The managed engine stages files atomically in a private configuration directory
+and starts its pipeline child with `VS_ENGINE_CONFIG` pointing at the generated
+`ventstream.yaml`.
 For a new pipeline, the first selection creates its initial desired state as
 `paused`; an explicit `resume` performs the first start. Later selections
 preserve the pipeline's current run state.
 
-After a supervisor restart, the engine remains stopped until the supervisor
+After a restart, the pipeline remains stopped until the engine's fleet client
 has acquired a current Fleet control session and converged the deployment.
 Persisted desired state is retained, but it is not treated as fresh permission
 to start before admission. An engine that is already running can continue
@@ -76,7 +77,7 @@ sink:
 
 Fleet stores the references, TLS file paths, and key-routing policy. The
 deployment provides the endpoint, credentials, and mounted trust material to
-the managed engine. The agent supplies `VS_FLEET_DEPLOYMENT_ID`, which is the
+the managed engine. The engine supplies `VS_FLEET_DEPLOYMENT_ID`, which is the
 default Redis writer identity; a managed revision does not need to duplicate
 that value in YAML.
 
@@ -108,7 +109,7 @@ sink:
 ```
 
 Fleet validates the topology shape before activation. The engine resolves the
-references in the agent environment, verifies the discovered primary or
+references in the workload environment, verifies the discovered primary or
 Cluster slot map, and blocks startup when the runtime topology does not match
 the revision. See the [Redis sink guide](/connectors/sinks/redis#endpoint-topology)
 for Cluster routing and Sentinel TLS requirements.

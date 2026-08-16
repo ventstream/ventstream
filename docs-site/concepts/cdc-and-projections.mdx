@@ -48,6 +48,15 @@ for a raw CDC tail that ships full per-event state. See
 
 ## Project
 
+A projection spec is **optional**. With no joins or denormalize spec at all,
+every change flows through as a flat per-row document with a deterministic id
+(`{schema.table}:["pk",…]` — see
+[deterministic document IDs](/concepts/architecture#deterministic-document-ids)):
+updates overwrite the document in place, deletes remove it, and a
+primary-key-changing update removes the old document and writes the new one.
+Reach for a spec when you want **composed** documents — a parent with embedded
+children — not for correctness.
+
 A **projection spec** (YAML) declares the target document. The engine
 uses it three ways:
 
@@ -141,4 +150,6 @@ discarded.
 
 This is the contract: the spec is the boundary. Nothing outside it can
 cause a write, which is exactly what keeps the index clean and the
-fan-out bounded.
+fan-out bounded. (In a flat pipeline with no spec, the source scope — the
+Postgres publication, the collection or table list, the topic set — is the
+boundary instead.)

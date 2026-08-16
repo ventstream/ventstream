@@ -3,14 +3,16 @@ title: "Kubernetes deployment"
 description: "Choose standalone engine workloads or Fleet-managed engines, then follow the matching Kubernetes runbook."
 ---
 
-VentStream has two distinct Kubernetes operating modes. Choose the mode before
-creating workloads because a standalone engine cannot be attached to Fleet in
-place.
+VentStream has two Kubernetes operating modes. Both run the same public engine
+image (`ghcr.io/ventstream/ventstream`); the mode is decided at runtime by the
+presence of a deployment [agent key](/fleet/enrollment). Choose the mode before
+creating workloads because configuration ownership differs — an agent key
+alongside local source/sink configuration is a hard startup error.
 
 | Mode | Engine process | Configuration owner | Operations | Control plane |
 | --- | --- | --- | --- | --- |
-| Standalone | `ventstream` is PID 1 | ConfigMap and Secret | Helm/Kubernetes restart and rollout | None |
-| Cloud-managed | Fleet supervisor is PID 1 and starts `ventstream` as a child | Immutable Cloud revision plus workload-local Secret | Dashboard and `ventstreamctl` | VentStream Cloud |
+| Standalone | `ventstream` is PID 1, no agent key | ConfigMap and Secret | Helm/Kubernetes restart and rollout | None |
+| Cloud-managed | The same `ventstream` binary is PID 1; its built-in fleet client re-executes the binary as the pipeline child | Immutable Cloud revision plus workload-local Secret | Dashboard and `ventstreamctl` | VentStream Cloud |
 
 ## Standalone
 
@@ -32,7 +34,8 @@ reconcile, or rebootstrap operations.
 
 1. Create or join a [VentStream Cloud](https://ventstream.dev/signup)
    organization.
-2. [Deploy a managed engine](/deploy/kubernetes-managed-engine) into your
+2. Mint a deployment [agent key](/fleet/enrollment) and
+   [deploy a managed engine](/deploy/kubernetes-managed-engine) into your
    Kubernetes cluster.
 3. [Administer it with ventstreamctl](/fleet/cli) or the dashboard.
 

@@ -25,13 +25,15 @@ curl -fsSL https://ventstream.dev/install.sh | sh
 
 Or grab a specific platform build from the
 [releases page](https://github.com/ventstream/ventstream/releases/latest).
-Container images are available for containerized deployments — see
-[Deploy](/deploy/kubernetes-managed-engine).
+For containerized deployments, the same engine ships as one public image,
+`ghcr.io/ventstream/ventstream` — it runs standalone or
+[managed](/concepts/managed-mode) depending only on whether an agent key is
+present. See [Deploy](/deploy/kubernetes-managed-engine).
 
 Pin a version or change the location with env vars:
 
 ```bash
-VENTSTREAM_VERSION=0.1.21 VENTSTREAM_INSTALL_DIR=/usr/local/bin \
+VENTSTREAM_VERSION=0.1.24 VENTSTREAM_INSTALL_DIR=/usr/local/bin \
   curl -fsSL https://ventstream.dev/install.sh | sh
 ```
 

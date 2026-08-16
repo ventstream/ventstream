@@ -16,9 +16,11 @@ and [Real-time subscriptions](/concepts/real-time-subscriptions).
 </Note>
 
 <Note>
-The demo runs the engines **standalone**. A running standalone process cannot be
-attached to VentStream Cloud in place. To use centralized configuration,
-visibility, and lifecycle operations, create a managed pipeline and deploy a new
+The demo runs the engines **standalone** — no key, no platform connection. The
+same binary becomes [managed](/concepts/managed-mode) when it starts with an
+agent key (`VS_AGENT_KEY`), which brings centralized configuration, visibility,
+and lifecycle operations. To manage a pipeline like this one, create it in
+VentStream Cloud and deploy the engine as a
 [managed agent](/deploy/kubernetes-managed-engine).
 </Note>
 
@@ -364,8 +366,9 @@ doesn't hit name/port clashes.
   <Card title="How fan-out works" icon="diagram-project" href="/concepts/fan-out">
     Why renaming a category updates 500 docs without exploding.
   </Card>
-  <Card title="Use VentStream Cloud" icon="gauge" href="/fleet/overview">
-    Enroll managed agents and administer pipelines from the dashboard or CLI.
+  <Card title="Use VentStream Cloud" icon="gauge" href="/concepts/managed-mode">
+    Attach the same engine with an agent key and administer pipelines from the
+    dashboard or CLI.
   </Card>
   <Card title="Deploy to Kubernetes" icon="server" href="/deploy/kubernetes">
     Ship the whole stack with the bundled manifests.

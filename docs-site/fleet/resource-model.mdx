@@ -21,6 +21,10 @@ Organization
 | Deployment | Stable installation of a pipeline in a customer environment |
 | Instance | One running pod or process observed under a deployment |
 
+Each deployment has at most one active [agent key](/fleet/enrollment) (`vsa1.`
+prefix). The key binds engine instances to the deployment at first connect;
+minting a new key revokes the previous one.
+
 CDC deployments are singleton because a source cursor or replication slot has one
 active consumer. Realtime deployments can have multiple instances when the role
 and transport support replication.

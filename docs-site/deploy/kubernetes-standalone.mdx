@@ -8,9 +8,11 @@ owns process lifecycle, while a ConfigMap owns non-secret engine configuration a
 a Secret supplies connector credentials.
 
 <Note>
-Standalone engines cannot be administered with `ventstreamctl`. To gain CLI
-lifecycle and managed-configuration operations, deploy a new
-[Fleet-managed engine](/deploy/kubernetes-managed-engine).
+Standalone engines cannot be administered with `ventstreamctl`. The same public
+image runs managed when given a deployment [agent key](/fleet/enrollment) — to
+gain CLI lifecycle and managed-configuration operations, install a
+[managed engine](/deploy/kubernetes-managed-engine) with a key instead of a
+local ConfigMap.
 </Note>
 
 ## Standalone CDC
@@ -97,9 +99,13 @@ data:
         related: []
 ```
 
-The example uses Postgres SQL denormalization mode. Add related tables and the
-required source indexes before production use. Use `memory` when you intentionally
-want the persisted in-process join engine instead.
+The `specs.joins` section is optional. Without it the engine runs flat CDC:
+every source stamps deterministic document ids (`{table}:["pk"]`), so updates,
+deletes, and primary-key changes are exact in the sink with no joins spec. Add
+a joins spec only when you want composed parent+children documents, as this
+example does. The example uses Postgres SQL denormalization mode; add related
+tables and the required source indexes before production use, or use `memory`
+when you intentionally want the persisted in-process join engine instead.
 
 ### Run the engine
 

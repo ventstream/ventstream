@@ -15,7 +15,7 @@ Validation fails when a required reference is missing.
 | `VS_ENGINE_CONFIG` | Optional path to canonical `ventstream.yaml`. When set, roles, source kind, sink endpoint/auth references, sink index routing, spec file paths, and DLQ path are read from the file with legacy env fallback for connector details. |
 | `VS_ROLES` | `cdc` (and/or `ws`, `graphql`). The CDC role is the pipeline. |
 | `VS_CDC_SOURCE` | `postgres`, `neo4j`, `mongodb`, `mysql` (`mariadb` alias), or `kafka` (`redpanda` alias). |
-| `VS_SINK` | Sink kind: `opensearch` (default), `elasticsearch`, or `redis`. |
+| `VS_SINK` | Sink kind: `opensearch` (default), `elasticsearch`, `meilisearch`, or `redis`. |
 | `VS_AGENT_NAME` | Standalone process identifier and default Kafka consumer-group ID. Managed identity comes from the Cloud deployment certificate. |
 | `VS_TENANT` | Server-authorized tenant for `ws` and `graphql`. Set it outside local development so clients cannot select another tenant during the handshake. |
 | `VS_OS_ENDPOINT` | OpenSearch base URL. |
@@ -38,6 +38,19 @@ Validation fails when a required reference is missing.
 | `VS_OS_TLS_MODE` | `verify_full` requires HTTPS and validates the certificate chain and hostname. `disabled` requires an `http://` endpoint. |
 | `VS_OS_TLS_CA_FILE` | Optional PEM CA bundle for a privately issued OpenSearch certificate. |
 | `VS_INSECURE_TLS` | Disable sink certificate verification. Default `false`; use only for isolated local testing. |
+
+## Meilisearch sink
+
+Canonical YAML is preferred (see the
+[Meilisearch sink guide](/connectors/sinks/meilisearch)); these are the
+environment fallbacks when no file config is present:
+
+| Variable | Meaning |
+|---|---|
+| `VS_MEILI_ENDPOINT` | Required Meilisearch base URL. |
+| `VS_MEILI_API_KEY` | API key with documents, indexes, tasks, and settings permissions on the target indexes. |
+| `VS_MEILI_INDEX_PREFIX` | Prefix for routed index names (default `vs_`; `[A-Za-z0-9_-]` only). |
+| `VS_MEILI_INDEX` | Fixed-routing index name (selects `index_routing: { mode: fixed }`). |
 
 ## Redis sink
 

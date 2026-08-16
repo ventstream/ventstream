@@ -10,10 +10,11 @@ carries its category, its supplier and the supplier's region, and its
 tags — gathered across up to 2 hops.
 
 <Note>
-VentStream writes to a **target**. **OpenSearch and Elasticsearch** are
-the supported targets today — they share the `_bulk` API, so the same
-engine handles both. The examples here use OpenSearch; set the endpoint
-with `VS_OS_ENDPOINT`.
+VentStream writes to a **target**:
+[OpenSearch / Elasticsearch](/connectors/sinks/opensearch) (one connector —
+they share the `_bulk` API), [Meilisearch](/connectors/sinks/meilisearch), or
+[Redis](/connectors/sinks/redis). The examples here use OpenSearch; set the
+endpoint with `VS_OS_ENDPOINT`.
 </Note>
 
 ## Source requirements
