@@ -14,7 +14,12 @@ use crate::{CredentialState, CredentialStore};
 pub const DEFAULT_GATEWAY_URL: &str = "https://gateway.ventstream.dev:8445";
 /// Default platform enrollment gateway (key handshake).
 pub const DEFAULT_ENROLLMENT_URL: &str = "https://gateway.ventstream.dev:8444";
+#[cfg(not(windows))]
 const DEFAULT_STATE_DIR: &str = "/var/lib/ventstream/managed";
+/// Machine-wide, non-roaming location; overridable via
+/// `VS_MANAGED_STATE_DIR` like on Unix.
+#[cfg(windows)]
+const DEFAULT_STATE_DIR: &str = r"C:\ProgramDataentstream\managed";
 const INSTANCE_ID_FILE: &str = "instance-id";
 
 /// Caller-supplied managed-mode inputs: the agent key plus optional overrides.

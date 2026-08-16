@@ -10,7 +10,13 @@ mod config;
 mod envelope;
 mod event_mapper;
 mod offset;
+#[cfg(not(windows))]
 mod source;
+#[cfg(windows)]
+mod source_unsupported;
 
 pub use config::{KafkaCdcConfig, UnwrapMode};
+#[cfg(not(windows))]
 pub use source::KafkaCdcSource;
+#[cfg(windows)]
+pub use source_unsupported::KafkaCdcSource;

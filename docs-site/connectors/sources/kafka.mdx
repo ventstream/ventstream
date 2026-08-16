@@ -3,6 +3,12 @@ title: "Kafka / Redpanda source"
 description: "Consume Debezium change topics (or raw JSON topics) and stream them into the sink."
 ---
 
+<Note>
+The Kafka source is available on Linux and macOS (and in the container
+image). It is not included in the native Windows build — its native
+library has no supported Windows toolchain.
+</Note>
+
 The Kafka source is a **consumer**: it reads change data that's already on a
 Kafka topic — typically produced by a **Debezium** source connector — and
 unwraps each message into a sink document. The current connector maps each

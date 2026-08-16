@@ -18,7 +18,6 @@ parking_lot = { workspace = true }
 neo4rs = { workspace = true }
 mongodb = { workspace = true }
 mysql_async = { workspace = true }
-rdkafka = { workspace = true }
 pgwire-replication = { workspace = true }
 rand = "0.8"
 rustls = { workspace = true }
@@ -53,3 +52,8 @@ path = "examples/postgres_cdc_edge.rs"
 
 [lints]
 workspace = true
+
+# librdkafka (C) does not build cleanly on Windows; the Kafka source is
+# Unix-only and stubbed with a clear startup error elsewhere.
+[target.'cfg(not(windows))'.dependencies]
+rdkafka = { workspace = true }

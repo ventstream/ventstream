@@ -56,8 +56,10 @@ tokio = { workspace = true, features = ["test-util", "rt", "rt-multi-thread", "m
 testcontainers = "0.27"
 reqwest = { workspace = true }
 mongodb = { workspace = true }
-rdkafka = { workspace = true }
 redis = { workspace = true }
 
 [lints]
 workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+rdkafka = { workspace = true }

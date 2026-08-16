@@ -9,7 +9,9 @@ VentStream is distributed as one native engine binary for:
 - macOS AMD64 and Apple silicon
 
 Linux archives target the Ubuntu 22.04 runtime baseline (glibc 2.35 or newer),
-and macOS archives target macOS 12 or newer. Native Windows is not supported —
+and macOS archives target macOS 12 or newer. Windows amd64 ships natively
+from engine v0.1.27 (`irm https://ventstream.dev/install.ps1 | iex`) with
+every connector except the Kafka source — for Kafka pipelines on Windows,
 run the engine inside WSL2 (the Linux installer works there as-is) or use the
 container image.
 

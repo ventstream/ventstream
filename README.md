@@ -113,10 +113,16 @@ cd ventstream/demo/stack && docker compose up -d
 # document appear in OpenSearch in real time
 ```
 
-**Install the binary** — checksum-verified Linux and macOS builds:
+**Install the binary** — checksum-verified Linux, macOS, and Windows builds:
 
 ```bash
 curl -fsSL https://ventstream.dev/install.sh | sh
+```
+
+Windows (PowerShell; every connector except the Kafka source):
+
+```powershell
+irm https://ventstream.dev/install.ps1 | iex
 ```
 
 **Or pull the image**:

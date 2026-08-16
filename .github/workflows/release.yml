@@ -247,8 +247,13 @@ jobs:
             runner: macos-15-intel
           - artifact: darwin-arm64
             runner: macos-15
+          - artifact: windows-amd64
+            runner: windows-2025
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
     permissions:
       artifact-metadata: write
       attestations: write
@@ -267,6 +272,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential clang cmake libclang-dev pkg-config
+      # aws-lc-sys assembles with NASM under windows-msvc.
+      - uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
+        if: startsWith(matrix.artifact, 'windows-')
       - name: Install auditable build tool
         uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2.83.2
         with:
@@ -289,10 +297,13 @@ jobs:
           VS_PG_SLOT: ventstream_slot
           VS_PG_USER: ventstream
         run: |
-          test "$(target/release/ventstream --version)" = "ventstream $EXPECTED_VERSION"
-          target/release/ventstream --validate-config \
+          BIN=target/release/ventstream
+          [ -e "$BIN.exe" ] && BIN="$BIN.exe"
+          test "$("$BIN" --version)" = "ventstream $EXPECTED_VERSION"
+          "$BIN" --validate-config \
             | grep -Fx 'configuration valid: roles=cdc'
       - name: Strip engine binary
+        if: ${{ !startsWith(matrix.artifact, 'windows-') }}
         run: strip target/release/ventstream
       - name: Prepare native archive
         id: package
@@ -300,20 +311,29 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          archive="ventstream-$VERSION-$ARTIFACT.tar.gz"
           mkdir -p dist/package
-          install -m 0755 target/release/ventstream dist/package/ventstream
-          install -m 0644 examples/standalone/ventstream.yaml \
-            dist/package/ventstream.example.yaml
-          install -m 0644 infra/release/BINARY_README.md dist/package/README.md
-          tar -czf "dist/$archive" -C dist/package \
-            ventstream ventstream.example.yaml README.md
+          if [[ "$ARTIFACT" == windows-* ]]; then
+            archive="ventstream-$VERSION-$ARTIFACT.zip"
+            cp target/release/ventstream.exe dist/package/ventstream.exe
+            cp examples/standalone/ventstream.yaml dist/package/ventstream.example.yaml
+            cp infra/release/BINARY_README.md dist/package/README.md
+            (cd dist/package && 7z a "../$archive" \
+              ventstream.exe ventstream.example.yaml README.md >/dev/null)
+          else
+            archive="ventstream-$VERSION-$ARTIFACT.tar.gz"
+            install -m 0755 target/release/ventstream dist/package/ventstream
+            install -m 0644 examples/standalone/ventstream.yaml \
+              dist/package/ventstream.example.yaml
+            install -m 0644 infra/release/BINARY_README.md dist/package/README.md
+            tar -czf "dist/$archive" -C dist/package \
+              ventstream ventstream.example.yaml README.md
+          fi
           rm -rf dist/package
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
       - name: Generate native binary SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          file: target/release/ventstream
+          file: ${{ startsWith(matrix.artifact, 'windows-') && 'target/release/ventstream.exe' || 'target/release/ventstream' }}
           format: spdx-json
           syft-version: v1.46.0
           output-file: dist/ventstream-${{ needs.validate.outputs.version }}-${{ matrix.artifact }}.spdx.json
@@ -363,19 +383,32 @@ jobs:
         run: |
           sh -n install.sh
           ./infra/release/test-installer.sh
-      - name: Prepare installer release asset
+      - name: Parse Windows installer
+        run: |
+          pwsh -NoProfile -Command \
+            '$tokens = $errors = $null; \
+             [System.Management.Automation.Language.Parser]::ParseFile("install.ps1", [ref]$tokens, [ref]$errors) | Out-Null; \
+             if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }'
+      - name: Prepare installer release assets
         run: |
           mkdir -p dist
           install -m 0755 install.sh dist/ventstream-installer.sh
+          install -m 0644 install.ps1 dist/ventstream-installer.ps1
       - name: Attest installer provenance
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
           subject-path: dist/ventstream-installer.sh
+      - name: Attest Windows installer provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: dist/ventstream-installer.ps1
       - name: Retain installer
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-native-installer
-          path: dist/ventstream-installer.sh
+          path: |
+            dist/ventstream-installer.sh
+            dist/ventstream-installer.ps1
           retention-days: 90
 
   publish-image:
