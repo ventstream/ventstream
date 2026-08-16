@@ -33,9 +33,7 @@ VentStream Cloud with a deployment [agent key](/fleet/enrollment).
 Install the latest release:
 
 ```bash
-curl -fsSL \
-  https://raw.githubusercontent.com/ventstream/ventstream-releases/main/install.sh |
-  sh
+curl -fsSL https://ventstream.dev/install-cli.sh | sh
 
 export PATH="$HOME/.local/bin:$PATH"
 ventstreamctl --version
@@ -49,9 +47,7 @@ version, and stages the executable into `$HOME/.local/bin`. It does not use
 To use a different install directory:
 
 ```bash
-curl -fsSL \
-  https://raw.githubusercontent.com/ventstream/ventstream-releases/main/install.sh |
-  VENTSTREAMCTL_INSTALL_DIR="$HOME/bin" sh
+curl -fsSL https://ventstream.dev/install-cli.sh | VENTSTREAMCTL_INSTALL_DIR="$HOME/bin" sh
 ```
 
 Rerun the installer to upgrade to the latest release. For a reproducible
