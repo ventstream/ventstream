@@ -41,9 +41,7 @@ The command also prints the authorization URL. Use `--no-browser` to suppress
 automatic launch and open that URL manually on the same workstation:
 
 ```bash
-ventstreamctl auth login \
-  --profile production \
-  --no-browser
+ventstreamctl auth login --profile production --no-browser
 ```
 
 The browser callback expires after five minutes.
@@ -62,10 +60,8 @@ For a non-interactive terminal, or to select explicitly, pass a UUID, an
 unambiguous UUID prefix of at least eight characters, or a slug:
 
 ```bash
-ventstreamctl auth login \
-  --profile production \
-  --organization acme \
-  --environment production
+ventstreamctl auth login --profile production \
+  --organization acme --environment production
 ```
 
 Change the saved context later without signing in again:
@@ -88,9 +84,7 @@ device-code URL and code.
 An identity provider using a private PKI can be trusted with:
 
 ```bash
-ventstreamctl auth login \
-  --profile enterprise \
-  --oidc-trust-bundle <ca.pem>
+ventstreamctl auth login --profile enterprise --oidc-trust-bundle <ca.pem>
 ```
 
 ## Check the session
