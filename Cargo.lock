@@ -5863,6 +5863,7 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "metrics",
  "parking_lot",
  "rand 0.8.6",
  "redis",

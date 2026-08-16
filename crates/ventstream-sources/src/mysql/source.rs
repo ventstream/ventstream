@@ -21,8 +21,9 @@ use ventstream_core::{
 
 use super::config::MySqlCdcConfig;
 use super::cursor::{BinlogPos, CursorFile, IncompleteKind};
+use super::ddl::{parse_ddl, DdlKind};
 use super::event_mapper::{self, Op};
-use super::schema::SchemaCache;
+use super::schema::{detect_drift, SchemaCache};
 use super::value::value_to_json;
 use crate::credential::{exhausted_message, CredentialFailureBudget};
 use crate::error::MySqlCdcError;
@@ -335,6 +336,57 @@ impl MySqlCdcSource {
         Ok(true)
     }
 
+    /// React to statement-level DDL in the binlog. Recognized DDL against a
+    /// tracked table evicts the cached schema and stale TABLE_MAP metadata so
+    /// the next rows event decodes against a fresh `INFORMATION_SCHEMA`
+    /// fetch, then reports column-level drift. Warn-only: the pipeline keeps
+    /// flowing; unrecognized statements are ignored.
+    async fn handle_query_event(
+        &self,
+        pool: &Pool,
+        schema_cache: &SchemaCache,
+        table_map: &mut HashMap<u64, mysql_async::binlog::events::TableMapEvent<'static>>,
+        default_db: &str,
+        sql: &str,
+    ) {
+        let Some(statement) = parse_ddl(sql, default_db) else {
+            return;
+        };
+        for (db, table) in &statement.tables {
+            if db != &self.config.database || !self.config.table_allowed(table) {
+                continue;
+            }
+            let table_label = format!("{db}.{table}");
+            if statement.kind == DdlKind::Truncate {
+                tracing::warn!(table = %table_label, "TRUNCATE observed in binlog");
+                metrics::counter!("vs_truncate_events_total", "table" => table_label.clone())
+                    .increment(1);
+                continue;
+            }
+            // Stale TABLE_MAP metadata must never pair with the new schema.
+            table_map.retain(|_, tme| !(tme.database_name() == *db && tme.table_name() == *table));
+            let old = schema_cache.invalidate(db, table);
+            match statement.kind {
+                DdlKind::Drop => {
+                    tracing::info!(table = %table_label, "tracked table dropped; schema cache evicted");
+                }
+                _ => match schema_cache.get(pool, db, table).await {
+                    Ok(new) => {
+                        if let Some(old) = old {
+                            detect_drift(db, table, &old, &new);
+                        }
+                    }
+                    Err(error) => {
+                        // The refetch will be retried lazily by the next rows
+                        // event; the eviction alone already prevents decoding
+                        // against the stale layout.
+                        tracing::warn!(table = %table_label, %error, "schema refetch after DDL failed");
+                    }
+                },
+            }
+        }
+    }
+
     async fn tail(
         &self,
         pool: &Pool,
@@ -426,6 +478,17 @@ impl MySqlCdcSource {
                             None
                         }
                         Some(EventData::RowsEvent(rows)) => decode_rows(&rows, &table_map)?,
+                        Some(EventData::QueryEvent(query)) => {
+                            self.handle_query_event(
+                                pool,
+                                &schema_cache,
+                                &mut table_map,
+                                &query.schema(),
+                                &query.query(),
+                            )
+                            .await;
+                            None
+                        }
                         _ => None,
                     };
 

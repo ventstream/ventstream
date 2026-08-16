@@ -849,6 +849,11 @@ impl PostgresCdcSource {
                     metric = "pg.replication.unknown_relation_skipped",
                     "skipping WAL message for an uncached relation; advancing past it"
                 );
+                metrics::counter!(
+                    "vs_pg_unknown_relation_skipped_total",
+                    "relation_oid" => oid.to_string()
+                )
+                .increment(1);
                 ventstream_telemetry::record_error(format!(
                     "pg unknown relation oid {oid} skipped"
                 ));
@@ -865,6 +870,20 @@ impl PostgresCdcSource {
         ctx: &SourceContext,
     ) -> Result<(), PostgresCdcError> {
         for event in events {
+            // Truncate visibility (A4): counted here, not at decode, because
+            // a buffered transaction decodes each payload twice.
+            if let Some(qualified) = event.subject.as_str().strip_suffix(".truncate") {
+                // Subject is `postgres.<schema>.<table>` — drop the kind
+                // segment so the label matches the drift counter's form.
+                let table = qualified
+                    .split_once('.')
+                    .map_or(qualified, |(_, rest)| rest);
+                metrics::counter!(
+                    "vs_truncate_events_total",
+                    "table" => table.to_owned()
+                )
+                .increment(1);
+            }
             let stamped = stamp_lsn(event, wal_start);
             ctx.sender
                 .send(stamped, &ctx.shutdown)

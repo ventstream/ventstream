@@ -281,7 +281,7 @@ impl OpenSearchSink {
                 ));
             };
             let request_started = Instant::now();
-            match self.send_once(body, &item_event_offsets).await {
+            match self.send_once(body, &item_event_offsets, attempt).await {
                 Ok(SendOutcome::AllOk) => {
                     self.adaptive.on_success(request_started.elapsed());
                     self.finish_transient_failure(&mut transient_failure);
@@ -481,6 +481,7 @@ impl OpenSearchSink {
         &self,
         body: Bytes,
         item_event_offsets: &[usize],
+        attempt_events: &[ventstream_core::Event],
     ) -> Result<SendOutcome, OpenSearchSinkError> {
         let mut http = self
             .client
@@ -495,7 +496,7 @@ impl OpenSearchSink {
             .await
             .map_err(|err| OpenSearchSinkError::Transport(err.to_string()))?;
 
-        classify_response(response, item_event_offsets).await
+        classify_response(response, item_event_offsets, attempt_events).await
     }
 }
 
@@ -540,7 +541,11 @@ enum SendOutcome {
 /// Pure (no I/O) so the transient/permanent split is unit-testable without a
 /// live HTTP server. Only known document-level errors are permanent. Unknown
 /// item failures fail closed instead of being misclassified into the DLQ.
-fn partition_bulk_items(parsed: &BulkResponse, item_event_offsets: &[usize]) -> SendOutcome {
+fn partition_bulk_items(
+    parsed: &BulkResponse,
+    item_event_offsets: &[usize],
+    attempt_events: &[ventstream_core::Event],
+) -> SendOutcome {
     let mut transient: Vec<ventstream_core::FailedItem> = Vec::new();
     let mut permanent: Vec<ventstream_core::FailedItem> = Vec::new();
     let mut blocked: Vec<ventstream_core::FailedItem> = Vec::new();
@@ -583,6 +588,7 @@ fn partition_bulk_items(parsed: &BulkResponse, item_event_offsets: &[usize]) -> 
         if is_transient_item_failure(entry) {
             transient.push(failed);
         } else if is_permanent_document_failure(entry) {
+            count_schema_casualty(entry, attempt_events.get(offset));
             permanent.push(failed);
         } else {
             blocked.push(failed);
@@ -640,14 +646,55 @@ fn response_error_type(body: &str) -> Option<String> {
 }
 
 fn is_permanent_document_failure(entry: &super::bulk::BulkResponseEntry) -> bool {
-    matches!(
-        entry.error_type(),
+    match entry.error_type() {
         Some(
             "document_parsing_exception"
-                | "mapper_parsing_exception"
-                | "strict_dynamic_mapping_exception"
-        )
+            | "mapper_parsing_exception"
+            | "strict_dynamic_mapping_exception",
+        ) => true,
+        // A mapping conflict surfaces as `illegal_argument_exception`
+        // ("mapper [x] cannot be changed from type [long] to [text]").
+        // Only the mapping-conflict shape is permanent; any other
+        // illegal_argument stays fail-closed so a real config problem
+        // cannot silently drain into the DLQ.
+        Some("illegal_argument_exception") => {
+            let reason = entry.error_reason().unwrap_or("");
+            reason.contains("mapper")
+                || reason.contains("cannot be changed")
+                || reason.contains("different type")
+        }
+        _ => false,
+    }
+}
+
+/// Count a schema-classified DLQ routing so mapping casualties are visible
+/// per table instead of only as DLQ file lines. The table label comes from
+/// the canonical doc id prefix (`{table}:[…]`).
+fn count_schema_casualty(
+    entry: &super::bulk::BulkResponseEntry,
+    event: Option<&ventstream_core::Event>,
+) {
+    let table = entry
+        .id
+        .as_deref()
+        .and_then(|id| id.split(":[").next())
+        .unwrap_or("unknown")
+        .to_owned();
+    let error_type = entry.error_type().unwrap_or("unknown").to_owned();
+    // Source scheme (postgres / mysql / mongodb / …) so shape drift on
+    // schemaless sources is attributable without opening the DLQ.
+    let source = event
+        .and_then(|e| e.source.as_str().split("://").next())
+        .unwrap_or("unknown")
+        .to_owned();
+    metrics::counter!(
+        "vs_schema_casualties_total",
+        "table" => table,
+        "sink" => "opensearch",
+        "source" => source,
+        "error_type" => error_type
     )
+    .increment(1);
 }
 
 /// Build the pooled HTTP client from the sink's TLS and timeout settings.
@@ -677,6 +724,7 @@ pub(crate) fn apply_auth(rb: reqwest::RequestBuilder, auth: &AuthMode) -> reqwes
 async fn classify_response(
     response: reqwest::Response,
     item_event_offsets: &[usize],
+    attempt_events: &[ventstream_core::Event],
 ) -> Result<SendOutcome, OpenSearchSinkError> {
     let status = response.status();
     let retry_after = response
@@ -701,7 +749,11 @@ async fn classify_response(
                 item_event_offsets.len()
             )));
         }
-        return Ok(partition_bulk_items(&parsed, item_event_offsets));
+        return Ok(partition_bulk_items(
+            &parsed,
+            item_event_offsets,
+            attempt_events,
+        ));
     }
 
     // Non-2xx — read at most 1 KiB of the body for the error message so a
@@ -885,6 +937,42 @@ mod tests {
     use ventstream_core::{ContentType, Event, Headers, Payload, SourceUri, Subject};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn entry_with_error(error_type: &str, reason: &str) -> super::super::bulk::BulkResponseEntry {
+        serde_json::from_value(serde_json::json!({
+            "_id": "public.orders:[\"42\"]",
+            "status": 400,
+            "error": { "type": error_type, "reason": reason }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn illegal_argument_is_permanent_only_for_mapping_conflicts() {
+        // Mapping conflict shapes route to the DLQ.
+        assert!(is_permanent_document_failure(&entry_with_error(
+            "illegal_argument_exception",
+            "mapper [price] cannot be changed from type [long] to [text]"
+        )));
+        assert!(is_permanent_document_failure(&entry_with_error(
+            "illegal_argument_exception",
+            "field [tags] is of different type in other index"
+        )));
+        // Any other illegal_argument stays fail-closed (retried, not dropped).
+        assert!(!is_permanent_document_failure(&entry_with_error(
+            "illegal_argument_exception",
+            "Limit of total fields [1000] has been exceeded"
+        )));
+        // Existing permanent types keep their classification.
+        assert!(is_permanent_document_failure(&entry_with_error(
+            "mapper_parsing_exception",
+            "failed to parse field"
+        )));
+        assert!(!is_permanent_document_failure(&entry_with_error(
+            "es_rejected_execution_exception",
+            "queue full"
+        )));
+    }
 
     #[test]
     fn adaptive_concurrency_halves_on_pressure_and_recovers_additively() {
@@ -1272,7 +1360,7 @@ mod tests {
         let response = reqwest::get(format!("{}/retry", server.uri()))
             .await
             .expect("response");
-        let error = classify_response(response, &[])
+        let error = classify_response(response, &[], &[])
             .await
             .expect_err("429 must be retryable");
         assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
@@ -1436,7 +1524,7 @@ mod tests {
             ]
         });
         let parsed: BulkResponse = serde_json::from_value(json).unwrap();
-        match partition_bulk_items(&parsed, &[]) {
+        match partition_bulk_items(&parsed, &[], &[]) {
             SendOutcome::PerItem {
                 transient,
                 permanent,
@@ -1473,7 +1561,7 @@ mod tests {
         });
         let parsed: BulkResponse = serde_json::from_value(json).unwrap();
         assert!(matches!(
-            partition_bulk_items(&parsed, &[]),
+            partition_bulk_items(&parsed, &[], &[]),
             SendOutcome::AllOk
         ));
     }
@@ -1527,7 +1615,7 @@ mod tests {
         });
         let parsed: BulkResponse = serde_json::from_value(json).unwrap();
         assert!(
-            matches!(partition_bulk_items(&parsed, &[]), SendOutcome::AllOk),
+            matches!(partition_bulk_items(&parsed, &[], &[]), SendOutcome::AllOk),
             "a batch whose only non-2xx item is a version conflict is fully applied"
         );
     }
@@ -1578,7 +1666,7 @@ mod tests {
             ]
         });
         let parsed: BulkResponse = serde_json::from_value(json).unwrap();
-        match partition_bulk_items(&parsed, &[]) {
+        match partition_bulk_items(&parsed, &[], &[]) {
             SendOutcome::PerItem {
                 transient,
                 permanent,
@@ -1636,7 +1724,7 @@ mod tests {
         });
         let parsed: BulkResponse = serde_json::from_value(json).unwrap();
         assert!(matches!(
-            partition_bulk_items(&parsed, &[]),
+            partition_bulk_items(&parsed, &[], &[]),
             SendOutcome::AllOk
         ));
     }

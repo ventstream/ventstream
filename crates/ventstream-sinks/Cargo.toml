@@ -19,6 +19,7 @@ redis = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+metrics = "0.24"
 sha2 = "0.10"
 thiserror = { workspace = true }
 tokio = { workspace = true }

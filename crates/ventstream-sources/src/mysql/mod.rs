@@ -8,6 +8,7 @@
 
 mod config;
 mod cursor;
+mod ddl;
 mod event_mapper;
 mod fetcher;
 mod schema;

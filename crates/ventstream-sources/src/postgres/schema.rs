@@ -12,7 +12,7 @@
 //! exclusive lock briefly when a new `RELATION` arrives.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
 use tracing::warn;
@@ -32,6 +32,7 @@ use super::pgoutput::Relation;
 /// bounded `table` + `kind` become metric labels.
 pub(crate) fn detect_drift(old: &Relation, new: &Relation) {
     let table = format!("{}.{}", new.namespace, new.name);
+    let mut retyped = false;
     for d in diff_columns(old, new) {
         match d.types {
             Some((from, to)) => warn!(
@@ -53,7 +54,49 @@ pub(crate) fn detect_drift(old: &Relation, new: &Relation) {
         }
         metrics::counter!("vs_schema_drift_total", "table" => table.clone(), "kind" => d.kind)
             .increment(1);
+        retyped |= d.types.is_some();
     }
+    if retyped {
+        bump_type_change_epoch(&new.name);
+    }
+}
+
+/// Process-wide type-change epoch per table, keyed by unqualified
+/// lowercased name. Bumped when a RELATION message shows a column retype,
+/// so SQL builders that cache catalog types (the related fetcher, the SQL
+/// denormaliser) can notice staleness without holding a reference to the
+/// replication decoder.
+static TYPE_CHANGE_EPOCHS: OnceLock<RwLock<HashMap<String, u64>>> = OnceLock::new();
+
+fn type_change_epochs() -> &'static RwLock<HashMap<String, u64>> {
+    TYPE_CHANGE_EPOCHS.get_or_init(RwLock::default)
+}
+
+/// Accepts any qualification (`orders`, `public.orders`, `"public"."orders"`).
+fn epoch_key(table: &str) -> String {
+    table
+        .rsplit('.')
+        .next()
+        .unwrap_or(table)
+        .trim_matches('"')
+        .to_ascii_lowercase()
+}
+
+/// Current type-change epoch for a table. Starts at 0; each detected
+/// column retype increments it.
+pub fn type_change_epoch(table: &str) -> u64 {
+    type_change_epochs()
+        .read()
+        .get(&epoch_key(table))
+        .copied()
+        .unwrap_or(0)
+}
+
+fn bump_type_change_epoch(table: &str) {
+    *type_change_epochs()
+        .write()
+        .entry(epoch_key(table))
+        .or_insert(0) += 1;
 }
 
 /// One detected column-level drift. `kind` is `added`, `dropped`, or
