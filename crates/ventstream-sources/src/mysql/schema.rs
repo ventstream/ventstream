@@ -15,6 +15,9 @@ use crate::error::MySqlCdcError;
 pub(crate) struct TableSchema {
     /// Column names in table ordinal order.
     pub(crate) column_names: Vec<String>,
+    /// `DATA_TYPE` per column, aligned with `column_names`. Used only for
+    /// drift diffing; decoding is positional.
+    pub(crate) column_types: Vec<String>,
     /// PK column names, in key order.
     pub(crate) pk_names: Vec<String>,
     /// PK positions in a binlog row (0-based), aligned with `pk_names`.
@@ -49,6 +52,56 @@ impl SchemaCache {
         self.inner.lock().insert(key, Arc::clone(&schema));
         Ok(schema)
     }
+
+    /// Drop a cached schema so the next `get` refetches from
+    /// `INFORMATION_SCHEMA`. Returns the evicted schema for drift diffing.
+    pub(crate) fn invalidate(&self, db: &str, table: &str) -> Option<Arc<TableSchema>> {
+        self.inner.lock().remove(&(db.to_owned(), table.to_owned()))
+    }
+}
+
+/// Log + count column-level differences after a DDL-triggered refetch —
+/// warn-only, mirroring the Postgres source's drift reporting
+/// (`vs_schema_drift_total{table, kind}`). A `pk_change` is the one that
+/// would silently produce wrong doc ids, so it is called out separately.
+pub(crate) fn detect_drift(db: &str, table: &str, old: &TableSchema, new: &TableSchema) {
+    let table_label = format!("{db}.{table}");
+    let mut drifts: Vec<(String, &'static str)> = Vec::new();
+    let old_set: HashSet<&String> = old.column_names.iter().filter(|n| !n.is_empty()).collect();
+    let new_set: HashSet<&String> = new.column_names.iter().filter(|n| !n.is_empty()).collect();
+    for name in new_set.difference(&old_set) {
+        drifts.push(((*name).clone(), "added"));
+    }
+    for name in old_set.difference(&new_set) {
+        drifts.push(((*name).clone(), "dropped"));
+    }
+    for (index, name) in old.column_names.iter().enumerate() {
+        if name.is_empty() || !new_set.contains(name) {
+            continue;
+        }
+        let old_type = old.column_types.get(index);
+        let new_index = new.column_names.iter().position(|n| n == name);
+        let new_type = new_index.and_then(|i| new.column_types.get(i));
+        if let (Some(from), Some(to)) = (old_type, new_type) {
+            if from != to {
+                drifts.push((name.clone(), "type_change"));
+            }
+        }
+    }
+    if old.pk_names != new.pk_names {
+        drifts.push((new.pk_names.join(","), "pk_change"));
+    }
+    for (column, kind) in drifts {
+        tracing::warn!(
+            metric = "schema.drift",
+            table = %table_label,
+            column = %column,
+            kind,
+            "source schema drift detected"
+        );
+        metrics::counter!("vs_schema_drift_total", "table" => table_label.clone(), "kind" => kind)
+            .increment(1);
+    }
 }
 
 async fn load(pool: &Pool, db: &str, table: &str) -> Result<TableSchema, MySqlCdcError> {
@@ -82,12 +135,16 @@ async fn load(pool: &Pool, db: &str, table: &str) -> Result<TableSchema, MySqlCd
         .max()
         .unwrap_or(0);
     let mut column_names = vec![String::new(); column_count];
+    let mut column_types = vec![String::new(); column_count];
     let mut ordinal_of: HashMap<String, usize> = HashMap::new();
     let mut json_columns = HashSet::new();
     for (name, ord, dtype) in cols {
         let ordinal = (ord as usize).saturating_sub(1);
         if let Some(slot) = column_names.get_mut(ordinal) {
             *slot = name.clone();
+        }
+        if let Some(slot) = column_types.get_mut(ordinal) {
+            *slot = dtype.clone();
         }
         ordinal_of.insert(name.clone(), ordinal);
         if dtype.eq_ignore_ascii_case("json") {
@@ -121,6 +178,7 @@ async fn load(pool: &Pool, db: &str, table: &str) -> Result<TableSchema, MySqlCd
 
     Ok(TableSchema {
         column_names,
+        column_types,
         pk_names,
         pk_ordinals,
         json_columns,

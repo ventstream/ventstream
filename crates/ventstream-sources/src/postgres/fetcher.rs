@@ -46,6 +46,10 @@ pub struct PostgresFetcher {
     inner: Arc<Inner>,
 }
 
+/// Cached catalog types for one table plus the type-change epoch they
+/// were loaded under.
+type EpochedTypes = (u64, HashMap<String, String>);
+
 const DEFAULT_POOL_SIZE: usize = 4;
 const BATCH_KEY_CHUNK: usize = 256;
 
@@ -56,7 +60,9 @@ struct Inner {
     /// Server-rendered SQL types keyed by configured table and column. Values
     /// come from `pg_catalog.format_type`, which quotes user-defined types
     /// safely for use in generated casts.
-    column_types: AsyncMutex<HashMap<String, HashMap<String, String>>>,
+    /// Value is `(type_change_epoch at load, name -> type)`; an epoch bump
+    /// from a source-observed column retype makes the entry stale.
+    column_types: AsyncMutex<HashMap<String, EpochedTypes>>,
     /// Last time we logged the connection state. Used only to throttle
     /// the noisy reconnect-attempt log lines.
     last_log: Mutex<std::time::Instant>,
@@ -320,11 +326,19 @@ impl PostgresFetcher {
         table: &str,
         columns: &[String],
     ) -> Result<Vec<String>, FetchError> {
+        let epoch = super::schema::type_change_epoch(table);
         {
             let cache = self.inner.column_types.lock().await;
-            if let Some(table_types) = cache.get(table) {
-                if let Some(types) = ordered_column_types(table_types, columns) {
-                    return Ok(types);
+            if let Some((cached_epoch, table_types)) = cache.get(table) {
+                if *cached_epoch == epoch {
+                    if let Some(types) = ordered_column_types(table_types, columns) {
+                        return Ok(types);
+                    }
+                } else {
+                    debug!(
+                        table,
+                        "postgres fetcher: cached column types stale after type change, re-resolving"
+                    );
                 }
             }
         }
@@ -377,7 +391,7 @@ impl PostgresFetcher {
             .column_types
             .lock()
             .await
-            .insert(table.to_owned(), table_types);
+            .insert(table.to_owned(), (epoch, table_types));
         Ok(types)
     }
 

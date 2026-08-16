@@ -37,7 +37,7 @@ use ventstream_joins::{Cardinality, JoinDefinition, PkSpec, PrimaryRef, RelatedD
 #[cfg(test)]
 use ventstream_sinks::opensearch::index_template;
 use ventstream_sinks::ReverseLookup;
-use ventstream_sources::postgres::{connect_client, PostgresCdcConfig};
+use ventstream_sources::postgres::{connect_client, type_change_epoch, PostgresCdcConfig};
 
 /// Greedy-drain ceiling for the tail loop. `recv_batch` returns one event
 /// immediately when idle (low latency) and opportunistically drains up to this
@@ -266,6 +266,10 @@ struct PreparedDef {
     /// foreign-change reverse lookup can compare in the column's type and
     /// hit the FK index instead of seq-scanning via `::text`.
     from_types: HashMap<String, String>,
+    /// `type_change_epoch` of the primary table when the types above were
+    /// loaded; a bump means the source saw a column retype and the cached
+    /// spellings may build wrong casts.
+    type_epoch: u64,
     def: JoinDefinition,
 }
 
@@ -384,6 +388,7 @@ impl SqlDenormalizer {
             let from_types = load_column_types(&client, &primary_table, &from_cols)
                 .await
                 .with_context(|| format!("fetching join-column types for {primary_table}"))?;
+            let type_epoch = type_change_epoch(&primary_table);
             defs.push(PreparedDef {
                 primary_table,
                 pk_cols,
@@ -391,6 +396,7 @@ impl SqlDenormalizer {
                 doc: doc_expr(&def),
                 pk_text_select,
                 from_types,
+                type_epoch,
                 def,
             });
         }
@@ -1021,8 +1027,73 @@ impl SqlDenormalizer {
     }
 
     /// Run: bootstrap, then drain the tail receiver until shutdown.
+    /// Reload catalog types for any def whose primary table saw a column
+    /// retype since the types were loaded (signalled via the source's
+    /// type-change epoch). On reload failure the stale epoch is kept so the
+    /// next batch retries; the old spellings keep flowing meanwhile.
+    async fn refresh_stale_types(&mut self) {
+        for pd in &mut self.defs {
+            let epoch = type_change_epoch(&pd.primary_table);
+            if epoch == pd.type_epoch {
+                continue;
+            }
+            let pk_columns = pd.def.primary.pk.columns();
+            let pk_type_map = match load_column_types(&self.client, &pd.primary_table, pk_columns)
+                .await
+            {
+                Ok(map) => map,
+                Err(err) => {
+                    warn!(
+                        table = %pd.primary_table,
+                        error = %err,
+                        "sql-denormalize: pk type reload after type change failed; retrying next batch"
+                    );
+                    continue;
+                }
+            };
+            let from_cols: Vec<String> = {
+                let mut seen = std::collections::BTreeSet::new();
+                for r in &pd.def.related {
+                    for c in r.join_on.from.columns() {
+                        seen.insert(c.clone());
+                    }
+                }
+                seen.into_iter().collect()
+            };
+            let from_types = match load_column_types(&self.client, &pd.primary_table, &from_cols)
+                .await
+            {
+                Ok(map) => map,
+                Err(err) => {
+                    warn!(
+                        table = %pd.primary_table,
+                        error = %err,
+                        "sql-denormalize: join-column type reload after type change failed; retrying next batch"
+                    );
+                    continue;
+                }
+            };
+            pd.pk_types = pk_columns
+                .iter()
+                .map(|column| {
+                    pk_type_map
+                        .get(column)
+                        .cloned()
+                        .unwrap_or_else(|| "text".to_owned())
+                })
+                .collect();
+            pd.from_types = from_types;
+            pd.type_epoch = epoch;
+            info!(
+                table = %pd.primary_table,
+                epoch,
+                "sql-denormalize: reloaded column types after source type change"
+            );
+        }
+    }
+
     pub async fn run(
-        self,
+        mut self,
         mut receiver: EventReceiver,
         sender: EventSender,
         shutdown: ShutdownToken,
@@ -1069,6 +1140,7 @@ impl SqlDenormalizer {
                         break; // all senders dropped
                     }
 
+                    self.refresh_stale_types().await;
                     let source_watermark = max_lsn_u64(&batch);
                     loop {
                         if shutdown.is_cancelled() {

@@ -403,6 +403,14 @@ impl BulkResponseEntry {
         (400..500).contains(&self.status) && self.status != 429
     }
 
+    /// Human-readable failure reason, when the response supplied one.
+    pub fn error_reason(&self) -> Option<&str> {
+        self.error
+            .as_ref()
+            .and_then(|error| error.get("reason"))
+            .and_then(serde_json::Value::as_str)
+    }
+
     /// OpenSearch/Elasticsearch error type, when the response supplied one.
     pub fn error_type(&self) -> Option<&str> {
         self.error
