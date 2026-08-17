@@ -1,169 +1,134 @@
-<svg width="1240" height="836" viewBox="0 0 1240 836" fill="none" xmlns="http://www.w3.org/2000/svg" font-family="Inter, -apple-system, 'Segoe UI', sans-serif">
+<svg width="1240" height="880" viewBox="0 0 1240 880" fill="none" xmlns="http://www.w3.org/2000/svg" font-family="Inter, -apple-system, 'Segoe UI', sans-serif">
   <defs>
-    <radialGradient id="glow" cx="50%" cy="0%" r="90%">
-      <stop offset="0%" stop-color="#173226" stop-opacity="0.55"/>
-      <stop offset="55%" stop-color="#0A100D" stop-opacity="0"/>
-    </radialGradient>
-    <linearGradient id="engineEdge" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#2FCF88" stop-opacity="0.55"/>
-      <stop offset="100%" stop-color="#2FCF88" stop-opacity="0.12"/>
+    <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+      <circle cx="1.2" cy="1.2" r="1.1" fill="#243129" opacity="0.5"/>
+    </pattern>
+    <linearGradient id="pillGreen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#17281F"/>
+      <stop offset="100%" stop-color="#0E1713"/>
     </linearGradient>
-    <marker id="aGreen" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0.5 0.8 L7.2 4 L0.5 7.2 Z" fill="#2FCF88"/>
-    </marker>
-    <marker id="aSlate" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0.5 0.8 L7.2 4 L0.5 7.2 Z" fill="#7D8B9F"/>
-    </marker>
+    <linearGradient id="pillBlue" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#14212E"/>
+      <stop offset="100%" stop-color="#0D141C"/>
+    </linearGradient>
+    <linearGradient id="pillSlate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1A2027"/>
+      <stop offset="100%" stop-color="#10151B"/>
+    </linearGradient>
+    <radialGradient id="engineGlow" cx="50%" cy="50%" r="60%">
+      <stop offset="0%" stop-color="#2FCF88" stop-opacity="0.20"/>
+      <stop offset="100%" stop-color="#2FCF88" stop-opacity="0"/>
+    </radialGradient>
   </defs>
 
   <!-- canvas -->
-  <rect width="1240" height="836" rx="18" fill="#0A100D"/>
-  <rect width="1240" height="836" rx="18" fill="url(#glow)"/>
-  <rect x="0.5" y="0.5" width="1239" height="835" rx="17.5" stroke="#1D2822"/>
+  <rect width="1240" height="880" rx="20" fill="#0A0E0C"/>
+  <rect x="0.5" y="0.5" width="1239" height="879" rx="19.5" stroke="#1C2620"/>
 
-  <!-- header -->
-  <text x="48" y="66" font-size="21" font-weight="650" fill="#ECF3EE" letter-spacing="-0.2">VentStream architecture</text>
-  <text x="48" y="90" font-size="12.5" fill="#8CA096">One engine binary. Your data stays in your environment; the control plane only carries intent.</text>
+  <!-- ── VentStream Cloud ─────────────────────────────── -->
+  <rect x="340" y="56" width="560" height="208" rx="16" fill="#0D1210" stroke="#232E28"/>
+  <rect x="340" y="56" width="560" height="208" rx="16" fill="url(#dots)"/>
+  <text x="620" y="92" font-size="15" font-weight="600" fill="#C7D4CC" text-anchor="middle">VentStream Cloud</text>
 
-  <!-- legend -->
-  <g font-size="11" fill="#8CA096">
-    <circle cx="962" cy="61" r="4" fill="#2FCF88"/>
-    <text x="974" y="65">data path</text>
-    <circle cx="1062" cy="61" r="4" fill="#7D8B9F"/>
-    <text x="1074" y="65">control path</text>
+  <g font-size="12.5" fill="#B9C4CF" text-anchor="middle">
+    <rect x="372" y="112" width="240" height="50" rx="10" fill="url(#pillSlate)" stroke="#55636F"/>
+    <text x="492" y="142">Control API</text>
+    <rect x="628" y="112" width="240" height="50" rx="10" fill="url(#pillSlate)" stroke="#55636F"/>
+    <text x="748" y="142">Agent gateway</text>
+    <rect x="372" y="182" width="240" height="50" rx="10" fill="url(#pillSlate)" stroke="#55636F"/>
+    <text x="492" y="212">Durable operations</text>
+    <rect x="628" y="182" width="240" height="50" rx="10" fill="url(#pillSlate)" stroke="#55636F"/>
+    <text x="748" y="212">Fleet Postgres</text>
   </g>
 
-  <!-- ── management plane ─────────────────────────────────────── -->
-  <rect x="48" y="112" width="1144" height="164" rx="14" fill="#0E1613" stroke="#212D26"/>
-  <text x="72" y="141" font-size="10.5" font-weight="600" fill="#7D8B9F" letter-spacing="1.6">VENTSTREAM CLOUD · MANAGEMENT PLANE</text>
-  <text x="1168" y="141" font-size="10.5" fill="#5C6B62" text-anchor="end">inventory · desired state · operations · audit</text>
+  <!-- spine: cloud → environment -->
+  <line x1="620" y1="264" x2="620" y2="336" stroke="#4A5A52" stroke-width="1.6" stroke-dasharray="2 7" stroke-linecap="round"/>
+  <text x="636" y="296" font-size="10.5" fill="#71837A">outbound mTLS</text>
+  <text x="636" y="311" font-size="10.5" fill="#4E5D55">desired state only</text>
 
-  <!-- cloud nodes -->
-  <g>
-    <rect x="72" y="160" width="196" height="72" rx="10" fill="#121B17" stroke="#26332C"/>
-    <text x="92" y="188" font-size="12.5" font-weight="600" fill="#DCE6E0">ventstreamctl · Dashboard</text>
-    <text x="92" y="208" font-size="10.5" fill="#7E9187">operators and automation</text>
+  <!-- ── Your environment ─────────────────────────────── -->
+  <rect x="280" y="336" width="680" height="356" rx="16" fill="#0C120F" stroke="#232E28"/>
+  <rect x="280" y="336" width="680" height="356" rx="16" fill="url(#dots)"/>
+  <text x="620" y="372" font-size="15" font-weight="600" fill="#C7D4CC" text-anchor="middle">Your environment</text>
 
-    <rect x="316" y="160" width="180" height="72" rx="10" fill="#121B17" stroke="#26332C"/>
-    <text x="336" y="188" font-size="12.5" font-weight="600" fill="#DCE6E0">Control API</text>
-    <text x="336" y="208" font-size="10.5" fill="#7E9187">authz · idempotent · audited</text>
+  <!-- engine pill -->
+  <ellipse cx="620" cy="424" rx="250" ry="64" fill="url(#engineGlow)"/>
+  <rect x="452" y="398" width="336" height="54" rx="11" fill="url(#pillGreen)" stroke="#2FCF88" stroke-width="1.4"/>
+  <text x="620" y="430" font-size="14" font-weight="650" fill="#E9F4EE" text-anchor="middle">VentStream Engine</text>
 
-    <rect x="544" y="160" width="180" height="72" rx="10" fill="#121B17" stroke="#26332C"/>
-    <text x="564" y="188" font-size="12.5" font-weight="600" fill="#DCE6E0">Control worker</text>
-    <text x="564" y="208" font-size="10.5" fill="#7E9187">durable operations</text>
-
-    <rect x="772" y="160" width="160" height="72" rx="10" fill="#121B17" stroke="#26332C"/>
-    <text x="792" y="188" font-size="12.5" font-weight="600" fill="#DCE6E0">Postgres</text>
-    <text x="792" y="208" font-size="10.5" fill="#7E9187">tenant-isolated · RLS</text>
-
-    <rect x="980" y="160" width="184" height="72" rx="10" fill="#121B17" stroke="#26332C"/>
-    <text x="1000" y="188" font-size="12.5" font-weight="600" fill="#DCE6E0">Agent gateway</text>
-    <text x="1000" y="208" font-size="10.5" fill="#7E9187">mTLS identity · fenced</text>
+  <!-- engine capabilities -->
+  <g font-size="12.5" fill="#BFD2C8" text-anchor="middle">
+    <rect x="318" y="484" width="292" height="50" rx="10" fill="url(#pillGreen)" stroke="#2FCF88" stroke-opacity="0.42"/>
+    <text x="464" y="514">Capture · CDC</text>
+    <rect x="630" y="484" width="292" height="50" rx="10" fill="url(#pillGreen)" stroke="#2FCF88" stroke-opacity="0.42"/>
+    <text x="776" y="514">Projection · joins</text>
+    <rect x="318" y="554" width="292" height="50" rx="10" fill="url(#pillGreen)" stroke="#2FCF88" stroke-opacity="0.42"/>
+    <text x="464" y="584">ACK-gated delivery</text>
+    <rect x="630" y="554" width="292" height="50" rx="10" fill="url(#pillGreen)" stroke="#2FCF88" stroke-opacity="0.42"/>
+    <text x="776" y="584">Real-time fan-out</text>
   </g>
 
-  <!-- cloud connectors -->
-  <g stroke="#7D8B9F" stroke-width="1.4">
-    <line x1="268" y1="196" x2="308" y2="196" marker-end="url(#aSlate)"/>
-    <line x1="496" y1="196" x2="536" y2="196" marker-end="url(#aSlate)"/>
-    <line x1="724" y1="196" x2="764" y2="196" marker-end="url(#aSlate)"/>
-    <line x1="932" y1="196" x2="972" y2="196" marker-end="url(#aSlate)"/>
+  <!-- environment footnote -->
+  <text x="620" y="660" font-size="11" fill="#66786E" text-anchor="middle">durable local state · cursors · dead-letter queue · keys</text>
+
+  <!-- ── Sources (left column) ────────────────────────── -->
+  <text x="168" y="368" font-size="11" font-weight="600" fill="#7E93A8" letter-spacing="1.6" text-anchor="middle">SOURCES</text>
+  <g font-size="12.5" fill="#B9CBDD" text-anchor="middle">
+    <rect x="64" y="388" width="208" height="46" rx="10" fill="url(#pillBlue)" stroke="#3D5A78"/>
+    <text x="168" y="416">PostgreSQL</text>
+    <rect x="64" y="450" width="208" height="46" rx="10" fill="url(#pillBlue)" stroke="#3D5A78"/>
+    <text x="168" y="478">MySQL</text>
+    <rect x="64" y="512" width="208" height="46" rx="10" fill="url(#pillBlue)" stroke="#3D5A78"/>
+    <text x="168" y="540">MongoDB</text>
+    <rect x="64" y="574" width="208" height="46" rx="10" fill="url(#pillBlue)" stroke="#3D5A78"/>
+    <text x="168" y="602">Neo4j</text>
+    <rect x="64" y="636" width="208" height="46" rx="10" fill="url(#pillBlue)" stroke="#3D5A78"/>
+    <text x="168" y="664">Kafka · Debezium</text>
+  </g>
+  <!-- left connectors: collector + elbow into engine row -->
+  <g stroke="#3A4A42" stroke-width="1.4" stroke-dasharray="2 6" stroke-linecap="round">
+    <line x1="272" y1="411" x2="296" y2="411"/>
+    <line x1="272" y1="473" x2="296" y2="473"/>
+    <line x1="272" y1="535" x2="296" y2="535"/>
+    <line x1="272" y1="597" x2="296" y2="597"/>
+    <line x1="272" y1="659" x2="296" y2="659"/>
+    <line x1="296" y1="411" x2="296" y2="659"/>
+    <line x1="296" y1="514" x2="318" y2="514"/>
   </g>
 
-  <!-- control drop: gateway → supervisor -->
-  <path d="M1072 232 V300" stroke="#7D8B9F" stroke-width="1.4" stroke-dasharray="1 5" stroke-linecap="round" marker-end="url(#aSlate)"/>
-  <text x="1086" y="262" font-size="10.5" fill="#7D8B9F">outbound mTLS</text>
-  <text x="1086" y="277" font-size="10.5" fill="#5C6B62">desired state only</text>
-
-  <!-- ── data plane ───────────────────────────────────────────── -->
-  <rect x="48" y="300" width="1144" height="470" rx="14" fill="#0D1411" stroke="#212D26"/>
-  <text x="72" y="329" font-size="10.5" font-weight="600" fill="#2FCF88" letter-spacing="1.6">YOUR ENVIRONMENT · DATA PLANE</text>
-  <text x="1168" y="329" font-size="10.5" fill="#5C6B62" text-anchor="end">records, documents, events, and secrets never leave</text>
-
-  <!-- supervisor strip -->
-  <rect x="356" y="348" width="520" height="38" rx="9" fill="#101915" stroke="#26332C"/>
-  <text x="376" y="372" font-size="11.5" font-weight="600" fill="#B9C7BF">Fleet supervisor · PID 1</text>
-  <text x="856" y="372" font-size="10.5" fill="#7E9187" text-anchor="end">stages validated config · restarts the engine</text>
-
-  <!-- sources -->
-  <rect x="72" y="410" width="224" height="182" rx="10" fill="#121B17" stroke="#26332C"/>
-  <text x="92" y="438" font-size="12.5" font-weight="600" fill="#DCE6E0">Sources</text>
-  <g font-size="11" fill="#93A79C">
-    <text x="92" y="464">PostgreSQL <tspan fill="#5C6B62">· logical replication</tspan></text>
-    <text x="92" y="486">MySQL <tspan fill="#5C6B62">· binlog</tspan></text>
-    <text x="92" y="508">MongoDB <tspan fill="#5C6B62">· change streams</tspan></text>
-    <text x="92" y="530">Neo4j <tspan fill="#5C6B62">· CDC + Cypher</tspan></text>
-    <text x="92" y="552">Kafka <tspan fill="#5C6B62">· Debezium topics</tspan></text>
+  <!-- ── Targets & clients (right column) ─────────────── -->
+  <text x="1072" y="368" font-size="11" font-weight="600" fill="#7E93A8" letter-spacing="1.6" text-anchor="middle">TARGETS &amp; CLIENTS</text>
+  <g font-size="12.5" fill="#B9CBDD" text-anchor="middle">
+    <rect x="968" y="388" width="208" height="46" rx="10" fill="url(#pillBlue)" stroke="#3D5A78"/>
+    <text x="1072" y="416">OpenSearch</text>
+    <rect x="968" y="450" width="208" height="46" rx="10" fill="url(#pillBlue)" stroke="#3D5A78"/>
+    <text x="1072" y="478">Elasticsearch</text>
+    <rect x="968" y="512" width="208" height="46" rx="10" fill="url(#pillBlue)" stroke="#3D5A78"/>
+    <text x="1072" y="540">Meilisearch</text>
+    <rect x="968" y="574" width="208" height="46" rx="10" fill="url(#pillBlue)" stroke="#3D5A78"/>
+    <text x="1072" y="602">Redis</text>
+    <rect x="968" y="636" width="208" height="46" rx="10" fill="url(#pillBlue)" stroke="#3D5A78"/>
+    <text x="1072" y="664">Browsers &amp; apps</text>
   </g>
-  <text x="92" y="578" font-size="10" fill="#5C6B62">TLS · native cursors</text>
-
-  <!-- engine (CDC role) -->
-  <rect x="356" y="410" width="520" height="118" rx="12" fill="#0F1A15" stroke="url(#engineEdge)" stroke-width="1.5"/>
-  <text x="376" y="438" font-size="10.5" font-weight="600" fill="#2FCF88" letter-spacing="1.4">VENTSTREAM ENGINE · CDC</text>
-  <g>
-    <rect x="376" y="452" width="148" height="56" rx="8" fill="#14211B"/>
-    <text x="394" y="476" font-size="12" font-weight="600" fill="#DCE6E0">Capture</text>
-    <text x="394" y="494" font-size="10.5" fill="#7E9187">snapshot, then tail</text>
-
-    <rect x="542" y="452" width="148" height="56" rx="8" fill="#14211B"/>
-    <text x="560" y="476" font-size="12" font-weight="600" fill="#DCE6E0">Project</text>
-    <text x="560" y="494" font-size="10.5" fill="#7E9187">joins · document shape</text>
-
-    <rect x="708" y="452" width="148" height="56" rx="8" fill="#14211B"/>
-    <text x="726" y="476" font-size="12" font-weight="600" fill="#DCE6E0">Deliver</text>
-    <text x="726" y="494" font-size="10.5" fill="#7E9187">ACK-gated cursor · DLQ</text>
-  </g>
-  <g stroke="#2FCF88" stroke-width="1.4" opacity="0.7">
-    <line x1="524" y1="480" x2="536" y2="480" marker-end="url(#aGreen)"/>
-    <line x1="690" y1="480" x2="702" y2="480" marker-end="url(#aGreen)"/>
+  <!-- right connectors -->
+  <g stroke="#3A4A42" stroke-width="1.4" stroke-dasharray="2 6" stroke-linecap="round">
+    <line x1="944" y1="411" x2="968" y2="411"/>
+    <line x1="944" y1="473" x2="968" y2="473"/>
+    <line x1="944" y1="535" x2="968" y2="535"/>
+    <line x1="944" y1="597" x2="968" y2="597"/>
+    <line x1="944" y1="659" x2="968" y2="659"/>
+    <line x1="944" y1="411" x2="944" y2="659"/>
+    <line x1="922" y1="514" x2="944" y2="514"/>
   </g>
 
-  <!-- durable state strip -->
-  <rect x="356" y="548" width="520" height="44" rx="9" fill="none" stroke="#26332C" stroke-dasharray="3 5"/>
-  <text x="376" y="575" font-size="10.5" fill="#7E9187">Durable local state on your volume — cursors · join state · dead-letter queue · keys</text>
-
-  <!-- targets -->
-  <rect x="936" y="410" width="228" height="182" rx="10" fill="#121B17" stroke="#26332C"/>
-  <text x="956" y="438" font-size="12.5" font-weight="600" fill="#DCE6E0">Search &amp; serving stores</text>
-  <g font-size="11" fill="#93A79C">
-    <text x="956" y="466">OpenSearch <tspan fill="#5C6B62">/ Elasticsearch</tspan></text>
-    <text x="956" y="490">Meilisearch</text>
-    <text x="956" y="514">Redis</text>
+  <!-- ── Brokers (bottom) ─────────────────────────────── -->
+  <line x1="620" y1="692" x2="620" y2="744" stroke="#3A4A42" stroke-width="1.4" stroke-dasharray="2 6" stroke-linecap="round"/>
+  <g font-size="12.5" fill="#B9CBDD" text-anchor="middle">
+    <rect x="452" y="744" width="336" height="50" rx="10" fill="url(#pillBlue)" stroke="#3D5A78"/>
+    <text x="620" y="774">NATS · Redis Streams</text>
   </g>
-  <text x="956" y="548" font-size="10" fill="#5C6B62">deterministic ids · idempotent</text>
-  <text x="956" y="566" font-size="10" fill="#5C6B62">upserts · exact deletes</text>
+  <text x="620" y="820" font-size="11" fill="#66786E" text-anchor="middle">event brokers for real-time delivery · live or replayable</text>
 
-  <!-- CDC flow arrows -->
-  <line x1="296" y1="469" x2="348" y2="469" stroke="#2FCF88" stroke-width="1.6" marker-end="url(#aGreen)"/>
-  <line x1="876" y1="469" x2="928" y2="469" stroke="#2FCF88" stroke-width="1.6" marker-end="url(#aGreen)"/>
-
-  <!-- realtime row -->
-  <text x="72" y="634" font-size="10.5" font-weight="600" fill="#7E9187" letter-spacing="1.4">REAL-TIME DELIVERY</text>
-  <rect x="72" y="648" width="224" height="76" rx="10" fill="#121B17" stroke="#26332C"/>
-  <text x="92" y="676" font-size="12.5" font-weight="600" fill="#DCE6E0">Your services</text>
-  <text x="92" y="696" font-size="10.5" fill="#7E9187">publish domain events once</text>
-
-  <rect x="356" y="648" width="180" height="76" rx="10" fill="#121B17" stroke="#26332C"/>
-  <text x="376" y="676" font-size="12.5" font-weight="600" fill="#DCE6E0">NATS · Redis</text>
-  <text x="376" y="696" font-size="10.5" fill="#7E9187">live or replayable</text>
-
-  <rect x="596" y="648" width="280" height="76" rx="10" fill="#0F1A15" stroke="url(#engineEdge)" stroke-width="1.5"/>
-  <text x="616" y="672" font-size="10.5" font-weight="600" fill="#2FCF88" letter-spacing="1.4">VENTSTREAM ENGINE · REALTIME</text>
-  <text x="616" y="694" font-size="11.5" fill="#B9C7BF">WebSocket gateway · GraphQL subscriptions</text>
-  <text x="616" y="712" font-size="10.5" fill="#7E9187">fan-out to any number of subscribers</text>
-
-  <rect x="936" y="648" width="228" height="76" rx="10" fill="#121B17" stroke="#26332C"/>
-  <text x="956" y="676" font-size="12.5" font-weight="600" fill="#DCE6E0">Browsers &amp; apps</text>
-  <text x="956" y="696" font-size="10.5" fill="#7E9187">native WS · Apollo compatible</text>
-
-  <g stroke="#2FCF88" stroke-width="1.6">
-    <line x1="296" y1="686" x2="348" y2="686" marker-end="url(#aGreen)"/>
-    <line x1="536" y1="686" x2="588" y2="686" marker-end="url(#aGreen)"/>
-    <line x1="876" y1="686" x2="928" y2="686" marker-end="url(#aGreen)"/>
-  </g>
-
-  <!-- footer note -->
-  <text x="620" y="752" font-size="11" fill="#7E9187" text-anchor="middle">The control plane is never in the data path. Remove the agent key and the same binary runs fully standalone.</text>
-
-  <!-- outer caption -->
-  <text x="620" y="810" font-size="11" fill="#5C6B62" text-anchor="middle">Open-core engine · optional managed fleet</text>
+  <!-- caption -->
+  <text x="1176" y="846" font-size="13" font-weight="600" fill="#93A69B" text-anchor="end">VentStream architecture overview</text>
 </svg>

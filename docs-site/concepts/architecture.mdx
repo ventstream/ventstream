@@ -13,11 +13,12 @@ The separation is operational, security-sensitive, and deliberate.
   className="rounded-lg"
 />
 
-Green is the data path — CDC from source connectors through projection and
-ACK-gated delivery, and the independent broker-to-WebSocket/GraphQL fan-out.
-Slate is the control path: a single outbound mTLS stream carrying desired
-state, never data. Neither data path enters VentStream Cloud, and the same
-engine binary runs fully standalone without a control-plane dependency.
+Green is the engine and its capabilities; blue is everything you own —
+sources, targets, brokers, and clients. The only line between the planes is
+a single outbound mTLS stream carrying desired state, never data: records,
+documents, and events stay inside your environment. Remove the agent key
+and the same binary runs fully standalone without a control-plane
+dependency.
 
 ## Data plane
 
