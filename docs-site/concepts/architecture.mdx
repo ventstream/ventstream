@@ -13,11 +13,11 @@ The separation is operational, security-sensitive, and deliberate.
   className="rounded-lg"
 />
 
-The purple path is management traffic. Teal and green show the CDC path from
-source connectors through projection and sink acknowledgement. Orange shows the
-independent broker-to-WebSocket/GraphQL delivery path. Neither data path enters
-VentStream Cloud. The same engine binary can also run standalone without a
-control-plane dependency.
+Green is the data path — CDC from source connectors through projection and
+ACK-gated delivery, and the independent broker-to-WebSocket/GraphQL fan-out.
+Slate is the control path: a single outbound mTLS stream carrying desired
+state, never data. Neither data path enters VentStream Cloud, and the same
+engine binary runs fully standalone without a control-plane dependency.
 
 ## Data plane
 
