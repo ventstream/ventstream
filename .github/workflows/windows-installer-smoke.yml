@@ -9,6 +9,10 @@ on:
         description: Engine version to install (empty = latest release)
         required: false
         default: ""
+      cli_version:
+        description: CLI version to install (empty = latest release)
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -38,5 +42,28 @@ jobs:
           }
           if (-not (Test-Path (Join-Path $env:APPDATA "ventstream\ventstream.example.yaml"))) {
             Write-Error "example configuration missing"
+            exit 1
+          }
+
+  install-cli:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - name: Run the public CLI installer
+        shell: pwsh
+        env:
+          VENTSTREAMCTL_VERSION: ${{ inputs.cli_version }}
+        run: |
+          irm https://ventstream.dev/install-cli.ps1 | iex
+      - name: Verify installed CLI
+        shell: pwsh
+        env:
+          VENTSTREAMCTL_VERSION: ${{ inputs.cli_version }}
+        run: |
+          $exe = Join-Path $env:LOCALAPPDATA "Programs\ventstream\ventstreamctl.exe"
+          $reported = & $exe --version
+          Write-Host "installed: $reported"
+          if ($env:VENTSTREAMCTL_VERSION -and $reported -ne "ventstreamctl $env:VENTSTREAMCTL_VERSION") {
+            Write-Error "version mismatch: $reported"
             exit 1
           }
