@@ -100,7 +100,6 @@
             "group": "Guides",
             "icon": "map",
             "pages": [
-              "guides/zero-downtime-migration",
               "guides/authoring-specs",
               "guides/database-tls",
               "guides/mcp-server",
@@ -120,6 +119,20 @@
             "pages": [
               "reference/engine-env",
               "reference/troubleshooting"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Data migration",
+        "icon": "truck-fast",
+        "groups": [
+          {
+            "group": "Migration",
+            "icon": "truck-fast",
+            "pages": [
+              "guides/zero-downtime-migration",
+              "guides/one-time-migration"
             ]
           }
         ]
