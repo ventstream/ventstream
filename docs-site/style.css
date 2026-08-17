@@ -1,16 +1,22 @@
-/* Slim, quiet scrollbars — most visible on the sidebar navigation. */
+/* Sidebar scrollbar: near-invisible until needed, hairline when shown. */
 
 #sidebar,
 #sidebar-content,
 #navigation-items {
   scrollbar-width: thin;
-  scrollbar-color: rgba(127, 148, 138, 0.28) transparent;
+  scrollbar-color: transparent transparent;
+}
+
+#sidebar:hover,
+#sidebar-content:hover,
+#navigation-items:hover {
+  scrollbar-color: rgba(127, 148, 138, 0.25) transparent;
 }
 
 #sidebar::-webkit-scrollbar,
 #sidebar-content::-webkit-scrollbar,
 #navigation-items::-webkit-scrollbar {
-  width: 5px;
+  width: 3px;
 }
 
 #sidebar::-webkit-scrollbar-track,
@@ -19,22 +25,41 @@
   background: transparent;
 }
 
+/* Invisible at rest; a hairline pill appears only while the pointer is
+   over the navigation, and warms slightly under the cursor. */
 #sidebar::-webkit-scrollbar-thumb,
 #sidebar-content::-webkit-scrollbar-thumb,
 #navigation-items::-webkit-scrollbar-thumb {
-  background: rgba(127, 148, 138, 0.28);
+  background: transparent;
   border-radius: 999px;
+}
+
+#sidebar:hover::-webkit-scrollbar-thumb,
+#sidebar-content:hover::-webkit-scrollbar-thumb,
+#navigation-items:hover::-webkit-scrollbar-thumb {
+  background: rgba(127, 148, 138, 0.25);
 }
 
 #sidebar::-webkit-scrollbar-thumb:hover,
 #sidebar-content::-webkit-scrollbar-thumb:hover,
 #navigation-items::-webkit-scrollbar-thumb:hover {
-  background: rgba(127, 148, 138, 0.5);
+  background: rgba(47, 207, 136, 0.45);
 }
 
-/* Page-level scrollbar: keep native size for accessibility, but soften
-   the thumb so it recedes on the dark theme. */
+/* Page scrollbar: same quiet family. */
+body::-webkit-scrollbar {
+  width: 8px;
+}
+
+body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
 body::-webkit-scrollbar-thumb {
-  background: rgba(127, 148, 138, 0.3);
+  background: rgba(127, 148, 138, 0.22);
   border-radius: 999px;
+}
+
+body::-webkit-scrollbar-thumb:hover {
+  background: rgba(127, 148, 138, 0.4);
 }
