@@ -1,197 +1,169 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 860"
-     font-family="Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif"
-     role="img" aria-labelledby="title description">
-  <title id="title">VentStream engine and Fleet architecture</title>
-  <desc id="description">VentStream Fleet manages engine deployments over an outbound mutual TLS control stream while CDC records and realtime events remain inside the customer workload environment.</desc>
-
+<svg width="1240" height="836" viewBox="0 0 1240 836" fill="none" xmlns="http://www.w3.org/2000/svg" font-family="Inter, -apple-system, 'Segoe UI', sans-serif">
   <defs>
-    <marker id="arrow-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M0 0 10 5 0 10z" fill="#5eead4"/>
+    <radialGradient id="glow" cx="50%" cy="0%" r="90%">
+      <stop offset="0%" stop-color="#173226" stop-opacity="0.55"/>
+      <stop offset="55%" stop-color="#0A100D" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="engineEdge" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#2FCF88" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#2FCF88" stop-opacity="0.12"/>
+    </linearGradient>
+    <marker id="aGreen" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0.5 0.8 L7.2 4 L0.5 7.2 Z" fill="#2FCF88"/>
     </marker>
-    <marker id="arrow-orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M0 0 10 5 0 10z" fill="#fb923c"/>
+    <marker id="aSlate" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0.5 0.8 L7.2 4 L0.5 7.2 Z" fill="#7D8B9F"/>
     </marker>
-    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M0 0 10 5 0 10z" fill="#a78bfa"/>
-    </marker>
-    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M0 0 10 5 0 10z" fill="#4ade80"/>
-    </marker>
-    <style>
-      .panel{fill:#0a0e1a;stroke:#1f2937;stroke-width:1.5}
-      .plane{fill:#0f1422;stroke:#334155;stroke-width:1.5}
-      .fleet{fill:#111827;stroke:#a78bfa;stroke-width:1.5}
-      .node{fill:#0a0e1a;stroke:#475569;stroke-width:1.25}
-      .source{fill:#0a0e1a;stroke:#5eead4;stroke-width:1.35}
-      .realtime{fill:#0a0e1a;stroke:#fb923c;stroke-width:1.35}
-      .sink{fill:#0a0e1a;stroke:#4ade80;stroke-width:1.35}
-      .engine{fill:#151a2a;stroke:#a78bfa;stroke-width:1.5}
-      .state{fill:#0a0e1a;stroke:#64748b;stroke-width:1.25;stroke-dasharray:5 4}
-      .title{fill:#f8fafc;font-size:28px;font-weight:750}
-      .subtitle{fill:#94a3b8;font-size:13px}
-      .heading{fill:#e2e8f0;font-size:15px;font-weight:700}
-      .label{fill:#e2e8f0;font-size:13px;font-weight:650}
-      .small{fill:#94a3b8;font-size:10.5px}
-      .mono{fill:#94a3b8;font-size:10px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-      .eyebrow{fill:#a78bfa;font-size:10.5px;font-weight:700;letter-spacing:.08em}
-      .teal{fill:#5eead4}.orange{fill:#fb923c}.green{fill:#4ade80}.purple{fill:#c4b5fd}
-      .line-teal{fill:none;stroke:#5eead4;stroke-width:1.6}
-      .line-orange{fill:none;stroke:#fb923c;stroke-width:1.6}
-      .line-purple{fill:none;stroke:#a78bfa;stroke-width:1.6}
-      .line-green{fill:none;stroke:#4ade80;stroke-width:1.6}
-      .line-muted{fill:none;stroke:#64748b;stroke-width:1.2;stroke-dasharray:5 4}
-    </style>
   </defs>
 
-  <rect class="panel" x="1" y="1" width="1398" height="858" rx="14"/>
-  <text class="title" x="34" y="46">VentStream architecture</text>
-  <text class="subtitle" x="34" y="69">open-core data plane · optional multi-tenant Fleet management plane</text>
+  <!-- canvas -->
+  <rect width="1240" height="836" rx="18" fill="#0A100D"/>
+  <rect width="1240" height="836" rx="18" fill="url(#glow)"/>
+  <rect x="0.5" y="0.5" width="1239" height="835" rx="17.5" stroke="#1D2822"/>
 
-  <!-- Management plane -->
-  <rect class="plane" x="24" y="92" width="1352" height="205" rx="8"/>
-  <text class="eyebrow" x="44" y="116">MANAGEMENT PLANE · VENTSTREAM FLEET</text>
-  <text class="small" x="44" y="135">inventory, authorization, desired state, configuration revisions, operations, status, and audit</text>
+  <!-- header -->
+  <text x="48" y="66" font-size="21" font-weight="650" fill="#ECF3EE" letter-spacing="-0.2">VentStream architecture</text>
+  <text x="48" y="90" font-size="12.5" fill="#8CA096">One engine binary. Your data stays in your environment; the control plane only carries intent.</text>
 
-  <rect class="node" x="44" y="160" width="150" height="72" rx="5"/>
-  <text class="label" x="119" y="187" text-anchor="middle">Operator</text>
-  <text class="mono" x="119" y="207" text-anchor="middle">ventstreamctl</text>
-  <text class="small" x="119" y="222" text-anchor="middle">human or automation</text>
+  <!-- legend -->
+  <g font-size="11" fill="#8CA096">
+    <circle cx="962" cy="61" r="4" fill="#2FCF88"/>
+    <text x="974" y="65">data path</text>
+    <circle cx="1062" cy="61" r="4" fill="#7D8B9F"/>
+    <text x="1074" y="65">control path</text>
+  </g>
 
-  <rect class="fleet" x="266" y="150" width="176" height="92" rx="5"/>
-  <text class="label purple" x="354" y="177" text-anchor="middle">Control API</text>
-  <text class="small" x="354" y="198" text-anchor="middle">HTTPS · authz · If-Match</text>
-  <text class="small" x="354" y="215" text-anchor="middle">idempotency · audit</text>
+  <!-- ── management plane ─────────────────────────────────────── -->
+  <rect x="48" y="112" width="1144" height="164" rx="14" fill="#0E1613" stroke="#212D26"/>
+  <text x="72" y="141" font-size="10.5" font-weight="600" fill="#7D8B9F" letter-spacing="1.6">VENTSTREAM CLOUD · MANAGEMENT PLANE</text>
+  <text x="1168" y="141" font-size="10.5" fill="#5C6B62" text-anchor="end">inventory · desired state · operations · audit</text>
 
-  <rect class="fleet" x="508" y="150" width="174" height="92" rx="5"/>
-  <text class="label purple" x="595" y="177" text-anchor="middle">Control worker</text>
-  <text class="small" x="595" y="198" text-anchor="middle">durable operations</text>
-  <text class="small" x="595" y="215" text-anchor="middle">status and reconciliation</text>
+  <!-- cloud nodes -->
+  <g>
+    <rect x="72" y="160" width="196" height="72" rx="10" fill="#121B17" stroke="#26332C"/>
+    <text x="92" y="188" font-size="12.5" font-weight="600" fill="#DCE6E0">ventstreamctl · Dashboard</text>
+    <text x="92" y="208" font-size="10.5" fill="#7E9187">operators and automation</text>
 
-  <rect class="fleet" x="748" y="150" width="196" height="92" rx="5"/>
-  <text class="label purple" x="846" y="177" text-anchor="middle">Fleet PostgreSQL</text>
-  <text class="small" x="846" y="198" text-anchor="middle">tenant metadata</text>
-  <text class="small" x="846" y="215" text-anchor="middle">forced RLS · separate migrator</text>
+    <rect x="316" y="160" width="180" height="72" rx="10" fill="#121B17" stroke="#26332C"/>
+    <text x="336" y="188" font-size="12.5" font-weight="600" fill="#DCE6E0">Control API</text>
+    <text x="336" y="208" font-size="10.5" fill="#7E9187">authz · idempotent · audited</text>
 
-  <rect class="fleet" x="1010" y="150" width="182" height="92" rx="5"/>
-  <text class="label purple" x="1101" y="177" text-anchor="middle">Agent gateway</text>
-  <text class="small" x="1101" y="198" text-anchor="middle">enrollment · mTLS identity</text>
-  <text class="small" x="1101" y="215" text-anchor="middle">fenced control streams</text>
+    <rect x="544" y="160" width="180" height="72" rx="10" fill="#121B17" stroke="#26332C"/>
+    <text x="564" y="188" font-size="12.5" font-weight="600" fill="#DCE6E0">Control worker</text>
+    <text x="564" y="208" font-size="10.5" fill="#7E9187">durable operations</text>
 
-  <rect class="state" x="1240" y="150" width="116" height="92" rx="5"/>
-  <text class="label" x="1298" y="178" text-anchor="middle">Secrets</text>
-  <text class="small" x="1298" y="198" text-anchor="middle">not stored</text>
-  <text class="small" x="1298" y="215" text-anchor="middle">by Fleet</text>
+    <rect x="772" y="160" width="160" height="72" rx="10" fill="#121B17" stroke="#26332C"/>
+    <text x="792" y="188" font-size="12.5" font-weight="600" fill="#DCE6E0">Postgres</text>
+    <text x="792" y="208" font-size="10.5" fill="#7E9187">tenant-isolated · RLS</text>
 
-  <path class="line-purple" d="M194 196H266" marker-end="url(#arrow-purple)"/>
-  <text class="mono" x="230" y="187" text-anchor="middle">HTTPS</text>
-  <path class="line-purple" d="M442 196H508" marker-end="url(#arrow-purple)"/>
-  <path class="line-purple" d="M682 183H748" marker-end="url(#arrow-purple)"/>
-  <path class="line-purple" d="M944 210H1010" marker-end="url(#arrow-purple)"/>
-  <path class="line-purple" d="M1010 178H944" marker-end="url(#arrow-purple)"/>
-  <path class="line-muted" d="M1192 196H1240"/>
-  <text class="small" x="1216" y="186" text-anchor="middle">no path</text>
+    <rect x="980" y="160" width="184" height="72" rx="10" fill="#121B17" stroke="#26332C"/>
+    <text x="1000" y="188" font-size="12.5" font-weight="600" fill="#DCE6E0">Agent gateway</text>
+    <text x="1000" y="208" font-size="10.5" fill="#7E9187">mTLS identity · fenced</text>
+  </g>
 
-  <!-- Customer boundary -->
-  <rect class="plane" x="24" y="320" width="1352" height="510" rx="8"/>
-  <text class="eyebrow teal" x="44" y="346">CUSTOMER WORKLOAD ENVIRONMENT · DATA PLANE</text>
-  <text class="small" x="44" y="365">source records, destination documents, broker events, client traffic, connector secrets, and private keys remain here</text>
+  <!-- cloud connectors -->
+  <g stroke="#7D8B9F" stroke-width="1.4">
+    <line x1="268" y1="196" x2="308" y2="196" marker-end="url(#aSlate)"/>
+    <line x1="496" y1="196" x2="536" y2="196" marker-end="url(#aSlate)"/>
+    <line x1="724" y1="196" x2="764" y2="196" marker-end="url(#aSlate)"/>
+    <line x1="932" y1="196" x2="972" y2="196" marker-end="url(#aSlate)"/>
+  </g>
 
-  <!-- Managed supervisor and control stream -->
-  <rect class="engine" x="492" y="382" width="416" height="102" rx="6"/>
-  <text class="eyebrow" x="510" y="405">MANAGED DEPLOYMENT</text>
-  <text class="heading" x="510" y="430">Fleet supervisor · PID 1</text>
-  <text class="small" x="510" y="450">X.509 workload identity · cached desired state · operation receipts</text>
-  <text class="small" x="510" y="468">stages validated config and supervises the engine child process</text>
+  <!-- control drop: gateway → supervisor -->
+  <path d="M1072 232 V300" stroke="#7D8B9F" stroke-width="1.4" stroke-dasharray="1 5" stroke-linecap="round" marker-end="url(#aSlate)"/>
+  <text x="1086" y="262" font-size="10.5" fill="#7D8B9F">outbound mTLS</text>
+  <text x="1086" y="277" font-size="10.5" fill="#5C6B62">desired state only</text>
 
-  <path class="line-purple" d="M1101 242V273H870V382" marker-end="url(#arrow-purple)"/>
-  <text class="mono purple" x="989" y="266" text-anchor="middle">outbound mTLS control stream</text>
-  <text class="small" x="1348" y="286" text-anchor="end">Fleet never opens a database or data-path connection</text>
+  <!-- ── data plane ───────────────────────────────────────────── -->
+  <rect x="48" y="300" width="1144" height="470" rx="14" fill="#0D1411" stroke="#212D26"/>
+  <text x="72" y="329" font-size="10.5" font-weight="600" fill="#2FCF88" letter-spacing="1.6">YOUR ENVIRONMENT · DATA PLANE</text>
+  <text x="1168" y="329" font-size="10.5" fill="#5C6B62" text-anchor="end">records, documents, events, and secrets never leave</text>
 
-  <!-- CDC path -->
-  <text class="eyebrow teal" x="44" y="408">CAPTURE / CDC</text>
-  <rect class="source" x="44" y="424" width="174" height="178" rx="6"/>
-  <text class="label teal" x="131" y="452" text-anchor="middle">Source connectors</text>
-  <text class="small" x="131" y="478" text-anchor="middle">PostgreSQL · pgoutput</text>
-  <text class="small" x="131" y="499" text-anchor="middle">Neo4j · CDC + Cypher</text>
-  <text class="small" x="131" y="520" text-anchor="middle">MongoDB · change streams</text>
-  <text class="small" x="131" y="541" text-anchor="middle">MySQL / MariaDB · binlog</text>
-  <text class="small" x="131" y="562" text-anchor="middle">Kafka / Redpanda</text>
-  <text class="mono" x="131" y="584" text-anchor="middle">native cursors · TLS</text>
+  <!-- supervisor strip -->
+  <rect x="356" y="348" width="520" height="38" rx="9" fill="#101915" stroke="#26332C"/>
+  <text x="376" y="372" font-size="11.5" font-weight="600" fill="#B9C7BF">Fleet supervisor · PID 1</text>
+  <text x="856" y="372" font-size="10.5" fill="#7E9187" text-anchor="end">stages validated config · restarts the engine</text>
 
-  <rect class="engine" x="270" y="510" width="638" height="144" rx="6"/>
-  <text class="eyebrow" x="290" y="533">VENTSTREAM ENGINE CHILD · ROLE=cdc</text>
-  <rect class="node" x="290" y="552" width="132" height="70" rx="4"/>
-  <text class="label" x="356" y="578" text-anchor="middle">Source adapter</text>
-  <text class="small" x="356" y="598" text-anchor="middle">snapshot + tail</text>
-  <rect class="node" x="446" y="552" width="140" height="70" rx="4"/>
-  <text class="label" x="516" y="578" text-anchor="middle">Projection</text>
-  <text class="small" x="516" y="598" text-anchor="middle">joins · N-hop</text>
-  <rect class="node" x="610" y="552" width="132" height="70" rx="4"/>
-  <text class="label" x="676" y="578" text-anchor="middle">Dispatcher</text>
-  <text class="small" x="676" y="598" text-anchor="middle">bounded bulk + DLQ</text>
-  <rect class="node" x="766" y="552" width="122" height="70" rx="4"/>
-  <text class="label" x="827" y="578" text-anchor="middle">Sink adapter</text>
-  <text class="small" x="827" y="598" text-anchor="middle">ACK-gated cursor</text>
+  <!-- sources -->
+  <rect x="72" y="410" width="224" height="182" rx="10" fill="#121B17" stroke="#26332C"/>
+  <text x="92" y="438" font-size="12.5" font-weight="600" fill="#DCE6E0">Sources</text>
+  <g font-size="11" fill="#93A79C">
+    <text x="92" y="464">PostgreSQL <tspan fill="#5C6B62">· logical replication</tspan></text>
+    <text x="92" y="486">MySQL <tspan fill="#5C6B62">· binlog</tspan></text>
+    <text x="92" y="508">MongoDB <tspan fill="#5C6B62">· change streams</tspan></text>
+    <text x="92" y="530">Neo4j <tspan fill="#5C6B62">· CDC + Cypher</tspan></text>
+    <text x="92" y="552">Kafka <tspan fill="#5C6B62">· Debezium topics</tspan></text>
+  </g>
+  <text x="92" y="578" font-size="10" fill="#5C6B62">TLS · native cursors</text>
 
-  <path class="line-teal" d="M218 513H270" marker-end="url(#arrow-teal)"/>
-  <path class="line-teal" d="M422 587H446" marker-end="url(#arrow-teal)"/>
-  <path class="line-teal" d="M586 587H610" marker-end="url(#arrow-teal)"/>
-  <path class="line-teal" d="M742 587H766" marker-end="url(#arrow-teal)"/>
+  <!-- engine (CDC role) -->
+  <rect x="356" y="410" width="520" height="118" rx="12" fill="#0F1A15" stroke="url(#engineEdge)" stroke-width="1.5"/>
+  <text x="376" y="438" font-size="10.5" font-weight="600" fill="#2FCF88" letter-spacing="1.4">VENTSTREAM ENGINE · CDC</text>
+  <g>
+    <rect x="376" y="452" width="148" height="56" rx="8" fill="#14211B"/>
+    <text x="394" y="476" font-size="12" font-weight="600" fill="#DCE6E0">Capture</text>
+    <text x="394" y="494" font-size="10.5" fill="#7E9187">snapshot, then tail</text>
 
-  <rect class="sink" x="980" y="526" width="190" height="102" rx="6"/>
-  <text class="label green" x="1075" y="555" text-anchor="middle">OpenSearch</text>
-  <text class="label green" x="1075" y="576" text-anchor="middle">Elasticsearch</text>
-  <text class="small" x="1075" y="599" text-anchor="middle">deterministic document IDs</text>
-  <text class="mono" x="1075" y="615" text-anchor="middle">_bulk · idempotent upsert</text>
-  <path class="line-green" d="M908 587H980" marker-end="url(#arrow-green)"/>
+    <rect x="542" y="452" width="148" height="56" rx="8" fill="#14211B"/>
+    <text x="560" y="476" font-size="12" font-weight="600" fill="#DCE6E0">Project</text>
+    <text x="560" y="494" font-size="10.5" fill="#7E9187">joins · document shape</text>
 
-  <!-- Realtime path -->
-  <text class="eyebrow orange" x="44" y="687">REAL-TIME DELIVERY</text>
-  <rect class="realtime" x="44" y="703" width="174" height="76" rx="6"/>
-  <text class="label orange" x="131" y="731" text-anchor="middle">Server publishers</text>
-  <text class="small" x="131" y="752" text-anchor="middle">SDK · apps · services</text>
-  <text class="mono" x="131" y="768" text-anchor="middle">publish vs.t.&gt;</text>
+    <rect x="708" y="452" width="148" height="56" rx="8" fill="#14211B"/>
+    <text x="726" y="476" font-size="12" font-weight="600" fill="#DCE6E0">Deliver</text>
+    <text x="726" y="494" font-size="10.5" fill="#7E9187">ACK-gated cursor · DLQ</text>
+  </g>
+  <g stroke="#2FCF88" stroke-width="1.4" opacity="0.7">
+    <line x1="524" y1="480" x2="536" y2="480" marker-end="url(#aGreen)"/>
+    <line x1="690" y1="480" x2="702" y2="480" marker-end="url(#aGreen)"/>
+  </g>
 
-  <rect class="realtime" x="270" y="703" width="156" height="76" rx="6"/>
-  <text class="label orange" x="348" y="727" text-anchor="middle">NATS / Redis</text>
-  <text class="small" x="348" y="747" text-anchor="middle">Core · JetStream · Streams</text>
-  <text class="small" x="348" y="763" text-anchor="middle">live or replayable delivery</text>
+  <!-- durable state strip -->
+  <rect x="356" y="548" width="520" height="44" rx="9" fill="none" stroke="#26332C" stroke-dasharray="3 5"/>
+  <text x="376" y="575" font-size="10.5" fill="#7E9187">Durable local state on your volume — cursors · join state · dead-letter queue · keys</text>
 
-  <rect class="engine" x="492" y="684" width="416" height="114" rx="6"/>
-  <text class="eyebrow" x="510" y="707">VENTSTREAM ENGINE CHILD · ROLE=ws,graphql</text>
-  <rect class="node" x="518" y="725" width="162" height="54" rx="4"/>
-  <text class="label" x="599" y="748" text-anchor="middle">WebSocket gateway</text>
-  <text class="small" x="599" y="766" text-anchor="middle">native protocol</text>
-  <rect class="node" x="712" y="725" width="170" height="54" rx="4"/>
-  <text class="label" x="797" y="748" text-anchor="middle">GraphQL subscriptions</text>
-  <text class="small" x="797" y="766" text-anchor="middle">Apollo compatible</text>
+  <!-- targets -->
+  <rect x="936" y="410" width="228" height="182" rx="10" fill="#121B17" stroke="#26332C"/>
+  <text x="956" y="438" font-size="12.5" font-weight="600" fill="#DCE6E0">Search &amp; serving stores</text>
+  <g font-size="11" fill="#93A79C">
+    <text x="956" y="466">OpenSearch <tspan fill="#5C6B62">/ Elasticsearch</tspan></text>
+    <text x="956" y="490">Meilisearch</text>
+    <text x="956" y="514">Redis</text>
+  </g>
+  <text x="956" y="548" font-size="10" fill="#5C6B62">deterministic ids · idempotent</text>
+  <text x="956" y="566" font-size="10" fill="#5C6B62">upserts · exact deletes</text>
 
-  <rect class="sink" x="980" y="703" width="190" height="76" rx="6"/>
-  <text class="label green" x="1075" y="731" text-anchor="middle">Web and mobile clients</text>
-  <text class="small" x="1075" y="752" text-anchor="middle">native WS · Apollo Client</text>
+  <!-- CDC flow arrows -->
+  <line x1="296" y1="469" x2="348" y2="469" stroke="#2FCF88" stroke-width="1.6" marker-end="url(#aGreen)"/>
+  <line x1="876" y1="469" x2="928" y2="469" stroke="#2FCF88" stroke-width="1.6" marker-end="url(#aGreen)"/>
 
-  <path class="line-orange" d="M218 741H270" marker-end="url(#arrow-orange)"/>
-  <path class="line-orange" d="M426 741H492" marker-end="url(#arrow-orange)"/>
-  <path class="line-green" d="M908 741H980" marker-end="url(#arrow-green)"/>
+  <!-- realtime row -->
+  <text x="72" y="634" font-size="10.5" font-weight="600" fill="#7E9187" letter-spacing="1.4">REAL-TIME DELIVERY</text>
+  <rect x="72" y="648" width="224" height="76" rx="10" fill="#121B17" stroke="#26332C"/>
+  <text x="92" y="676" font-size="12.5" font-weight="600" fill="#DCE6E0">Your services</text>
+  <text x="92" y="696" font-size="10.5" fill="#7E9187">publish domain events once</text>
 
-  <!-- State and standalone callouts -->
-  <rect class="state" x="1208" y="424" width="148" height="204" rx="6"/>
-  <text class="label" x="1282" y="452" text-anchor="middle">Local state / PVC</text>
-  <text class="small" x="1282" y="480" text-anchor="middle">source cursor</text>
-  <text class="small" x="1282" y="501" text-anchor="middle">join state</text>
-  <text class="small" x="1282" y="522" text-anchor="middle">dead-letter queue</text>
-  <text class="small" x="1282" y="543" text-anchor="middle">trusted desired state</text>
-  <text class="small" x="1282" y="564" text-anchor="middle">agent private key</text>
-  <line x1="1228" y1="582" x2="1336" y2="582" stroke="#334155"/>
-  <text class="mono" x="1282" y="603" text-anchor="middle">survives restart</text>
-  <path class="line-muted" d="M1170 577H1208"/>
+  <rect x="356" y="648" width="180" height="76" rx="10" fill="#121B17" stroke="#26332C"/>
+  <text x="376" y="676" font-size="12.5" font-weight="600" fill="#DCE6E0">NATS · Redis</text>
+  <text x="376" y="696" font-size="10.5" fill="#7E9187">live or replayable</text>
 
-  <rect class="state" x="1208" y="684" width="148" height="114" rx="6"/>
-  <text class="label" x="1282" y="711" text-anchor="middle">Standalone mode</text>
-  <text class="small" x="1282" y="733" text-anchor="middle">run the same engine</text>
-  <text class="small" x="1282" y="751" text-anchor="middle">without Fleet</text>
-  <text class="mono" x="1282" y="777" text-anchor="middle">open core</text>
-  <path class="line-muted" d="M1208 741H1170"/>
+  <rect x="596" y="648" width="280" height="76" rx="10" fill="#0F1A15" stroke="url(#engineEdge)" stroke-width="1.5"/>
+  <text x="616" y="672" font-size="10.5" font-weight="600" fill="#2FCF88" letter-spacing="1.4">VENTSTREAM ENGINE · REALTIME</text>
+  <text x="616" y="694" font-size="11.5" fill="#B9C7BF">WebSocket gateway · GraphQL subscriptions</text>
+  <text x="616" y="712" font-size="10.5" fill="#7E9187">fan-out to any number of subscribers</text>
 
-  <text class="mono" x="700" y="823" text-anchor="middle">Fleet controls desired state; it is never in the CDC or realtime data path.</text>
+  <rect x="936" y="648" width="228" height="76" rx="10" fill="#121B17" stroke="#26332C"/>
+  <text x="956" y="676" font-size="12.5" font-weight="600" fill="#DCE6E0">Browsers &amp; apps</text>
+  <text x="956" y="696" font-size="10.5" fill="#7E9187">native WS · Apollo compatible</text>
+
+  <g stroke="#2FCF88" stroke-width="1.6">
+    <line x1="296" y1="686" x2="348" y2="686" marker-end="url(#aGreen)"/>
+    <line x1="536" y1="686" x2="588" y2="686" marker-end="url(#aGreen)"/>
+    <line x1="876" y1="686" x2="928" y2="686" marker-end="url(#aGreen)"/>
+  </g>
+
+  <!-- footer note -->
+  <text x="620" y="752" font-size="11" fill="#7E9187" text-anchor="middle">The control plane is never in the data path. Remove the agent key and the same binary runs fully standalone.</text>
+
+  <!-- outer caption -->
+  <text x="620" y="810" font-size="11" fill="#5C6B62" text-anchor="middle">Open-core engine · optional managed fleet</text>
 </svg>
