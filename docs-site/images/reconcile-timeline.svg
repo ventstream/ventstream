@@ -1,0 +1,31 @@
+<svg width="1240" height="150" viewBox="0 0 1240 150" fill="none" xmlns="http://www.w3.org/2000/svg" font-family="Inter, -apple-system, 'Segoe UI', sans-serif">
+  <defs>
+    <linearGradient id="rtGreen" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#17281F"/><stop offset="100%" stop-color="#0E1713"/></linearGradient>
+    <linearGradient id="rtSlate" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1A2027"/><stop offset="100%" stop-color="#10151B"/></linearGradient>
+    <marker id="rtArrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 0.8 L7.2 4 L0.5 7.2 Z" fill="#4E5F57"/></marker>
+  </defs>
+  <rect width="1240" height="150" rx="18" fill="#0A0E0C"/>
+  <rect x="0.5" y="0.5" width="1239" height="149" rx="17.5" stroke="#1C2620"/>
+
+  <rect x="64" y="50" width="176" height="50" rx="10" fill="url(#rtSlate)" stroke="#55636F"/>
+  <text x="152" y="80" font-size="12.5" fill="#B9C4CF" text-anchor="middle">drained</text>
+
+  <rect x="300" y="50" width="176" height="50" rx="10" fill="url(#rtGreen)" stroke="#2FCF88" stroke-opacity="0.4"/>
+  <text x="388" y="80" font-size="12.5" fill="#BFD2C8" text-anchor="middle">resume</text>
+
+  <rect x="536" y="50" width="176" height="50" rx="10" fill="url(#rtGreen)" stroke="#2FCF88" stroke-opacity="0.4"/>
+  <text x="624" y="80" font-size="12.5" fill="#BFD2C8" text-anchor="middle">reconcile deletes</text>
+
+  <rect x="772" y="50" width="176" height="50" rx="10" fill="url(#rtGreen)" stroke="#2FCF88" stroke-opacity="0.4"/>
+  <text x="860" y="80" font-size="12.5" fill="#BFD2C8" text-anchor="middle">bootstrap</text>
+
+  <rect x="1008" y="50" width="168" height="50" rx="10" fill="url(#rtGreen)" stroke="#2FCF88" stroke-width="1.4"/>
+  <text x="1092" y="80" font-size="12.5" font-weight="600" fill="#E9F4EE" text-anchor="middle">tailing</text>
+
+  <g stroke="#4E5F57" stroke-width="1.4">
+    <line x1="240" y1="75" x2="292" y2="75" marker-end="url(#rtArrow)"/>
+    <line x1="476" y1="75" x2="528" y2="75" marker-end="url(#rtArrow)"/>
+    <line x1="712" y1="75" x2="764" y2="75" marker-end="url(#rtArrow)"/>
+    <line x1="948" y1="75" x2="1000" y2="75" marker-end="url(#rtArrow)"/>
+  </g>
+</svg>

@@ -1,0 +1,47 @@
+<svg width="1240" height="300" viewBox="0 0 1240 300" fill="none" xmlns="http://www.w3.org/2000/svg" font-family="Inter, -apple-system, 'Segoe UI', sans-serif">
+  <defs>
+    <linearGradient id="foGreen" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#17281F"/><stop offset="100%" stop-color="#0E1713"/></linearGradient>
+    <linearGradient id="foBlue" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#14212E"/><stop offset="100%" stop-color="#0D141C"/></linearGradient>
+    <linearGradient id="foSlate" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1A2027"/><stop offset="100%" stop-color="#10151B"/></linearGradient>
+    <marker id="foArrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 0.8 L7.2 4 L0.5 7.2 Z" fill="#4E5F57"/></marker>
+    <marker id="foSlateArrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 0.8 L7.2 4 L0.5 7.2 Z" fill="#71837A"/></marker>
+  </defs>
+  <rect width="1240" height="300" rx="18" fill="#0A0E0C"/>
+  <rect x="0.5" y="0.5" width="1239" height="299" rx="17.5" stroke="#1C2620"/>
+
+  <rect x="64" y="68" width="184" height="50" rx="10" fill="url(#foSlate)" stroke="#55636F"/>
+  <text x="156" y="98" font-size="12.5" fill="#B9C4CF" text-anchor="middle">Dashboard</text>
+  <rect x="64" y="150" width="184" height="50" rx="10" fill="url(#foSlate)" stroke="#55636F"/>
+  <text x="156" y="180" font-size="12.5" fill="#B9C4CF" text-anchor="middle">ventstreamctl</text>
+
+  <rect x="360" y="108" width="240" height="56" rx="11" fill="url(#foSlate)" stroke="#55636F"/>
+  <text x="480" y="134" font-size="13" font-weight="600" fill="#CBD6DE" text-anchor="middle">VentStream Cloud</text>
+  <text x="480" y="152" font-size="10.5" fill="#66788A" text-anchor="middle">desired state · operations · audit</text>
+
+  <g stroke="#4E5F57" stroke-width="1.4" fill="none">
+    <path d="M248 93 C 300 93, 310 118, 352 126" marker-end="url(#foArrow)"/>
+    <path d="M248 175 C 300 175, 310 152, 352 146" marker-end="url(#foArrow)"/>
+  </g>
+  <text x="292" y="80" font-size="10.5" fill="#66786E">HTTPS</text>
+
+  <!-- customer environment -->
+  <rect x="700" y="48" width="476" height="212" rx="14" fill="#0C120F" stroke="#232E28"/>
+  <text x="724" y="76" font-size="10.5" font-weight="600" fill="#6E8478" letter-spacing="1.5">CUSTOMER ENVIRONMENT</text>
+
+  <rect x="770" y="92" width="336" height="54" rx="11" fill="url(#foGreen)" stroke="#2FCF88" stroke-width="1.3"/>
+  <text x="938" y="118" font-size="13" font-weight="600" fill="#E9F4EE" text-anchor="middle">Managed engine</text>
+  <text x="938" y="136" font-size="10.5" fill="#6E8478" text-anchor="middle">fleet client + pipeline · one binary</text>
+
+  <rect x="770" y="182" width="336" height="50" rx="11" fill="url(#foBlue)" stroke="#3D5A78"/>
+  <text x="938" y="212" font-size="12.5" fill="#B9CBDD" text-anchor="middle">Sources · brokers · sinks</text>
+
+  <line x1="938" y1="146" x2="938" y2="174" stroke="#4E5F57" stroke-width="1.4" marker-end="url(#foArrow)"/>
+  <text x="954" y="166" font-size="10.5" fill="#66786E">CDC · realtime data</text>
+
+  <!-- mTLS: engine dials out; desired state flows back -->
+  <g stroke="#71837A" stroke-width="1.5" stroke-dasharray="2 7" stroke-linecap="round" fill="none">
+    <path d="M762 110 C 700 104, 660 128, 608 130" marker-end="url(#foSlateArrow)"/>
+  </g>
+  <text x="686" y="94" font-size="10.5" fill="#71837A" text-anchor="middle">outbound mTLS</text>
+  <text x="686" y="109" font-size="10.5" fill="#4E5D55" text-anchor="middle">desired state returns</text>
+</svg>

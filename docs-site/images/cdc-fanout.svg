@@ -1,0 +1,31 @@
+<svg width="1240" height="190" viewBox="0 0 1240 190" fill="none" xmlns="http://www.w3.org/2000/svg" font-family="Inter, -apple-system, 'Segoe UI', sans-serif">
+  <defs>
+    <linearGradient id="cfGreen" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#17281F"/><stop offset="100%" stop-color="#0E1713"/></linearGradient>
+    <linearGradient id="cfBlue" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#14212E"/><stop offset="100%" stop-color="#0D141C"/></linearGradient>
+    <marker id="cfArrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 0.8 L7.2 4 L0.5 7.2 Z" fill="#4E5F57"/></marker>
+  </defs>
+  <rect width="1240" height="190" rx="18" fill="#0A0E0C"/>
+  <rect x="0.5" y="0.5" width="1239" height="189" rx="17.5" stroke="#1C2620"/>
+
+  <rect x="64" y="62" width="212" height="66" rx="11" fill="url(#cfBlue)" stroke="#3D5A78"/>
+  <text x="170" y="91" font-size="13" font-weight="600" fill="#DCE6EE" text-anchor="middle">Change event</text>
+  <text x="170" y="110" font-size="10.5" fill="#66788A" text-anchor="middle">insert · update · delete</text>
+
+  <rect x="356" y="62" width="252" height="66" rx="11" fill="url(#cfGreen)" stroke="#2FCF88" stroke-opacity="0.5"/>
+  <text x="482" y="91" font-size="13" font-weight="600" fill="#E9F4EE" text-anchor="middle">Fan-out</text>
+  <text x="482" y="110" font-size="10.5" fill="#6E8478" text-anchor="middle">which primary documents does this touch?</text>
+
+  <rect x="688" y="62" width="252" height="66" rx="11" fill="url(#cfGreen)" stroke="#2FCF88" stroke-opacity="0.5"/>
+  <text x="814" y="91" font-size="13" font-weight="600" fill="#E9F4EE" text-anchor="middle">Recompose</text>
+  <text x="814" y="110" font-size="10.5" fill="#6E8478" text-anchor="middle">run the projection spec for each</text>
+
+  <rect x="1020" y="62" width="156" height="66" rx="11" fill="url(#cfBlue)" stroke="#3D5A78"/>
+  <text x="1098" y="91" font-size="13" font-weight="600" fill="#DCE6EE" text-anchor="middle">Sink</text>
+  <text x="1098" y="110" font-size="10.5" fill="#66788A" text-anchor="middle">idempotent upsert</text>
+
+  <g stroke="#4E5F57" stroke-width="1.4">
+    <line x1="276" y1="95" x2="348" y2="95" marker-end="url(#cfArrow)"/>
+    <line x1="608" y1="95" x2="680" y2="95" marker-end="url(#cfArrow)"/>
+    <line x1="940" y1="95" x2="1012" y2="95" marker-end="url(#cfArrow)"/>
+  </g>
+</svg>

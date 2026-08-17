@@ -14,19 +14,11 @@ infrastructure and connect outbound to Cloud. Source records, sink writes, broke
 events, GraphQL subscriptions, and WebSocket traffic stay in the engine data
 path; they are not proxied through the control plane.
 
-```mermaid
-flowchart LR
-  O[Operator] -->|Dashboard / HTTPS| API[VentStream Cloud]
-  CLI[ventstreamctl] -->|HTTPS| API
-  API --> OP[Desired state and operations]
-  subgraph Customer environment
-    E[Managed engine<br/>fleet client + pipeline]
-    D[Sources, brokers, and sinks]
-  end
-  E -->|outbound mTLS| G[Cloud agent gateway]
-  G -->|desired state and operations| E
-  E -->|CDC / realtime data| D
-```
+<img
+  src="/images/fleet-overview.svg"
+  alt="Operators use the dashboard or ventstreamctl over HTTPS to set desired state in VentStream Cloud; the managed engine dials out over mTLS from the customer environment and applies it, while CDC and realtime data flow only between the engine and local sources, brokers, and sinks."
+  className="rounded-lg"
+/>
 
 ## Administration surfaces
 

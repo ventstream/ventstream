@@ -25,12 +25,11 @@ On a **drain → resume** cycle, before the bootstrap re-emits documents.
 If rows were deleted during the drain window, the agent reconciles them
 away first, so the re-bootstrap starts from a clean index.
 
-```mermaid
-flowchart LR
-    d["drained"] --> r["resume"] --> rec["reconcile<br/>deletes"] --> b["bootstrap"] --> t["tailing"]
-    classDef n fill:#0b1220,stroke:#2563eb,color:#e6edf3;
-    class d,r,rec,b,t n;
-```
+<img
+  src="/images/reconcile-timeline.svg"
+  alt="Reconciliation timeline: drained, resume, reconcile deletes, bootstrap, then tailing."
+  className="rounded-lg"
+/>
 
 It does not run on a normal lossless resume — there, the replayed
 change stream carries the deletes directly.
