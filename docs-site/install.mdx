@@ -9,7 +9,7 @@ description: "Download the VentStream engine and the VentStream Cloud CLI"
 | --- | --- | --- |
 | macOS (Apple Silicon / Intel) | ✅ | ✅ |
 | Linux (arm64 / amd64) | ✅ | ✅ |
-| Windows (amd64) | ✅ native (engine v0.1.27+; no Kafka source) | ✅ `.zip` download (no installer script) |
+| Windows (amd64) | ✅ native (engine v0.1.28+; no Kafka source) | ✅ (CLI v0.2.27+) |
 
 On Windows every source and sink is available **except the Kafka source**
 (its native library has no supported Windows build) — use WSL2 or the
@@ -17,44 +17,72 @@ container image for Kafka pipelines.
 
 ## Engine
 
-**macOS / Linux** — one line: detects your OS and architecture, verifies
-checksums, installs to `~/.local/bin`:
+<Tabs>
+  <Tab title="macOS / Linux">
+    One line — detects your OS and architecture, verifies checksums,
+    installs to `~/.local/bin`:
 
-```bash
-curl -fsSL https://ventstream.dev/install.sh | sh
-```
+    ```bash
+    curl -fsSL https://ventstream.dev/install.sh | sh
+    ```
 
-**Windows** — PowerShell: verifies the SHA256 checksum against the release
-manifest before extracting, installs to
-`%LOCALAPPDATA%\Programs\ventstream`, and adds it to your user PATH:
+    Pin a version or change the location with env vars:
 
-```powershell
-irm https://ventstream.dev/install.ps1 | iex
-```
+    ```bash
+    VENTSTREAM_VERSION=0.1.28 VENTSTREAM_INSTALL_DIR=/usr/local/bin \
+      curl -fsSL https://ventstream.dev/install.sh | sh
+    ```
+  </Tab>
+  <Tab title="Windows">
+    PowerShell — verifies the SHA256 checksum against the release manifest
+    before extracting, installs to `%LOCALAPPDATA%\Programs\ventstream`,
+    and adds it to your user PATH:
 
-Or grab a specific platform build from the
+    ```powershell
+    irm https://ventstream.dev/install.ps1 | iex
+    ```
+
+    Pin a version with an env var:
+
+    ```powershell
+    $env:VENTSTREAM_VERSION = "0.1.28"; irm https://ventstream.dev/install.ps1 | iex
+    ```
+
+    The Kafka source is not included in the Windows build — use WSL2 or
+    the container image for Kafka pipelines.
+  </Tab>
+  <Tab title="Container">
+    One public image runs standalone or [managed](/concepts/managed-mode)
+    depending only on whether an agent key is present:
+
+    ```bash
+    docker run ghcr.io/ventstream/ventstream:latest
+    ```
+
+    See [Deploy](/deploy/kubernetes-managed-engine) for Kubernetes.
+  </Tab>
+</Tabs>
+
+Specific platform builds are on the
 [releases page](https://github.com/ventstream/ventstream/releases/latest).
-For containerized deployments, the same engine ships as one public image,
-`ghcr.io/ventstream/ventstream` — it runs standalone or
-[managed](/concepts/managed-mode) depending only on whether an agent key is
-present. See [Deploy](/deploy/kubernetes-managed-engine).
-
-Pin a version or change the location with env vars:
-
-```bash
-VENTSTREAM_VERSION=0.1.24 VENTSTREAM_INSTALL_DIR=/usr/local/bin \
-  curl -fsSL https://ventstream.dev/install.sh | sh
-```
 
 ## VentStream Cloud CLI (managed users)
 
-```bash
-curl -fsSL https://ventstream.dev/install-cli.sh | sh
-```
+<Tabs>
+  <Tab title="macOS / Linux">
+    ```bash
+    curl -fsSL https://ventstream.dev/install-cli.sh | sh
+    ```
+  </Tab>
+  <Tab title="Windows">
+    ```powershell
+    irm https://ventstream.dev/install-cli.ps1 | iex
+    ```
 
-**Windows:** download `ventstreamctl-<version>-windows-amd64.zip` from the
-[CLI releases page](https://github.com/ventstream/ventstream-releases/releases/latest),
-unzip, and put `ventstreamctl.exe` on your `PATH`.
+    Installs `ventstreamctl.exe` to `%LOCALAPPDATA%\Programs\ventstream`
+    after verifying its checksum, and adds it to your user PATH.
+  </Tab>
+</Tabs>
 
 Every artifact ships with `SHA256SUMS` and per-platform SBOMs; the installer
 scripts verify checksums before installing.
