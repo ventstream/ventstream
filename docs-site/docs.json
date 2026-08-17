@@ -23,9 +23,11 @@
     "tabs": [
       {
         "tab": "Documentation",
+        "icon": "book-open",
         "groups": [
           {
             "group": "Get started",
+            "icon": "flag-checkered",
             "pages": [
               "introduction",
               "install",
@@ -35,6 +37,7 @@
           },
           {
             "group": "Concepts",
+            "icon": "lightbulb",
             "pages": [
               "concepts/managed-mode",
               "concepts/cdc-and-projections",
@@ -47,10 +50,12 @@
           },
           {
             "group": "Connectors",
+            "icon": "plug",
             "pages": [
               "connectors/overview",
               {
                 "group": "Sources",
+                "icon": "database",
                 "pages": [
                   "connectors/sources/postgres",
                   "connectors/sources/mysql",
@@ -61,6 +66,7 @@
               },
               {
                 "group": "Sinks",
+                "icon": "magnifying-glass",
                 "pages": [
                   "connectors/sinks/opensearch",
                   "connectors/sinks/meilisearch",
@@ -71,6 +77,7 @@
           },
           {
             "group": "Real-time",
+            "icon": "tower-broadcast",
             "pages": [
               "concepts/real-time-subscriptions",
               "concepts/realtime-brokers",
@@ -80,6 +87,7 @@
           },
           {
             "group": "Deploy",
+            "icon": "server",
             "pages": [
               "deploy/local",
               "deploy/native-binary",
@@ -89,19 +97,8 @@
             ]
           },
           {
-            "group": "VentStream Cloud",
-            "pages": [
-              "fleet/overview",
-              "fleet/resource-model",
-              "fleet/authentication",
-              "fleet/enrollment",
-              "fleet/configuration",
-              "fleet/cli",
-              "fleet/security"
-            ]
-          },
-          {
             "group": "Guides",
+            "icon": "map",
             "pages": [
               "guides/authoring-specs",
               "guides/database-tls",
@@ -111,16 +108,49 @@
           },
           {
             "group": "Deep dives",
+            "icon": "water",
             "pages": [
               "engineering/neo4j-hot-nodes"
             ]
           },
           {
             "group": "Reference",
+            "icon": "bookmark",
             "pages": [
               "reference/engine-env",
-              "reference/control-plane-api",
               "reference/troubleshooting"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "VentStream Cloud",
+        "icon": "cloud",
+        "groups": [
+          {
+            "group": "VentStream Cloud",
+            "icon": "cloud",
+            "pages": [
+              "fleet/overview",
+              "fleet/resource-model",
+              "fleet/authentication",
+              "fleet/enrollment",
+              "fleet/configuration",
+              "fleet/security"
+            ]
+          },
+          {
+            "group": "CLI",
+            "icon": "terminal",
+            "pages": [
+              "fleet/cli"
+            ]
+          },
+          {
+            "group": "API",
+            "icon": "code",
+            "pages": [
+              "reference/control-plane-api"
             ]
           }
         ]
@@ -147,6 +177,36 @@
   "footer": {
     "socials": {
       "github": "https://github.com/ventstream/ventstream"
+    }
+  },
+  "appearance": {
+    "default": "dark"
+  },
+  "background": {
+    "decoration": "gradient",
+    "color": {
+      "dark": "#0B120F",
+      "light": "#FFFFFF"
+    }
+  },
+  "styling": {
+    "eyebrows": "breadcrumbs",
+    "codeblocks": "dark"
+  },
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "chatgpt",
+      "claude"
+    ]
+  },
+  "fonts": {
+    "heading": {
+      "family": "Inter"
+    },
+    "body": {
+      "family": "Inter"
     }
   }
 }
