@@ -1,0 +1,42 @@
+# Manually-dispatched end-to-end proof of the Windows install path:
+# runs the public domain installer on a clean Windows runner and checks
+# the installed binary answers with the expected version.
+name: windows installer smoke
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Engine version to install (empty = latest release)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - name: Run the public installer
+        shell: pwsh
+        env:
+          VENTSTREAM_VERSION: ${{ inputs.version }}
+        run: |
+          irm https://ventstream.dev/install.ps1 | iex
+      - name: Verify installed binary
+        shell: pwsh
+        env:
+          VENTSTREAM_VERSION: ${{ inputs.version }}
+        run: |
+          $exe = Join-Path $env:LOCALAPPDATA "Programs\ventstream\ventstream.exe"
+          $reported = & $exe --version
+          Write-Host "installed: $reported"
+          if ($env:VENTSTREAM_VERSION -and $reported -ne "ventstream $env:VENTSTREAM_VERSION") {
+            Write-Error "version mismatch: $reported"
+            exit 1
+          }
+          if (-not (Test-Path (Join-Path $env:APPDATA "ventstream\ventstream.example.yaml"))) {
+            Write-Error "example configuration missing"
+            exit 1
+          }
