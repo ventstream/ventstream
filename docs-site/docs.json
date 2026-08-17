@@ -160,12 +160,19 @@
   "navbar": {
     "links": [
       {
-        "label": "Website",
-        "href": "https://ventstream.dev"
+        "label": "Blog",
+        "href": "https://ventstream.dev/blog",
+        "icon": "newspaper"
+      },
+      {
+        "label": "Dashboard",
+        "href": "https://ventstream.dev/dashboard",
+        "icon": "grid-2"
       },
       {
         "label": "GitHub",
-        "href": "https://github.com/ventstream/ventstream"
+        "href": "https://github.com/ventstream/ventstream",
+        "icon": "github"
       }
     ],
     "primary": {
@@ -176,8 +183,45 @@
   },
   "footer": {
     "socials": {
-      "github": "https://github.com/ventstream/ventstream"
-    }
+      "github": "https://github.com/ventstream/ventstream",
+      "website": "https://ventstream.dev"
+    },
+    "links": [
+      {
+        "header": "Product",
+        "items": [
+          {
+            "label": "Website",
+            "href": "https://ventstream.dev"
+          },
+          {
+            "label": "Dashboard",
+            "href": "https://ventstream.dev/dashboard"
+          },
+          {
+            "label": "Blog",
+            "href": "https://ventstream.dev/blog"
+          }
+        ]
+      },
+      {
+        "header": "Resources",
+        "items": [
+          {
+            "label": "Releases",
+            "href": "https://github.com/ventstream/ventstream/releases"
+          },
+          {
+            "label": "Quickstart",
+            "href": "https://ventstream.dev/docs/quickstart"
+          },
+          {
+            "label": "Install",
+            "href": "https://ventstream.dev/docs/install"
+          }
+        ]
+      }
+    ]
   },
   "appearance": {
     "default": "dark"
