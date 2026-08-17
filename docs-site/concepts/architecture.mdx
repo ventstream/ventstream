@@ -1,6 +1,7 @@
 ---
 title: "Architecture"
 description: "How VentStream separates engine data paths from optional VentStream Cloud management."
+icon: "diagram-project"
 ---
 
 VentStream has an open-source data plane and an optional Cloud management plane.
@@ -12,11 +13,12 @@ The separation is operational, security-sensitive, and deliberate.
   className="rounded-lg"
 />
 
-The purple path is management traffic. Teal and green show the CDC path from
-source connectors through projection and sink acknowledgement. Orange shows the
-independent broker-to-WebSocket/GraphQL delivery path. Neither data path enters
-VentStream Cloud. The same engine binary can also run standalone without a
-control-plane dependency.
+Green is the engine and its capabilities; blue is everything you own —
+sources, targets, brokers, and clients. The only line between the planes is
+a single outbound mTLS stream carrying desired state, never data: records,
+documents, and events stay inside your environment. Remove the agent key
+and the same binary runs fully standalone without a control-plane
+dependency.
 
 ## Data plane
 

@@ -1,0 +1,53 @@
+---
+title: "One-time migration"
+description: "Copy a dataset once — bootstrap at bulk speed, confirm parity, stop."
+icon: "box-archive"
+---
+
+Sometimes you don't want a permanently-synced projection — you want the
+data moved once: seed a new search index, populate a staging environment,
+or lift a dataset into a serving store and be done.
+
+<Note>
+A dedicated one-shot mode (`bootstrap` **and exit**) is a planned engine
+capability and is not in the released binary yet. The pattern below
+achieves a one-time copy with the shipped engine today.
+</Note>
+
+## The pattern today
+
+A one-time copy is the [zero-downtime migration](/guides/zero-downtime-migration)
+flow, stopped early:
+
+1. Run the pipeline with `bootstrap: mode: snapshot`. The engine captures
+   a cursor, streams every existing row through your projection into the
+   target at bulk speed, then switches to tailing.
+2. Wait for the tail to catch up (cursor age near zero) — this guarantees
+   rows written *during* the copy were also delivered, which a plain dump
+   script cannot promise.
+3. Stop the engine. The target now holds a complete, consistent copy as
+   of the moment you stopped.
+
+Because delivery is idempotent and the cursor is durable, an interrupted
+run resumes exactly where it left off — restart the engine and the copy
+completes rather than starting over.
+
+## Verifying the copy
+
+Before declaring the migration done:
+
+- Compare source row count with target document count (deterministic ids
+  mean one row → one document; no duplicates to distort the count).
+- Spot-check recently-written rows — anything committed before you
+  stopped the engine must be present.
+- The engine's delivery counters (`events_delivered_total`, dlq `0`)
+  confirm nothing was routed to the dead-letter queue.
+
+## What the planned one-shot mode adds
+
+The dedicated mode will remove step 3's judgement call: the engine will
+bootstrap, drain the change stream to the captured high-water mark,
+report parity, and **exit on its own** — making it scriptable in CI and
+batch contexts. Watch the
+[release notes](https://github.com/ventstream/ventstream/releases) for
+availability.

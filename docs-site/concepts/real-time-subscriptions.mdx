@@ -1,6 +1,7 @@
 ---
 title: "Real-time subscriptions"
 description: "Fan live events out to browsers and services over WebSocket or GraphQL subscriptions."
+icon: "tower-broadcast"
 ---
 
 Alongside the CDC pipeline (source → denormalized documents), VentStream
@@ -9,15 +10,11 @@ publish events to NATS or Redis Streams; the engine fans them out to subscribed 
 real time over two transports — a **native WebSocket** protocol and
 **GraphQL subscriptions** (`graphql-transport-ws`, Apollo-compatible).
 
-```mermaid
-flowchart LR
-    pub["Publisher"] -- "publish vs.t.…" --> broker[("NATS or<br/>Redis Streams")]
-    broker --> eng{{"engine"}}
-    eng -- "role: ws<br/>:4040 /ws" --> raw["Raw WebSocket client"]
-    eng -- "role: graphql<br/>:4041 /graphql/ws" --> apollo["Apollo Client"]
-    classDef n fill:#0b1220,stroke:#2563eb,color:#e6edf3;
-    class pub,eng n;
-```
+<img
+  src="/images/realtime-paths.svg"
+  alt="A publisher writes to NATS or Redis Streams; the realtime engine fans out to raw WebSocket clients on :4040 /ws and Apollo clients on :4041 /graphql/ws."
+  className="rounded-lg"
+/>
 
 One engine binary runs both gateways — select them with
 `VS_ROLES=ws,graphql` (either alone is fine too). This path shares

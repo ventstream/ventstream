@@ -1,0 +1,76 @@
+<svg width="1240" height="352" viewBox="0 0 1240 352" fill="none" xmlns="http://www.w3.org/2000/svg" font-family="Inter, -apple-system, 'Segoe UI', sans-serif">
+  <defs>
+    <linearGradient id="emPillGreen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#17281F"/>
+      <stop offset="100%" stop-color="#0E1713"/>
+    </linearGradient>
+    <linearGradient id="emPillBlue" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#14212E"/>
+      <stop offset="100%" stop-color="#0D141C"/>
+    </linearGradient>
+    <linearGradient id="emPillSlate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1A2027"/>
+      <stop offset="100%" stop-color="#10151B"/>
+    </linearGradient>
+    <marker id="emArrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M0.5 0.8 L7.2 4 L0.5 7.2 Z" fill="#4E5F57"/>
+    </marker>
+  </defs>
+
+  <rect width="1240" height="352" rx="18" fill="#0A0E0C"/>
+  <rect x="0.5" y="0.5" width="1239" height="351" rx="17.5" stroke="#1C2620"/>
+
+  <!-- control plane -->
+  <rect x="495" y="28" width="250" height="46" rx="10" fill="url(#emPillSlate)" stroke="#55636F"/>
+  <text x="620" y="56" font-size="12.5" fill="#B9C4CF" text-anchor="middle">VentStream Cloud · optional</text>
+
+  <!-- control spine touching both engines -->
+  <g stroke="#4A5A52" stroke-width="1.5" stroke-dasharray="2 7" stroke-linecap="round">
+    <line x1="620" y1="74" x2="620" y2="126"/>
+    <line x1="620" y1="180" x2="620" y2="232"/>
+  </g>
+  <text x="634" y="102" font-size="10.5" fill="#71837A">outbound mTLS · desired state only</text>
+
+  <!-- ── CDC lane ─────────────────────────────────────── -->
+  <text x="64" y="118" font-size="10.5" font-weight="600" fill="#66786E" letter-spacing="1.5">CAPTURE &amp; SYNC</text>
+  <rect x="64" y="130" width="180" height="50" rx="10" fill="url(#emPillBlue)" stroke="#3D5A78"/>
+  <text x="154" y="160" font-size="12.5" fill="#B9CBDD" text-anchor="middle">Source system</text>
+
+  <rect x="495" y="130" width="250" height="50" rx="10" fill="url(#emPillGreen)" stroke="#2FCF88" stroke-width="1.3"/>
+  <text x="620" y="160" font-size="13" font-weight="600" fill="#E9F4EE" text-anchor="middle">Engine · CDC</text>
+
+  <rect x="996" y="130" width="180" height="50" rx="10" fill="url(#emPillBlue)" stroke="#3D5A78"/>
+  <text x="1086" y="160" font-size="12.5" fill="#B9CBDD" text-anchor="middle">Target store</text>
+
+  <g stroke="#4E5F57" stroke-width="1.4">
+    <line x1="244" y1="155" x2="487" y2="155" marker-end="url(#emArrow)"/>
+    <line x1="745" y1="155" x2="988" y2="155" marker-end="url(#emArrow)"/>
+  </g>
+  <text x="366" y="147" font-size="10.5" fill="#66786E" text-anchor="middle">change stream</text>
+  <text x="866" y="147" font-size="10.5" fill="#66786E" text-anchor="middle">synced documents</text>
+
+  <!-- ── Real-time lane ───────────────────────────────── -->
+  <text x="64" y="224" font-size="10.5" font-weight="600" fill="#66786E" letter-spacing="1.5">REAL-TIME DELIVERY</text>
+  <rect x="64" y="236" width="150" height="50" rx="10" fill="url(#emPillBlue)" stroke="#3D5A78"/>
+  <text x="139" y="266" font-size="12.5" fill="#B9CBDD" text-anchor="middle">Publishers</text>
+
+  <rect x="278" y="236" width="150" height="50" rx="10" fill="url(#emPillBlue)" stroke="#3D5A78"/>
+  <text x="353" y="266" font-size="12.5" fill="#B9CBDD" text-anchor="middle">Event bus</text>
+
+  <rect x="495" y="236" width="250" height="50" rx="10" fill="url(#emPillGreen)" stroke="#2FCF88" stroke-width="1.3"/>
+  <text x="620" y="266" font-size="13" font-weight="600" fill="#E9F4EE" text-anchor="middle">Engine · Realtime</text>
+
+  <rect x="996" y="236" width="180" height="50" rx="10" fill="url(#emPillBlue)" stroke="#3D5A78"/>
+  <text x="1086" y="266" font-size="12.5" fill="#B9CBDD" text-anchor="middle">Subscribers</text>
+
+  <g stroke="#4E5F57" stroke-width="1.4">
+    <line x1="214" y1="261" x2="270" y2="261" marker-end="url(#emArrow)"/>
+    <line x1="428" y1="261" x2="487" y2="261" marker-end="url(#emArrow)"/>
+    <line x1="745" y1="261" x2="988" y2="261" marker-end="url(#emArrow)"/>
+  </g>
+  <text x="242" y="253" font-size="10.5" fill="#66786E" text-anchor="middle">events</text>
+  <text x="866" y="253" font-size="10.5" fill="#66786E" text-anchor="middle">WebSocket · GraphQL</text>
+
+  <!-- caption -->
+  <text x="620" y="326" font-size="11" fill="#66786E" text-anchor="middle">Two independent workloads, one binary — the control plane never touches data traffic.</text>
+</svg>

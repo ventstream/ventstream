@@ -1,0 +1,37 @@
+<svg width="1240" height="280" viewBox="0 0 1240 280" fill="none" xmlns="http://www.w3.org/2000/svg" font-family="Inter, -apple-system, 'Segoe UI', sans-serif">
+  <defs>
+    <linearGradient id="rpGreen" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#17281F"/><stop offset="100%" stop-color="#0E1713"/></linearGradient>
+    <linearGradient id="rpBlue" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#14212E"/><stop offset="100%" stop-color="#0D141C"/></linearGradient>
+    <marker id="rpArrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 0.8 L7.2 4 L0.5 7.2 Z" fill="#4E5F57"/></marker>
+  </defs>
+  <rect width="1240" height="280" rx="18" fill="#0A0E0C"/>
+  <rect x="0.5" y="0.5" width="1239" height="279" rx="17.5" stroke="#1C2620"/>
+
+  <rect x="64" y="112" width="176" height="56" rx="11" fill="url(#rpBlue)" stroke="#3D5A78"/>
+  <text x="152" y="145" font-size="12.5" fill="#B9CBDD" text-anchor="middle">Publisher</text>
+
+  <rect x="320" y="112" width="220" height="56" rx="11" fill="url(#rpBlue)" stroke="#3D5A78"/>
+  <text x="430" y="138" font-size="12.5" fill="#B9CBDD" text-anchor="middle">NATS · Redis Streams</text>
+  <text x="430" y="156" font-size="10.5" fill="#66788A" text-anchor="middle">live or replayable</text>
+
+  <rect x="620" y="112" width="200" height="56" rx="11" fill="url(#rpGreen)" stroke="#2FCF88" stroke-width="1.3"/>
+  <text x="720" y="145" font-size="13" font-weight="600" fill="#E9F4EE" text-anchor="middle">Engine · Realtime</text>
+
+  <rect x="984" y="52" width="192" height="56" rx="11" fill="url(#rpBlue)" stroke="#3D5A78"/>
+  <text x="1080" y="78" font-size="12.5" fill="#B9CBDD" text-anchor="middle">WebSocket client</text>
+  <text x="1080" y="96" font-size="10.5" fill="#66788A" text-anchor="middle">:4040 /ws</text>
+
+  <rect x="984" y="172" width="192" height="56" rx="11" fill="url(#rpBlue)" stroke="#3D5A78"/>
+  <text x="1080" y="198" font-size="12.5" fill="#B9CBDD" text-anchor="middle">Apollo Client</text>
+  <text x="1080" y="216" font-size="10.5" fill="#66788A" text-anchor="middle">:4041 /graphql/ws</text>
+
+  <g stroke="#4E5F57" stroke-width="1.4" fill="none">
+    <line x1="240" y1="140" x2="312" y2="140" marker-end="url(#rpArrow)"/>
+    <line x1="540" y1="140" x2="612" y2="140" marker-end="url(#rpArrow)"/>
+    <path d="M820 128 C 900 118, 920 92, 976 82" marker-end="url(#rpArrow)"/>
+    <path d="M820 152 C 900 162, 920 188, 976 198" marker-end="url(#rpArrow)"/>
+  </g>
+  <text x="276" y="130" font-size="10.5" fill="#66786E" text-anchor="middle">publish vs.t.…</text>
+  <text x="898" y="84" font-size="10.5" fill="#66786E" text-anchor="middle">role: ws</text>
+  <text x="898" y="200" font-size="10.5" fill="#66786E" text-anchor="middle">role: graphql</text>
+</svg>

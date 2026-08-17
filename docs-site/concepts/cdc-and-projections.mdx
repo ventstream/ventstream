@@ -1,6 +1,7 @@
 ---
 title: "CDC & projections"
 description: "How a source change becomes a denormalized document."
+icon: "layer-group"
 ---
 
 A VentStream pipeline has two halves: **capture** (read the source's
@@ -125,14 +126,11 @@ cap is 2 simply isn't reached.
 
 The join engine sits between the source and the sink. On each event:
 
-```mermaid
-flowchart LR
-    e["change event"] --> f["which primaries<br/>does this touch?<br/><i>projection fan-out</i>"]
-    f --> r["recompute each<br/><i>run spec</i>"]
-    r --> s[("sink")]
-    classDef n fill:#0b1220,stroke:#2563eb,color:#e6edf3;
-    class e,f,r n;
-```
+<img
+  src="/images/cdc-fanout.svg"
+  alt="A change event fans out to the primary documents it touches; each is recomposed by the projection spec and idempotently upserted into the sink."
+  className="rounded-lg"
+/>
 
 For Postgres the "which primaries" step uses an in-memory reverse index
 of foreign keys. For Neo4j it's a Cypher query anchored on the changed

@@ -1,6 +1,7 @@
 ---
 title: "Introduction"
 description: "What VentStream is, the problems it solves, and when to reach for it."
+icon: "book-open"
 ---
 
 VentStream is an open-source data-streaming engine with two independent
@@ -13,6 +14,12 @@ workloads in one binary:
 - **Real-time data delivery** — publish domain events once and stream
   them to any number of subscribers (browsers, services) in real time
   over native WebSocket or GraphQL subscriptions.
+
+The capture workload doubles as a **zero-downtime migration tool**: the
+snapshot bootstrap moves existing data in bulk through the same code
+path that then tails live changes, so a store can be populated, kept in
+sync, and cut over without a maintenance window — see the
+[migration guide](/guides/zero-downtime-migration).
 
 Both pipelines are the same idea — turn a stream of changes into the
 exact shape a consumer needs. The difference is how you consume it: a
@@ -45,6 +52,10 @@ or read model, the copy can drift from its source:
   store and rot the moment one path forgets to update it.
 - **Hand-rolled triggers** become an unmaintainable web of per-table
   glue as the projection grows.
+
+**Migrations demand windows.** Bulk-copy scripts race the writes that
+happen while they run, so moves get scheduled into maintenance windows —
+or worse, skipped.
 
 **Real-time delivery repeats infrastructure work.** Teams need connection
 lifecycle, subscription routing, reconnect, replay, and slow-consumer handling
@@ -105,21 +116,11 @@ Two planes, deployed independently:
   reconcile revisioned desired state, and report bounded status. Cloud never
   touches source systems or data traffic.
 
-```mermaid
-flowchart LR
-    src[("Source system")] -- "change stream" --> cdc["engine · cdc"]
-    cdc -- "synced documents" --> tgt[("Target store")]
-
-    pub["Publishers"] -- "events" --> bus[("Event bus")]
-    bus --> fan["engine · ws / graphql"]
-    fan -- "WebSocket / GraphQL" --> sub["Subscribers"]
-
-    cp["VentStream Cloud"] -. "outbound mTLS desired state" .-> cdc
-    cp -. "outbound mTLS desired state" .-> fan
-
-    classDef n fill:#0b1220,stroke:#2563eb,color:#e6edf3;
-    class cdc,fan,cp n;
-```
+<img
+  src="/images/engine-modes.svg"
+  alt="The two engine workloads: CDC capture from a source system through the engine into a target store, and real-time delivery from publishers through an event bus and the engine to subscribers. VentStream Cloud optionally sends desired state over outbound mTLS and never touches data traffic."
+  className="rounded-lg"
+/>
 
 See [Architecture](/concepts/architecture) for the full picture.
 
@@ -135,6 +136,9 @@ See [Architecture](/concepts/architecture) for the full picture.
   </Card>
   <Card title="Concepts" icon="book" href="/concepts/cdc-and-projections">
     How capture, projections, and fan-out work.
+  </Card>
+  <Card title="Zero-downtime migration" icon="truck-fast" href="/guides/zero-downtime-migration">
+    Bootstrap existing data, tail changes, and cut over without a window.
   </Card>
   <Card title="Deploy" icon="server" href="/deploy/local">
     Run locally with Docker Compose, or ship the stack to Kubernetes.

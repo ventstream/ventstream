@@ -1,0 +1,84 @@
+---
+title: "Zero-downtime migration"
+description: "Move existing data into a new store and keep it in sync until cutover — one pipeline for backfill and steady state."
+icon: "truck-fast"
+---
+
+Migrating data into a new store usually means a bulk copy script, a
+maintenance window, and a prayer that nothing changed while the copy ran.
+VentStream's pipeline *is* the migration tool: the same run that will keep
+your target in sync forever also performs the initial move, so there is no
+separate backfill code path and no window where changes are lost.
+
+<Note>
+Today the engine migrates **into search and serving stores** — OpenSearch,
+Elasticsearch, Meilisearch, and Redis. Relational targets (PostgreSQL,
+MySQL) are on the [connector roadmap](https://ventstream.dev/connectors).
+</Note>
+
+## How the mechanics make it safe
+
+The ordering is what removes the downtime, and it is worth understanding:
+
+1. **The replication cursor is captured first.** Before any data is read,
+   the engine records its position in the source's change stream (creating
+   the replication slot, binlog position, or change-stream token).
+2. **Bootstrap streams the existing data.** Every current row flows
+   through the same projection and delivery code as live changes — same
+   document shapes, same deterministic ids — at bulk speed
+   (measured up to ~1M documents/minute into Meilisearch; see
+   [Performance](/concepts/performance)).
+3. **Tailing resumes from the captured cursor.** Anything written *during*
+   the bootstrap was retained by the source's log and is replayed after it.
+   Nothing that happened mid-copy is lost, and replays are harmless:
+   deterministic ids make every write idempotent.
+4. **The cursor only advances on sink-confirmed durability**, so a crash
+   at any point resumes exactly — never skipping, never duplicating.
+
+When the tail shows the target keeping pace with the source (cursor age
+near zero, delivery healthy), the stores are equivalent and stay
+equivalent.
+
+## Cutover
+
+Cutover is a client-side switch, not a data operation:
+
+1. Watch the pipeline until it is tailing with near-zero cursor age
+   (`ventstreamctl agents status` in managed mode, or the engine's health
+   endpoint standalone).
+2. Point readers at the new store. The pipeline keeps both sides in sync
+   while old readers drain, so the switch can be gradual — per service,
+   per tenant, or behind a flag.
+3. When nothing reads the old path anymore, stop the pipeline (or keep it:
+   a permanently-synced projection is the same pipeline left running).
+
+There is no step where writes must pause.
+
+## Rollback
+
+Because the source was never modified, rollback is pointing readers back
+at it. The migration pipeline can keep running throughout — the target
+simply stays warm for the next attempt.
+
+## Run it
+
+The [quickstart](/quickstart) is the migration recipe — a minimal config
+with `bootstrap: mode: snapshot` performs steps 1–3 automatically:
+
+```yaml
+source:
+  kind: postgres
+  postgres:
+    # …connection refs…
+    bootstrap:
+      mode: snapshot
+
+sink:
+  kind: meilisearch
+  meilisearch:
+    # …connection refs…
+```
+
+For joined documents rather than flat rows, add a
+[projection spec](/concepts/cdc-and-projections) — the bootstrap composes
+them the same way the live path does.
