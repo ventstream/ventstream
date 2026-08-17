@@ -563,11 +563,11 @@ mod tests {
         })?;
 
         assert_eq!(state.active().certificate_serial(), "ca-serial-1");
-        let metadata = fs::metadata(&path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
 
+            let metadata = fs::metadata(&path)?;
             assert_eq!(metadata.permissions().mode() & 0o077, 0);
         }
         let (state, first) = store.ensure_pending_renewal(state)?;
