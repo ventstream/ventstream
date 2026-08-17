@@ -17,6 +17,7 @@ fn source_from_env() -> PostgresCdcConfig {
         .first()
         .and_then(|host| match host {
             Host::Tcp(host) => Some(host.clone()),
+            #[cfg(unix)]
             Host::Unix(_) => None,
         })
         .expect("TCP host");

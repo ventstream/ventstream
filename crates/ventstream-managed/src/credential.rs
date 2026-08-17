@@ -474,10 +474,18 @@ fn validate_private_permissions(_path: &Path, _metadata: &fs::Metadata) -> Resul
     Ok(())
 }
 
+/// Directory durability barrier; no-op on Windows, which cannot open
+/// directories via `File::open` and journals renames in NTFS.
+#[cfg(unix)]
 fn sync_parent(path: &Path) -> Result<(), AgentError> {
     fs::File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| state_io(path, error))
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_path: &Path) -> Result<(), AgentError> {
+    Ok(())
 }
 
 fn invalid_state(path: &Path, message: impl Into<String>) -> AgentError {
@@ -563,11 +571,11 @@ mod tests {
         })?;
 
         assert_eq!(state.active().certificate_serial(), "ca-serial-1");
-        let metadata = fs::metadata(&path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
 
+            let metadata = fs::metadata(&path)?;
             assert_eq!(metadata.permissions().mode() & 0o077, 0);
         }
         let (state, first) = store.ensure_pending_renewal(state)?;

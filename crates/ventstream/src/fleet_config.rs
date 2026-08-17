@@ -1,6 +1,6 @@
 //! Loader for Fleet-staged non-secret engine configuration.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -219,7 +219,20 @@ fn write_private_file_and_replace(
     file.sync_all()?;
     drop(file);
     fs::rename(temporary, destination)?;
-    File::open(parent)?.sync_all()?;
+    sync_directory(parent)?;
+    Ok(())
+}
+
+/// Durability barrier on the containing directory after a rename. Windows
+/// cannot open directories via `File::open`; NTFS journals the metadata
+/// update, so this is a no-op there.
+#[cfg(unix)]
+fn sync_directory(parent: &Path) -> std::io::Result<()> {
+    fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_parent: &Path) -> std::io::Result<()> {
     Ok(())
 }
 

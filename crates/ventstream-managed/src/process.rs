@@ -1,4 +1,4 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -646,9 +646,19 @@ fn write_private_file_and_replace(
     drop(file);
     fs::rename(temporary, destination)
         .map_err(|_| "activating staged configuration failed".to_owned())?;
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| "syncing configuration directory failed".to_owned())
+    sync_directory(parent).map_err(|_| "syncing configuration directory failed".to_owned())
+}
+
+/// Directory durability barrier; no-op on Windows, which cannot open
+/// directories via `File::open` and journals renames in NTFS.
+#[cfg(unix)]
+fn sync_directory(parent: &Path) -> std::io::Result<()> {
+    fs::File::open(parent).and_then(|directory| directory.sync_all())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_parent: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]

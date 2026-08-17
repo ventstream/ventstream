@@ -9,18 +9,27 @@ description: "Download the VentStream engine and the VentStream Cloud CLI"
 | --- | --- | --- |
 | macOS (Apple Silicon / Intel) | ✅ | ✅ |
 | Linux (arm64 / amd64) | ✅ | ✅ |
-| Windows | via **WSL2** or **Docker** | ✅ `.zip` download (no installer script) |
+| Windows (amd64) | ✅ native (engine v0.1.27+; no Kafka source) | ✅ `.zip` download (no installer script) |
 
-Windows is not supported natively for the engine — it is a server workload.
-Run it inside WSL2 (the Linux installer works there as-is) or as a container.
+On Windows every source and sink is available **except the Kafka source**
+(its native library has no supported Windows build) — use WSL2 or the
+container image for Kafka pipelines.
 
 ## Engine
 
-One line — detects your OS and architecture, verifies checksums, installs to
-`~/.local/bin`:
+**macOS / Linux** — one line: detects your OS and architecture, verifies
+checksums, installs to `~/.local/bin`:
 
 ```bash
 curl -fsSL https://ventstream.dev/install.sh | sh
+```
+
+**Windows** — PowerShell: verifies the SHA256 checksum against the release
+manifest before extracting, installs to
+`%LOCALAPPDATA%\Programs\ventstream`, and adds it to your user PATH:
+
+```powershell
+irm https://ventstream.dev/install.ps1 | iex
 ```
 
 Or grab a specific platform build from the

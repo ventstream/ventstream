@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
@@ -186,9 +186,19 @@ fn write_and_replace(
     drop(file);
 
     fs::rename(temporary, destination).map_err(|error| AgentError::io(destination, error))?;
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| AgentError::io(parent, error))
+    sync_directory(parent).map_err(|error| AgentError::io(parent, error))
+}
+
+/// Directory durability barrier; no-op on Windows, which cannot open
+/// directories via `File::open` and journals renames in NTFS.
+#[cfg(unix)]
+fn sync_directory(parent: &Path) -> std::io::Result<()> {
+    fs::File::open(parent).and_then(|directory| directory.sync_all())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_parent: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn validate_regular_private_file(path: &Path, metadata: &fs::Metadata) -> Result<(), AgentError> {
