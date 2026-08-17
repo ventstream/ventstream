@@ -31,8 +31,8 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
-use tokio_postgres::{Client, NoTls};
-use tracing::{debug, error, info, warn};
+use tokio_postgres::Client;
+use tracing::{debug, info, warn};
 use ventstream_joins::{FetchError, PkValue, RelatedFetcher};
 
 use super::config::PostgresCdcConfig;
@@ -69,35 +69,22 @@ struct Inner {
 }
 
 #[derive(Clone)]
-enum FetcherConnection {
-    Legacy(String),
-    Source(Box<PostgresCdcConfig>),
-}
+struct FetcherConnection(Box<PostgresCdcConfig>);
 
 impl PostgresFetcher {
-    /// Construct a fetcher and open the initial connection.
-    ///
-    /// Takes the same connection string the replication source uses
-    /// — the fetcher just opens a fresh, non-replication connection
-    /// over it.
-    pub async fn connect(connection_string: String) -> Result<Self, FetchError> {
-        Self::connect_with_pool_size(connection_string, DEFAULT_POOL_SIZE).await
+    /// Construct a fetcher and open the initial connection. Inherits
+    /// the source's TLS policy; opens fresh non-replication
+    /// connections.
+    pub async fn connect_config(source: PostgresCdcConfig) -> Result<Self, FetchError> {
+        Self::connect_config_with_pool_size(source, DEFAULT_POOL_SIZE).await
     }
 
     /// Construct a fetcher with a bounded, lazily grown query pool.
-    pub async fn connect_with_pool_size(
-        connection_string: String,
-        pool_size: usize,
-    ) -> Result<Self, FetchError> {
-        Self::connect_inner(FetcherConnection::Legacy(connection_string), pool_size).await
-    }
-
-    /// Construct a fetcher that inherits the source's TLS policy.
     pub async fn connect_config_with_pool_size(
         source: PostgresCdcConfig,
         pool_size: usize,
     ) -> Result<Self, FetchError> {
-        Self::connect_inner(FetcherConnection::Source(Box::new(source)), pool_size).await
+        Self::connect_inner(FetcherConnection(Box::new(source)), pool_size).await
     }
 
     async fn connect_inner(
@@ -175,22 +162,9 @@ impl PostgresFetcher {
 }
 
 async fn open_client(connection: &FetcherConnection) -> Result<Client, FetchError> {
-    match connection {
-        FetcherConnection::Source(source) => connect_client(source, "related-row fetcher")
-            .await
-            .map_err(|err| FetchError::Unreachable(err.to_string())),
-        FetcherConnection::Legacy(connection_string) => {
-            let (client, connection) = tokio_postgres::connect(connection_string, NoTls)
-                .await
-                .map_err(|err| FetchError::Unreachable(err.to_string()))?;
-            tokio::spawn(async move {
-                if let Err(err) = connection.await {
-                    error!(error = %err, "postgres fetcher connection task ended");
-                }
-            });
-            Ok(client)
-        }
-    }
+    connect_client(&connection.0, "related-row fetcher")
+        .await
+        .map_err(|err| FetchError::Unreachable(err.to_string()))
 }
 
 #[async_trait]

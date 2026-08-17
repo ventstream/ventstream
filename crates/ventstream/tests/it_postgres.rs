@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use redis::AsyncCommands;
 use serde_json::Value;
 use ventstream_joins::{PkValue, RelatedFetcher};
-use ventstream_sources::postgres::PostgresFetcher;
+use ventstream_sources::postgres::{PostgresCdcConfig, PostgresFetcher};
 
 const ORDERS_SPEC: &str = r#"
 joins:
@@ -945,14 +945,17 @@ async fn related_fetcher_batches_real_postgres_lookups() {
     .await
     .expect("seed fetch benchmark");
 
-    let connection_string = format!(
-        "host=127.0.0.1 port={} user={} password={} dbname={}",
-        stack.pg_port,
+    let mut source = PostgresCdcConfig::new(
+        "bench-fetch",
+        "127.0.0.1",
         common::PG_USER,
         common::PG_PASSWORD,
-        common::PG_DB
+        common::PG_DB,
+        "bench_pub",
+        "bench_slot",
     );
-    let fetcher = PostgresFetcher::connect_with_pool_size(connection_string, 4)
+    source.port = stack.pg_port;
+    let fetcher = PostgresFetcher::connect_config_with_pool_size(source, 4)
         .await
         .expect("connect fetcher");
     let keys = (1..=KEY_COUNT)

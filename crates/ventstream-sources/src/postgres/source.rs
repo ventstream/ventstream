@@ -99,6 +99,7 @@ use crate::credential::{exhausted_message, CredentialFailureBudget};
 use super::config::PostgresCdcConfig;
 use super::event_mapper;
 use super::pgoutput::{self, LogicalMessage};
+use super::preflight;
 use super::schema::RelationCache;
 use super::snapshot;
 use crate::error::PostgresCdcError;
@@ -517,6 +518,16 @@ impl PostgresCdcSource {
     /// Connect via `pgwire-replication`, then run the event loop until
     /// shutdown or fatal error.
     async fn run_replication(&self, ctx: SourceContext) -> Result<(), PostgresCdcError> {
+        // Preflight: definitive misconfigurations (pooler endpoint,
+        // wal_level, missing publication) fail fast with the fix in
+        // the message. Transient connect trouble is NOT fatal here —
+        // the replication path owns retries.
+        preflight::check_endpoint(&self.config)?;
+        if let Err(err) = preflight::run(&self.config).await {
+            ventstream_telemetry::record_error(format!("postgres preflight failed: {err}"));
+            return Err(err);
+        }
+
         // Snapshot bootstrap runs BEFORE the replication slot is
         // opened. It's a no-op when (a) no bootstrap config is set or
         // (b) the slot already exists. See `snapshot.rs` for the
@@ -578,26 +589,46 @@ impl PostgresCdcSource {
             let mut client = match ReplicationClient::connect(cfg).await {
                 Ok(client) => client,
                 Err(err) => {
+                    let rendered = err.to_string();
+                    // A missing slot can't heal by retrying — fail now
+                    // so a supervised restart re-bootstraps instead of
+                    // burning the whole backoff budget first.
+                    if is_missing_slot_message(&rendered) {
+                        let message = missing_slot_message(&self.config, &rendered);
+                        error!(source = %self.config.id, "{message}");
+                        ventstream_telemetry::record_error(message.clone());
+                        return Err(PostgresCdcError::Connection(message));
+                    }
                     consecutive_failures += 1;
-                    if is_credential_message(&err.to_string())
+                    if is_credential_message(&rendered)
                         && credential_budget.record_credential_failure()
                     {
                         let message = exhausted_message(&err);
                         error!(source = %self.config.id, error = %err, "{message}");
                         return Err(PostgresCdcError::Connection(message));
                     }
+                    let detail = match preflight::unreachable_hint(
+                        &self.config.host,
+                        self.config.port,
+                        &rendered,
+                    )
+                    .await
+                    {
+                        Some(hint) => format!("{rendered} ({hint})"),
+                        None => rendered,
+                    };
                     ventstream_telemetry::record_error(format!(
-                        "postgres replication connect failed: {err}"
+                        "postgres replication connect failed: {detail}"
                     ));
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                         return Err(PostgresCdcError::Connection(format!(
-                            "reconnect budget exhausted after {consecutive_failures} consecutive failures: {err}"
+                            "reconnect budget exhausted after {consecutive_failures} consecutive failures: {detail}"
                         )));
                     }
                     warn!(
                         attempt = consecutive_failures,
                         backoff_ms = backoff.as_millis() as u64,
-                        error = %err,
+                        error = %detail,
                         "postgres connect failed; retrying after backoff"
                     );
                     tokio::select! {
@@ -625,6 +656,18 @@ impl PostgresCdcSource {
                 // drive_replication returns Ok only on shutdown.
                 Ok(()) => return Ok(()),
                 // A connection-level drop is transient — reconnect.
+                // Exception: the replication worker reporting a missing
+                // slot (it connects first, then START_REPLICATION fails)
+                // — retrying can't recreate it, so fail now and let a
+                // supervised restart re-bootstrap.
+                Err(err @ PostgresCdcError::Connection(_))
+                    if is_missing_slot_message(&err.to_string()) =>
+                {
+                    let message = missing_slot_message(&self.config, &err.to_string());
+                    error!(source = %self.config.id, "{message}");
+                    ventstream_telemetry::record_error(message.clone());
+                    return Err(PostgresCdcError::Connection(message));
+                }
                 Err(err @ PostgresCdcError::Connection(_)) => {
                     // Healthy for a while → treat as a fresh transient
                     // event and reset the budget.
@@ -952,6 +995,34 @@ impl Source for PostgresCdcSource {
 /// as "authentication error: ..." with no SQLSTATE.
 pub fn is_credential_message(message: &str) -> bool {
     crate::credential::is_postgres_credential_text(message)
+}
+
+/// Missing replication slot at connect (server ERRCODE 42704, rendered
+/// as text by the replication client). Retrying cannot fix it.
+pub fn is_missing_slot_message(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("replication slot") && lowered.contains("does not exist")
+}
+
+/// Operator-facing message for a vanished slot. Managed providers
+/// (Supabase, RDS blue/green) drop logical slots on engine upgrades
+/// and project pauses, so name that cause and the way out.
+fn missing_slot_message(config: &PostgresCdcConfig, cause: &str) -> String {
+    let heal = if config.bootstrap.is_some() {
+        "restarting will re-bootstrap and recreate it".to_owned()
+    } else {
+        format!(
+            "recreate it (SELECT pg_create_logical_replication_slot('{}', 'pgoutput')) \
+             or configure bootstrap",
+            config.slot_name
+        )
+    };
+    format!(
+        "replication slot \"{}\" does not exist on the server: {cause}. If it existed \
+         before, the provider likely dropped it (managed Postgres drops logical slots \
+         on upgrades and pauses); {heal}",
+        config.slot_name
+    )
 }
 
 #[cfg(test)]
@@ -1363,6 +1434,32 @@ mod tests {
         assert!(!is_credential_message(
             "server error: canceling statement due to statement timeout (SQLSTATE 57014)"
         ));
+    }
+
+    #[test]
+    fn missing_slot_is_terminal_and_other_absences_are_not() {
+        assert!(is_missing_slot_message(
+            "server error: replication slot \"vs_orders\" does not exist (SQLSTATE 42704)"
+        ));
+        assert!(!is_missing_slot_message(
+            "server error: database \"orders\" does not exist (SQLSTATE 3D000)"
+        ));
+        assert!(!is_missing_slot_message(
+            "server error: replication slot \"vs_orders\" is active for PID 123"
+        ));
+    }
+
+    #[test]
+    fn missing_slot_message_names_the_heal_path() {
+        let mut config = PostgresCdcConfig::new("pg", "h", "u", "p", "db", "pub", "vs_orders");
+        let plain = missing_slot_message(&config, "cause");
+        assert!(plain.contains("pg_create_logical_replication_slot('vs_orders'"));
+        config.bootstrap = Some(crate::postgres::SnapshotBootstrap {
+            tables: Vec::new(),
+            chunk_size: 10_000,
+        });
+        let with_bootstrap = missing_slot_message(&config, "cause");
+        assert!(with_bootstrap.contains("re-bootstrap"));
     }
 
     #[test]

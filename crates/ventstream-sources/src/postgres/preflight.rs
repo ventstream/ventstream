@@ -1,0 +1,161 @@
+//! Startup diagnostics for the Postgres CDC source.
+//!
+//! Managed Postgres providers add failure modes that surface as opaque
+//! protocol errors deep into startup: connection poolers that don't
+//! speak the replication protocol, `wal_level` below `logical`, and
+//! publications that were never created. These checks run once, before
+//! the replication connect, and turn each into a precise error with
+//! the fix in the message.
+//!
+//! Definitive misconfigurations (pooler endpoint, wrong `wal_level`,
+//! missing publication) are fatal. A transient connect failure here is
+//! NOT — the replication path has its own retry budget, and preflight
+//! must not make startup more fragile than it was without it.
+
+use tracing::{info, warn};
+
+use super::config::PostgresCdcConfig;
+use super::connection::connect_client;
+use crate::error::PostgresCdcError;
+
+/// Reject connection-pooler endpoints before any connect attempt.
+///
+/// Poolers (pgbouncer, Supavisor) don't support the replication
+/// protocol; the resulting server errors are cryptic. Matches the
+/// Supabase pooler hostname and its transaction-mode port.
+pub fn check_endpoint(config: &PostgresCdcConfig) -> Result<(), PostgresCdcError> {
+    let host = config.host.to_ascii_lowercase();
+    let pooler_host = host.ends_with(".pooler.supabase.com");
+    if pooler_host || config.port == 6543 {
+        return Err(PostgresCdcError::Connection(format!(
+            "{}:{} is a connection-pooler endpoint; logical replication needs the direct \
+             connection (on Supabase: db.<project-ref>.supabase.co:5432, not the pooler)",
+            config.host, config.port
+        )));
+    }
+    Ok(())
+}
+
+/// Server-side checks over a regular (non-replication) connection.
+pub async fn run(config: &PostgresCdcConfig) -> Result<(), PostgresCdcError> {
+    let client = match connect_client(config, "preflight").await {
+        Ok(client) => client,
+        Err(err) => {
+            // Best-effort: let the replication connect's retry budget
+            // own transient failures.
+            warn!(error = %err, "postgres preflight skipped — could not connect");
+            return Ok(());
+        }
+    };
+
+    let wal_level: String = match client.query_one("SHOW wal_level", &[]).await {
+        Ok(row) => row.get(0),
+        Err(err) => {
+            warn!(error = %err, "postgres preflight skipped — SHOW wal_level failed");
+            return Ok(());
+        }
+    };
+    if wal_level != "logical" {
+        return Err(PostgresCdcError::Connection(format!(
+            "wal_level is '{wal_level}' but logical replication requires 'logical'; \
+             set wal_level=logical and restart the server"
+        )));
+    }
+
+    match client
+        .query_opt(
+            "SELECT 1 FROM pg_publication WHERE pubname = $1",
+            &[&config.publication],
+        )
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(PostgresCdcError::Connection(format!(
+                "publication \"{}\" does not exist; create it first: \
+                 CREATE PUBLICATION {} FOR TABLE <your tables>;",
+                config.publication, config.publication
+            )));
+        }
+        Err(err) => {
+            warn!(error = %err, "postgres preflight skipped — publication check failed");
+            return Ok(());
+        }
+    }
+
+    // REPLICATION is a role attribute, not inherited via membership, so
+    // current_user's own flags are what the walsender will check. Some
+    // setups still pass differently — warn, don't fail.
+    match client
+        .query_opt(
+            "SELECT rolreplication OR rolsuper FROM pg_roles WHERE rolname = current_user",
+            &[],
+        )
+        .await
+    {
+        Ok(Some(row)) if !row.get::<_, bool>(0) => {
+            warn!(
+                user = %config.user,
+                "connecting role lacks the REPLICATION attribute; replication connect will \
+                 likely be refused (ALTER ROLE {} REPLICATION;)",
+                config.user
+            );
+        }
+        Ok(_) => {}
+        Err(err) => warn!(error = %err, "postgres preflight — privilege check failed"),
+    }
+
+    info!(
+        publication = %config.publication,
+        "postgres preflight passed (wal_level=logical, publication present)"
+    );
+    Ok(())
+}
+
+/// Hint appended to connect errors when the host resolves to IPv6
+/// only and the network can't route it. Supabase direct hostnames are
+/// IPv6-only unless the project buys the IPv4 add-on.
+pub(crate) async fn unreachable_hint(host: &str, port: u16, error_text: &str) -> Option<String> {
+    let lowered = error_text.to_ascii_lowercase();
+    if !lowered.contains("unreachable") && !lowered.contains("no route") {
+        return None;
+    }
+    let addrs: Vec<_> = tokio::net::lookup_host((host, port)).await.ok()?.collect();
+    if !addrs.is_empty() && addrs.iter().all(|addr| addr.is_ipv6()) {
+        return Some(format!(
+            "{host} resolves only to IPv6 and this host has no IPv6 route; \
+             enable your provider's IPv4 add-on or run from an IPv6-capable network"
+        ));
+    }
+    None
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn config(host: &str, port: u16) -> PostgresCdcConfig {
+        let mut config = PostgresCdcConfig::new("pg", host, "u", "p", "db", "pub", "slot");
+        config.port = port;
+        config
+    }
+
+    #[test]
+    fn pooler_hostname_is_rejected() {
+        let err = check_endpoint(&config("aws-0-eu-west-1.pooler.supabase.com", 5432))
+            .expect_err("pooler host must be rejected");
+        assert!(err.to_string().contains("direct connection"));
+    }
+
+    #[test]
+    fn pooler_port_is_rejected() {
+        assert!(check_endpoint(&config("db.abc.supabase.co", 6543)).is_err());
+    }
+
+    #[test]
+    fn direct_endpoint_passes() {
+        assert!(check_endpoint(&config("db.abc.supabase.co", 5432)).is_ok());
+        assert!(check_endpoint(&config("127.0.0.1", 5432)).is_ok());
+    }
+}

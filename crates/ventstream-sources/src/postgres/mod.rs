@@ -27,6 +27,7 @@ pub mod connection;
 pub mod event_mapper;
 pub mod fetcher;
 pub mod pgoutput;
+pub mod preflight;
 pub mod schema;
 pub mod snapshot;
 pub mod source;

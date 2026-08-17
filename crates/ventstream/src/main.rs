@@ -2089,6 +2089,12 @@ fn pg_sql_denormalize_enabled(engine_config: Option<&EngineFileConfig>) -> bool 
 /// *before* the SQL-join bootstrap means WAL retains any change made
 /// during the bootstrap window for the tail to replay.
 async fn ensure_replication_slot(pg: &PostgresCdcConfig, slot: &str) -> Result<()> {
+    // Preflight first: this path runs before the source does, so a
+    // pooler endpoint or missing publication would otherwise surface
+    // here as an opaque connect / denormalizer error.
+    ventstream_sources::postgres::preflight::check_endpoint(pg)?;
+    ventstream_sources::postgres::preflight::run(pg).await?;
+
     // This connect authenticates with the same rotating credentials as the
     // tail; a credential rejection here is terminal for the iteration, so
     // classify it (SQLSTATE now visible via describe_db_error) instead of
