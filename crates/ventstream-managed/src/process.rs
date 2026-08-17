@@ -1,4 +1,4 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -653,7 +653,7 @@ fn write_private_file_and_replace(
 /// directories via `File::open` and journals renames in NTFS.
 #[cfg(unix)]
 fn sync_directory(parent: &Path) -> std::io::Result<()> {
-    File::open(parent).and_then(|directory| directory.sync_all())
+    fs::File::open(parent).and_then(|directory| directory.sync_all())
 }
 
 #[cfg(not(unix))]

@@ -1,6 +1,6 @@
 //! Loader for Fleet-staged non-secret engine configuration.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -228,7 +228,7 @@ fn write_private_file_and_replace(
 /// update, so this is a no-op there.
 #[cfg(unix)]
 fn sync_directory(parent: &Path) -> std::io::Result<()> {
-    File::open(parent)?.sync_all()
+    fs::File::open(parent)?.sync_all()
 }
 
 #[cfg(not(unix))]
