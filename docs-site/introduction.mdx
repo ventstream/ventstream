@@ -15,6 +15,12 @@ workloads in one binary:
   them to any number of subscribers (browsers, services) in real time
   over native WebSocket or GraphQL subscriptions.
 
+The capture workload doubles as a **zero-downtime migration tool**: the
+snapshot bootstrap moves existing data in bulk through the same code
+path that then tails live changes, so a store can be populated, kept in
+sync, and cut over without a maintenance window — see the
+[migration guide](/guides/zero-downtime-migration).
+
 Both pipelines are the same idea — turn a stream of changes into the
 exact shape a consumer needs. The difference is how you consume it: a
 **queryable derived view** you read from a store (capture), or a **live
@@ -46,6 +52,10 @@ or read model, the copy can drift from its source:
   store and rot the moment one path forgets to update it.
 - **Hand-rolled triggers** become an unmaintainable web of per-table
   glue as the projection grows.
+
+**Migrations demand windows.** Bulk-copy scripts race the writes that
+happen while they run, so moves get scheduled into maintenance windows —
+or worse, skipped.
 
 **Real-time delivery repeats infrastructure work.** Teams need connection
 lifecycle, subscription routing, reconnect, replay, and slow-consumer handling
@@ -126,6 +136,9 @@ See [Architecture](/concepts/architecture) for the full picture.
   </Card>
   <Card title="Concepts" icon="book" href="/concepts/cdc-and-projections">
     How capture, projections, and fan-out work.
+  </Card>
+  <Card title="Zero-downtime migration" icon="truck-fast" href="/guides/zero-downtime-migration">
+    Bootstrap existing data, tail changes, and cut over without a window.
   </Card>
   <Card title="Deploy" icon="server" href="/deploy/local">
     Run locally with Docker Compose, or ship the stack to Kubernetes.
