@@ -384,11 +384,15 @@ jobs:
           sh -n install.sh
           ./infra/release/test-installer.sh
       - name: Parse Windows installer
+        shell: pwsh
         run: |
-          pwsh -NoProfile -Command \
-            '$tokens = $errors = $null; \
-             [System.Management.Automation.Language.Parser]::ParseFile("install.ps1", [ref]$tokens, [ref]$errors) | Out-Null; \
-             if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }'
+          $tokens = $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path "install.ps1").Path, [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
       - name: Prepare installer release assets
         run: |
           mkdir -p dist
