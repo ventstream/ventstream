@@ -1,5 +1,8 @@
 //! Kafka/Redpanda CDC integration test: raw events, durable consumer-group
 //! offsets, engine restart, and a real OpenSearch sink.
+//!
+//! The Kafka source is Unix-only (librdkafka).
+#![cfg(not(windows))]
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
