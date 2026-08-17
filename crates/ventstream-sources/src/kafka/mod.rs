@@ -7,8 +7,13 @@
 //! raw 1:1 (one message -> one sink doc), JSON values only.
 
 mod config;
+// The message-unwrap internals are only consumed by the real source,
+// which is Unix-only; gating them avoids dead-code denials on Windows.
+#[cfg(not(windows))]
 mod envelope;
+#[cfg(not(windows))]
 mod event_mapper;
+#[cfg(not(windows))]
 mod offset;
 #[cfg(not(windows))]
 mod source;
