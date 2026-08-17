@@ -1,0 +1,40 @@
+/* Slim, quiet scrollbars — most visible on the sidebar navigation. */
+
+#sidebar,
+#sidebar-content,
+#navigation-items {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(127, 148, 138, 0.28) transparent;
+}
+
+#sidebar::-webkit-scrollbar,
+#sidebar-content::-webkit-scrollbar,
+#navigation-items::-webkit-scrollbar {
+  width: 5px;
+}
+
+#sidebar::-webkit-scrollbar-track,
+#sidebar-content::-webkit-scrollbar-track,
+#navigation-items::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+#sidebar::-webkit-scrollbar-thumb,
+#sidebar-content::-webkit-scrollbar-thumb,
+#navigation-items::-webkit-scrollbar-thumb {
+  background: rgba(127, 148, 138, 0.28);
+  border-radius: 999px;
+}
+
+#sidebar::-webkit-scrollbar-thumb:hover,
+#sidebar-content::-webkit-scrollbar-thumb:hover,
+#navigation-items::-webkit-scrollbar-thumb:hover {
+  background: rgba(127, 148, 138, 0.5);
+}
+
+/* Page-level scrollbar: keep native size for accessibility, but soften
+   the thumb so it recedes on the dark theme. */
+body::-webkit-scrollbar-thumb {
+  background: rgba(127, 148, 138, 0.3);
+  border-radius: 999px;
+}
