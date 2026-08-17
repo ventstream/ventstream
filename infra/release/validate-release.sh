@@ -31,7 +31,7 @@ if [ "$tag" != "v$version" ]; then
   exit 1
 fi
 
-for chart in infra/helm/ventstream-agent infra/helm/ventstream-gateway; do
+for chart in infra/helm/ventstream-gateway; do
   chart_version=$(awk '$1 == "version:" { gsub(/"/, "", $2); print $2; exit }' "$chart/Chart.yaml")
   app_version=$(awk '$1 == "appVersion:" { gsub(/"/, "", $2); print $2; exit }' "$chart/Chart.yaml")
   if [ "$chart_version" != "$version" ] || [ "$app_version" != "$version" ]; then

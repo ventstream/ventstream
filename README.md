@@ -267,7 +267,7 @@ sizing math.
 | Native binary | `install.sh`, systemd or anything else — [guide](docs-site/deploy/native-binary.mdx) |
 | Docker / Compose | `ghcr.io/ventstream/ventstream:<version>` |
 | Kubernetes, standalone | manifests in the [standalone guide](docs-site/deploy/kubernetes-standalone.mdx) |
-| Kubernetes, managed | `oci://ghcr.io/ventstream/charts/ventstream-managed-agent` with an agent-key Secret — [guide](docs-site/deploy/kubernetes-managed-engine.mdx) |
+| Kubernetes, managed | `oci://ghcr.io/ventstream/charts/ventstream-engine` with an agent-key Secret — [guide](docs-site/deploy/kubernetes-managed-engine.mdx) |
 | Realtime gateway | `oci://ghcr.io/ventstream/charts/ventstream-gateway` |
 
 Tagged releases publish multi-architecture images; production values should

@@ -137,7 +137,7 @@ attaches it to VentStream Cloud. Install the chart with the key Secret:
 
 ```bash
 helm upgrade --install orders-primary \
-  oci://ghcr.io/ventstream/charts/ventstream-managed-agent \
+  oci://ghcr.io/ventstream/charts/ventstream-engine \
   --namespace ventstream-workloads \
   --create-namespace \
   --set image.repository=ghcr.io/ventstream/ventstream \
@@ -230,7 +230,7 @@ kubectl -n ventstream-workloads create secret generic orders-agent-key \
   --from-file=key=/dev/stdin
 
 helm upgrade orders-primary \
-  oci://ghcr.io/ventstream/charts/ventstream-managed-agent \
+  oci://ghcr.io/ventstream/charts/ventstream-engine \
   --namespace ventstream-workloads \
   --reuse-values \
   --set image.repository=ghcr.io/ventstream/ventstream \
