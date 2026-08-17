@@ -1,4 +1,5 @@
-/* Sidebar scrollbar: near-invisible until needed, hairline when shown. */
+/* Scrollbars: hidden at rest; a 2px hairline with a faint track outline
+   appears while scrolling (see scrollbar.js) or while hovering the rail. */
 
 #sidebar,
 #sidebar-content,
@@ -7,26 +8,25 @@
   scrollbar-color: transparent transparent;
 }
 
-#sidebar:hover,
-#sidebar-content:hover,
-#navigation-items:hover {
-  scrollbar-color: rgba(127, 148, 138, 0.25) transparent;
+#sidebar.is-scrolling,
+#sidebar-content.is-scrolling,
+#navigation-items.is-scrolling {
+  scrollbar-color: rgba(127, 148, 138, 0.35) rgba(127, 148, 138, 0.08);
 }
 
 #sidebar::-webkit-scrollbar,
 #sidebar-content::-webkit-scrollbar,
 #navigation-items::-webkit-scrollbar {
-  width: 3px;
+  width: 2px;
 }
 
 #sidebar::-webkit-scrollbar-track,
 #sidebar-content::-webkit-scrollbar-track,
 #navigation-items::-webkit-scrollbar-track {
   background: transparent;
+  border-radius: 999px;
 }
 
-/* Invisible at rest; a hairline pill appears only while the pointer is
-   over the navigation, and warms slightly under the cursor. */
 #sidebar::-webkit-scrollbar-thumb,
 #sidebar-content::-webkit-scrollbar-thumb,
 #navigation-items::-webkit-scrollbar-thumb {
@@ -34,6 +34,20 @@
   border-radius: 999px;
 }
 
+/* Visible while scrolling: thumb plus a whisper of track outline. */
+#sidebar.is-scrolling::-webkit-scrollbar-track,
+#sidebar-content.is-scrolling::-webkit-scrollbar-track,
+#navigation-items.is-scrolling::-webkit-scrollbar-track {
+  background: rgba(127, 148, 138, 0.08);
+}
+
+#sidebar.is-scrolling::-webkit-scrollbar-thumb,
+#sidebar-content.is-scrolling::-webkit-scrollbar-thumb,
+#navigation-items.is-scrolling::-webkit-scrollbar-thumb {
+  background: rgba(127, 148, 138, 0.38);
+}
+
+/* Hover keeps it discoverable without scrolling. */
 #sidebar:hover::-webkit-scrollbar-thumb,
 #sidebar-content:hover::-webkit-scrollbar-thumb,
 #navigation-items:hover::-webkit-scrollbar-thumb {
