@@ -309,7 +309,11 @@ fn build_document(event: &Event, doc_id: &str, lookup_paths: &[&str]) -> Result<
     );
     for path in lookup_paths {
         let mut values = Vec::new();
-        collect_path_strings(&Value::Object(map.clone()), path, &mut values);
+        let mut segments = path.split('.');
+        if let Some(root) = segments.next().and_then(|head| map.get(head)) {
+            let rest: Vec<&str> = segments.collect();
+            collect_path_strings(root, &rest, &mut values);
+        }
         map.insert(
             super::config::lookup_field_name(path),
             Value::Array(values.into_iter().map(Value::String).collect()),
@@ -318,37 +322,33 @@ fn build_document(event: &Event, doc_id: &str, lookup_paths: &[&str]) -> Result<
     Ok(Value::Object(map))
 }
 
-/// Collect the string-canonical forms of every scalar reachable at a
-/// dotted `path`, descending through arrays — the write-side twin of
-/// the read predicate's flatten/map, so stored values compare equal to
-/// the WAL's canonical text forms.
-fn collect_path_strings(value: &Value, path: &str, out: &mut Vec<String>) {
-    fn descend(value: &Value, segments: &[&str], out: &mut Vec<String>) {
-        match value {
-            Value::Array(items) => {
-                for item in items {
-                    descend(item, segments, out);
-                }
+/// Collect the string-canonical forms of every scalar reachable via
+/// the remaining path `segments`, descending through arrays — the
+/// write-side twin of the read predicate's flatten/map, so stored
+/// values compare equal to the WAL's canonical text forms. Borrows the
+/// tree; no document copies.
+fn collect_path_strings(value: &Value, segments: &[&str], out: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_path_strings(item, segments, out);
             }
-            Value::Object(map) => {
-                if let Some((head, rest)) = segments.split_first() {
-                    if let Some(next) = map.get(*head) {
-                        descend(next, rest, out);
-                    }
-                }
-            }
-            other if segments.is_empty() => match other {
-                Value::String(text) => out.push(text.clone()),
-                Value::Number(number) => out.push(number.to_string()),
-                Value::Bool(flag) => out.push(flag.to_string()),
-                Value::Null => {}
-                _ => {}
-            },
-            _ => {}
         }
+        Value::Object(map) => {
+            if let Some((head, rest)) = segments.split_first() {
+                if let Some(next) = map.get(*head) {
+                    collect_path_strings(next, rest, out);
+                }
+            }
+        }
+        other if segments.is_empty() => match other {
+            Value::String(text) => out.push(text.clone()),
+            Value::Number(number) => out.push(number.to_string()),
+            Value::Bool(flag) => out.push(flag.to_string()),
+            _ => {}
+        },
+        _ => {}
     }
-    let segments: Vec<&str> = path.split('.').collect();
-    descend(value, &segments, out);
 }
 
 #[cfg(test)]
