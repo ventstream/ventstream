@@ -1,3 +1,9 @@
 # Release vulnerability exceptions must be package-scoped, owner-approved, and
 # time-bounded. Keep the list empty unless an upstream fix is unavailable.
-vulnerabilities: []
+vulnerabilities:
+  - id: CVE-2026-14456
+    statement: >-
+      libssl3 ships in the Debian base but the engine is rustls-only and
+      links no OpenSSL; the vulnerable QUIC server path is not present.
+      No fixed Debian package available yet. Owner-approved 2026-08-19.
+    expired_at: 2026-09-15
