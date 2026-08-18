@@ -21,9 +21,10 @@ Before configuring the pipeline, make sure all four are in place:
    are certain your environment has working IPv6 egress.
 2. **The direct connection string** — `db.<project-ref>.supabase.co:5432`,
    not the pooler (details below).
-3. **The project CA certificate** — downloaded from the database settings
-   page, for TLS verification (details below).
-4. **A publication** listing the tables you want to stream (details below).
+3. **A publication** listing the tables you want to stream (details below).
+
+TLS needs nothing from you: Supabase's root CA ships with the engine and is
+applied automatically for `*.supabase.co` hosts (details below).
 
 ## Use the direct connection, not the pooler
 
@@ -78,13 +79,15 @@ source:
       mode: snapshot
     tls:
       mode: verify_full
-      ca_file: /etc/ventstream/supabase-ca.crt
 ```
 
 Supabase signs its database certificates with its own CA ("Supabase Root
-2021 CA") — it is not in system trust stores, so `verify_full` needs the
-project CA certificate: download it from the database settings page and
-point `tls.ca_file` at it.
+2021 CA"), which no system trust store carries. The engine packages that
+root (SHA-256 pinned, valid through April 2031) and applies it
+automatically for `*.supabase.co` hosts, so `verify_full` works with no
+certificate download. To be explicit — or for a custom domain in front of
+Supabase — set `tls.trust.provider: supabase`, or point `tls.ca_file` at
+your own downloaded copy; an operator-supplied `ca_file` always wins.
 
 From here, everything in the [Postgres source](/connectors/sources/postgres)
 guide applies unchanged — flat sync, joins specs, replica identity choices,
