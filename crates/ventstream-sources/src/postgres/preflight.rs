@@ -112,20 +112,48 @@ pub async fn run(config: &PostgresCdcConfig) -> Result<(), PostgresCdcError> {
     Ok(())
 }
 
-/// Hint appended to connect errors when the host resolves to IPv6
-/// only and the network can't route it. Supabase direct hostnames are
-/// IPv6-only unless the project buys the IPv4 add-on.
-pub(crate) async fn unreachable_hint(host: &str, port: u16, error_text: &str) -> Option<String> {
+/// Hint appended to connect errors when the target resolves to IPv6
+/// only. Supabase direct hostnames are IPv6-only unless the project
+/// buys the IPv4 add-on; on an IPv4-only network the failure renders
+/// differently per OS ("Network is unreachable" on Linux, a bare
+/// "error connecting to server" on macOS), so match connect failures
+/// broadly and let the AAAA-only resolution be the discriminator.
+pub async fn unreachable_hint(host: &str, port: u16, error_text: &str) -> Option<String> {
     let lowered = error_text.to_ascii_lowercase();
-    if !lowered.contains("unreachable") && !lowered.contains("no route") {
+    let connectish = [
+        "unreachable",
+        "no route",
+        "error connecting",
+        "timed out",
+        "timeout",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle));
+    if !connectish {
         return None;
     }
-    let addrs: Vec<_> = tokio::net::lookup_host((host, port)).await.ok()?.collect();
-    if !addrs.is_empty() && addrs.iter().all(|addr| addr.is_ipv6()) {
-        return Some(format!(
-            "{host} resolves only to IPv6 and this host has no IPv6 route; \
-             enable your provider's IPv4 add-on or run from an IPv6-capable network"
-        ));
+    match tokio::net::lookup_host((host, port)).await {
+        Ok(addrs) => {
+            let addrs: Vec<_> = addrs.collect();
+            if !addrs.is_empty() && addrs.iter().all(|addr| addr.is_ipv6()) {
+                return Some(format!(
+                    "{host} resolves only to IPv6 and this network may not route it; \
+                     enable your provider's IPv4 add-on or run from an IPv6-capable network"
+                ));
+            }
+        }
+        // macOS suppresses AAAA answers entirely on hosts without an
+        // IPv6 route, so a v6-only hostname looks like a DNS failure.
+        // Only Supabase direct hosts are known v6-only — anything else
+        // failing resolution is more likely a typo.
+        Err(_) if host.ends_with(".supabase.co") => {
+            return Some(format!(
+                "{host} did not resolve on this machine; Supabase direct hostnames are \
+                 IPv6-only, and hosts without an IPv6 route may return no address at all — \
+                 enable the project's IPv4 add-on or run from an IPv6-capable network"
+            ));
+        }
+        Err(_) => {}
     }
     None
 }
