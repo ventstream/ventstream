@@ -39,7 +39,7 @@ joins:
       index: orders
 "#;
 
-fn engine_yaml(pg_port: u16, surreal_port: u16, state_dir: &str) -> String {
+fn engine_yaml(pg_port: u16, state_dir: &str) -> String {
     format!(
         r#"
 schema_version: 1
@@ -136,11 +136,7 @@ async fn composed_docs_reach_surrealdb_and_stay_consistent() {
     std::fs::create_dir_all(&state_dir).expect("state dir");
     std::fs::write(format!("{state_dir}/joins.yaml"), JOINS).expect("joins");
     let config_path = format!("{state_dir}/engine.yaml");
-    std::fs::write(
-        &config_path,
-        engine_yaml(stack.pg_port, stack.surreal_port, &state_dir),
-    )
-    .expect("engine yaml");
+    std::fs::write(&config_path, engine_yaml(stack.pg_port, &state_dir)).expect("engine yaml");
 
     let env = [
         ("VS_PG_HOST", "127.0.0.1".to_owned()),
