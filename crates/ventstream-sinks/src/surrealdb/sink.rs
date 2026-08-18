@@ -364,8 +364,8 @@ impl SurrealDbSink {
             method: &'static str,
             params: (&'static str, Vars<'a>),
         }
-        let (sql, pairs, rids): (&'static str, Option<&[Value]>, Option<&[Value]>) = match &run.kind
-        {
+        type RunParts<'a> = (&'static str, Option<&'a [Value]>, Option<&'a [Value]>);
+        let (sql, pairs, rids): RunParts<'_> = match &run.kind {
             RunKind::Upsert(pairs) => (
                 "FOR $pair IN $pairs { UPSERT type::record($tb, $pair.rid) CONTENT $pair.doc; };",
                 Some(pairs),
