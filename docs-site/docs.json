@@ -58,7 +58,6 @@
                 "icon": "database",
                 "pages": [
                   "connectors/sources/postgres",
-                  "connectors/sources/supabase",
                   "connectors/sources/mysql",
                   "connectors/sources/mongodb",
                   "connectors/sources/neo4j",
