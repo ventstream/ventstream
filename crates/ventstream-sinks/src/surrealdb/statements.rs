@@ -24,8 +24,14 @@ pub(crate) const SOURCE_ID_FIELD: &str = "source_id";
 ///
 /// Canonical doc ids are `table:["pk",…]`; the JSON key array maps onto
 /// SurrealDB's native array record ids, so composite keys round-trip
-/// without encoding. Ids that don't parse (opaque upstream identifiers)
-/// fall back to the whole string.
+/// without encoding. Opaque suffixes (Neo4j elementIds, denormalize
+/// ids) become single-element arrays.
+///
+/// The component is ALWAYS an array, never a bare string: inside a
+/// query's param path, `type::record` coerces strings by PARSING them
+/// as record-id literals — `"products:4:uuid:7"` collapses to id `4`,
+/// silently merging every document whose id shares that prefix. Array
+/// components are taken verbatim.
 pub(crate) fn record_id_component(doc_id: &str) -> Value {
     if let Some((_, keys)) = doc_id.split_once(':') {
         if let Ok(parsed) = serde_json::from_str::<Value>(keys) {
@@ -33,8 +39,9 @@ pub(crate) fn record_id_component(doc_id: &str) -> Value {
                 return parsed;
             }
         }
+        return serde_json::json!([keys]);
     }
-    Value::String(doc_id.to_owned())
+    serde_json::json!([doc_id])
 }
 
 /// One ordered RPC call: consecutive same-table, same-operation events.
@@ -282,11 +289,17 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_ids_fall_back_to_the_whole_string() {
+    fn opaque_ids_become_single_element_arrays_never_strings() {
+        // Neo4j-style: table prefix + elementId suffix keeps the suffix.
         assert_eq!(
-            record_id_component("4:e0b0-af..:17"),
-            Value::String("4:e0b0-af..:17".into())
+            record_id_component("products:4:e0b0-af..:17"),
+            serde_json::json!(["4:e0b0-af..:17"])
         );
-        assert_eq!(record_id_component("plain"), Value::String("plain".into()));
+        // No separator: the whole id is the single element.
+        assert_eq!(record_id_component("plain"), serde_json::json!(["plain"]));
+        // Bare strings are forbidden — param-path type::record would
+        // parse them as record literals and merge documents.
+        assert!(!record_id_component("products:4").is_string());
+        assert_eq!(record_id_component("products:4"), serde_json::json!(["4"]));
     }
 }
