@@ -1111,6 +1111,10 @@ pub struct SurrealDbSinkConfig {
     pub username_ref: ValueRef,
     /// Basic-auth password reference.
     pub password_ref: ValueRef,
+    /// Opt-in: create the namespace/database at startup (needs root or
+    /// namespace credentials). Default false.
+    #[serde(default)]
+    pub auto_create_database: Option<bool>,
     /// Per-event table routing policy.
     #[serde(default)]
     pub table_routing: SurrealTableRoutingConfig,

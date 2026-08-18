@@ -18,6 +18,10 @@ pub struct SurrealReverseLookup {
     config: SurrealDbConfig,
     client: reqwest::Client,
     rpc_url: String,
+    signin_url: String,
+    /// Bearer token from `/signin` (scoped users can't use basic auth);
+    /// refreshed once on expiry, mirroring the writer.
+    token: tokio::sync::RwLock<Option<String>>,
 }
 
 impl SurrealReverseLookup {
@@ -28,11 +32,15 @@ impl SurrealReverseLookup {
             config.verify_tls,
             config.ca_file.as_deref(),
         )?;
-        let rpc_url = format!("{}/rpc", config.endpoint.trim_end_matches('/'));
+        let base = config.endpoint.trim_end_matches('/');
+        let rpc_url = format!("{base}/rpc");
+        let signin_url = format!("{base}/signin");
         Ok(Self {
             config,
             client,
             rpc_url,
+            signin_url,
+            token: tokio::sync::RwLock::new(None),
         })
     }
 
@@ -100,21 +108,77 @@ impl SurrealReverseLookup {
             .await
     }
 
+    async fn signin(&self) -> Result<String, String> {
+        let attempts = [
+            json!({"user": self.config.username, "pass": self.config.password,
+                   "ns": self.config.namespace, "db": self.config.database}),
+            json!({"user": self.config.username, "pass": self.config.password,
+                   "ns": self.config.namespace}),
+            json!({"user": self.config.username, "pass": self.config.password}),
+        ];
+        let mut last = "no signin attempt ran".to_owned();
+        for body in attempts {
+            let response = self
+                .client
+                .post(&self.signin_url)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|err| format!("surrealdb reverse lookup signin: {err}"))?;
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            if status.is_success() {
+                let parsed: Value = serde_json::from_str(&text)
+                    .map_err(|err| format!("surrealdb signin malformed response: {err}"))?;
+                let token = parsed
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .ok_or("surrealdb signin response has no token")?
+                    .to_owned();
+                *self.token.write().await = Some(token.clone());
+                return Ok(token);
+            }
+            last = format!("surrealdb reverse lookup signin HTTP {}", status.as_u16());
+            if status.as_u16() != 401 && status.as_u16() != 403 {
+                return Err(last);
+            }
+        }
+        Err(last)
+    }
+
+    async fn bearer(&self) -> Result<String, String> {
+        if let Some(token) = self.token.read().await.clone() {
+            return Ok(token);
+        }
+        self.signin().await
+    }
+
     async fn collect_ids(&self, sql: &str, vars: Value) -> Result<Vec<String>, String> {
         let body = json!({"method": "query", "params": [sql, vars]});
-        let response = self
-            .client
-            .post(&self.rpc_url)
-            .basic_auth(&self.config.username, Some(&self.config.password))
-            .header("Surreal-NS", &self.config.namespace)
-            .header("Surreal-DB", &self.config.database)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|err| format!("surrealdb reverse lookup transport: {err}"))?;
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let mut refreshed = false;
+        let (status, text) = loop {
+            let token = self.bearer().await?;
+            let response = self
+                .client
+                .post(&self.rpc_url)
+                .bearer_auth(&token)
+                .header("Surreal-NS", &self.config.namespace)
+                .header("Surreal-DB", &self.config.database)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|err| format!("surrealdb reverse lookup transport: {err}"))?;
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            if status.as_u16() == 401 && !refreshed {
+                refreshed = true;
+                self.token.write().await.take();
+                continue;
+            }
+            break (status, text);
+        };
         if !status.is_success() {
             return Err(format!(
                 "surrealdb reverse lookup HTTP {}: {}",

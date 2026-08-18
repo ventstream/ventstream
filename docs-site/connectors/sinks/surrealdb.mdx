@@ -25,9 +25,32 @@ sink:
 ```
 
 Each output relation becomes a table (`table_prefix` prepends to every
-name; `table_routing.mode: fixed` pins one table). The namespace and
-database are created automatically at startup when the credentials allow
-it; set `auto_create_database: false` to require pre-provisioned scopes.
+name; `table_routing.mode: fixed` pins one table).
+
+## Provision the target (one-time)
+
+VentStream never needs root. Create the namespace, database, and a
+database-scoped user once — in Surrealist or any client with admin
+authority:
+
+```sql
+DEFINE NAMESPACE IF NOT EXISTS production;
+USE NS production;
+DEFINE DATABASE IF NOT EXISTS app;
+USE DB app;
+DEFINE USER ventstream ON DATABASE PASSWORD '<generate one>' ROLES OWNER;
+```
+
+Those are the credentials the sink runs with: enough to write records
+and define table-level indexes, nothing more. Scoped users authenticate
+via `/signin`; the sink handles token refresh automatically. If the
+database is missing at startup, the sink fails with exactly this DDL in
+the error message.
+
+For local development against a throwaway instance, `auto_create_database:
+true` lets the sink create the namespace/database itself — that path
+needs root- or namespace-level credentials, so keep it out of production
+configs.
 
 ## Record identity
 

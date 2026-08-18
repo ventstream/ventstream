@@ -29,9 +29,11 @@ pub struct SurrealDbConfig {
     /// Basic-auth password.
     pub password: String,
 
-    /// Ensure the namespace and database exist at startup with
-    /// `DEFINE … IF NOT EXISTS` (requires root or namespace-level
-    /// credentials). When false, both must already exist.
+    /// Opt-in: ensure the namespace and database exist at startup with
+    /// `DEFINE … IF NOT EXISTS`. Requires root- or namespace-level
+    /// credentials, so it is OFF by default — production deployments
+    /// provision the scopes once and run the sink with a
+    /// database-scoped user.
     pub auto_create_database: bool,
 
     /// Per-event table routing.
@@ -84,7 +86,7 @@ impl SurrealDbConfig {
             database: database.into(),
             username: username.into(),
             password: password.into(),
-            auto_create_database: true,
+            auto_create_database: false,
             table_routing: SurrealTableRouting::ByOutputRelation,
             table_prefix: String::new(),
             batching: SurrealBatchConfig::default(),

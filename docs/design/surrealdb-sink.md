@@ -58,11 +58,22 @@ Declared `vector_indexes` are ensured at startup with idempotent
 arrays flow through documents as ordinary JSON; declaring the index makes
 them KNN-searchable (`embedding <|K,EF|> $vec`).
 
+## Auth
+
+Every request carries a bearer token from `/signin`, tried at database →
+namespace → root scope (narrowest wins). Basic auth is deliberately not
+used: Surreal Cloud rejects it for non-root users, and tokens expire
+(1h default) — one transparent re-signin retries a 401. The production
+posture is a database-scoped user (`DEFINE USER … ON DATABASE … ROLES
+OWNER`); root is never required.
+
 ## Startup
 
-`auto_create_database` (default on) ensures namespace + database with
-root-scoped `DEFINE … IF NOT EXISTS` — SurrealDB 3.x does not auto-create
-them. The probe then proves reachability/auth/scoping with `RETURN 1`.
+`auto_create_database` (default OFF) optionally ensures namespace +
+database with `DEFINE … IF NOT EXISTS` for dev instances — SurrealDB 3.x
+does not auto-create them, and creating them needs elevated credentials,
+so production provisions once and runs scoped. A missing scope fails the
+probe with the exact provisioning DDL in the message.
 
 ## Version pin
 

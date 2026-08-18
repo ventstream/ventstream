@@ -71,6 +71,7 @@ sink:
     database: app
     username_ref: env:VS_SURREAL_USERNAME
     password_ref: env:VS_SURREAL_PASSWORD
+    auto_create_database: true
     vector_indexes:
       - table: orders
         field: embedding

@@ -3964,6 +3964,9 @@ fn load_surrealdb_config(engine_config: Option<&EngineFileConfig>) -> Result<Sur
         username,
         password,
     );
+    if let Some(auto_create) = surreal.auto_create_database {
+        config.auto_create_database = auto_create;
+    }
     config.table_routing = match &surreal.table_routing {
         FileSurrealTableRouting::ByOutputRelation => SurrealTableRouting::ByOutputRelation,
         FileSurrealTableRouting::ByProjectionTarget => SurrealTableRouting::ByProjectionTarget,

@@ -25,6 +25,12 @@ pub struct SurrealDbSink {
     config: SurrealDbConfig,
     client: reqwest::Client,
     rpc_url: String,
+    signin_url: String,
+    /// Bearer token from `/signin`. Database- and namespace-scoped users
+    /// cannot use HTTP basic auth (Surreal Cloud returns 401); every
+    /// request authenticates with a signed-in token, refreshed once on
+    /// expiry. Root users sign in the same way, so one path serves all.
+    token: tokio::sync::RwLock<Option<String>>,
     delivery_health: SinkHealth,
 }
 
@@ -51,12 +57,16 @@ impl SurrealDbSink {
             config.ca_file.as_deref(),
         )
         .map_err(SurrealSinkError::Internal)?;
-        let rpc_url = format!("{}/rpc", config.endpoint.trim_end_matches('/'));
+        let base = config.endpoint.trim_end_matches('/');
+        let rpc_url = format!("{base}/rpc");
+        let signin_url = format!("{base}/signin");
         let delivery_health = config.delivery_health.clone().unwrap_or_default();
         Ok(Self {
             config,
             client,
             rpc_url,
+            signin_url,
+            token: tokio::sync::RwLock::new(None),
             delivery_health,
         })
     }
@@ -97,9 +107,11 @@ impl SurrealDbSink {
         }
     }
 
-    /// Startup probe: ensure the namespace/database when configured,
-    /// prove reachability/auth/scoping with one trivial query, then
-    /// ensure declared vector indexes with idempotent DDL.
+    /// Startup probe: prove reachability/auth/scoping with one trivial
+    /// query (optionally ensuring the namespace/database first when the
+    /// operator opted in), then ensure declared vector indexes with
+    /// idempotent DDL. A missing scope without the opt-in fails with
+    /// the exact DDL to run.
     async fn probe(&self) -> Result<(), SurrealSinkError> {
         if self.config.auto_create_database {
             if !is_safe_identifier(&self.config.namespace)
@@ -119,7 +131,22 @@ impl SurrealDbSink {
             );
             self.query_with_scope(&ddl, json!({}), false).await?;
         }
-        self.query("RETURN 1;", json!({})).await?;
+        if let Err(err) = self.query("RETURN 1;", json!({})).await {
+            let text = err.to_string().to_ascii_lowercase();
+            if text.contains("does not exist")
+                && (text.contains("namespace") || text.contains("database"))
+            {
+                return Err(SurrealSinkError::QueryBlocked(format!(
+                    "namespace `{ns}` / database `{db}` is not provisioned: {err}. Create \
+                     them once (DEFINE NAMESPACE IF NOT EXISTS ⟨{ns}⟩; USE NS ⟨{ns}⟩; DEFINE \
+                     DATABASE IF NOT EXISTS ⟨{db}⟩;) and grant the sink a database-scoped \
+                     user, or set auto_create_database: true with namespace-level credentials",
+                    ns = self.config.namespace,
+                    db = self.config.database
+                )));
+            }
+            return Err(err);
+        }
         for index in &self.config.vector_indexes {
             // Identifiers pass the safe-charset gate in `new`; ⟨⟩
             // escaping covers the dots routed table names contain.
@@ -155,6 +182,56 @@ impl SurrealDbSink {
         self.query_with_scope(sql, vars, true).await
     }
 
+    /// Sign in and cache the bearer token, trying database-, then
+    /// namespace-, then root-level credentials — the narrowest scope
+    /// the user's authority satisfies wins.
+    async fn signin(&self) -> Result<String, SurrealSinkError> {
+        let attempts = [
+            json!({"user": self.config.username, "pass": self.config.password,
+                   "ns": self.config.namespace, "db": self.config.database}),
+            json!({"user": self.config.username, "pass": self.config.password,
+                   "ns": self.config.namespace}),
+            json!({"user": self.config.username, "pass": self.config.password}),
+        ];
+        let mut last = SurrealSinkError::Internal("no signin attempt ran".into());
+        for body in attempts {
+            let response = self
+                .client
+                .post(&self.signin_url)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|err| SurrealSinkError::Transport(err.to_string()))?;
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            if status.is_success() {
+                let parsed: Value = serde_json::from_str(&text)
+                    .map_err(|err| SurrealSinkError::MalformedResponse(err.to_string()))?;
+                if let Some(token) = parsed.get("token").and_then(Value::as_str) {
+                    let mut guard = self.token.write().await;
+                    *guard = Some(token.to_owned());
+                    return Ok(token.to_owned());
+                }
+                return Err(SurrealSinkError::MalformedResponse(
+                    "signin response has no token".into(),
+                ));
+            }
+            last = classify_status(status, &text);
+            if !matches!(last, SurrealSinkError::Auth { .. }) {
+                return Err(last);
+            }
+        }
+        Err(last)
+    }
+
+    async fn bearer(&self) -> Result<String, SurrealSinkError> {
+        if let Some(token) = self.token.read().await.clone() {
+            return Ok(token);
+        }
+        self.signin().await
+    }
+
     async fn query_with_scope(
         &self,
         sql: &str,
@@ -165,23 +242,34 @@ impl SurrealDbSink {
             "method": "query",
             "params": [sql, vars],
         });
-        let mut request = self
-            .client
-            .post(&self.rpc_url)
-            .basic_auth(&self.config.username, Some(&self.config.password))
-            .header(reqwest::header::ACCEPT, "application/json");
-        if scoped {
-            request = request
-                .header("Surreal-NS", &self.config.namespace)
-                .header("Surreal-DB", &self.config.database);
-        }
-        let response = request
-            .json(&body)
-            .send()
-            .await
-            .map_err(|err| SurrealSinkError::Transport(err.to_string()))?;
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let mut refreshed = false;
+        let (status, text) = loop {
+            let token = self.bearer().await?;
+            let mut request = self
+                .client
+                .post(&self.rpc_url)
+                .bearer_auth(&token)
+                .header(reqwest::header::ACCEPT, "application/json");
+            if scoped {
+                request = request
+                    .header("Surreal-NS", &self.config.namespace)
+                    .header("Surreal-DB", &self.config.database);
+            }
+            let response = request
+                .json(&body)
+                .send()
+                .await
+                .map_err(|err| SurrealSinkError::Transport(err.to_string()))?;
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            // Tokens expire (1h default): one transparent re-signin.
+            if status == StatusCode::UNAUTHORIZED && !refreshed {
+                refreshed = true;
+                self.token.write().await.take();
+                continue;
+            }
+            break (status, text);
+        };
         if !status.is_success() {
             return Err(classify_status(status, &text));
         }
@@ -474,6 +562,27 @@ mod tests {
         SurrealDbSink::new(config).expect("sink")
     }
 
+    async fn rpc_requests(server: &MockServer) -> Vec<Request> {
+        server
+            .received_requests()
+            .await
+            .expect("requests")
+            .into_iter()
+            .filter(|request| request.url.path() == "/rpc")
+            .collect()
+    }
+
+    async fn mount_signin(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/signin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"code": 200, "token": "test-token"})),
+            )
+            .mount(server)
+            .await;
+    }
+
     fn ok_response() -> ResponseTemplate {
         ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": 1,
@@ -491,6 +600,7 @@ mod tests {
     #[tokio::test]
     async fn upsert_batch_sends_one_rpc_call_with_bound_pairs() {
         let server = MockServer::start().await;
+        mount_signin(&server).await;
         Mock::given(method("POST"))
             .and(path("/rpc"))
             .and(body_partial_json(serde_json::json!({"method": "query"})))
@@ -505,7 +615,8 @@ mod tests {
         ]);
         sink.write(batch).await.expect("write");
 
-        let request: &Request = &server.received_requests().await.expect("requests")[0];
+        let requests = rpc_requests(&server).await;
+        let request: &Request = &requests[0];
         let body: serde_json::Value = serde_json::from_slice(&request.body).expect("json");
         let sql = body["params"][0].as_str().expect("sql");
         assert!(sql.contains("UPSERT type::record($tb, $pair.rid) CONTENT $pair.doc"));
@@ -528,6 +639,7 @@ mod tests {
     #[tokio::test]
     async fn transaction_conflict_retries_and_succeeds() {
         let server = MockServer::start().await;
+        mount_signin(&server).await;
         Mock::given(method("POST"))
             .and(path("/rpc"))
             .respond_with(err_response(
@@ -555,6 +667,7 @@ mod tests {
     #[tokio::test]
     async fn schema_rejection_blocks_instead_of_retrying() {
         let server = MockServer::start().await;
+        mount_signin(&server).await;
         Mock::given(method("POST"))
             .and(path("/rpc"))
             .respond_with(err_response(
@@ -576,13 +689,15 @@ mod tests {
     #[tokio::test]
     async fn auth_failure_maps_to_blocked() {
         let server = MockServer::start().await;
+        mount_signin(&server).await;
         Mock::given(method("POST"))
             .and(path("/rpc"))
             .respond_with(
                 ResponseTemplate::new(401)
                     .set_body_string("There was a problem with authentication"),
             )
-            .expect(1)
+            // First 401 triggers one transparent token refresh + retry.
+            .expect(2)
             .mount(&server)
             .await;
         let sink = sink_against(&server.uri());
@@ -594,6 +709,7 @@ mod tests {
     #[tokio::test]
     async fn missing_doc_id_rejects_that_event_only() {
         let server = MockServer::start().await;
+        mount_signin(&server).await;
         Mock::given(method("POST"))
             .and(path("/rpc"))
             .respond_with(ok_response())
@@ -632,6 +748,7 @@ mod tests {
     #[tokio::test]
     async fn probe_ensures_declared_vector_indexes() {
         let server = MockServer::start().await;
+        mount_signin(&server).await;
         Mock::given(method("POST"))
             .and(path("/rpc"))
             .respond_with(ok_response())
@@ -640,6 +757,7 @@ mod tests {
             .await;
         let mut config =
             SurrealDbConfig::new("test-surreal", server.uri(), "vs", "app", "root", "root");
+        config.auto_create_database = true;
         config.vector_indexes = vec![SurrealVectorIndex {
             table: "public.orders".into(),
             field: "embedding".into(),
@@ -649,7 +767,7 @@ mod tests {
         let sink = SurrealDbSink::new(config).expect("sink");
         sink.probe().await.expect("probe");
 
-        let requests = server.received_requests().await.expect("requests");
+        let requests = rpc_requests(&server).await;
         // Request order: ns/db ensure (unscoped) → RETURN 1 → index DDL.
         let ensure: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json");
         assert!(ensure["params"][0]
@@ -667,6 +785,7 @@ mod tests {
     #[tokio::test]
     async fn relocation_deletes_the_old_record_before_upserting() {
         let server = MockServer::start().await;
+        mount_signin(&server).await;
         Mock::given(method("POST"))
             .and(path("/rpc"))
             .respond_with(ok_response())
@@ -692,7 +811,7 @@ mod tests {
             .await
             .expect("write");
 
-        let requests = server.received_requests().await.expect("requests");
+        let requests = rpc_requests(&server).await;
         let first: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json");
         let second: serde_json::Value = serde_json::from_slice(&requests[1].body).expect("json");
         assert!(first["params"][0].as_str().unwrap().contains("DELETE"));
