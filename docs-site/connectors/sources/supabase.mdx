@@ -10,6 +10,21 @@ same bootstrap. This page covers the Supabase-specific setup: which
 connection string works, what to create in the SQL editor, and the two
 platform behaviors worth knowing about before production.
 
+## Prerequisites
+
+Before configuring the pipeline, make sure all four are in place:
+
+1. **IPv4 add-on enabled** — Project Settings → Add-ons → Dedicated IPv4
+   address. Supabase direct hostnames are **IPv6-only** without it, and most
+   machines, clusters, and cloud VPCs cannot route IPv6 — the connection
+   fails before anything else gets a chance to work. Skip this only if you
+   are certain your environment has working IPv6 egress.
+2. **The direct connection string** — `db.<project-ref>.supabase.co:5432`,
+   not the pooler (details below).
+3. **The project CA certificate** — downloaded from the database settings
+   page, for TLS verification (details below).
+4. **A publication** listing the tables you want to stream (details below).
+
 ## Use the direct connection, not the pooler
 
 Logical replication needs a persistent replication-protocol connection.
@@ -63,6 +78,7 @@ source:
       mode: snapshot
     tls:
       mode: verify_full
+      ca_file: /etc/ventstream/supabase-ca.crt
 ```
 
 Supabase signs its database certificates with its own CA ("Supabase Root
