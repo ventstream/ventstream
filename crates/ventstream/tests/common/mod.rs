@@ -1272,3 +1272,67 @@ fn spawn_engine_command(mut command: Command, state_dir: &str) -> EngineHandle {
     let child = command.spawn().expect("spawn engine binary");
     EngineHandle { child, log_path }
 }
+
+/// A running Postgres + SurrealDB pair for the SurrealDB sink suite.
+pub struct PgSurrealStack {
+    pub pg: ContainerAsync<GenericImage>,
+    pub surreal: ContainerAsync<GenericImage>,
+    pub pg_port: u16,
+    pub surreal_port: u16,
+}
+
+/// Start Postgres (logical replication enabled) + SurrealDB (in-memory,
+/// root auth) and wait until both accept connections.
+pub async fn start_pg_surreal() -> PgSurrealStack {
+    let (pg, pg_port) = start_postgres().await;
+    let surreal = GenericImage::new("surrealdb/surrealdb", "latest")
+        .with_exposed_port(8000.tcp())
+        .with_cmd(["start", "--user", "root", "--pass", "root", "memory"])
+        .start()
+        .await
+        .expect("start surrealdb container");
+    let surreal_port = surreal
+        .get_host_port_ipv4(8000.tcp())
+        .await
+        .expect("surreal host port");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if surreal_rpc(surreal_port, "RETURN 1;").await.is_ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "surrealdb did not become ready");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    PgSurrealStack {
+        pg,
+        surreal,
+        pg_port,
+        surreal_port,
+    }
+}
+
+/// Execute one SurrealQL query against the test instance (ns `vs`, db
+/// `app`, root auth) and return the per-statement results.
+pub async fn surreal_rpc(port: u16, sql: &str) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/rpc"))
+        .basic_auth("root", Some("root"))
+        .header("Surreal-NS", "vs")
+        .header("Surreal-DB", "app")
+        .header("Accept", "application/json")
+        .json(&serde_json::json!({"method": "query", "params": [sql]}))
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    let body: serde_json::Value = response.json().await.map_err(|err| err.to_string())?;
+    if body.get("error").is_some() {
+        return Err(body["error"].to_string());
+    }
+    for statement in body["result"].as_array().into_iter().flatten() {
+        if statement["status"] != "OK" {
+            return Err(statement["result"].to_string());
+        }
+    }
+    Ok(body["result"].clone())
+}

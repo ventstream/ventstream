@@ -661,11 +661,14 @@ impl SqlDenormalizer {
         let batch_lsn = max_lsn(events);
         let batch_lsn = batch_lsn.as_deref();
 
-        // Parse each event once: (relation, op, effective row). Insert payloads
-        // are the flat row; updates are a `{new, old}` envelope; deletes are
-        // `{old}` — `effective_row` picks the post-image for insert/update and
-        // the pre-image for delete.
-        let parsed: Vec<(String, String, Value)> = events
+        // Parse each event once: (relation, op, effective row, update
+        // pre-image). Insert payloads are the flat row; updates are a
+        // `{new, old}` envelope; deletes are `{old}` — `effective_row`
+        // picks the post-image for insert/update and the pre-image for
+        // delete. The update pre-image is kept separately: when the
+        // primary key itself changed it names the OLD identity, whose
+        // projection must be tombstoned or it stays behind forever.
+        let parsed: Vec<(String, String, Value, Option<Value>)> = events
             .iter()
             .map(|event| {
                 let relation = event
@@ -683,15 +686,16 @@ impl SqlDenormalizer {
                 let raw: Value =
                     serde_json::from_slice(event.payload.as_slice()).unwrap_or(Value::Null);
                 let row = effective_row(&raw, &op);
-                (relation, op, row)
+                let pre_image = (op == "update").then(|| raw.get("old").cloned()).flatten();
+                (relation, op, row, pre_image)
             })
             .collect();
 
         for pd in &self.defs {
-            let primary_truncated = parsed.iter().any(|(relation, op, _)| {
+            let primary_truncated = parsed.iter().any(|(relation, op, _, _)| {
                 op == "truncate" && relation_of(&pd.primary_table) == relation
             });
-            let related_truncated = parsed.iter().any(|(relation, op, _)| {
+            let related_truncated = parsed.iter().any(|(relation, op, _, _)| {
                 op == "truncate"
                     && pd
                         .def
@@ -735,7 +739,7 @@ impl SqlDenormalizer {
             // def index, for one coalesced PG lookup each.
             let mut many1_buckets: HashMap<usize, Vec<Vec<String>>> = HashMap::new();
 
-            for (relation, op, row) in &parsed {
+            for (relation, op, row, pre_image) in &parsed {
                 // Primary-table event → the row's own PK.
                 if relation_of(&pd.primary_table) == relation.as_str() {
                     if op == "delete" {
@@ -745,6 +749,18 @@ impl SqlDenormalizer {
                         continue;
                     }
                     if let Some(pk) = extract_cols(row, pd.def.primary.pk.columns()) {
+                        // A key-changing update relocated the projection:
+                        // the pre-image names the old identity, which must
+                        // be tombstoned (verified against Postgres truth
+                        // below like any other delete).
+                        if let Some(old_pk) = pre_image
+                            .as_ref()
+                            .and_then(|old| extract_cols(old, pd.def.primary.pk.columns()))
+                        {
+                            if old_pk != pk {
+                                deletes.insert(old_pk);
+                            }
+                        }
                         affected.insert(pk);
                     }
                 }

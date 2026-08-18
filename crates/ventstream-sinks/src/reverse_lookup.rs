@@ -10,6 +10,7 @@ use ventstream_core::Event;
 
 use crate::meilisearch::MeiliReverseLookup;
 use crate::opensearch::{index_template, OsReverseLookup};
+use crate::surrealdb::SurrealReverseLookup;
 
 /// Reverse-lookup client for whichever sink the pipeline writes to.
 pub enum ReverseLookup {
@@ -17,6 +18,8 @@ pub enum ReverseLookup {
     OpenSearch(Box<OsReverseLookup>),
     /// Meilisearch: filter query on (auto-ensured) filterable fields.
     Meilisearch(Box<MeiliReverseLookup>),
+    /// SurrealDB: `WHERE` filter on any field — no index required.
+    SurrealDb(Box<SurrealReverseLookup>),
 }
 
 impl ReverseLookup {
@@ -28,6 +31,7 @@ impl ReverseLookup {
                 index_template::render(lookup.index_template(), probe, chrono::Utc::now()).ok()
             }
             Self::Meilisearch(lookup) => lookup.resolve_index_for(probe),
+            Self::SurrealDb(lookup) => lookup.resolve_index_for(probe),
         }
     }
 
@@ -44,6 +48,7 @@ impl ReverseLookup {
                 .await
                 .map_err(|err| err.to_string()),
             Self::Meilisearch(lookup) => lookup.doc_ids_by_terms(index, field, values).await,
+            Self::SurrealDb(lookup) => lookup.doc_ids_by_terms(index, field, values).await,
         }
     }
 
@@ -60,6 +65,7 @@ impl ReverseLookup {
                 .await
                 .map_err(|err| err.to_string()),
             Self::Meilisearch(lookup) => lookup.doc_ids_by_term_tuples(index, fields, tuples).await,
+            Self::SurrealDb(lookup) => lookup.doc_ids_by_term_tuples(index, fields, tuples).await,
         }
     }
 }

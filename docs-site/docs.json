@@ -71,6 +71,7 @@
                 "pages": [
                   "connectors/sinks/opensearch",
                   "connectors/sinks/meilisearch",
+                  "connectors/sinks/surrealdb",
                   "connectors/sinks/redis"
                 ]
               }

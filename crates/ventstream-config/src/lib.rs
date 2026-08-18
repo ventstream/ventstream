@@ -977,6 +977,9 @@ pub struct SinkConfig {
     /// Meilisearch sink settings.
     #[serde(default)]
     pub meilisearch: Option<MeilisearchSinkConfig>,
+    /// SurrealDB sink settings.
+    #[serde(default)]
+    pub surrealdb: Option<SurrealDbSinkConfig>,
 }
 
 impl SinkConfig {
@@ -991,6 +994,11 @@ impl SinkConfig {
                 if self.meilisearch.is_some() {
                     return Err(ConfigError::InvalidField(
                         "sink.meilisearch cannot be set for opensearch/elasticsearch sinks",
+                    ));
+                }
+                if self.surrealdb.is_some() {
+                    return Err(ConfigError::InvalidField(
+                        "sink.surrealdb cannot be set for opensearch/elasticsearch sinks",
                     ));
                 }
                 let Some(opensearch) = &self.opensearch else {
@@ -1011,6 +1019,11 @@ impl SinkConfig {
                         "sink.meilisearch cannot be set for redis sinks",
                     ));
                 }
+                if self.surrealdb.is_some() {
+                    return Err(ConfigError::InvalidField(
+                        "sink.surrealdb cannot be set for redis sinks",
+                    ));
+                }
                 let Some(redis) = &self.redis else {
                     return Err(ConfigError::InvalidField(
                         "sink.redis is required for redis sinks",
@@ -1029,12 +1042,40 @@ impl SinkConfig {
                         "sink.redis cannot be set for meilisearch sinks",
                     ));
                 }
+                if self.surrealdb.is_some() {
+                    return Err(ConfigError::InvalidField(
+                        "sink.surrealdb cannot be set for meilisearch sinks",
+                    ));
+                }
                 let Some(meilisearch) = &self.meilisearch else {
                     return Err(ConfigError::InvalidField(
                         "sink.meilisearch is required for meilisearch sinks",
                     ));
                 };
                 meilisearch.validate()
+            }
+            SinkKind::Surrealdb => {
+                if self.opensearch.is_some() {
+                    return Err(ConfigError::InvalidField(
+                        "sink.opensearch cannot be set for surrealdb sinks",
+                    ));
+                }
+                if self.redis.is_some() {
+                    return Err(ConfigError::InvalidField(
+                        "sink.redis cannot be set for surrealdb sinks",
+                    ));
+                }
+                if self.meilisearch.is_some() {
+                    return Err(ConfigError::InvalidField(
+                        "sink.meilisearch cannot be set for surrealdb sinks",
+                    ));
+                }
+                let Some(surrealdb) = &self.surrealdb else {
+                    return Err(ConfigError::InvalidField(
+                        "sink.surrealdb is required for surrealdb sinks",
+                    ));
+                };
+                surrealdb.validate()
             }
         }
     }
@@ -1052,6 +1093,157 @@ pub enum SinkKind {
     Redis,
     /// Meilisearch search sink.
     Meilisearch,
+    /// SurrealDB multi-model sink.
+    Surrealdb,
+}
+
+/// SurrealDB sink settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurrealDbSinkConfig {
+    /// Deployment-provided endpoint reference, usually `env:VS_SURREAL_ENDPOINT`.
+    pub endpoint_ref: ValueRef,
+    /// Namespace to write into.
+    pub namespace: String,
+    /// Database to write into.
+    pub database: String,
+    /// Basic-auth username reference.
+    pub username_ref: ValueRef,
+    /// Basic-auth password reference.
+    pub password_ref: ValueRef,
+    /// Per-event table routing policy.
+    #[serde(default)]
+    pub table_routing: SurrealTableRoutingConfig,
+    /// Prefix prepended to routed table names.
+    #[serde(default)]
+    pub table_prefix: Option<String>,
+    /// Maximum documents per statement run. Default 1000.
+    #[serde(default)]
+    pub max_batch_docs: Option<usize>,
+    /// Maximum request body bytes. Default 8MiB.
+    #[serde(default)]
+    pub max_batch_bytes: Option<usize>,
+    /// Per-request HTTP timeout in milliseconds. Default 30000.
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+    /// HNSW vector indexes ensured at startup.
+    #[serde(default)]
+    pub vector_indexes: Vec<SurrealVectorIndexConfig>,
+    /// Disable TLS certificate verification. Development only.
+    #[serde(default)]
+    pub insecure_tls: Option<bool>,
+    /// TLS transport policy. Prefer this over `insecure_tls`.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+impl SurrealDbSinkConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        const MAX_BATCH_DOCS: usize = 250_000;
+        const MAX_BATCH_BYTES: usize = 96 * 1024 * 1024;
+        const MAX_REQUEST_TIMEOUT_MS: u64 = 600_000;
+
+        if self.namespace.is_empty() {
+            return Err(ConfigError::InvalidField(
+                "sink.surrealdb.namespace must not be empty",
+            ));
+        }
+        if self.database.is_empty() {
+            return Err(ConfigError::InvalidField(
+                "sink.surrealdb.database must not be empty",
+            ));
+        }
+        if let SurrealTableRoutingConfig::Fixed { table } = &self.table_routing {
+            if table.is_empty() {
+                return Err(ConfigError::InvalidField(
+                    "sink.surrealdb.table_routing.table must not be empty",
+                ));
+            }
+        }
+        if self.max_batch_docs == Some(0) || self.max_batch_docs > Some(MAX_BATCH_DOCS) {
+            return Err(ConfigError::InvalidField(
+                "sink.surrealdb.max_batch_docs must be between 1 and 250000",
+            ));
+        }
+        if self.max_batch_bytes == Some(0) || self.max_batch_bytes > Some(MAX_BATCH_BYTES) {
+            return Err(ConfigError::InvalidField(
+                "sink.surrealdb.max_batch_bytes must be between 1 and 96MiB",
+            ));
+        }
+        if self.request_timeout_ms == Some(0)
+            || self.request_timeout_ms > Some(MAX_REQUEST_TIMEOUT_MS)
+        {
+            return Err(ConfigError::InvalidField(
+                "sink.surrealdb.request_timeout_ms must be between 1 and 600000",
+            ));
+        }
+        for index in &self.vector_indexes {
+            let safe = |value: &str| {
+                !value.is_empty()
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
+            };
+            if !safe(&index.table) || !safe(&index.field) {
+                return Err(ConfigError::InvalidField(
+                    "sink.surrealdb.vector_indexes table/field must match [A-Za-z0-9_.-]",
+                ));
+            }
+            if index.dimension == 0 || index.dimension > 65_535 {
+                return Err(ConfigError::InvalidField(
+                    "sink.surrealdb.vector_indexes dimension must be between 1 and 65535",
+                ));
+            }
+        }
+        if let Some(tls) = &self.tls {
+            tls.validate("sink.surrealdb.tls")?;
+        }
+        Ok(())
+    }
+}
+
+/// How events map to SurrealDB tables.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, tag = "mode", rename_all = "snake_case")]
+pub enum SurrealTableRoutingConfig {
+    /// Route by the event output relation. Default.
+    #[default]
+    ByOutputRelation,
+    /// Route by the projection target header.
+    ByProjectionTarget,
+    /// All events target one table.
+    Fixed {
+        /// Target table name, before prefixing.
+        table: String,
+    },
+}
+
+/// One HNSW vector index ensured at startup.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurrealVectorIndexConfig {
+    /// Routed table name the index lives on (post-prefix, as written).
+    pub table: String,
+    /// Document field holding the embedding array.
+    pub field: String,
+    /// Embedding dimension.
+    pub dimension: u32,
+    /// Distance function. Default cosine.
+    #[serde(default)]
+    pub distance: SurrealVectorDistanceConfig,
+}
+
+/// Distance functions for SurrealDB HNSW indexes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurrealVectorDistanceConfig {
+    /// Cosine distance. Default.
+    #[default]
+    Cosine,
+    /// Euclidean (L2) distance.
+    Euclidean,
+    /// Manhattan (L1) distance.
+    Manhattan,
 }
 
 /// Meilisearch sink settings.
