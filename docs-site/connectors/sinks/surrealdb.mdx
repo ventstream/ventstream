@@ -77,6 +77,19 @@ the HNSW index at startup:
 Embedding arrays flow through documents unchanged; query with
 `WHERE embedding <|10,40|> $vec`.
 
+## Large joined tables
+
+For 1:many joined pipelines, declare the embedded join paths so child
+deletes filter a flat materialized field instead of evaluating a
+per-row closure (~5x cheaper today, index-ready in future SurrealDB
+versions):
+
+```yaml
+    lookup_fields:
+      - table: orders
+        field: items.item_id
+```
+
 ## Semantics to know
 
 - **Concurrent writers converge.** SurrealDB uses optimistic

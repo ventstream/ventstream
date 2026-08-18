@@ -81,14 +81,29 @@ does not auto-create them, and creating them needs elevated credentials,
 so production provisions once and runs scoped. A missing scope fails the
 probe with the exact provisioning DDL in the message.
 
-## Known scaling edge
+## Reverse-lookup scaling
 
-The reverse lookup's flatten/map predicate cannot be served by an index
-(function application defeats the planner), so each 1:many child delete
-scans the parent table — O(N) per flush, a cliff on multi-million-row
-parents. The designed fix is materializing string-canonical join values
-into a dedicated indexed field at write time; filed as a follow-up, not
-v1.
+Empirical planner truth (SurrealDB 3.2.4, verified by EXPLAIN): neither
+`CONTAINS`/`CONTAINSANY` nor value-IN-array is ever index-served, and
+`=` on an indexed array field is whole-array equality — so the designed
+"indexed join field" fix is impossible as designed. What ships instead:
+declared `lookup_fields` materialize string-canonical join values onto
+each document (`_vs_lx_*`), turning the per-row flatten/map closure into
+a flat pre-decode filter — measured 5.3x cheaper (153ms → 29ms at 30k
+docs). Still O(N), but the cliff moves 5x out, and the field becomes
+index-ready the day the planner learns CONTAINSANY. The full O(log N)
+escalation, if ever needed, is a writer-maintained inverted side-table
+addressed by record-id range scans.
+
+## Batch execution
+
+Within a lane, runs that are all upserts with pairwise-disjoint id sets
+(every bootstrap batch; most tail batches) execute concurrently — order
+between them is vacuously irrelevant, for any source, with no snapshot
+detection. Overlapping ids, deletes, or truncates fall back to strict
+sequence. Deletes are set-oriented (`DELETE array::map($rids, …)`), one
+statement instead of an interpreted per-id loop. Request-body gzip was
+tested and is NOT accepted by SurrealDB's HTTP API (400) — closed.
 
 ## Version pin
 

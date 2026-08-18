@@ -26,6 +26,6 @@ pub use redis::{
 };
 pub use reverse_lookup::ReverseLookup;
 pub use surrealdb::{
-    SurrealBatchConfig, SurrealDbConfig, SurrealDbSink, SurrealReverseLookup, SurrealSinkError,
-    SurrealTableRouting, SurrealVectorDistance, SurrealVectorIndex,
+    SurrealBatchConfig, SurrealDbConfig, SurrealDbSink, SurrealLookupField, SurrealReverseLookup,
+    SurrealSinkError, SurrealTableRouting, SurrealVectorDistance, SurrealVectorIndex,
 };

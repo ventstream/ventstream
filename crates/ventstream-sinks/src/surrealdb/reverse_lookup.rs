@@ -62,10 +62,8 @@ impl SurrealReverseLookup {
         }
         let field = safe_field(field)?;
         let sql = format!(
-            "SELECT VALUE {CANONICAL_ID_FIELD} FROM type::table($tb) \
-             WHERE array::map(array::flatten([{}]), |$v| type::string($v)) \
-             CONTAINSANY $values;",
-            field_path(field)
+            "SELECT VALUE {CANONICAL_ID_FIELD} FROM type::table($tb) WHERE {};",
+            self.term_predicate(table, field)
         );
         self.collect_ids(&sql, json!({"tb": table, "values": values}))
             .await
@@ -92,9 +90,8 @@ impl SurrealReverseLookup {
             .map(|(position, field)| {
                 safe_field(field).map(|field| {
                     format!(
-                        "array::map(array::flatten([{}]), |$v| type::string($v)) \
-                         CONTAINSANY [$t[{position}]]",
-                        field_path(field)
+                        "{} CONTAINSANY [$t[{position}]]",
+                        self.term_source(table, field)
                     )
                 })
             })
@@ -152,6 +149,30 @@ impl SurrealReverseLookup {
             return Ok(token);
         }
         self.signin().await
+    }
+
+    /// The expression producing string-canonical join values for one
+    /// field: the materialized `_vs_lx_*` flat field when the operator
+    /// declared it (a plain pre-decode filter, ~5x cheaper than the
+    /// closure and index-ready), else the generic flatten/map form.
+    fn term_source(&self, table: &str, field: &str) -> String {
+        let materialized = self
+            .config
+            .lookup_fields
+            .iter()
+            .any(|entry| entry.table == table && entry.field == field);
+        if materialized {
+            format!("⟨{}⟩", super::config::lookup_field_name(field))
+        } else {
+            format!(
+                "array::map(array::flatten([{}]), |$v| type::string($v))",
+                field_path(field)
+            )
+        }
+    }
+
+    fn term_predicate(&self, table: &str, field: &str) -> String {
+        format!("{} CONTAINSANY $values", self.term_source(table, field))
     }
 
     async fn collect_ids(&self, sql: &str, vars: Value) -> Result<Vec<String>, String> {

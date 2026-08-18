@@ -153,11 +153,17 @@ pub(super) fn translate_batch(config: &SurrealDbConfig, events: &[Event]) -> Tra
             continue;
         }
 
+        let lookup_paths: Vec<&str> = config
+            .lookup_fields
+            .iter()
+            .filter(|entry| entry.table == table)
+            .map(|entry| entry.field.as_str())
+            .collect();
         // Build and validate the replacement document BEFORE any run is
         // enqueued: a relocation's old-id delete must never execute on
         // behalf of an event that is then rejected — that would destroy
         // the old record while its replacement rides to the DLQ.
-        let document = match build_document(event, doc_id) {
+        let document = match build_document(event, doc_id, &lookup_paths) {
             Ok(doc) => doc,
             Err(error) => {
                 rejects.push(FailedItem { offset, error });
@@ -271,7 +277,7 @@ fn required_doc_id(event: &Event) -> Result<&str, String> {
     Ok(doc_id)
 }
 
-fn build_document(event: &Event, doc_id: &str) -> Result<Value, String> {
+fn build_document(event: &Event, doc_id: &str, lookup_paths: &[&str]) -> Result<Value, String> {
     let mut parsed: Value = serde_json::from_slice(event.payload.as_slice())
         .map_err(|err| format!("event {} payload is not valid JSON: {err}", event.id))?;
     // Flat CDC updates carry the `{"new":…, "old":…}` transition envelope;
@@ -301,7 +307,48 @@ fn build_document(event: &Event, doc_id: &str) -> Result<Value, String> {
         CANONICAL_ID_FIELD.to_owned(),
         Value::String(doc_id.to_owned()),
     );
+    for path in lookup_paths {
+        let mut values = Vec::new();
+        collect_path_strings(&Value::Object(map.clone()), path, &mut values);
+        map.insert(
+            super::config::lookup_field_name(path),
+            Value::Array(values.into_iter().map(Value::String).collect()),
+        );
+    }
     Ok(Value::Object(map))
+}
+
+/// Collect the string-canonical forms of every scalar reachable at a
+/// dotted `path`, descending through arrays — the write-side twin of
+/// the read predicate's flatten/map, so stored values compare equal to
+/// the WAL's canonical text forms.
+fn collect_path_strings(value: &Value, path: &str, out: &mut Vec<String>) {
+    fn descend(value: &Value, segments: &[&str], out: &mut Vec<String>) {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    descend(item, segments, out);
+                }
+            }
+            Value::Object(map) => {
+                if let Some((head, rest)) = segments.split_first() {
+                    if let Some(next) = map.get(*head) {
+                        descend(next, rest, out);
+                    }
+                }
+            }
+            other if segments.is_empty() => match other {
+                Value::String(text) => out.push(text.clone()),
+                Value::Number(number) => out.push(number.to_string()),
+                Value::Bool(flag) => out.push(flag.to_string()),
+                Value::Null => {}
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    let segments: Vec<&str> = path.split('.').collect();
+    descend(value, &segments, out);
 }
 
 #[cfg(test)]

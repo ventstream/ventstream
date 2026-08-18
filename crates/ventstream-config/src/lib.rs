@@ -1133,6 +1133,9 @@ pub struct SurrealDbSinkConfig {
     /// HNSW vector indexes ensured at startup.
     #[serde(default)]
     pub vector_indexes: Vec<SurrealVectorIndexConfig>,
+    /// Join paths materialized per document for cheap reverse lookups.
+    #[serde(default)]
+    pub lookup_fields: Vec<SurrealLookupFieldConfig>,
     /// Disable TLS certificate verification. Development only.
     #[serde(default)]
     pub insecure_tls: Option<bool>,
@@ -1181,6 +1184,20 @@ impl SurrealDbSinkConfig {
                 "sink.surrealdb.request_timeout_ms must be between 1 and 600000",
             ));
         }
+        for entry in &self.lookup_fields {
+            let safe_path = |value: &str| {
+                !value.is_empty()
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
+                    && value.split('.').all(|segment| !segment.is_empty())
+            };
+            if entry.table.is_empty() || !safe_path(&entry.field) {
+                return Err(ConfigError::InvalidField(
+                    "sink.surrealdb.lookup_fields entries need a table and a dotted field in [A-Za-z0-9_.-]",
+                ));
+            }
+        }
         for index in &self.vector_indexes {
             let safe = |value: &str| {
                 !value.is_empty()
@@ -1220,6 +1237,16 @@ pub enum SurrealTableRoutingConfig {
         /// Target table name, before prefixing.
         table: String,
     },
+}
+
+/// One join path materialized for reverse lookups.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurrealLookupFieldConfig {
+    /// Routed table name (post-prefix, as written).
+    pub table: String,
+    /// Dotted document path of the embedded join key.
+    pub field: String,
 }
 
 /// One HNSW vector index ensured at startup.

@@ -64,6 +64,15 @@ pub struct SurrealDbConfig {
     /// searchable with `<|K|>` KNN queries.
     pub vector_indexes: Vec<SurrealVectorIndex>,
 
+    /// Join paths whose string-canonical values are materialized onto
+    /// each document (as `_vs_lx_*` fields) so reverse lookups filter a
+    /// flat field instead of evaluating a flatten/map closure per row —
+    /// measured ~5x cheaper at 30k docs, and index-ready if SurrealDB's
+    /// planner gains CONTAINSANY support. Declare the 1:many embed
+    /// paths of joined pipelines, e.g. `{table: "orders", field:
+    /// "items.item_id"}`.
+    pub lookup_fields: Vec<SurrealLookupField>,
+
     /// Process-local availability state shared with the health server.
     #[doc(hidden)]
     pub delivery_health: Option<SinkHealth>,
@@ -95,6 +104,7 @@ impl SurrealDbConfig {
             verify_tls: true,
             ca_file: None,
             vector_indexes: Vec::new(),
+            lookup_fields: Vec::new(),
             delivery_health: None,
         }
     }
@@ -147,6 +157,30 @@ pub struct SurrealVectorIndex {
     pub distance: SurrealVectorDistance,
 }
 
+/// One join path materialized for cheap reverse lookups.
+#[derive(Debug, Clone)]
+pub struct SurrealLookupField {
+    /// Routed table name (post-prefix, as written).
+    pub table: String,
+    /// Dotted document path of the embedded join key.
+    pub field: String,
+}
+
+/// Field name carrying the materialized string-canonical values of a
+/// lookup path: `items.item_id` → `_vs_lx_items_item_id`.
+pub(crate) fn lookup_field_name(path: &str) -> String {
+    let mut name = String::with_capacity(path.len() + 7);
+    name.push_str("_vs_lx_");
+    for byte in path.bytes() {
+        name.push(if byte.is_ascii_alphanumeric() {
+            byte as char
+        } else {
+            '_'
+        });
+    }
+    name
+}
+
 /// Distance functions supported by SurrealDB's HNSW index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SurrealVectorDistance {
@@ -185,6 +219,7 @@ impl std::fmt::Debug for SurrealDbConfig {
             .field("table_prefix", &self.table_prefix)
             .field("batching", &self.batching)
             .field("vector_indexes", &self.vector_indexes)
+            .field("lookup_fields", &self.lookup_fields)
             .finish_non_exhaustive()
     }
 }

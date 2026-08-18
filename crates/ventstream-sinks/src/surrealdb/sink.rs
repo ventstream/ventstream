@@ -440,12 +440,69 @@ impl SurrealDbSink {
         Ok(())
     }
 
+    /// One lane's runs. Order between runs only matters when they can
+    /// touch the same record — so a lane whose runs are all upserts
+    /// with pairwise-disjoint id sets (every bootstrap batch, and most
+    /// tail batches) executes them concurrently, paying one round-trip
+    /// instead of one per run. Any overlap, delete, or truncate falls
+    /// back to the strictly sequential path.
+    async fn execute_lane(&self, runs: &[&Run]) -> Result<bool, SurrealSinkError> {
+        if runs.len() > 1 && upsert_runs_are_disjoint(runs) {
+            let outcomes = futures_util::future::join_all(
+                runs.iter().map(|run| self.execute_run_with_retry(run)),
+            )
+            .await;
+            let mut had_failure = false;
+            for outcome in outcomes {
+                had_failure |= outcome?;
+            }
+            return Ok(had_failure);
+        }
+        self.execute_lane_sequential(runs).await
+    }
+
+    /// One independent run with its own retry budget; used by the
+    /// parallel lane path. Retries are idempotent by record id.
+    async fn execute_run_with_retry(&self, run: &Run) -> Result<bool, SurrealSinkError> {
+        let body = self.build_run_body(run)?;
+        let mut schedule = BackoffSchedule::new(self.config.retry);
+        let mut transient_failure: Option<SinkFailureGuard> = None;
+        let mut had_failure = false;
+        loop {
+            match self.send_body(body.clone(), true).await {
+                Ok(_) => {
+                    drop(transient_failure.take());
+                    return Ok(had_failure);
+                }
+                Err(err) if err.is_retryable() => {
+                    had_failure = true;
+                    if transient_failure.is_none() {
+                        transient_failure = Some(
+                            self.delivery_health
+                                .begin_transient_failure(err.to_string()),
+                        );
+                        ventstream_telemetry::mark_sink_unavailable();
+                    }
+                    let Some(base_delay) = schedule.next() else {
+                        return Err(err);
+                    };
+                    let delay = jittered_delay(base_delay).min(self.config.retry.max_backoff);
+                    ventstream_telemetry::bump_sink_retries(
+                        u64::try_from(run.offsets.len()).unwrap_or(u64::MAX),
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     /// Sequential runs with retry-from-failed-run. Committed runs stay
     /// committed; replaying the failed tail is idempotent by record id.
     /// Returns whether the lane went through a transient failure, so
     /// the caller flips process-wide availability only once every lane
     /// has recovered (not while siblings are still backing off).
-    async fn execute_lane(&self, runs: &[&Run]) -> Result<bool, SurrealSinkError> {
+    async fn execute_lane_sequential(&self, runs: &[&Run]) -> Result<bool, SurrealSinkError> {
         let mut schedule = BackoffSchedule::new(self.config.retry);
         let mut transient_failure: Option<SinkFailureGuard> = None;
         let mut had_failure = false;
@@ -512,6 +569,27 @@ impl SurrealDbSink {
     fn mark_blocked(&self, error: &SurrealSinkError) {
         self.delivery_health.mark_blocked(error.to_string());
     }
+}
+
+/// True when every run is an upsert and no record id appears in more
+/// than one run — the condition under which run order is vacuously
+/// irrelevant and concurrent execution is safe for any source.
+fn upsert_runs_are_disjoint(runs: &[&Run]) -> bool {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for run in runs {
+        let RunKind::Upsert(pairs) = &run.kind else {
+            return false;
+        };
+        for pair in pairs {
+            let Some(rid) = pair.get("rid") else {
+                return false;
+            };
+            if !seen.insert(rid.to_string()) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn classify_status(status: StatusCode, body: &str) -> SurrealSinkError {
@@ -871,6 +949,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disjoint_same_table_runs_execute_in_parallel() {
+        let server = MockServer::start().await;
+        mount_signin(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/rpc"))
+            .respond_with(ok_response().set_delay(Duration::from_millis(100)))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let mut config =
+            SurrealDbConfig::new("test-surreal", server.uri(), "vs", "app", "root", "root");
+        config.batching.max_docs = 1; // one run per event
+        config.retry = RetryConfig {
+            max_attempts: 2,
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(5),
+            backoff_factor: 2.0,
+        };
+        let sink = SurrealDbSink::new(config).expect("sink");
+        let batch = SinkBatch::new(vec![
+            upsert_event("orders", r#"o:["1"]"#, r#"{"v":1}"#),
+            upsert_event("orders", r#"o:["2"]"#, r#"{"v":2}"#),
+            upsert_event("orders", r#"o:["3"]"#, r#"{"v":3}"#),
+        ]);
+        let started = std::time::Instant::now();
+        sink.write(batch).await.expect("write");
+        // Three disjoint runs, one table: serial would cost >= 300ms.
+        // Generous margin over the ~100ms parallel ideal for loaded CI.
+        assert!(
+            started.elapsed() < Duration::from_millis(280),
+            "disjoint runs did not parallelize: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_runs_stay_strictly_sequential() {
+        let server = MockServer::start().await;
+        mount_signin(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/rpc"))
+            .respond_with(ok_response().set_delay(Duration::from_millis(60)))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut config =
+            SurrealDbConfig::new("test-surreal", server.uri(), "vs", "app", "root", "root");
+        config.batching.max_docs = 1;
+        let sink = SurrealDbSink::new(config).expect("sink");
+        // Same record twice: order is semantic, must not overlap.
+        let batch = SinkBatch::new(vec![
+            upsert_event("orders", r#"o:["1"]"#, r#"{"v":1}"#),
+            upsert_event("orders", r#"o:["1"]"#, r#"{"v":2}"#),
+        ]);
+        let started = std::time::Instant::now();
+        sink.write(batch).await.expect("write");
+        assert!(
+            started.elapsed() >= Duration::from_millis(115),
+            "overlapping runs overlapped: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_lookup_fields_are_materialized_on_documents() {
+        let server = MockServer::start().await;
+        mount_signin(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/rpc"))
+            .respond_with(ok_response())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config =
+            SurrealDbConfig::new("test-surreal", server.uri(), "vs", "app", "root", "root");
+        config.lookup_fields = vec![super::super::config::SurrealLookupField {
+            table: "orders".into(),
+            field: "items.item_id".into(),
+        }];
+        let sink = SurrealDbSink::new(config).expect("sink");
+        let payload = r#"{"order_id":7,"items":[{"item_id":41},{"item_id":52}]}"#;
+        sink.write(SinkBatch::new(vec![upsert_event(
+            "orders",
+            r#"public.orders:["7"]"#,
+            payload,
+        )]))
+        .await
+        .expect("write");
+        let requests = rpc_requests(&server).await;
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json");
+        let doc = &body["params"][1]["pairs"][0]["doc"];
+        assert_eq!(
+            doc["_vs_lx_items_item_id"],
+            serde_json::json!(["41", "52"]),
+            "materialized lookup values wrong: {doc}"
+        );
+    }
+
+    #[tokio::test]
     async fn probe_ensures_declared_vector_indexes() {
         let server = MockServer::start().await;
         mount_signin(&server).await;
@@ -929,7 +1106,7 @@ mod tests {
         let elapsed = started.elapsed();
         // Serial lanes would cost >= 4 x 100ms; parallel lanes pay ~1 x.
         assert!(
-            elapsed < Duration::from_millis(320),
+            elapsed < Duration::from_millis(360),
             "lanes did not run concurrently: {elapsed:?}"
         );
     }

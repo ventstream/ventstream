@@ -85,7 +85,8 @@ use ventstream_sinks::{
     RedisKeyspaceOwnership, RedisSentinelTopology, RedisSink, RedisTlsConfig, RedisTopology,
     RedisView, RedisViewCondition, RedisViewConditionOperator, RedisViewFilter,
     RedisViewFilterMode, RedisViewKey, RedisViewMissingBehavior, RedisViewSource, RedisViewValue,
-    SurrealDbConfig, SurrealDbSink, SurrealTableRouting, SurrealVectorDistance, SurrealVectorIndex,
+    SurrealDbConfig, SurrealDbSink, SurrealLookupField, SurrealTableRouting, SurrealVectorDistance,
+    SurrealVectorIndex,
 };
 use ventstream_sources::kafka::{KafkaCdcConfig, KafkaCdcSource, UnwrapMode};
 use ventstream_sources::mongodb::{
@@ -3984,6 +3985,14 @@ fn load_surrealdb_config(engine_config: Option<&EngineFileConfig>) -> Result<Sur
     if let Some(timeout) = surreal.request_timeout_ms {
         config.request_timeout = Duration::from_millis(timeout);
     }
+    config.lookup_fields = surreal
+        .lookup_fields
+        .iter()
+        .map(|entry| SurrealLookupField {
+            table: entry.table.clone(),
+            field: entry.field.clone(),
+        })
+        .collect();
     config.vector_indexes = surreal
         .vector_indexes
         .iter()
