@@ -593,7 +593,7 @@ async fn build_registry_from(
                 reader: reader_index,
             });
         }
-        reader_configs.push(reader_config(sink));
+        reader_configs.push(reader_config(sink)?);
     }
 
     check_collisions(&targets)?;
@@ -611,11 +611,14 @@ async fn build_registry_from(
     })
 }
 
-fn reader_config(sink: SinkRuntimeConfig) -> SinkReaderConfig {
+fn reader_config(sink: SinkRuntimeConfig) -> Result<SinkReaderConfig> {
     match sink {
-        SinkRuntimeConfig::Redis(config) => SinkReaderConfig::Redis(config),
-        SinkRuntimeConfig::OpenSearch(config) => SinkReaderConfig::OpenSearch(config),
-        SinkRuntimeConfig::Meilisearch(config) => SinkReaderConfig::Meilisearch(config),
+        SinkRuntimeConfig::Redis(config) => Ok(SinkReaderConfig::Redis(config)),
+        SinkRuntimeConfig::OpenSearch(config) => Ok(SinkReaderConfig::OpenSearch(config)),
+        SinkRuntimeConfig::Meilisearch(config) => Ok(SinkReaderConfig::Meilisearch(config)),
+        SinkRuntimeConfig::SurrealDb(_) => Err(anyhow!(
+            "the MCP server cannot read SurrealDB targets yet; point agents at              SurrealDB directly or serve this pipeline's documents from a search sink"
+        )),
     }
 }
 
@@ -695,6 +698,9 @@ fn sink_targets(
             MeilisearchIndexRouting::ByProjectionTarget => projection_targets(joins),
             MeilisearchIndexRouting::ByOutputRelation => explicit_targets(cli_targets),
         },
+        SinkRuntimeConfig::SurrealDb(_) => Err(anyhow!(
+            "the MCP server cannot read SurrealDB targets yet; point agents at              SurrealDB directly or serve this pipeline's documents from a search sink"
+        )),
     }
 }
 

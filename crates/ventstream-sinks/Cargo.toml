@@ -17,6 +17,7 @@ base64 = "0.22"
 rand = "0.8"
 redis = { workspace = true }
 reqwest = { workspace = true }
+futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 metrics = "0.24"

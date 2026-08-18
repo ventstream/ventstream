@@ -1,0 +1,106 @@
+---
+title: "SurrealDB sink"
+description: "Materialize CDC streams as SurrealDB records — documents, joins, and KNN-searchable vectors."
+icon: "circle-nodes"
+---
+
+The SurrealDB sink writes each change as a full-replace upsert on a
+native record id, so your tables in SurrealDB mirror the source — flat
+rows or composed documents with embedded joins — and stay consistent
+through updates, deletes, primary-key changes, and truncates. SurrealDB
+commits synchronously: a confirmed write is durable, with no task queue
+to poll.
+
+## Configure the sink
+
+```yaml
+sink:
+  kind: surrealdb
+  surrealdb:
+    endpoint_ref: env:VS_SURREAL_ENDPOINT   # http(s)://host:8000
+    namespace: production
+    database: app
+    username_ref: env:VS_SURREAL_USERNAME
+    password_ref: env:VS_SURREAL_PASSWORD
+```
+
+Each output relation becomes a table (`table_prefix` prepends to every
+name; `table_routing.mode: fixed` pins one table).
+
+## Provision the target (one-time)
+
+VentStream never needs root. Create the namespace, database, and a
+database-scoped user once — in Surrealist or any client with admin
+authority:
+
+```sql
+DEFINE NAMESPACE IF NOT EXISTS production;
+USE NS production;
+DEFINE DATABASE IF NOT EXISTS app;
+USE DB app;
+DEFINE USER ventstream ON DATABASE PASSWORD '<generate one>' ROLES OWNER;
+```
+
+Those are the credentials the sink runs with: enough to write records
+and define table-level indexes, nothing more. Scoped users authenticate
+via `/signin`; the sink handles token refresh automatically. If the
+database is missing at startup, the sink fails with exactly this DDL in
+the error message.
+
+For local development against a throwaway instance, `auto_create_database:
+true` lets the sink create the namespace/database itself — that path
+needs root- or namespace-level credentials, so keep it out of production
+configs.
+
+## Record identity
+
+VentStream's deterministic doc id `table:["pk",…]` maps directly onto
+SurrealDB's array record ids — `orders:['299']`, composite keys included
+— so upserts are idempotent and deletes always find their record. The
+canonical id is stamped on every document as `_vs_id`. A source column
+named `id` is preserved as `source_id` (SurrealDB reserves `id` for the
+record id itself).
+
+## Vector search
+
+Declare embedding fields to make them KNN-searchable — the sink ensures
+the HNSW index at startup:
+
+```yaml
+    vector_indexes:
+      - table: orders
+        field: embedding
+        dimension: 384
+        distance: cosine     # cosine | euclidean | manhattan
+```
+
+Embedding arrays flow through documents unchanged; query with
+`WHERE embedding <|10,40|> $vec`.
+
+## Large joined tables
+
+For 1:many joined pipelines, declare the embedded join paths so child
+deletes filter a flat materialized field instead of evaluating a
+per-row closure (~5x cheaper today, index-ready in future SurrealDB
+versions):
+
+```yaml
+    lookup_fields:
+      - table: orders
+        field: items.item_id
+```
+
+## Semantics to know
+
+- **Concurrent writers converge.** SurrealDB uses optimistic
+  transactions; the sink classifies conflicts as transient and retries
+  the ordered tail — replays are idempotent, so external writers hammering
+  the same records cost retries, not corruption.
+- **Full-replace materialization.** Documents are replaced, not merged:
+  fields written by other applications on the same records are overwritten
+  on the next sync. Give VentStream its own tables.
+- **Requires SurrealDB 3.x.**
+
+Everything upstream — sources, joins specs, schema-drift handling —
+applies unchanged; see the [Postgres source](/connectors/sources/postgres)
+guide for the pipeline side.

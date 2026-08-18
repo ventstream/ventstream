@@ -8,6 +8,7 @@ pub mod opensearch;
 pub mod read;
 pub mod redis;
 pub mod reverse_lookup;
+pub mod surrealdb;
 mod util;
 
 pub use error::OpenSearchSinkError;
@@ -24,3 +25,7 @@ pub use redis::{
     RedisViewMissingBehavior, RedisViewSchemaStatus, RedisViewSource, RedisViewValue,
 };
 pub use reverse_lookup::ReverseLookup;
+pub use surrealdb::{
+    SurrealBatchConfig, SurrealDbConfig, SurrealDbSink, SurrealLookupField, SurrealReverseLookup,
+    SurrealSinkError, SurrealTableRouting, SurrealVectorDistance, SurrealVectorIndex,
+};

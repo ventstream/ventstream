@@ -71,8 +71,9 @@ use ventstream_config::{
     RedisViewFilterModeConfig as FileRedisViewFilterMode,
     RedisViewMissingBehaviorConfig as FileRedisViewMissingBehavior,
     RedisViewValueConfig as FileRedisViewValue, Role as ConfigRole, SinkKind, SourceKind,
-    SqlDenormalizeMode, TlsConfig as FileTlsConfig, TlsMode as FileTlsMode,
-    TlsTrustProvider as FileTlsTrustProvider, ValueRef,
+    SqlDenormalizeMode, SurrealTableRoutingConfig as FileSurrealTableRouting,
+    SurrealVectorDistanceConfig as FileSurrealVectorDistance, TlsConfig as FileTlsConfig,
+    TlsMode as FileTlsMode, TlsTrustProvider as FileTlsTrustProvider, ValueRef,
 };
 use ventstream_core::{MemoryAdmission, ReadinessSignal, ShutdownToken};
 use ventstream_graphql::GraphQlConfig;
@@ -84,6 +85,8 @@ use ventstream_sinks::{
     RedisKeyspaceOwnership, RedisSentinelTopology, RedisSink, RedisTlsConfig, RedisTopology,
     RedisView, RedisViewCondition, RedisViewConditionOperator, RedisViewFilter,
     RedisViewFilterMode, RedisViewKey, RedisViewMissingBehavior, RedisViewSource, RedisViewValue,
+    SurrealDbConfig, SurrealDbSink, SurrealLookupField, SurrealTableRouting, SurrealVectorDistance,
+    SurrealVectorIndex,
 };
 use ventstream_sources::kafka::{KafkaCdcConfig, KafkaCdcSource, UnwrapMode};
 use ventstream_sources::mongodb::{
@@ -960,6 +963,11 @@ async fn build_sink(
             MeilisearchSink::connect_with_shutdown(*meili, shutdown)
                 .await
                 .context("building Meilisearch sink")?,
+        )),
+        SinkRuntimeConfig::SurrealDb(surreal) => Ok(std::sync::Arc::new(
+            SurrealDbSink::connect_with_shutdown(*surreal, shutdown)
+                .await
+                .context("building SurrealDB sink")?,
         )),
     }
 }
@@ -2160,7 +2168,7 @@ async fn build_and_run_pg_sql_denormalize_engine(
     let mut denorm = sql_denormalize::SqlDenormalizer::connect(&pg, &pg.publication, joins, chunk)
         .await
         .context("building SQL denormalizer")?;
-    if matches!(runtime.sink.kind(), "redis" | "meilisearch") {
+    if matches!(runtime.sink.kind(), "redis" | "meilisearch" | "surrealdb") {
         denorm = denorm.with_target_clears();
     }
     // Search sinks can serve as a reverse index when the WAL delete
@@ -2168,7 +2176,10 @@ async fn build_and_run_pg_sql_denormalize_engine(
     // replica identity on child tables.
     if postgres_sink_reverse_lookup_enabled(
         runtime.engine_file_config.as_ref(),
-        matches!(runtime.sink.kind(), "opensearch" | "meilisearch"),
+        matches!(
+            runtime.sink.kind(),
+            "opensearch" | "meilisearch" | "surrealdb"
+        ),
     ) {
         let lookup = runtime.sink.build_reverse_lookup()?.ok_or_else(|| {
             anyhow!(
@@ -2794,7 +2805,10 @@ async fn build_and_run_mysql_sql_denormalize_engine(
     // consumes the MySQL before-image and requires binlog_row_image=FULL.
     if mysql_sink_reverse_lookup_enabled(
         runtime.engine_file_config.as_ref(),
-        matches!(runtime.sink.kind(), "opensearch" | "meilisearch"),
+        matches!(
+            runtime.sink.kind(),
+            "opensearch" | "meilisearch" | "surrealdb"
+        ),
     ) {
         let lookup = runtime.sink.build_reverse_lookup()?.ok_or_else(|| {
             anyhow!(
@@ -3030,6 +3044,7 @@ enum SinkRuntimeConfig {
     OpenSearch(Box<OpenSearchConfig>),
     Redis(Box<RedisConfig>),
     Meilisearch(Box<MeilisearchConfig>),
+    SurrealDb(Box<SurrealDbConfig>),
 }
 
 impl SinkRuntimeConfig {
@@ -3038,6 +3053,7 @@ impl SinkRuntimeConfig {
             Self::OpenSearch(_) => "opensearch",
             Self::Redis(_) => "redis",
             Self::Meilisearch(_) => "meilisearch",
+            Self::SurrealDb(_) => "surrealdb",
         }
     }
 
@@ -3048,13 +3064,14 @@ impl SinkRuntimeConfig {
                 .discovery_endpoint()
                 .unwrap_or("redis://unconfigured"),
             Self::Meilisearch(config) => &config.endpoint,
+            Self::SurrealDb(config) => &config.endpoint,
         }
     }
 
     fn open_search(&self) -> Option<&OpenSearchConfig> {
         match self {
             Self::OpenSearch(config) => Some(config),
-            Self::Redis(_) | Self::Meilisearch(_) => None,
+            Self::Redis(_) | Self::Meilisearch(_) | Self::SurrealDb(_) => None,
         }
     }
 
@@ -3077,13 +3094,17 @@ impl SinkRuntimeConfig {
                         })?,
                 )))
             }
+            Self::SurrealDb(config) => Some(ventstream_sinks::ReverseLookup::SurrealDb(Box::new(
+                ventstream_sinks::surrealdb::SurrealReverseLookup::new((**config).clone())
+                    .map_err(|err| anyhow!("building SurrealDB reverse-lookup client: {err}"))?,
+            ))),
             Self::Redis(_) => None,
         })
     }
 
     fn redis(&self) -> Option<&RedisConfig> {
         match self {
-            Self::OpenSearch(_) | Self::Meilisearch(_) => None,
+            Self::OpenSearch(_) | Self::Meilisearch(_) | Self::SurrealDb(_) => None,
             Self::Redis(config) => Some(config),
         }
     }
@@ -3129,6 +3150,9 @@ impl SinkRuntimeConfig {
             Self::Meilisearch(_) => Err(anyhow!(
                 "Meilisearch orphan reconciliation is not available; drain-resume is blocked"
             )),
+            Self::SurrealDb(_) => Err(anyhow!(
+                "SurrealDB orphan reconciliation is not available; drain-resume is blocked"
+            )),
         }
     }
 
@@ -3137,6 +3161,7 @@ impl SinkRuntimeConfig {
             Self::OpenSearch(config) => config.delivery_health = Some(health),
             Self::Redis(config) => config.delivery_health = Some(health),
             Self::Meilisearch(config) => config.delivery_health = Some(health),
+            Self::SurrealDb(config) => config.delivery_health = Some(health),
         }
     }
 }
@@ -3796,6 +3821,9 @@ fn load_sink_config(engine_config: Option<&EngineFileConfig>) -> Result<SinkRunt
         Some(SinkKind::Meilisearch) => load_meilisearch_config(engine_config)
             .map(Box::new)
             .map(SinkRuntimeConfig::Meilisearch),
+        Some(SinkKind::Surrealdb) => load_surrealdb_config(engine_config)
+            .map(Box::new)
+            .map(SinkRuntimeConfig::SurrealDb),
         None => match env_kind.trim().to_ascii_lowercase().as_str() {
             "opensearch" | "elasticsearch" | "es" => load_opensearch_config(engine_config)
                 .map(Box::new)
@@ -3806,8 +3834,11 @@ fn load_sink_config(engine_config: Option<&EngineFileConfig>) -> Result<SinkRunt
             "meilisearch" | "meili" => load_meilisearch_config(engine_config)
                 .map(Box::new)
                 .map(SinkRuntimeConfig::Meilisearch),
+            "surrealdb" | "surreal" => load_surrealdb_config(engine_config)
+                .map(Box::new)
+                .map(SinkRuntimeConfig::SurrealDb),
             other => Err(anyhow!(
-                "unknown VS_SINK '{other}' (expected 'opensearch', 'elasticsearch', 'redis', or 'meilisearch')"
+                "unknown VS_SINK '{other}' (expected 'opensearch', 'elasticsearch', 'redis', 'meilisearch', or 'surrealdb')"
             )),
         },
     }
@@ -3911,6 +3942,159 @@ fn load_meilisearch_config_from_env() -> Result<MeilisearchConfig> {
         config.index_routing = MeilisearchIndexRouting::Fixed(index);
     }
     if opt("VS_INSECURE_TLS")?.as_deref() == Some("true") {
+        config.verify_tls = false;
+    }
+    Ok(config)
+}
+
+fn load_surrealdb_config(engine_config: Option<&EngineFileConfig>) -> Result<SurrealDbConfig> {
+    let file = engine_config
+        .and_then(|config| config.sink.as_ref())
+        .and_then(|sink| sink.surrealdb.as_ref());
+    let Some(surreal) = file else {
+        return load_surrealdb_config_from_env();
+    };
+    let endpoint = resolve_value_ref(&surreal.endpoint_ref)?;
+    let username = resolve_value_ref(&surreal.username_ref)?;
+    let password = resolve_value_ref(&surreal.password_ref)?;
+    let mut config = SurrealDbConfig::new(
+        "surrealdb",
+        endpoint,
+        surreal.namespace.clone(),
+        surreal.database.clone(),
+        username,
+        password,
+    );
+    if let Some(auto_create) = surreal.auto_create_database {
+        config.auto_create_database = auto_create;
+    }
+    config.table_routing = match &surreal.table_routing {
+        FileSurrealTableRouting::ByOutputRelation => SurrealTableRouting::ByOutputRelation,
+        FileSurrealTableRouting::ByProjectionTarget => SurrealTableRouting::ByProjectionTarget,
+        FileSurrealTableRouting::Fixed { table } => SurrealTableRouting::Fixed(table.clone()),
+    };
+    if let Some(prefix) = &surreal.table_prefix {
+        config.table_prefix = prefix.clone();
+    }
+    if let Some(docs) = surreal.max_batch_docs {
+        config.batching.max_docs = docs;
+    }
+    if let Some(bytes) = surreal.max_batch_bytes {
+        config.batching.max_bytes = bytes;
+    }
+    if let Some(timeout) = surreal.request_timeout_ms {
+        config.request_timeout = Duration::from_millis(timeout);
+    }
+    config.lookup_fields = surreal
+        .lookup_fields
+        .iter()
+        .map(|entry| SurrealLookupField {
+            table: entry.table.clone(),
+            field: entry.field.clone(),
+        })
+        .collect();
+    config.vector_indexes = surreal
+        .vector_indexes
+        .iter()
+        .map(|index| SurrealVectorIndex {
+            table: index.table.clone(),
+            field: index.field.clone(),
+            dimension: index.dimension,
+            distance: match index.distance {
+                FileSurrealVectorDistance::Cosine => SurrealVectorDistance::Cosine,
+                FileSurrealVectorDistance::Euclidean => SurrealVectorDistance::Euclidean,
+                FileSurrealVectorDistance::Manhattan => SurrealVectorDistance::Manhattan,
+            },
+        })
+        .collect();
+    let tls = database_tls_or_env(
+        surreal.tls.as_ref(),
+        "VS_SURREAL_TLS_MODE",
+        "VS_SURREAL_TLS_CA_FILE",
+        None,
+    )?;
+    let insecure_tls = config_bool_or_env(surreal.insecure_tls, "VS_INSECURE_TLS", false);
+    if tls.is_some() && insecure_tls {
+        return Err(anyhow!(
+            "strict SurrealDB TLS and VS_INSECURE_TLS=true are mutually exclusive"
+        ));
+    }
+    if let Some(tls) = tls {
+        match tls.mode {
+            DatabaseTlsMode::VerifyFull => {
+                if !config.endpoint.starts_with("https://") {
+                    return Err(anyhow!(
+                        "sink.surrealdb.tls.mode=verify_full requires an https:// endpoint"
+                    ));
+                }
+                if let Some(path) = tls.ca_file {
+                    config.ca_file = Some(path);
+                }
+            }
+            DatabaseTlsMode::Disabled => {
+                if !config.endpoint.starts_with("http://") {
+                    return Err(anyhow!(
+                        "sink.surrealdb.tls.mode=disabled requires an http:// endpoint"
+                    ));
+                }
+            }
+        }
+    }
+    if insecure_tls {
+        config.verify_tls = false;
+    }
+    Ok(config)
+}
+
+fn load_surrealdb_config_from_env() -> Result<SurrealDbConfig> {
+    let endpoint = req("VS_SURREAL_ENDPOINT")?;
+    let namespace = req("VS_SURREAL_NAMESPACE")?;
+    let database = req("VS_SURREAL_DATABASE")?;
+    let username = req("VS_SURREAL_USERNAME")?;
+    let password = req("VS_SURREAL_PASSWORD")?;
+    let mut config = SurrealDbConfig::new(
+        "surrealdb",
+        endpoint,
+        namespace,
+        database,
+        username,
+        password,
+    );
+    if let Some(prefix) = opt("VS_SURREAL_TABLE_PREFIX")? {
+        config.table_prefix = prefix;
+    }
+    if let Some(table) = opt("VS_SURREAL_TABLE")? {
+        config.table_routing = SurrealTableRouting::Fixed(table);
+    }
+    let tls = database_tls_or_env(None, "VS_SURREAL_TLS_MODE", "VS_SURREAL_TLS_CA_FILE", None)?;
+    let insecure_tls = opt("VS_INSECURE_TLS")?.as_deref() == Some("true");
+    if tls.is_some() && insecure_tls {
+        return Err(anyhow!(
+            "strict SurrealDB TLS and VS_INSECURE_TLS=true are mutually exclusive"
+        ));
+    }
+    if let Some(tls) = tls {
+        match tls.mode {
+            DatabaseTlsMode::VerifyFull => {
+                if !config.endpoint.starts_with("https://") {
+                    return Err(anyhow!(
+                        "VS_SURREAL_TLS_MODE=verify_full requires an https:// endpoint"
+                    ));
+                }
+                if let Some(path) = tls.ca_file {
+                    config.ca_file = Some(path);
+                }
+            }
+            DatabaseTlsMode::Disabled => {
+                if !config.endpoint.starts_with("http://") {
+                    return Err(anyhow!(
+                        "VS_SURREAL_TLS_MODE=disabled requires an http:// endpoint"
+                    ));
+                }
+            }
+        }
+    }
+    if insecure_tls {
         config.verify_tls = false;
     }
     Ok(config)
