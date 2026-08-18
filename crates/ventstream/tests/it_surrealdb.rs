@@ -106,6 +106,7 @@ async fn wait_for(deadline_s: u64, mut check: impl AsyncFnMut() -> bool) {
 }
 
 #[tokio::test]
+#[ignore = "local integration: requires Docker; run explicitly"]
 async fn composed_docs_reach_surrealdb_and_stay_consistent() {
     let stack = common::start_pg_surreal().await;
     let client = common::pg_client(stack.pg_port).await;
