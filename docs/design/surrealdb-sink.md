@@ -5,9 +5,15 @@
 Ordered statement runs over the HTTP RPC protocol (`POST /rpc`, method
 `query`). SurrealDB commits synchronously, so a successful response is the
 delivery confirmation — there is no task-polling layer (contrast:
-Meilisearch). Runs execute sequentially at concurrency 1; on a retryable
-failure at run K execution restarts from K, and replaying committed runs
-is idempotent by record id.
+Meilisearch). Within a batch, runs partition into per-table lanes:
+strictly ordered inside each routed table (the only ordering that
+matters — every run for a record lives in its table's lane), concurrent
+across tables. Multi-table pipelines writing over the internet pay ~one
+round-trip per flush instead of one per table. Per lane, a retryable
+failure at run K restarts from K; replaying committed runs is idempotent
+by record id. Dispatcher-level concurrency stays 1 (no per-document
+external-version guard yet — the OpenSearch-style LSN versioning is the
+designed path to cross-batch parallelism).
 
 ## Identity
 

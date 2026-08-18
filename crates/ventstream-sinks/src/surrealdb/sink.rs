@@ -327,12 +327,43 @@ impl SurrealDbSink {
         self.query(sql, vars).await.map(|_| ())
     }
 
-    /// Sequential runs with retry-from-failed-run. Committed runs stay
-    /// committed; replaying the failed tail is idempotent by record id.
+    /// Execute a batch's runs: strictly ordered within each routed
+    /// table, concurrently across tables. Ordering only matters
+    /// per-record — and every run for a record lives in its table's
+    /// lane — so distinct tables draining in parallel is safe and
+    /// collapses the serial per-request round-trip cost that dominates
+    /// multi-table pipelines writing over the internet (a 4-projection
+    /// Neo4j pipeline pays 1 RTT instead of 4 per flush).
     async fn execute_runs(&self, runs: &[Run]) -> Result<(), SurrealSinkError> {
         if runs.is_empty() {
             return Ok(());
         }
+        let mut lanes: Vec<(&str, Vec<&Run>)> = Vec::new();
+        for run in runs {
+            match lanes
+                .iter_mut()
+                .find(|(table, _)| *table == run.table.as_str())
+            {
+                Some((_, lane)) => lane.push(run),
+                None => lanes.push((run.table.as_str(), vec![run])),
+            }
+        }
+        if lanes.len() == 1 {
+            let (_, lane) = lanes.remove(0);
+            return self.execute_lane(&lane).await;
+        }
+        let outcomes =
+            futures_util::future::join_all(lanes.iter().map(|(_, lane)| self.execute_lane(lane)))
+                .await;
+        // Every lane ran to completion or its own terminal error;
+        // committed lanes replay idempotently if the batch retries.
+        outcomes.into_iter().collect::<Result<Vec<_>, _>>()?;
+        Ok(())
+    }
+
+    /// Sequential runs with retry-from-failed-run. Committed runs stay
+    /// committed; replaying the failed tail is idempotent by record id.
+    async fn execute_lane(&self, runs: &[&Run]) -> Result<(), SurrealSinkError> {
         let mut schedule = BackoffSchedule::new(self.config.retry);
         let mut transient_failure: Option<SinkFailureGuard> = None;
         let mut from = 0usize;
@@ -780,6 +811,33 @@ mod tests {
         assert!(sql.contains("DEFINE INDEX IF NOT EXISTS"));
         assert!(sql.contains("HNSW DIMENSION 384 DIST COSINE"));
         assert!(sql.contains("⟨public.orders⟩"));
+    }
+
+    #[tokio::test]
+    async fn distinct_tables_write_in_parallel_lanes() {
+        let server = MockServer::start().await;
+        mount_signin(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/rpc"))
+            .respond_with(ok_response().set_delay(Duration::from_millis(100)))
+            .expect(4)
+            .mount(&server)
+            .await;
+        let sink = sink_against(&server.uri());
+        let batch = SinkBatch::new(vec![
+            upsert_event("t1", r#"a:["1"]"#, r#"{"v":1}"#),
+            upsert_event("t2", r#"b:["1"]"#, r#"{"v":1}"#),
+            upsert_event("t3", r#"c:["1"]"#, r#"{"v":1}"#),
+            upsert_event("t4", r#"d:["1"]"#, r#"{"v":1}"#),
+        ]);
+        let started = std::time::Instant::now();
+        sink.write(batch).await.expect("write");
+        let elapsed = started.elapsed();
+        // Serial lanes would cost >= 4 x 100ms; parallel lanes pay ~1 x.
+        assert!(
+            elapsed < Duration::from_millis(320),
+            "lanes did not run concurrently: {elapsed:?}"
+        );
     }
 
     #[tokio::test]
