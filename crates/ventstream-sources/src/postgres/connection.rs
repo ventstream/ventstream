@@ -51,9 +51,10 @@ pub async fn connect_client(
     match source.tls.as_ref().map(|tls| tls.mode) {
         None | Some(DatabaseTlsMode::Disabled) => {
             config.ssl_mode(SslMode::Disable);
-            let (client, connection) = config.connect(NoTls).await.map_err(|err| {
-                PostgresCdcError::Connection(format!("{purpose}: {}", describe_db_error(&err)))
-            })?;
+            let (client, connection) = match config.connect(NoTls).await {
+                Ok(pair) => pair,
+                Err(err) => return Err(connect_error(source, purpose, &err).await),
+            };
             tokio::spawn(async move {
                 if let Err(err) = connection.await {
                     warn!(error = %err, purpose, "postgres connection ended");
@@ -64,9 +65,10 @@ pub async fn connect_client(
         Some(DatabaseTlsMode::VerifyFull) => {
             config.ssl_mode(SslMode::Require);
             let connector = strict_tls_connector(source, purpose)?;
-            let (client, connection) = config.connect(connector).await.map_err(|err| {
-                PostgresCdcError::Connection(format!("{purpose}: {}", describe_db_error(&err)))
-            })?;
+            let (client, connection) = match config.connect(connector).await {
+                Ok(pair) => pair,
+                Err(err) => return Err(connect_error(source, purpose, &err).await),
+            };
             tokio::spawn(async move {
                 if let Err(err) = connection.await {
                     warn!(error = %err, purpose, "postgres TLS connection ended");
@@ -75,6 +77,23 @@ pub async fn connect_client(
             Ok(client)
         }
     }
+}
+
+/// Expand a connect failure and, when the target is IPv6-only, append
+/// the routing hint — this path sees every non-replication connect
+/// (preflight, slot creation, fetcher), which on some platforms is
+/// where an IPv4-only network fails first.
+async fn connect_error(
+    source: &PostgresCdcConfig,
+    purpose: &str,
+    err: &tokio_postgres::Error,
+) -> PostgresCdcError {
+    let mut detail = format!("{purpose}: {}", describe_db_error(err));
+    if let Some(hint) = super::preflight::unreachable_hint(&source.host, source.port, &detail).await
+    {
+        detail = format!("{detail} ({hint})");
+    }
+    PostgresCdcError::Connection(detail)
 }
 
 fn strict_tls_connector(
