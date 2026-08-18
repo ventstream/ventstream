@@ -496,7 +496,19 @@ impl PostgresCdcSource {
             }) => TlsConfig::disabled(),
             Some(config) => TlsConfig {
                 mode: pgwire_replication::config::SslMode::VerifyFull,
-                ca_pem_path: config.ca_file.clone(),
+                ca_pem_path: config.ca_file.clone().or_else(|| {
+                    // No operator CA — fall back to the packaged root for
+                    // known private-CA providers (Supabase). Failure to
+                    // materialize surfaces later as a clear TLS error.
+                    crate::tls::implicit_trust_provider(&self.config.host).and_then(|provider| {
+                        crate::tls::materialize_provider_ca_bundle(provider)
+                            .map_err(|err| {
+                                warn!(error = %err, "packaged provider CA unavailable");
+                                err
+                            })
+                            .ok()
+                    })
+                }),
                 ..TlsConfig::default()
             },
         };

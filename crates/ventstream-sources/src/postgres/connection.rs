@@ -143,6 +143,18 @@ fn strict_tls_connector(
                 path.display()
             )));
         }
+    } else if crate::tls::implicit_trust_provider(&source.host).is_some() {
+        // Known provider on a private CA (Supabase) and no operator
+        // override — trust the packaged root so verify_full works
+        // without a manual certificate download.
+        let certs = rustls_pemfile::certs(&mut BufReader::new(crate::tls::SUPABASE_CA_PEM))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| {
+                PostgresCdcError::Connection(format!(
+                    "{purpose}: parse packaged Supabase CA: {err}"
+                ))
+            })?;
+        roots.add_parsable_certificates(certs);
     }
 
     let config = ClientConfig::builder()

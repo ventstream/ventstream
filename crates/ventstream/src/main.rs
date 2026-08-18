@@ -4615,14 +4615,16 @@ fn database_tls_or_env(
     let trust_provider = match config.and_then(|tls| tls.trust.as_ref()) {
         Some(trust) => Some(match trust.provider {
             FileTlsTrustProvider::AwsRds => DatabaseTlsTrustProvider::AwsRds,
+            FileTlsTrustProvider::Supabase => DatabaseTlsTrustProvider::Supabase,
         }),
         None => env_trust_provider
             .as_deref()
             .map(
                 |provider| match provider.trim().to_ascii_lowercase().as_str() {
                     "aws_rds" | "aws-rds" => Ok(DatabaseTlsTrustProvider::AwsRds),
+                    "supabase" => Ok(DatabaseTlsTrustProvider::Supabase),
                     other => Err(anyhow!(
-                        "{} must be 'aws_rds', got '{other}'",
+                        "{} must be 'aws_rds' or 'supabase', got '{other}'",
                         trust_provider_env.unwrap_or("TLS trust provider")
                     )),
                 },

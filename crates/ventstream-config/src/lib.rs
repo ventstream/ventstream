@@ -95,6 +95,8 @@ pub struct TlsTrustConfig {
 pub enum TlsTrustProvider {
     /// Amazon RDS global CA bundle for PostgreSQL and MySQL.
     AwsRds,
+    /// Supabase root CA.
+    Supabase,
 }
 
 /// Supported database transport-security policies.
