@@ -4057,7 +4057,35 @@ fn load_surrealdb_config_from_env() -> Result<SurrealDbConfig> {
     if let Some(table) = opt("VS_SURREAL_TABLE")? {
         config.table_routing = SurrealTableRouting::Fixed(table);
     }
-    if opt("VS_INSECURE_TLS")?.as_deref() == Some("true") {
+    let tls = database_tls_or_env(None, "VS_SURREAL_TLS_MODE", "VS_SURREAL_TLS_CA_FILE", None)?;
+    let insecure_tls = opt("VS_INSECURE_TLS")?.as_deref() == Some("true");
+    if tls.is_some() && insecure_tls {
+        return Err(anyhow!(
+            "strict SurrealDB TLS and VS_INSECURE_TLS=true are mutually exclusive"
+        ));
+    }
+    if let Some(tls) = tls {
+        match tls.mode {
+            DatabaseTlsMode::VerifyFull => {
+                if !config.endpoint.starts_with("https://") {
+                    return Err(anyhow!(
+                        "VS_SURREAL_TLS_MODE=verify_full requires an https:// endpoint"
+                    ));
+                }
+                if let Some(path) = tls.ca_file {
+                    config.ca_file = Some(path);
+                }
+            }
+            DatabaseTlsMode::Disabled => {
+                if !config.endpoint.starts_with("http://") {
+                    return Err(anyhow!(
+                        "VS_SURREAL_TLS_MODE=disabled requires an http:// endpoint"
+                    ));
+                }
+            }
+        }
+    }
+    if insecure_tls {
         config.verify_tls = false;
     }
     Ok(config)

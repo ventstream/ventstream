@@ -70,9 +70,10 @@ redis = { version = "1.4", default-features = false, features = ["cluster-async"
 byteorder = "1.5"
 
 # HTTP client for the OpenSearch / Elasticsearch sink. rustls keeps the
-# build statically linked; `gzip` enables request compression which
-# materially cuts bulk-API egress for large index batches.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "gzip"] }
+# build statically linked; `gzip` only decompresses RESPONSES (request
+# bodies are NOT compressed by this feature); `http2` restores ALPN h2
+# so concurrent requests multiplex one connection.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "gzip", "http2"] }
 
 # rustls 0.23+ requires the application to install a CryptoProvider
 # once at process start before any TLS handshake. Both neo4rs (Bolt

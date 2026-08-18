@@ -44,6 +44,20 @@ pub(crate) fn record_id_component(doc_id: &str) -> Value {
     serde_json::json!([doc_id])
 }
 
+/// Routing-aware record id. Fixed routing funnels every relation into
+/// one table, so the table qualifier the canonical id carries is the
+/// only thing keeping `users:["1"]` and `orders:["1"]` apart — the id
+/// must stay fully qualified there or the relations silently merge
+/// (and delete each other). Relation-per-table routing re-supplies the
+/// qualifier through the table itself, so the bare key array is both
+/// safe and natural.
+pub(crate) fn routed_record_id(config: &SurrealDbConfig, doc_id: &str) -> Value {
+    if matches!(config.table_routing, SurrealTableRouting::Fixed(_)) {
+        return serde_json::json!([doc_id]);
+    }
+    record_id_component(doc_id)
+}
+
 /// One ordered RPC call: consecutive same-table, same-operation events.
 #[derive(Debug)]
 pub(super) struct Run {
@@ -59,8 +73,9 @@ pub(super) struct Run {
 
 #[derive(Debug)]
 pub(super) enum RunKind {
-    /// Full-replace upserts: `(record id component, document)` pairs.
-    Upsert(Vec<(Value, Value)>),
+    /// Full-replace upserts: pre-shaped `{"rid": …, "doc": …}` objects,
+    /// built once by move so no later stage deep-copies documents.
+    Upsert(Vec<Value>),
     /// Deletes by record id component.
     Delete(Vec<Value>),
     /// Remove every record in the table.
@@ -111,7 +126,7 @@ pub(super) fn translate_batch(config: &SurrealDbConfig, events: &[Event]) -> Tra
                 continue;
             }
         };
-        let rid = record_id_component(doc_id);
+        let rid = routed_record_id(config, doc_id);
 
         if is_delete {
             let bytes = doc_id.len() + 8;
@@ -138,18 +153,10 @@ pub(super) fn translate_batch(config: &SurrealDbConfig, events: &[Event]) -> Tra
             continue;
         }
 
-        // A key-changing update relocated the doc: enqueue a delete for
-        // the previous record first (runs execute in order) so no stale
-        // copy stays behind.
-        if let Some(old_id) = event.headers.get("ventstream.doc.old_id") {
-            let bytes = old_id.len() + 8;
-            runs.push(Run {
-                table: table.clone(),
-                kind: RunKind::Delete(vec![record_id_component(old_id)]),
-                offsets: vec![offset],
-                bytes,
-            });
-        }
+        // Build and validate the replacement document BEFORE any run is
+        // enqueued: a relocation's old-id delete must never execute on
+        // behalf of an event that is then rejected — that would destroy
+        // the old record while its replacement rides to the DLQ.
         let document = match build_document(event, doc_id) {
             Ok(doc) => doc,
             Err(error) => {
@@ -157,17 +164,44 @@ pub(super) fn translate_batch(config: &SurrealDbConfig, events: &[Event]) -> Tra
                 continue;
             }
         };
-        let bytes = document.to_string().len() + doc_id.len() + 8;
+        // Conservative size estimate: payload plus id and framing. The
+        // exact-serialization check this replaces allocated the whole
+        // document per event; the sink still enforces its precise
+        // protocol limit at request time.
+        let bytes = event.payload.as_slice().len() + doc_id.len() + 192;
         if bytes > config.batching.max_bytes {
             rejects.push(FailedItem {
                 offset,
                 error: format!(
-                    "document encodes to {bytes} bytes, exceeding max_bytes={}",
+                    "document is ~{bytes} bytes, exceeding max_bytes={}",
                     config.batching.max_bytes
                 ),
             });
             continue;
         }
+        // A key-changing update relocated the doc: enqueue a delete for
+        // the previous record first (runs execute in order) so no stale
+        // copy stays behind. A malformed old id is a corrupt header —
+        // reject the event rather than guess at a destructive write.
+        if let Some(old_id) = event.headers.get("ventstream.doc.old_id") {
+            if old_id.is_empty() || old_id.chars().any(char::is_control) {
+                rejects.push(FailedItem {
+                    offset,
+                    error: format!(
+                        "event {} has an empty or control-character `ventstream.doc.old_id`",
+                        event.id
+                    ),
+                });
+                continue;
+            }
+            runs.push(Run {
+                table: table.clone(),
+                kind: RunKind::Delete(vec![routed_record_id(config, old_id)]),
+                offsets: vec![offset],
+                bytes: old_id.len() + 8,
+            });
+        }
+        let pair = serde_json::json!({"rid": rid, "doc": document});
         match runs.last_mut() {
             Some(run)
                 if run.table == table
@@ -176,14 +210,14 @@ pub(super) fn translate_batch(config: &SurrealDbConfig, events: &[Event]) -> Tra
                     && run.bytes + bytes <= config.batching.max_bytes =>
             {
                 if let RunKind::Upsert(pairs) = &mut run.kind {
-                    pairs.push((rid, document));
+                    pairs.push(pair);
                 }
                 run.offsets.push(offset);
                 run.bytes += bytes;
             }
             _ => runs.push(Run {
                 table,
-                kind: RunKind::Upsert(vec![(rid, document)]),
+                kind: RunKind::Upsert(vec![pair]),
                 offsets: vec![offset],
                 bytes,
             }),
@@ -243,8 +277,12 @@ fn build_document(event: &Event, doc_id: &str) -> Result<Value, String> {
     // Flat CDC updates carry the `{"new":…, "old":…}` transition envelope;
     // the document to materialize is the `new` row.
     if event.subject.as_str().ends_with(".update") {
-        if let Some(row) = parsed.get("new").filter(|row| row.is_object()) {
-            parsed = row.clone();
+        if let Some(row) = parsed
+            .get_mut("new")
+            .filter(|row| row.is_object())
+            .map(Value::take)
+        {
+            parsed = row;
         }
     }
     let Value::Object(mut map) = parsed else {
@@ -285,6 +323,28 @@ mod tests {
         assert_eq!(
             record_id_component(r#"t:["a","b"]"#),
             serde_json::json!(["a", "b"])
+        );
+    }
+
+    #[test]
+    fn fixed_routing_keeps_ids_fully_qualified() {
+        // One shared table: `users:["1"]` and `orders:["1"]` must stay
+        // distinct records or the relations silently merge.
+        let mut config = SurrealDbConfig::new("s", "http://x", "vs", "app", "u", "p");
+        config.table_routing = SurrealTableRouting::Fixed("everything".into());
+        assert_eq!(
+            routed_record_id(&config, r#"users:["1"]"#),
+            serde_json::json!([r#"users:["1"]"#])
+        );
+        assert_ne!(
+            routed_record_id(&config, r#"users:["1"]"#),
+            routed_record_id(&config, r#"orders:["1"]"#)
+        );
+        // Relation-per-table routing keeps the natural bare key.
+        config.table_routing = SurrealTableRouting::ByOutputRelation;
+        assert_eq!(
+            routed_record_id(&config, r#"users:["1"]"#),
+            serde_json::json!(["1"])
         );
     }
 

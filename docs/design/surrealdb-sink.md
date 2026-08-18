@@ -81,6 +81,15 @@ does not auto-create them, and creating them needs elevated credentials,
 so production provisions once and runs scoped. A missing scope fails the
 probe with the exact provisioning DDL in the message.
 
+## Known scaling edge
+
+The reverse lookup's flatten/map predicate cannot be served by an index
+(function application defeats the planner), so each 1:many child delete
+scans the parent table — O(N) per flush, a cliff on multi-million-row
+parents. The designed fix is materializing string-canonical join values
+into a dedicated indexed field at write time; filed as a follow-up, not
+v1.
+
 ## Version pin
 
 SurrealDB 3.x only: 3.0 renamed `type::thing` to `type::record`, and the

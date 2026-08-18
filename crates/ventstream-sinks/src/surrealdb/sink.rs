@@ -8,6 +8,8 @@
 //! are already committed and replaying them is idempotent by record id.
 
 use reqwest::StatusCode;
+use std::sync::Arc;
+
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 use ventstream_core::{
@@ -30,13 +32,29 @@ pub struct SurrealDbSink {
     /// cannot use HTTP basic auth (Surreal Cloud returns 401); every
     /// request authenticates with a signed-in token, refreshed once on
     /// expiry. Root users sign in the same way, so one path serves all.
-    token: tokio::sync::RwLock<Option<String>>,
+    /// `Arc` so per-request access clones a pointer, not the JWT, and
+    /// so 401 invalidation can identity-check the exact expired token.
+    token: tokio::sync::RwLock<Option<Arc<str>>>,
     delivery_health: SinkHealth,
 }
 
 impl SurrealDbSink {
     /// Build the sink and HTTP client without touching the network.
     pub fn new(config: SurrealDbConfig) -> Result<Self, SurrealSinkError> {
+        // Namespace/database ride as HTTP header values on every
+        // request; a non-visible-ASCII byte would fail each send as a
+        // retryable transport error instead of a config error.
+        for (label, value) in [
+            ("namespace", &config.namespace),
+            ("database", &config.database),
+        ] {
+            if !value.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
+                return Err(SurrealSinkError::Internal(format!(
+                    "{label} `{value}` contains characters that cannot travel as an \
+                     HTTP header value (visible ASCII only)"
+                )));
+            }
+        }
         for index in &config.vector_indexes {
             if !is_safe_identifier(&index.table) || !is_safe_identifier(&index.field) {
                 return Err(SurrealSinkError::Internal(format!(
@@ -185,7 +203,7 @@ impl SurrealDbSink {
     /// Sign in and cache the bearer token, trying database-, then
     /// namespace-, then root-level credentials — the narrowest scope
     /// the user's authority satisfies wins.
-    async fn signin(&self) -> Result<String, SurrealSinkError> {
+    async fn signin(&self) -> Result<Arc<str>, SurrealSinkError> {
         let attempts = [
             json!({"user": self.config.username, "pass": self.config.password,
                    "ns": self.config.namespace, "db": self.config.database}),
@@ -209,9 +227,10 @@ impl SurrealDbSink {
                 let parsed: Value = serde_json::from_str(&text)
                     .map_err(|err| SurrealSinkError::MalformedResponse(err.to_string()))?;
                 if let Some(token) = parsed.get("token").and_then(Value::as_str) {
+                    let token: Arc<str> = Arc::from(token);
                     let mut guard = self.token.write().await;
-                    *guard = Some(token.to_owned());
-                    return Ok(token.to_owned());
+                    *guard = Some(Arc::clone(&token));
+                    return Ok(token);
                 }
                 return Err(SurrealSinkError::MalformedResponse(
                     "signin response has no token".into(),
@@ -225,8 +244,8 @@ impl SurrealDbSink {
         Err(last)
     }
 
-    async fn bearer(&self) -> Result<String, SurrealSinkError> {
-        if let Some(token) = self.token.read().await.clone() {
+    async fn bearer(&self) -> Result<Arc<str>, SurrealSinkError> {
+        if let Some(token) = self.token.read().await.as_ref().map(Arc::clone) {
             return Ok(token);
         }
         self.signin().await
@@ -242,30 +261,53 @@ impl SurrealDbSink {
             "method": "query",
             "params": [sql, vars],
         });
+        let body = serde_json::to_vec(&body)
+            .map(bytes::Bytes::from)
+            .map_err(|err| SurrealSinkError::Internal(format!("serializing rpc body: {err}")))?;
+        self.send_body(body, scoped).await
+    }
+
+    /// Send pre-serialized RPC bytes; classify HTTP and per-statement
+    /// results. Tokens expire (1h default): one transparent re-signin,
+    /// invalidating the cache only if it still holds the exact token
+    /// that got the 401 — a sibling lane may already have refreshed it,
+    /// and discarding its fresh token would cascade redundant signins.
+    async fn send_body(
+        &self,
+        body: bytes::Bytes,
+        scoped: bool,
+    ) -> Result<Vec<Value>, SurrealSinkError> {
         let mut refreshed = false;
         let (status, text) = loop {
             let token = self.bearer().await?;
             let mut request = self
                 .client
                 .post(&self.rpc_url)
-                .bearer_auth(&token)
-                .header(reqwest::header::ACCEPT, "application/json");
+                .bearer_auth(token.as_ref())
+                .header(reqwest::header::ACCEPT, "application/json")
+                .header(reqwest::header::CONTENT_TYPE, "application/json");
             if scoped {
                 request = request
                     .header("Surreal-NS", &self.config.namespace)
                     .header("Surreal-DB", &self.config.database);
             }
             let response = request
-                .json(&body)
+                .body(body.clone())
                 .send()
                 .await
                 .map_err(|err| SurrealSinkError::Transport(err.to_string()))?;
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            // Tokens expire (1h default): one transparent re-signin.
             if status == StatusCode::UNAUTHORIZED && !refreshed {
                 refreshed = true;
-                self.token.write().await.take();
+                let mut guard = self.token.write().await;
+                if guard
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &token))
+                {
+                    guard.take();
+                }
+                drop(guard);
                 continue;
             }
             break (status, text);
@@ -305,26 +347,51 @@ impl SurrealDbSink {
         Ok(results)
     }
 
-    /// Execute one translated run as a single RPC call.
-    async fn execute_run(&self, run: &Run) -> Result<(), SurrealSinkError> {
-        let (sql, vars) = match &run.kind {
-            RunKind::Upsert(pairs) => {
-                let pairs: Vec<Value> = pairs
-                    .iter()
-                    .map(|(rid, doc)| json!({"rid": rid, "doc": doc}))
-                    .collect();
-                (
-                    "FOR $pair IN $pairs { UPSERT type::record($tb, $pair.rid) CONTENT $pair.doc; };",
-                    json!({"tb": run.table, "pairs": pairs}),
-                )
-            }
+    /// Serialize one run's RPC body exactly once. Pairs and rids are
+    /// borrowed straight into the serializer — no deep copies — and the
+    /// returned bytes are reused verbatim across retry attempts.
+    fn build_run_body(&self, run: &Run) -> Result<bytes::Bytes, SurrealSinkError> {
+        #[derive(serde::Serialize)]
+        struct Vars<'a> {
+            tb: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pairs: Option<&'a [Value]>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            rids: Option<&'a [Value]>,
+        }
+        #[derive(serde::Serialize)]
+        struct Body<'a> {
+            method: &'static str,
+            params: (&'static str, Vars<'a>),
+        }
+        let (sql, pairs, rids): (&'static str, Option<&[Value]>, Option<&[Value]>) = match &run.kind
+        {
+            RunKind::Upsert(pairs) => (
+                "FOR $pair IN $pairs { UPSERT type::record($tb, $pair.rid) CONTENT $pair.doc; };",
+                Some(pairs),
+                None,
+            ),
             RunKind::Delete(rids) => (
                 "FOR $rid IN $rids { DELETE type::record($tb, $rid); };",
-                json!({"tb": run.table, "rids": rids}),
+                None,
+                Some(rids),
             ),
-            RunKind::Truncate => ("DELETE type::table($tb);", json!({"tb": run.table})),
+            RunKind::Truncate => ("DELETE type::table($tb);", None, None),
         };
-        self.query(sql, vars).await.map(|_| ())
+        let body = Body {
+            method: "query",
+            params: (
+                sql,
+                Vars {
+                    tb: &run.table,
+                    pairs,
+                    rids,
+                },
+            ),
+        };
+        serde_json::to_vec(&body)
+            .map(bytes::Bytes::from)
+            .map_err(|err| SurrealSinkError::Internal(format!("serializing run body: {err}")))
     }
 
     /// Execute a batch's runs: strictly ordered within each routed
@@ -350,43 +417,70 @@ impl SurrealDbSink {
         }
         if lanes.len() == 1 {
             let (_, lane) = lanes.remove(0);
-            return self.execute_lane(&lane).await;
+            if self.execute_lane(&lane).await? {
+                ventstream_telemetry::mark_sink_available();
+            }
+            return Ok(());
         }
         let outcomes =
             futures_util::future::join_all(lanes.iter().map(|(_, lane)| self.execute_lane(lane)))
                 .await;
         // Every lane ran to completion or its own terminal error;
         // committed lanes replay idempotently if the batch retries.
-        outcomes.into_iter().collect::<Result<Vec<_>, _>>()?;
+        // Availability flips back only here, once ALL lanes finished —
+        // one recovered lane must not mask siblings still failing.
+        let recovered = outcomes
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .any(|had_failure| had_failure);
+        if recovered {
+            ventstream_telemetry::mark_sink_available();
+        }
         Ok(())
     }
 
     /// Sequential runs with retry-from-failed-run. Committed runs stay
     /// committed; replaying the failed tail is idempotent by record id.
-    async fn execute_lane(&self, runs: &[&Run]) -> Result<(), SurrealSinkError> {
+    /// Returns whether the lane went through a transient failure, so
+    /// the caller flips process-wide availability only once every lane
+    /// has recovered (not while siblings are still backing off).
+    async fn execute_lane(&self, runs: &[&Run]) -> Result<bool, SurrealSinkError> {
         let mut schedule = BackoffSchedule::new(self.config.retry);
         let mut transient_failure: Option<SinkFailureGuard> = None;
+        let mut had_failure = false;
+        let mut bodies: Vec<Option<bytes::Bytes>> = vec![None; runs.len()];
         let mut from = 0usize;
         loop {
             let mut failure: Option<(usize, SurrealSinkError)> = None;
             for (idx, run) in runs.iter().enumerate().skip(from) {
-                if let Err(err) = self.execute_run(run).await {
+                let cached = bodies.get_mut(idx).ok_or_else(|| {
+                    SurrealSinkError::Internal("run body cache index out of range".into())
+                })?;
+                let body = match cached {
+                    Some(body) => body.clone(),
+                    None => {
+                        let body = self.build_run_body(run)?;
+                        *cached = Some(body.clone());
+                        body
+                    }
+                };
+                if let Err(err) = self.send_body(body, true).await.map(|_| ()) {
                     failure = Some((idx, err));
                     break;
                 }
             }
             let (idx, err) = match failure {
                 None => {
-                    if transient_failure.take().is_some() {
-                        ventstream_telemetry::mark_sink_available();
-                    }
-                    return Ok(());
+                    drop(transient_failure.take());
+                    return Ok(had_failure);
                 }
                 Some(found) => found,
             };
             if !err.is_retryable() {
                 return Err(err);
             }
+            had_failure = true;
             if transient_failure.is_none() {
                 transient_failure = Some(
                     self.delivery_health
@@ -838,6 +932,41 @@ mod tests {
             elapsed < Duration::from_millis(320),
             "lanes did not run concurrently: {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_relocation_event_issues_no_delete() {
+        // A key-changing update with a malformed payload must NOT
+        // delete the old record on its way to the DLQ — that would
+        // destroy data on behalf of a failed delivery.
+        let server = MockServer::start().await;
+        mount_signin(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/rpc"))
+            .respond_with(ok_response())
+            .expect(0)
+            .mount(&server)
+            .await;
+        let sink = sink_against(&server.uri());
+        let source = SourceUri::new("postgres://test").expect("uri");
+        let subject = Subject::new("postgres.public.orders.update").expect("subject");
+        let event = Event::builder(source, subject)
+            .payload(Payload::from_vec(b"not json".to_vec()))
+            .headers(
+                Headers::empty()
+                    .with_header("ventstream.doc.id".into(), r#"public.orders:["2"]"#.into())
+                    .with_header(
+                        "ventstream.doc.old_id".into(),
+                        r#"public.orders:["1"]"#.into(),
+                    )
+                    .with_header("ventstream.cdc.relation".into(), "orders".into()),
+            )
+            .build();
+        let err = sink
+            .write(SinkBatch::new(vec![event]))
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, SinkError::Rejected { .. }), "got {err:?}");
     }
 
     #[tokio::test]
