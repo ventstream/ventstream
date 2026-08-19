@@ -126,6 +126,21 @@
         ]
       },
       {
+        "tab": "Demos",
+        "icon": "play",
+        "groups": [
+          {
+            "group": "Live demos",
+            "icon": "bolt",
+            "pages": [
+              "demos/overview",
+              "demos/surrealdb-live",
+              "demos/mcp-live"
+            ]
+          }
+        ]
+      },
+      {
         "tab": "Data migration",
         "icon": "truck-fast",
         "groups": [
