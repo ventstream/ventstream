@@ -12,6 +12,7 @@ description = "Sink adapters for the VentStream engine."
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+ciborium = { workspace = true }
 parking_lot = { workspace = true }
 base64 = "0.22"
 rand = "0.8"
