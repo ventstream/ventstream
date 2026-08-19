@@ -1,0 +1,23 @@
+---
+title: "Live demos"
+description: "Running VentStream pipelines you can poke at — no signup, no setup."
+icon: "play"
+---
+
+These are real pipelines running in our infrastructure, not recordings. Each
+one is the same open-source engine you would deploy yourself, managed by the
+same fleet control plane, syncing real databases in real time.
+
+<CardGroup cols={2}>
+  <Card title="Watch your database think" icon="bolt" href="/demos/surrealdb-live">
+    Click buttons that write plain SQL to Postgres, and watch composed
+    documents update live in SurrealDB — in your browser, in under a second.
+  </Card>
+  <Card title="Ask your data, live" icon="robot" href="/demos/mcp-live">
+    A public MCP endpoint over live-synced documents. Point Claude at it
+    and query data that updates while you talk to it.
+  </Card>
+</CardGroup>
+
+Both demos are bounded, rate-limited, and reset periodically — click as much
+as you like.

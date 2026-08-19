@@ -1,0 +1,51 @@
+---
+title: "SurrealDB live sync"
+description: "Postgres → VentStream → SurrealDB, streaming into your browser."
+icon: "bolt"
+---
+
+<Card title="Open the demo" icon="arrow-up-right-from-square" href="https://surreal-demo.ventstream.dev" horizontal>
+  surreal-demo.ventstream.dev — no signup, nothing to install.
+</Card>
+
+Every card on that page is a **composed document in SurrealDB**: an order row
+joined with its customer and its items, kept in sync by VentStream as three
+normalized Postgres tables change. Your browser holds a SurrealDB
+`LIVE SELECT` over a WebSocket — no polling, no replay. When a document
+changes, SurrealDB pushes it to you the moment VentStream writes it.
+
+## What to try
+
+1. **Place an order.** Your click gets a tag like `#7f3k`. The button writes
+   plain SQL to Postgres — and the composed document comes back through the
+   whole pipeline carrying your tag, with the measured commit-to-browser
+   latency next to it. Typically under half a second.
+2. **Boost a customer's tier** (left panel). This updates **one row** in the
+   `customers` table — and every order document embedding that customer
+   re-composes at once. Those cards flash blue: that's join fan-out, the
+   hard part of keeping denormalized views honest.
+3. **Cancel an order.** The delete tombstones through and the card fades out.
+4. Watch the terminal in the header: those are the actual SQL statements
+   hitting Postgres, including yours.
+
+## How it works
+
+```
+your click ──▶ Postgres ──CDC──▶ VentStream ──▶ SurrealDB ──LIVE SELECT──▶ your browser
+              3 normalized       joins them      1 composed
+              tables             into documents  document per order
+```
+
+The pipeline is declared in one config: a Postgres source, a
+[joins spec](/guides/authoring-specs) composing `orders` + `customers` +
+`order_items`, and a [SurrealDB sink](/connectors/sinks/surrealdb). The
+engine runs **fleet-managed** — the same demo you're clicking is a pipeline
+in our own dashboard, deployed with an agent key like any customer workload.
+
+The browser connects as a SurrealDB user with a read-only `VIEWER` role;
+writes only ever flow through the pipeline.
+
+## Run this yourself
+
+The [SurrealDB sink guide](/connectors/sinks/surrealdb) walks the same
+shape from zero: provision, one config file, one command, live documents.

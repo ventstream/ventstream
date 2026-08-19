@@ -1,0 +1,46 @@
+---
+title: "MCP over live data"
+description: "A public MCP endpoint an AI agent can query — over documents that update in real time."
+icon: "robot"
+---
+
+VentStream's engine ships a read-only [MCP server](/guides/mcp-server). This
+demo exposes one publicly, over documents that live pipelines keep in sync
+from Postgres and MySQL sources in our acceptance cluster.
+
+## Point Claude at it
+
+Add the endpoint to Claude Desktop, Claude Code, or any MCP client:
+
+```json
+{
+  "mcpServers": {
+    "ventstream-demo": {
+      "type": "http",
+      "url": "https://mcp-demo.ventstream.dev/mcp",
+      "headers": {
+        "Authorization": "Bearer vsk_1xscwJ4l0to5pD-tiFXMQuZ8AJBvDLtoG_73E85VBwc"
+      }
+    }
+  }
+}
+```
+
+That bearer token is a real, published demo key — read-only, scoped to the
+demo dataset, and rotated periodically. Then ask things like:
+
+- *"What targets can you see?"*
+- *"Find the five most recent orders and summarize them."*
+- *"Any orders updated in the last five minutes?"* — there will be; the
+  generators never stop.
+
+## Why it's interesting
+
+The agent holds **no database credentials**. It reads the sink documents a
+pipeline materializes — composed, current, and scoped by its token: a key
+scoped to one target simply cannot see the others (out of scope reads as
+nonexistent). That's the pattern for giving AI tools live operational data
+without handing them your database.
+
+The [MCP server guide](/guides/mcp-server) covers running this against your
+own pipelines, and `examples/mcp` in the repo is the full worked example.
