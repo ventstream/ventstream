@@ -6,6 +6,7 @@
 //! HNSW vector indexes are ensured at startup so embedding fields become
 //! KNN-searchable. Design notes: `docs/design/surrealdb-sink.md`.
 
+pub(crate) mod cbor;
 pub mod config;
 pub mod error;
 pub mod reverse_lookup;

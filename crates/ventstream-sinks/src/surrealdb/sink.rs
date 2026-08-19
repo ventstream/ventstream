@@ -261,7 +261,7 @@ impl SurrealDbSink {
             "method": "query",
             "params": [sql, vars],
         });
-        let body = serde_json::to_vec(&body)
+        let body = super::cbor::encode(&body)
             .map(bytes::Bytes::from)
             .map_err(|err| SurrealSinkError::Internal(format!("serializing rpc body: {err}")))?;
         self.send_body(body, scoped).await
@@ -278,14 +278,14 @@ impl SurrealDbSink {
         scoped: bool,
     ) -> Result<Vec<Value>, SurrealSinkError> {
         let mut refreshed = false;
-        let (status, text) = loop {
+        let (status, raw) = loop {
             let token = self.bearer().await?;
             let mut request = self
                 .client
                 .post(&self.rpc_url)
                 .bearer_auth(token.as_ref())
-                .header(reqwest::header::ACCEPT, "application/json")
-                .header(reqwest::header::CONTENT_TYPE, "application/json");
+                .header(reqwest::header::ACCEPT, "application/cbor")
+                .header(reqwest::header::CONTENT_TYPE, "application/cbor");
             if scoped {
                 request = request
                     .header("Surreal-NS", &self.config.namespace)
@@ -297,7 +297,7 @@ impl SurrealDbSink {
                 .await
                 .map_err(|err| SurrealSinkError::Transport(err.to_string()))?;
             let status = response.status();
-            let text = response.text().await.unwrap_or_default();
+            let raw = response.bytes().await.unwrap_or_default();
             if status == StatusCode::UNAUTHORIZED && !refreshed {
                 refreshed = true;
                 let mut guard = self.token.write().await;
@@ -310,13 +310,16 @@ impl SurrealDbSink {
                 drop(guard);
                 continue;
             }
-            break (status, text);
+            break (status, raw);
         };
         if !status.is_success() {
-            return Err(classify_status(status, &text));
+            // Error bodies may be CBOR or plain text; classification is
+            // substring-based, and CBOR text segments are raw UTF-8, so
+            // the lossy view preserves every match the classifier needs.
+            return Err(classify_status(status, &String::from_utf8_lossy(&raw)));
         }
-        let parsed: Value = serde_json::from_str(&text)
-            .map_err(|err| SurrealSinkError::MalformedResponse(err.to_string()))?;
+        let parsed: Value =
+            super::cbor::decode_to_json(&raw).map_err(SurrealSinkError::MalformedResponse)?;
         if let Some(error) = parsed.get("error") {
             let message = error
                 .get("message")
@@ -389,7 +392,7 @@ impl SurrealDbSink {
                 },
             ),
         };
-        serde_json::to_vec(&body)
+        super::cbor::encode(&body)
             .map(bytes::Bytes::from)
             .map_err(|err| SurrealSinkError::Internal(format!("serializing run body: {err}")))
     }
@@ -719,7 +722,7 @@ mod tests {
     use std::time::Duration;
 
     use ventstream_core::event::{ContentType, Headers, Payload, SourceUri, Subject};
-    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     use super::super::config::{SurrealVectorDistance, SurrealVectorIndex};
@@ -786,15 +789,20 @@ mod tests {
             .await;
     }
 
+    fn cbor_response(body: &serde_json::Value) -> ResponseTemplate {
+        let bytes = super::super::cbor::encode(body).expect("cbor response");
+        ResponseTemplate::new(200).set_body_raw(bytes, "application/cbor")
+    }
+
     fn ok_response() -> ResponseTemplate {
-        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        cbor_response(&serde_json::json!({
             "id": 1,
             "result": [{"result": null, "status": "OK", "time": "1ms"}],
         }))
     }
 
     fn err_response(message: &str) -> ResponseTemplate {
-        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        cbor_response(&serde_json::json!({
             "id": 1,
             "result": [{"result": message, "status": "ERR", "time": "1ms"}],
         }))
@@ -806,7 +814,6 @@ mod tests {
         mount_signin(&server).await;
         Mock::given(method("POST"))
             .and(path("/rpc"))
-            .and(body_partial_json(serde_json::json!({"method": "query"})))
             .respond_with(ok_response())
             .expect(1)
             .mount(&server)
@@ -820,7 +827,8 @@ mod tests {
 
         let requests = rpc_requests(&server).await;
         let request: &Request = &requests[0];
-        let body: serde_json::Value = serde_json::from_slice(&request.body).expect("json");
+        let body: serde_json::Value =
+            super::super::cbor::decode_to_json(&request.body).expect("cbor");
         let sql = body["params"][0].as_str().expect("sql");
         assert!(sql.contains("UPSERT type::record($tb, $pair.rid) CONTENT $pair.doc"));
         let pairs = body["params"][1]["pairs"].as_array().expect("pairs");
@@ -1038,7 +1046,8 @@ mod tests {
         .await
         .expect("write");
         let requests = rpc_requests(&server).await;
-        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json");
+        let body: serde_json::Value =
+            super::super::cbor::decode_to_json(&requests[0].body).expect("cbor");
         let doc = &body["params"][1]["pairs"][0]["doc"];
         assert_eq!(
             doc["_vs_lx_items_item_id"],
@@ -1071,13 +1080,15 @@ mod tests {
 
         let requests = rpc_requests(&server).await;
         // Request order: ns/db ensure (unscoped) → RETURN 1 → index DDL.
-        let ensure: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json");
+        let ensure: serde_json::Value =
+            super::super::cbor::decode_to_json(&requests[0].body).expect("cbor");
         assert!(ensure["params"][0]
             .as_str()
             .expect("sql")
             .contains("DEFINE DATABASE IF NOT EXISTS"));
         assert!(requests[0].headers.get("surreal-ns").is_none());
-        let ddl_body: serde_json::Value = serde_json::from_slice(&requests[2].body).expect("json");
+        let ddl_body: serde_json::Value =
+            super::super::cbor::decode_to_json(&requests[2].body).expect("cbor");
         let sql = ddl_body["params"][0].as_str().expect("sql");
         assert!(sql.contains("DEFINE INDEX IF NOT EXISTS"));
         assert!(sql.contains("HNSW DIMENSION 384 DIST COSINE"));
@@ -1176,8 +1187,10 @@ mod tests {
             .expect("write");
 
         let requests = rpc_requests(&server).await;
-        let first: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json");
-        let second: serde_json::Value = serde_json::from_slice(&requests[1].body).expect("json");
+        let first: serde_json::Value =
+            super::super::cbor::decode_to_json(&requests[0].body).expect("cbor");
+        let second: serde_json::Value =
+            super::super::cbor::decode_to_json(&requests[1].body).expect("cbor");
         assert!(first["params"][0].as_str().unwrap().contains("DELETE"));
         assert_eq!(first["params"][1]["rids"][0], serde_json::json!(["1"]));
         assert!(second["params"][0].as_str().unwrap().contains("UPSERT"));
