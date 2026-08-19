@@ -9,29 +9,14 @@ native record id, so your tables in SurrealDB mirror the source — flat
 rows or composed documents with embedded joins — and stay consistent
 through updates, deletes, primary-key changes, and truncates. SurrealDB
 commits synchronously: a confirmed write is durable, with no task queue
-to poll.
+to poll. Requires SurrealDB **3.x**.
 
-## Configure the sink
+## 1. Provision the target (one-time)
 
-```yaml
-sink:
-  kind: surrealdb
-  surrealdb:
-    endpoint_ref: env:VS_SURREAL_ENDPOINT   # http(s)://host:8000
-    namespace: production
-    database: app
-    username_ref: env:VS_SURREAL_USERNAME
-    password_ref: env:VS_SURREAL_PASSWORD
-```
-
-Each output relation becomes a table (`table_prefix` prepends to every
-name; `table_routing.mode: fixed` pins one table).
-
-## Provision the target (one-time)
-
-VentStream never needs root. Create the namespace, database, and a
-database-scoped user once — in Surrealist or any client with admin
-authority:
+VentStream never needs root. In [Surrealist](https://surrealist.app)
+(or any client with admin authority — for a local instance,
+`surreal sql -u root -p root` works), create the namespace, database,
+and a database-scoped user:
 
 ```sql
 DEFINE NAMESPACE IF NOT EXISTS production;
@@ -43,14 +28,75 @@ DEFINE USER ventstream ON DATABASE PASSWORD '<generate one>' ROLES OWNER;
 
 Those are the credentials the sink runs with: enough to write records
 and define table-level indexes, nothing more. Scoped users authenticate
-via `/signin`; the sink handles token refresh automatically. If the
+via `/signin`; the sink handles tokens and refresh automatically. If the
 database is missing at startup, the sink fails with exactly this DDL in
-the error message.
+the error message. (For a throwaway local instance you can instead set
+`auto_create_database: true` and connect with root — dev only.)
 
-For local development against a throwaway instance, `auto_create_database:
-true` lets the sink create the namespace/database itself — that path
-needs root- or namespace-level credentials, so keep it out of production
-configs.
+## 2. A complete pipeline
+
+The sink is one half of a pipeline file; any
+[source](/connectors/overview) provides the other. A minimal, complete
+Postgres → SurrealDB config:
+
+```yaml
+# ventstream.yaml
+schema_version: 1
+roles: [cdc]
+
+source:
+  kind: postgres
+  postgres:
+    host_ref: env:VS_PG_HOST
+    user_ref: env:VS_PG_USER
+    password_ref: env:VS_PG_PASSWORD
+    database_ref: env:VS_PG_DATABASE
+    publication_ref: env:VS_PG_PUBLICATION   # CREATE PUBLICATION … FOR TABLE …
+    slot_ref: env:VS_PG_SLOT                 # created by the engine
+    bootstrap:
+      mode: snapshot
+
+sink:
+  kind: surrealdb
+  surrealdb:
+    endpoint_ref: env:VS_SURREAL_ENDPOINT    # http(s)://host:8000
+    namespace: production
+    database: app
+    username_ref: env:VS_SURREAL_USERNAME
+    password_ref: env:VS_SURREAL_PASSWORD
+
+runtime:
+  health_listen: 127.0.0.1:4043
+  dlq_path: ./ventstream-state/dlq.jsonl
+```
+
+`*_ref: env:NAME` resolves each value from the environment at startup,
+so no secret lives in the file. Export them and run the engine:
+
+```bash
+export VS_PG_HOST=127.0.0.1 VS_PG_USER=app VS_PG_PASSWORD=… \
+       VS_PG_DATABASE=shop VS_PG_PUBLICATION=vs_pub VS_PG_SLOT=vs_slot \
+       VS_SURREAL_ENDPOINT=http://127.0.0.1:8000 \
+       VS_SURREAL_USERNAME=ventstream VS_SURREAL_PASSWORD=…
+
+VS_ENGINE_CONFIG=ventstream.yaml ventstream
+```
+
+The engine snapshots every published table into SurrealDB, then tails
+the WAL. **Each published table becomes a SurrealDB table named after
+its relation** — `public.orders` lands in table `orders` — and
+`table_prefix: "pg-"` would make that `pg-orders`. Verify in Surrealist:
+
+```sql
+SELECT count() FROM orders GROUP ALL;
+LIVE SELECT * FROM orders;   -- watch changes stream in
+```
+
+For **composed documents** (an order carrying its customer and line
+items), add a joins spec exactly as in the
+[Postgres source guide](/connectors/sources/postgres) — everything
+upstream of the sink, including joins and schema-drift handling, is
+identical for every sink.
 
 ## Record identity
 
@@ -99,8 +145,17 @@ versions):
 - **Full-replace materialization.** Documents are replaced, not merged:
   fields written by other applications on the same records are overwritten
   on the next sync. Give VentStream its own tables.
-- **Requires SurrealDB 3.x.**
+- **`table_routing.mode: fixed`** funnels every relation into one named
+  table (records keep fully-qualified ids so relations can't collide);
+  a TRUNCATE of any relation then clears that shared table — prefer the
+  default per-relation routing unless you need this.
 
-Everything upstream — sources, joins specs, schema-drift handling —
-applies unchanged; see the [Postgres source](/connectors/sources/postgres)
-guide for the pipeline side.
+## Troubleshooting
+
+- `namespace/database is not provisioned` — run the DDL from step 1, or
+  set `auto_create_database: true` with elevated credentials (dev only).
+- `HTTP 401` at startup — wrong credentials, or the user was defined at
+  a different scope than the configured namespace/database.
+- Writes retry with `transient statement failure` — normal under write
+  contention; sustained retries mean another process is hammering the
+  same records.
