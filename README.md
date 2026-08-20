@@ -11,6 +11,7 @@
   <a href="https://github.com/ventstream/ventstream/actions/workflows/ci.yml"><img src="https://github.com/ventstream/ventstream/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
   <a href="https://ventstream.dev/docs"><img src="https://img.shields.io/badge/docs-ventstream.dev-2FCF88" alt="Docs"></a>
+  <a href="#performance"><img src="https://img.shields.io/badge/benchmark-50M%20docs%20verified-2FCF88" alt="Benchmark: 50M docs verified"></a>
 </p>
 
 <p align="center">
