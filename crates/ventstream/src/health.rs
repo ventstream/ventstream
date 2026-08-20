@@ -178,7 +178,10 @@ enum ReadinessStatus {
     },
     /// The CDC transform stage has been retrying the same batch past the
     /// stall grace — the process is alive but not making progress.
-    PipelineStalled { duration: Duration, reason: String },
+    PipelineStalled {
+        duration: Duration,
+        reason: String,
+    },
     AtCapacity,
     Ready,
 }
@@ -321,7 +324,13 @@ mod tests {
     fn applies_capacity_only_after_gateway_startup() {
         let ws = ReadinessSignal::new();
         let active = Arc::new(AtomicUsize::new(9));
-        let gate = ReadinessGate::new(Some(ws.clone()), None, Some((Arc::clone(&active), 9)), None, None);
+        let gate = ReadinessGate::new(
+            Some(ws.clone()),
+            None,
+            Some((Arc::clone(&active), 9)),
+            None,
+            None,
+        );
 
         assert_eq!(gate.status(), ReadinessStatus::Starting(vec!["ws"]));
         ws.mark_ready();

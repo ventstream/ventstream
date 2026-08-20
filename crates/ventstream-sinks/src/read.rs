@@ -152,7 +152,10 @@ impl RedisReader {
         routing_key: &str,
         label: &'static str,
     ) -> Result<T, SinkError> {
-        let first_err = match connection.query_on_primary(command.clone(), routing_key).await {
+        let first_err = match connection
+            .query_on_primary(command.clone(), routing_key)
+            .await
+        {
             Ok(value) => return Ok(value),
             Err(err) => err,
         };
@@ -166,9 +169,7 @@ impl RedisReader {
         connection
             .query_on_primary(command, routing_key)
             .await
-            .map_err(|err| {
-                SinkError::Connection(format!("{label} failed after reconnect: {err}"))
-            })
+            .map_err(|err| SinkError::Connection(format!("{label} failed after reconnect: {err}")))
     }
 
     async fn get_document(&self, target: &str, doc_id: &str) -> Result<Option<Value>, SinkError> {
