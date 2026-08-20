@@ -3,11 +3,12 @@
 </p>
 
 <p align="center">
-  <b>Sync your database into search indexes and caches — joined, current, one binary.</b>
+  <b>Sync your database into search, caches, SurrealDB, and your AI's context — joined, current, one binary.</b>
 </p>
 
 <p align="center">
   <a href="https://github.com/ventstream/ventstream/releases"><img src="https://img.shields.io/github/v/release/ventstream/ventstream" alt="Release"></a>
+  <a href="https://github.com/ventstream/ventstream/actions/workflows/ci.yml"><img src="https://github.com/ventstream/ventstream/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
   <a href="https://ventstream.dev/docs"><img src="https://img.shields.io/badge/docs-ventstream.dev-2FCF88" alt="Docs"></a>
 </p>
@@ -16,16 +17,32 @@
   <img src="docs-site/images/ventstream-architecture.svg" alt="VentStream architecture — one Rust binary with a change-streaming pipeline and a real-time socket-delivery pipeline" width="860">
 </p>
 
-VentStream captures changes from PostgreSQL, MySQL/MariaDB, MongoDB, Neo4j, or
-Kafka, optionally runs stateful denormalizing joins, and materializes documents
-into OpenSearch/Elasticsearch, Meilisearch, or Redis — idempotent, crash-safe,
-and typically current within a couple of seconds. The same engine fans events
-out to browsers over native WebSockets and Apollo-compatible GraphQL
-subscriptions.
+VentStream captures changes from PostgreSQL, Supabase, MySQL/MariaDB, MongoDB,
+Neo4j, or Kafka, optionally runs stateful denormalizing joins, and materializes
+documents into OpenSearch/Elasticsearch, Meilisearch, Redis, or SurrealDB —
+idempotent, crash-safe, and typically current within a second. The same engine
+fans events out to browsers over native WebSockets and Apollo-compatible
+GraphQL subscriptions, and serves the materialized documents to AI agents over
+MCP.
 
 One public artifact runs everywhere: standalone against a local config file,
 or attached to [VentStream Cloud](https://ventstream.dev) with a single agent
 key.
+
+---
+
+## See it live
+
+- **[surreal-demo.ventstream.dev](https://surreal-demo.ventstream.dev)** —
+  Postgres orders joined with their customer, streaming into SurrealDB with
+  the sync latency measured live. Click a card, watch the document change.
+- **[MCP live demo](https://ventstream.dev/docs/demos/mcp-live)** — point
+  Claude at `https://mcp-demo.ventstream.dev/mcp` with the published demo key
+  and query a continuously-updated index in chat.
+
+Both run this repo's published images, managed by
+[VentStream Cloud](https://ventstream.dev). More at
+[ventstream.dev/docs/demos](https://ventstream.dev/docs/demos/overview).
 
 ---
 
@@ -38,6 +55,7 @@ key.
 - [Joined documents](#joined-documents)
 - [Managed mode](#managed-mode)
 - [Real-time delivery](#real-time-delivery)
+- [AI access over MCP](#ai-access-over-mcp)
 - [Performance](#performance)
 - [Deploy](#deploy)
 - [Configuration reference](#configuration-reference)
@@ -85,6 +103,7 @@ What that buys you in practice:
 | | Source | Mechanism |
 |---|---|---|
 | ✅ | PostgreSQL | logical replication (pgoutput) |
+| ✅ | Supabase | logical replication, pooler/IPv6-aware preflight |
 | ✅ | MySQL / MariaDB | row-based binlog |
 | ✅ | MongoDB | change streams |
 | ✅ | Neo4j 5.17+ Enterprise | CDC log with `txLogEnrichment` |
@@ -95,7 +114,9 @@ What that buys you in practice:
 | ✅ | OpenSearch / Elasticsearch | bulk API, external versioning |
 | ✅ | Meilisearch | task-confirmed writes, FIFO ordering |
 | ✅ | Redis | keyspace or view materialization, cluster-aware |
+| ✅ | SurrealDB | CBOR-native RPC, real record ids, optional graph edges |
 | ✅ | Browsers | native WebSocket + GraphQL subscriptions |
+| ✅ | AI agents | read-only MCP server over materialized documents |
 
 The engine is source/sink-pluggable; this is the matrix that is built and
 tested end to end today.
@@ -169,7 +190,7 @@ VS_ENGINE_CONFIG=./ventstream.yaml ventstream
 ```
 
 Inserts, updates, deletes — even primary-key changes — stay in exact lockstep
-with the table. Swap the sink block for `meilisearch` or `redis` and the same
+with the table. Swap the sink block for `meilisearch`, `redis`, or `surrealdb` and the same
 pipeline targets those instead.
 
 ## Joined documents
@@ -242,6 +263,28 @@ events to browsers:
 - NATS Core, NATS JetStream, or Redis Streams as the broker
 
 A TypeScript SDK and example apps live in [`packages/`](packages/).
+
+## AI access over MCP
+
+The documents VentStream materializes are exactly what an LLM needs as
+context — composed, current, and queryable. `ventstream mcp` serves them
+read-only over the Model Context Protocol:
+
+- `list_targets` / `get_entity` / `search` / `scan` tools over any Redis,
+  OpenSearch/Elasticsearch, or Meilisearch target, reading through the write
+  path's own key/index encoders
+- stdio for local agents, or stateless Streamable HTTP with bearer keys —
+  per-key target scoping, where out-of-scope means nonexistent
+- answers reflect the source database within seconds, not a stale export
+
+```bash
+ventstream mcp generate-token   # mint a vsk_ key
+VS_ROLES=mcp ventstream         # or run it as a managed role
+```
+
+See the [MCP server guide](docs-site/guides/mcp-server.mdx) or try the
+[live endpoint](https://ventstream.dev/docs/demos/mcp-live) against a real
+streaming index.
 
 ## Performance
 
@@ -333,6 +376,12 @@ cargo test --workspace
 
 Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) and
 [SECURITY.md](SECURITY.md).
+
+---
+
+If VentStream is useful to you, **a star helps other people find it** — and
+tells us which problems to keep solving. To run it with a control plane,
+dashboards, and managed pipelines, there's [VentStream Cloud](https://ventstream.dev).
 
 ## License
 
