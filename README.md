@@ -301,18 +301,18 @@ streaming index.
 
 Benchmarked end to end on 2 vCPUs / 1 GiB — every run verified for exact
 document counts, zero gaps, zero duplicates
-([`benchmarks/container-matrix/`](benchmarks/container-matrix/)):
+([`benchmarks/container-matrix/`](benchmarks/container-matrix/)).
 
-| Path | Throughput |
-|---|---|
-| PostgreSQL → OpenSearch | 58k events/s |
-| MongoDB → OpenSearch | 73k events/s |
-| Kafka → OpenSearch | 88k events/s |
+**Bootstrap, 50 million documents per source** ([results](benchmarks/container-matrix/BOOTSTRAP-50M-RESULTS-2026-08-20.md)):
 
-Four-million-document bootstrap runs land in minutes on commodity hardware,
-with engine CPU staying in the low double digits and memory bounded by
-explicit knobs — see [performance](docs-site/concepts/performance.mdx) for the
-sizing math.
+<p align="center">
+  <img src="docs-site/images/bootstrap-50m-benchmark.svg" alt="50M-document bootstrap benchmark: MongoDB 133k docs/s, PostgreSQL 128k, Neo4j ~126k, Kafka 113k, MySQL 93k — 6-9 minutes per source, peak engine memory 376 MiB, all counts verified exact" width="920">
+</p>
+
+**Live tail** stays in the same class: 58–88k events/s sustained across
+PostgreSQL, MongoDB, and Kafka on the same hardware, with engine CPU in the
+low double digits and memory bounded by explicit knobs — see
+[performance](docs-site/concepts/performance.mdx) for the sizing math.
 
 ## Deploy
 
