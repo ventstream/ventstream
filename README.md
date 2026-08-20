@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="docs-site/images/ventstream-architecture.svg" alt="VentStream architecture — one Rust binary with a change-streaming pipeline and a real-time socket-delivery pipeline" width="860">
+  <img src="docs-site/images/ventstream-architecture.svg" alt="VentStream architecture — one Rust binary with a change-streaming pipeline, a real-time socket-delivery pipeline, and an MCP serving surface for AI agents" width="860">
 </p>
 
 VentStream captures changes from PostgreSQL, Supabase, MySQL/MariaDB, MongoDB,
