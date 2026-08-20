@@ -33,8 +33,8 @@
 //! ### How it works
 //!
 //! - **Bootstrap.** For each spec, keyset-paginate the primaries by
-//!   `elementId(p)` — `MATCH (p:Label) WHERE elementId(p) > $lastEid
-//!   WITH p ORDER BY elementId(p) LIMIT $batch {cypher}` — so each page is
+//!   one streamed `MATCH (p:Label) RETURN elementId(p)` key scan,
+//!   chunked client-side into body queries — so each body page is
 //!   its own short read transaction rather than one long-streaming query.
 //!   Emit one event per row, keyed by `ventstream.doc.id =
 //!   "{output_table}:{primaryEid}"` so OS upserts in place.
@@ -260,23 +260,24 @@ pub async fn run_bootstrap_all(
     Ok(cursor)
 }
 
-/// Build the stage-1 keyset query for a bootstrap page: select the next
-/// `$batch` primary element-ids in order, independent of the user body. This
-/// is what drives termination + cursor advance (see [`bootstrap_one`]).
-fn build_keyset_cypher(label: &str, has_last: bool) -> String {
-    let where_clause = if has_last {
-        "WHERE elementId(p) > $lastEid\n"
-    } else {
-        ""
-    };
-    format!(
-        "MATCH (p:`{label}`)\n{where_clause}RETURN elementId(p) AS eid \
-         ORDER BY elementId(p) LIMIT $batch",
-    )
+/// Build the stage-1 key enumeration: one streamed scan of every
+/// primary element-id under the label. The previous per-page keyset
+/// (`ORDER BY elementId(p) LIMIT $batch`) re-ran a full label scan plus
+/// a top-K sort for every page — `elementId()` has no index and no
+/// native ordering — so each page cost O(label cardinality): flat on
+/// the graphs it was measured on (~60k primaries), a quadratic
+/// collapse at tens of millions (observed ~640 docs/s at 50M nodes).
+/// One streamed scan is O(n) total; the Bolt cursor fetches lazily so
+/// memory stays bounded by the chunking below. The stream's read
+/// transaction stays open for the scan's duration; a mid-stream
+/// failure restarts the bootstrap, which deterministic doc ids make
+/// idempotent.
+fn build_keys_cypher(label: &str) -> String {
+    format!("MATCH (p:`{label}`)\nRETURN elementId(p) AS eid")
 }
 
 /// Build the stage-2 body query: run the user's projection `body` over EXACTLY
-/// the primaries selected by the keyset (`elementId(p) IN $eids`). The body
+/// the primaries selected by stage 1 (`elementId(p) IN $eids`). The body
 /// composes after a `WITH p`, identical to the previous single-query form —
 /// only the primary selection changed from a `LIMIT` to an `IN $eids`.
 fn build_bootstrap_body_cypher(label: &str, body: &str) -> String {
@@ -292,70 +293,58 @@ async fn bootstrap_one(
     spec: &DenormalizeSpec,
     ctx: &SourceContext,
 ) -> Result<u64, Neo4jCdcError> {
-    // Keyset-paginate the primary scan rather than streaming one query
-    // over every primary. A single `MATCH (p:Label) {body}` for millions
-    // of primaries is one long-running read transaction — at scale it
-    // risks the server-side transaction timeout, and any mid-stream
-    // connection blip restarts the whole bootstrap. Paging by
-    // `elementId(p)` turns it into independent short queries: each page is
-    // its own transaction, bounded in duration. `elementId(p)` is a total
-    // order and SEEKS on a label scan (measured flat per-page to 60k+ on
-    // Aura), so pages stay O(batch), not O(offset). Deterministic doc IDs
-    // make pages idempotent, so a retried page can't double-count.
     let batch_size = config
         .bootstrap
         .as_ref()
         .map_or(2_000_i64, |b| b.batch_size);
     let label = &spec.primary_label;
     let mut emitted: u64 = 0;
-    let mut last_eid: Option<String> = None;
     let mut page: u64 = 0;
-    loop {
-        // PAGINATION IS DRIVEN BY THE PRIMARY KEYSET, NOT THE BODY OUTPUT.
-        //
-        // A previous design ran one query — `MATCH (p) … WITH p LIMIT $batch
-        // {body}` — and used the COUNT OF BODY ROWS for both termination and
-        // the cursor advance. But `LIMIT $batch` bounds primaries while the
-        // body decides how many rows to return: a body using a non-`OPTIONAL
-        // MATCH` (or any filter dropping primaries) emits fewer rows than the
-        // primaries scanned, so `rows < batch` ended the scan early and every
-        // remaining primary was silently never visited. The shipped example
-        // uses `OPTIONAL MATCH` so it was latent, but it's a data-loss trap
-        // for any other projection.
-        //
-        // Stage 1 selects this page's primary element-ids by keyset alone —
-        // count + max are authoritative regardless of the body.
-        let keyset_cypher = build_keyset_cypher(label, last_eid.is_some());
-        let mut kq = query(&keyset_cypher).param("batch", batch_size);
-        if let Some(last) = &last_eid {
-            kq = kq.param("lastEid", last.as_str());
-        }
-        let mut krows = graph.execute(kq).await.map_err(|err| {
-            Neo4jCdcError::Query(format!(
-                "bootstrap_one keyset primary={label} page={page}: {err}"
-            ))
+
+    // PAGINATION IS DRIVEN BY THE PRIMARY KEY STREAM, NOT THE BODY OUTPUT.
+    //
+    // A previous design ran one query — `MATCH (p) … WITH p LIMIT $batch
+    // {body}` — and used the COUNT OF BODY ROWS for both termination and
+    // the cursor advance. But `LIMIT $batch` bounds primaries while the
+    // body decides how many rows to return: a body using a non-`OPTIONAL
+    // MATCH` (or any filter dropping primaries) emits fewer rows than the
+    // primaries scanned, so `rows < batch` ended the scan early and every
+    // remaining primary was silently never visited. Stage 1 enumerates
+    // primaries by itself — its stream is authoritative regardless of the
+    // body's row count.
+    let mut krows = graph
+        .execute(query(&build_keys_cypher(label)))
+        .await
+        .map_err(|err| {
+            Neo4jCdcError::Query(format!("bootstrap_one keys primary={label}: {err}"))
         })?;
+
+    let mut exhausted = false;
+    while !exhausted {
+        // Collect the next chunk of primary ids off the key stream.
         let mut page_eids: Vec<String> = Vec::new();
-        while let Some(row) = krows
-            .next()
-            .await
-            .map_err(|err| Neo4jCdcError::Query(format!("bootstrap_one keyset iter: {err}")))?
-        {
+        while (page_eids.len() as i64) < batch_size {
+            let Some(row) = krows
+                .next()
+                .await
+                .map_err(|err| Neo4jCdcError::Query(format!("bootstrap_one keys iter: {err}")))?
+            else {
+                exhausted = true;
+                break;
+            };
             let eid = row
                 .get::<String>("eid")
-                .map_err(|err| Neo4jCdcError::Query(format!("bootstrap_one keyset eid: {err}")))?;
+                .map_err(|err| Neo4jCdcError::Query(format!("bootstrap_one keys eid: {err}")))?;
             page_eids.push(eid);
         }
         if page_eids.is_empty() {
             break;
         }
         let page_primary_count = page_eids.len() as i64;
-        // ORDER BY elementId ASC, so the last entry is the page's max primary.
-        let page_max_eid = page_eids.last().cloned();
 
-        // Stage 2 runs the user body over EXACTLY this page's primaries. The
+        // Stage 2 runs the user body over EXACTLY this chunk's primaries. The
         // body still composes after a `WITH p`, identical to before — only the
-        // primary selection is now `elementId(p) IN $eids` instead of a LIMIT.
+        // primary selection is `elementId(p) IN $eids`, a NodeByElementIdSeek.
         let body_cypher = build_bootstrap_body_cypher(label, &spec.cypher);
         let mut rows = graph
             .execute(query(&body_cypher).param("eids", page_eids.clone()))
@@ -396,16 +385,6 @@ async fn bootstrap_one(
             primaries = page_primary_count, docs = page_doc_count, total = emitted,
             "neo4j denormalize bootstrap: page complete"
         );
-        // Advance by the page's max PRIMARY id (authoritative — every primary
-        // is in `page_eids` whether or not the body emitted a doc for it), then
-        // stop only when the keyset page was short.
-        match page_max_eid {
-            Some(eid) => last_eid = Some(eid),
-            None => break,
-        }
-        if page_primary_count < batch_size {
-            break;
-        }
     }
     Ok(emitted)
 }
@@ -1830,20 +1809,19 @@ mod tests {
     }
 
     #[test]
-    fn keyset_cypher_paginates_primaries_independently_of_body() {
-        // First page: no WHERE, ordered LIMIT on the PRIMARY keyset.
-        let first = build_keyset_cypher("Author", false);
-        assert!(first.contains("MATCH (p:`Author`)"));
-        assert!(!first.contains("WHERE"), "first page has no keyset filter");
-        assert!(first.contains("RETURN elementId(p) AS eid"));
-        assert!(first.contains("ORDER BY elementId(p) LIMIT $batch"));
+    fn keys_cypher_is_one_unsorted_streaming_scan() {
+        let keys = build_keys_cypher("Author");
+        assert!(keys.contains("MATCH (p:`Author`)"));
+        assert!(keys.contains("RETURN elementId(p) AS eid"));
+        // One streamed scan: no per-page re-planning. ORDER BY / LIMIT over
+        // elementId() forced a full label scan + top-K sort per page —
+        // quadratic at scale (see build_keys_cypher docs).
+        assert!(!keys.contains("ORDER BY"), "key scan must not sort");
+        assert!(!keys.contains("LIMIT"), "key scan must not paginate");
+        assert!(!keys.contains("WHERE"), "key scan has no keyset filter");
         // It must NOT contain any user body / doc projection — it's a pure
         // primary scan, so its row count == primary count.
-        assert!(!first.contains("AS doc"));
-
-        // Subsequent pages add the keyset filter.
-        let next = build_keyset_cypher("Author", true);
-        assert!(next.contains("WHERE elementId(p) > $lastEid"));
+        assert!(!keys.contains("AS doc"));
     }
 
     #[test]
