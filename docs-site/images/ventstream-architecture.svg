@@ -1,122 +1,172 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 700" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif" role="img" aria-label="VentStream architecture: one Rust binary with a change-streaming pipeline, a real-time socket-delivery pipeline, and an MCP serving surface for AI agents">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 700" font-family="Inter,ui-sans-serif,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif" role="img" aria-label="VentStream architecture — one Rust binary with a change-streaming pipeline, a real-time socket-delivery pipeline, and an MCP serving surface for AI agents">
   <defs>
-    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
       <path d="M0 0 L10 5 L0 10 z" fill="#2fcf88"/>
     </marker>
+    <radialGradient id="bloom" cx="0.22" cy="0.06" r="0.85">
+      <stop offset="0" stop-color="#2fcf88" stop-opacity="0.10"/>
+      <stop offset="0.45" stop-color="#2fcf88" stop-opacity="0.03"/>
+      <stop offset="1" stop-color="#2fcf88" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="cardTop" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.045"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="engStroke" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#50dca0"/>
+      <stop offset="1" stop-color="#24b978"/>
+    </linearGradient>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="1" fill="#2fcf88" fill-opacity="0.055"/>
+    </pattern>
+    <linearGradient id="dotFade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity="1"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <mask id="dotMask"><rect x="0" y="0" width="980" height="360" fill="url(#dotFade)"/></mask>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="7" result="b"/>
+      <feFlood flood-color="#2fcf88" flood-opacity="0.32"/>
+      <feComposite in2="b" operator="in"/>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
     <style>
-      .bg{fill:#0b1220;stroke:#1e293b;stroke-width:1.5}
-      .box{fill:#111a2e;stroke:#31445f;stroke-width:1.5;rx:10}
-      .eng{fill:#0d2a20;stroke:#2fcf88;stroke-width:2;rx:12}
-      .t{fill:#e6edf3;font-size:14px;font-weight:600}
-      .s{fill:#8aa0b8;font-size:11.5px}
-      .lane{fill:#7ee6b8;font-size:13px;font-weight:700;letter-spacing:.3px}
-      .cap{fill:#64748b;font-size:11.5px}
-      .ln{stroke:#2fcf88;stroke-width:1.6;fill:none;opacity:.85}
-      .title{fill:#e6edf3;font-size:30px;font-weight:800}
-      .sub{fill:#94a3b8;font-size:14px}
+      .card{fill:#101a15;stroke:#233b30;stroke-width:1}
+      .eng{fill:#0e2018;stroke:url(#engStroke);stroke-width:1.6}
+      .t{fill:#ecf5f0;font-size:13.5px;font-weight:600}
+      .s{fill:#7f948a;font-size:11px;font-family:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
+      .engT{fill:#d9f5e8;font-size:13.5px;font-weight:700}
+      .engS{fill:#7fc9a8;font-size:10.5px;font-family:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
+      .eyebrow{fill:#8ee7bd;font-size:11px;font-weight:700;letter-spacing:.14em}
+      .cap{fill:#5c6f66;font-size:10.5px;font-family:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.04em}
+      .ln{stroke:#2fcf88;stroke-width:1.3;fill:none;opacity:.55}
+      .title{fill:#f2f8f5;font-size:27px;font-weight:800;letter-spacing:-.01em}
+      .pillT{fill:#9fb5aa;font-size:10.5px;font-family:'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace}
     </style>
   </defs>
 
-  <rect class="bg" x="1" y="1" width="978" height="698" rx="18"/>
-  <text class="title" x="34" y="50">VentStream</text>
-  <text class="sub" x="248" y="50">one Rust binary · change streaming + real-time delivery + AI access</text>
+  <!-- ground -->
+  <rect x="1" y="1" width="978" height="698" rx="20" fill="#0b120f" stroke="#1c2a23" stroke-width="1.5"/>
+  <rect x="1" y="1" width="978" height="698" rx="20" fill="url(#bloom)"/>
+  <rect x="1" y="1" width="978" height="698" rx="20" fill="url(#dots)" mask="url(#dotMask)"/>
 
-  <!-- Lane 1: CDC -->
-  <text class="lane" x="34" y="96">① Change streaming → any target</text>
+  <!-- header -->
+  <text class="title" x="36" y="52">VentStream</text>
+  <rect x="700" y="30" width="244" height="28" rx="14" fill="#0f1a15" stroke="#233b30" stroke-width="1"/>
+  <circle cx="718" cy="44" r="3" fill="#2fcf88"/>
+  <circle cx="718" cy="44" r="6" fill="#2fcf88" opacity="0.22"/>
+  <text class="pillT" x="730" y="48">roles: [cdc, ws, graphql, mcp]</text>
+  <text x="36" y="76" fill="#7f948a" font-size="13">one Rust binary · change streaming + real-time delivery + AI access</text>
 
-  <rect class="box" x="34" y="112" width="132" height="38" rx="10"/>
-  <text class="t" x="100" y="129" text-anchor="middle">PostgreSQL</text>
-  <text class="s" x="100" y="143" text-anchor="middle">incl. Supabase</text>
-  <rect class="box" x="34" y="158" width="132" height="38" rx="10"/>
-  <text class="t" x="100" y="175" text-anchor="middle">MySQL / MariaDB</text>
-  <text class="s" x="100" y="189" text-anchor="middle">row-based binlog</text>
-  <rect class="box" x="34" y="204" width="132" height="38" rx="10"/>
-  <text class="t" x="100" y="221" text-anchor="middle">MongoDB</text>
-  <text class="s" x="100" y="235" text-anchor="middle">change streams</text>
-  <rect class="box" x="34" y="250" width="132" height="38" rx="10"/>
-  <text class="t" x="100" y="267" text-anchor="middle">Neo4j</text>
-  <text class="s" x="100" y="281" text-anchor="middle">CDC log</text>
-  <rect class="box" x="34" y="296" width="132" height="38" rx="10"/>
-  <text class="t" x="100" y="313" text-anchor="middle">Kafka</text>
-  <text class="s" x="100" y="327" text-anchor="middle">Debezium / raw</text>
+  <!-- ── lane 1 ── -->
+  <circle cx="41" cy="112" r="3" fill="#2fcf88"/>
+  <circle cx="41" cy="112" r="6" fill="#2fcf88" opacity="0.22"/>
+  <text class="eyebrow" x="54" y="116">CHANGE STREAMING → ANY TARGET</text>
 
-  <rect class="eng" x="382" y="172" width="196" height="100" rx="12"/>
-  <text class="t" x="480" y="200" text-anchor="middle">VentStream · cdc</text>
-  <text class="s" x="480" y="220" text-anchor="middle">bootstrap + tail, one motion</text>
-  <text class="s" x="480" y="236" text-anchor="middle">joins → composed documents</text>
-  <text class="s" x="480" y="252" text-anchor="middle">deterministic ids, durable cursor</text>
+  <g>
+    <rect class="card" x="36" y="132" width="132" height="38" rx="9"/><rect x="36" y="132" width="132" height="19" rx="9" fill="url(#cardTop)"/>
+    <text class="t" x="102" y="148" text-anchor="middle">PostgreSQL</text>
+    <text class="s" x="102" y="163" text-anchor="middle">incl. Supabase</text>
+    <rect class="card" x="36" y="178" width="132" height="38" rx="9"/><rect x="36" y="178" width="132" height="19" rx="9" fill="url(#cardTop)"/>
+    <text class="t" x="102" y="194" text-anchor="middle">MySQL / MariaDB</text>
+    <text class="s" x="102" y="209" text-anchor="middle">row-based binlog</text>
+    <rect class="card" x="36" y="224" width="132" height="38" rx="9"/><rect x="36" y="224" width="132" height="19" rx="9" fill="url(#cardTop)"/>
+    <text class="t" x="102" y="240" text-anchor="middle">MongoDB</text>
+    <text class="s" x="102" y="255" text-anchor="middle">change streams</text>
+    <rect class="card" x="36" y="270" width="132" height="38" rx="9"/><rect x="36" y="270" width="132" height="19" rx="9" fill="url(#cardTop)"/>
+    <text class="t" x="102" y="286" text-anchor="middle">Neo4j</text>
+    <text class="s" x="102" y="301" text-anchor="middle">CDC log</text>
+    <rect class="card" x="36" y="316" width="132" height="38" rx="9"/><rect x="36" y="316" width="132" height="19" rx="9" fill="url(#cardTop)"/>
+    <text class="t" x="102" y="332" text-anchor="middle">Kafka</text>
+    <text class="s" x="102" y="347" text-anchor="middle">debezium / raw</text>
+  </g>
 
-  <rect class="box" x="788" y="118" width="158" height="44" rx="10"/>
-  <text class="t" x="867" y="137" text-anchor="middle">OpenSearch</text>
-  <text class="s" x="867" y="152" text-anchor="middle">/ Elasticsearch</text>
-  <rect class="box" x="788" y="172" width="158" height="44" rx="10"/>
-  <text class="t" x="867" y="191" text-anchor="middle">Meilisearch</text>
-  <text class="s" x="867" y="206" text-anchor="middle">task-confirmed</text>
-  <rect class="box" x="788" y="226" width="158" height="44" rx="10"/>
-  <text class="t" x="867" y="245" text-anchor="middle">Redis</text>
-  <text class="s" x="867" y="260" text-anchor="middle">keyspace / views</text>
-  <rect class="box" x="788" y="280" width="158" height="44" rx="10"/>
-  <text class="t" x="867" y="299" text-anchor="middle">SurrealDB</text>
-  <text class="s" x="867" y="314" text-anchor="middle">record ids · graph edges</text>
+  <g filter="url(#glow)">
+    <rect class="eng" x="372" y="192" width="220" height="100" rx="12"/>
+  </g>
+  <rect x="372" y="192" width="220" height="50" rx="12" fill="url(#cardTop)"/>
+  <text class="engT" x="482" y="219" text-anchor="middle">VentStream · cdc</text>
+  <text class="engS" x="482" y="240" text-anchor="middle">bootstrap + tail, one motion</text>
+  <text class="engS" x="482" y="256" text-anchor="middle">joins → composed documents</text>
+  <text class="engS" x="482" y="272" text-anchor="middle">deterministic ids · durable cursor</text>
 
-  <path class="ln" d="M166 131 L382 200" marker-end="url(#ar)"/>
-  <path class="ln" d="M166 177 L382 212" marker-end="url(#ar)"/>
-  <path class="ln" d="M166 223 L382 224" marker-end="url(#ar)"/>
-  <path class="ln" d="M166 269 L382 236" marker-end="url(#ar)"/>
-  <path class="ln" d="M166 315 L382 248" marker-end="url(#ar)"/>
-  <path class="ln" d="M578 200 L788 140" marker-end="url(#ar)"/>
-  <path class="ln" d="M578 214 L788 194" marker-end="url(#ar)"/>
-  <path class="ln" d="M578 230 L788 248" marker-end="url(#ar)"/>
-  <path class="ln" d="M578 244 L788 302" marker-end="url(#ar)"/>
-  <text class="cap" x="666" y="161" text-anchor="middle">idempotent, bounded</text>
+  <g>
+    <rect class="card" x="790" y="138" width="156" height="44" rx="9"/><rect x="790" y="138" width="156" height="22" rx="9" fill="url(#cardTop)"/>
+    <text class="t" x="868" y="156" text-anchor="middle">OpenSearch</text>
+    <text class="s" x="868" y="172" text-anchor="middle">/ elasticsearch</text>
+    <rect class="card" x="790" y="192" width="156" height="44" rx="9"/><rect x="790" y="192" width="156" height="22" rx="9" fill="url(#cardTop)"/>
+    <text class="t" x="868" y="210" text-anchor="middle">Meilisearch</text>
+    <text class="s" x="868" y="226" text-anchor="middle">task-confirmed</text>
+    <rect class="card" x="790" y="246" width="156" height="44" rx="9"/><rect x="790" y="246" width="156" height="22" rx="9" fill="url(#cardTop)"/>
+    <text class="t" x="868" y="264" text-anchor="middle">Redis</text>
+    <text class="s" x="868" y="280" text-anchor="middle">keyspace / views</text>
+    <rect class="card" x="790" y="300" width="156" height="44" rx="9"/><rect x="790" y="300" width="156" height="22" rx="9" fill="url(#cardTop)"/>
+    <text class="t" x="868" y="318" text-anchor="middle">SurrealDB</text>
+    <text class="s" x="868" y="334" text-anchor="middle">record ids · edges</text>
+  </g>
 
-  <!-- divider -->
-  <line x1="34" y1="368" x2="946" y2="368" stroke="#1e293b" stroke-width="1"/>
+  <path class="ln" d="M168 151 C 280 151, 300 220, 372 220" marker-end="url(#ar)"/>
+  <path class="ln" d="M168 197 C 280 197, 300 231, 372 231" marker-end="url(#ar)"/>
+  <path class="ln" d="M168 243 C 280 243, 300 242, 372 242" marker-end="url(#ar)"/>
+  <path class="ln" d="M168 289 C 280 289, 300 253, 372 253" marker-end="url(#ar)"/>
+  <path class="ln" d="M168 335 C 280 335, 300 264, 372 264" marker-end="url(#ar)"/>
+  <path class="ln" d="M592 220 C 686 220, 700 160, 790 160" marker-end="url(#ar)"/>
+  <path class="ln" d="M592 231 C 686 231, 700 214, 790 214" marker-end="url(#ar)"/>
+  <path class="ln" d="M592 253 C 686 253, 700 268, 790 268" marker-end="url(#ar)"/>
+  <path class="ln" d="M592 264 C 686 264, 700 322, 790 322" marker-end="url(#ar)"/>
+  <text class="cap" x="676" y="146" text-anchor="middle">idempotent · bounded</text>
 
-  <!-- Lane 2: real-time -->
-  <text class="lane" x="34" y="404">② Real-time socket delivery → clients</text>
-  <rect class="box" x="34" y="422" width="132" height="48" rx="10"/>
-  <text class="t" x="100" y="444" text-anchor="middle">Publishers</text>
-  <text class="s" x="100" y="460" text-anchor="middle">{event, id, data}</text>
+  <line x1="36" y1="388" x2="944" y2="388" stroke="#1c2a23" stroke-width="1"/>
 
-  <rect class="box" x="214" y="422" width="150" height="48" rx="10"/>
-  <text class="t" x="289" y="444" text-anchor="middle">Broker</text>
-  <text class="s" x="289" y="460" text-anchor="middle">NATS · JetStream · Redis</text>
+  <!-- ── lane 2 ── -->
+  <circle cx="41" cy="424" r="3" fill="#2fcf88"/>
+  <circle cx="41" cy="424" r="6" fill="#2fcf88" opacity="0.22"/>
+  <text class="eyebrow" x="54" y="428">REAL-TIME SOCKET DELIVERY → CLIENTS</text>
 
-  <rect class="eng" x="404" y="420" width="182" height="52" rx="12"/>
-  <text class="t" x="495" y="442" text-anchor="middle">VentStream</text>
-  <text class="s" x="495" y="458" text-anchor="middle">ws · graphql roles</text>
+  <rect class="card" x="36" y="444" width="132" height="48" rx="9"/><rect x="36" y="444" width="132" height="24" rx="9" fill="url(#cardTop)"/>
+  <text class="t" x="102" y="464" text-anchor="middle">Publishers</text>
+  <text class="s" x="102" y="481" text-anchor="middle">{event, id, data}</text>
 
-  <rect class="box" x="788" y="410" width="158" height="40" rx="10"/>
-  <text class="t" x="867" y="435" text-anchor="middle">WebSocket clients</text>
-  <rect class="box" x="788" y="458" width="158" height="40" rx="10"/>
-  <text class="t" x="867" y="483" text-anchor="middle">Apollo / GraphQL</text>
+  <rect class="card" x="206" y="444" width="170" height="48" rx="9"/><rect x="206" y="444" width="170" height="24" rx="9" fill="url(#cardTop)"/>
+  <text class="t" x="291" y="464" text-anchor="middle">Broker</text>
+  <text class="s" x="291" y="481" text-anchor="middle">nats · jetstream · redis</text>
 
-  <path class="ln" d="M166 446 L214 446" marker-end="url(#ar)"/>
-  <path class="ln" d="M364 446 L404 446" marker-end="url(#ar)"/>
-  <path class="ln" d="M578 440 L788 430" marker-end="url(#ar)"/>
-  <path class="ln" d="M578 452 L788 478" marker-end="url(#ar)"/>
+  <g filter="url(#glow)"><rect class="eng" x="398" y="442" width="194" height="52" rx="12"/></g>
+  <rect x="398" y="442" width="194" height="26" rx="12" fill="url(#cardTop)"/>
+  <text class="engT" x="495" y="464" text-anchor="middle">VentStream</text>
+  <text class="engS" x="495" y="481" text-anchor="middle">ws · graphql roles</text>
 
-  <!-- divider -->
-  <line x1="34" y1="524" x2="946" y2="524" stroke="#1e293b" stroke-width="1"/>
+  <rect class="card" x="790" y="432" width="156" height="40" rx="9"/><rect x="790" y="432" width="156" height="20" rx="9" fill="url(#cardTop)"/>
+  <text class="t" x="868" y="456" text-anchor="middle">WebSocket clients</text>
+  <rect class="card" x="790" y="480" width="156" height="40" rx="9"/><rect x="790" y="480" width="156" height="20" rx="9" fill="url(#cardTop)"/>
+  <text class="t" x="868" y="504" text-anchor="middle">Apollo / GraphQL</text>
 
-  <!-- Lane 3: MCP -->
-  <text class="lane" x="34" y="560">③ AI access → agents</text>
-  <rect class="box" x="34" y="578" width="150" height="48" rx="10"/>
-  <text class="t" x="109" y="600" text-anchor="middle">Materialized docs</text>
-  <text class="s" x="109" y="616" text-anchor="middle">Redis · search indexes</text>
+  <path class="ln" d="M168 468 L206 468" marker-end="url(#ar)"/>
+  <path class="ln" d="M376 468 L398 468" marker-end="url(#ar)"/>
+  <path class="ln" d="M592 462 C 680 462, 700 452, 790 452" marker-end="url(#ar)"/>
+  <path class="ln" d="M592 474 C 680 474, 700 500, 790 500" marker-end="url(#ar)"/>
 
-  <rect class="eng" x="404" y="576" width="182" height="52" rx="12"/>
-  <text class="t" x="495" y="598" text-anchor="middle">VentStream · mcp</text>
-  <text class="s" x="495" y="614" text-anchor="middle">read-only tools, scoped keys</text>
+  <line x1="36" y1="546" x2="944" y2="546" stroke="#1c2a23" stroke-width="1"/>
 
-  <rect class="box" x="788" y="578" width="158" height="48" rx="10"/>
-  <text class="t" x="867" y="600" text-anchor="middle">AI agents</text>
-  <text class="s" x="867" y="616" text-anchor="middle">Claude · any MCP client</text>
+  <!-- ── lane 3 ── -->
+  <circle cx="41" cy="582" r="3" fill="#2fcf88"/>
+  <circle cx="41" cy="582" r="6" fill="#2fcf88" opacity="0.22"/>
+  <text class="eyebrow" x="54" y="586">AI ACCESS → AGENTS</text>
 
-  <path class="ln" d="M184 602 L404 602" marker-end="url(#ar)"/>
-  <path class="ln" d="M586 602 L788 602" marker-end="url(#ar)"/>
-  <text class="cap" x="687" y="646" text-anchor="middle">answers reflect the source in seconds</text>
+  <rect class="card" x="36" y="602" width="160" height="48" rx="9"/><rect x="36" y="602" width="160" height="24" rx="9" fill="url(#cardTop)"/>
+  <text class="t" x="116" y="622" text-anchor="middle">Materialized docs</text>
+  <text class="s" x="116" y="639" text-anchor="middle">redis · search indexes</text>
 
-  <text class="cap" x="490" y="676" text-anchor="middle">role-selected on one binary — roles: [cdc, ws, graphql, mcp]</text>
+  <g filter="url(#glow)"><rect class="eng" x="398" y="600" width="194" height="52" rx="12"/></g>
+  <rect x="398" y="600" width="194" height="26" rx="12" fill="url(#cardTop)"/>
+  <text class="engT" x="495" y="622" text-anchor="middle">VentStream · mcp</text>
+  <text class="engS" x="495" y="639" text-anchor="middle">read-only tools · scoped keys</text>
+
+  <rect class="card" x="782" y="602" width="164" height="48" rx="9"/><rect x="782" y="602" width="164" height="24" rx="9" fill="url(#cardTop)"/>
+  <text class="t" x="864" y="622" text-anchor="middle">AI agents</text>
+  <text class="s" x="864" y="639" text-anchor="middle">claude · any mcp client</text>
+
+  <path class="ln" d="M196 626 L398 626" marker-end="url(#ar)"/>
+  <path class="ln" d="M592 626 L782 626" marker-end="url(#ar)"/>
+  <text class="cap" x="688" y="672" text-anchor="middle">answers reflect the source in seconds</text>
 </svg>
