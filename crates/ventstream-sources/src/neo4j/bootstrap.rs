@@ -164,93 +164,62 @@ async fn fetch_reltypes(graph: &Graph) -> Result<Vec<String>, Neo4jCdcError> {
 async fn scan_all_nodes(
     graph: &Graph,
     config: &Neo4jCdcConfig,
-    batch_size: i64,
+    _batch_size: i64,
     ctx: &SourceContext,
 ) -> Result<std::collections::BTreeMap<String, u64>, Neo4jCdcError> {
     let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    // Keyset pagination over elementId(n): each page resumes strictly
-    // after the previous page's final elementId via `WHERE elementId(n) >
-    // $last`, which Neo4j satisfies with a node-store seek — O(1) per
-    // page. SKIP/LIMIT was O(skip): the back half of a large scan
-    // re-walked and discarded every prior row. Measured on a 529k-node
-    // Aura graph, SKIP page latency grew ~2x toward the tail (pure-skip
-    // cost ~2µs/node, quadratic in aggregate) while keyset stayed flat to
-    // 500k+. ORDER BY elementId(n) is a total, stable order, so the bound
-    // never skips or repeats a node.
-    let mut last_eid: Option<String> = None;
-    loop {
-        let cypher = if last_eid.is_some() {
-            "MATCH (n) WHERE elementId(n) > $last RETURN \
-                elementId(n) AS eid, labels(n) AS labels, properties(n) AS props \
-             ORDER BY elementId(n) LIMIT $batch"
-        } else {
+    // One streamed scan: the Bolt cursor pulls rows lazily in
+    // fetch-size batches, so memory stays bounded without explicit
+    // paging. The previous keyset pagination over elementId(n)
+    // re-planned a full AllNodesScan plus a top-K sort for every page —
+    // elementId() has no index and no native ordering — so each page
+    // cost O(total nodes): invisible on the 529k-node graph it was
+    // measured on (~10 ms/page), a quadratic collapse at 50M nodes
+    // (~650 docs/s observed). One streamed scan is O(n) total, no sort.
+    let mut rows = graph
+        .execute(query(
             "MATCH (n) RETURN \
-                elementId(n) AS eid, labels(n) AS labels, properties(n) AS props \
-             ORDER BY elementId(n) LIMIT $batch"
+                elementId(n) AS eid, labels(n) AS labels, properties(n) AS props",
+        ))
+        .await
+        .map_err(|err| Neo4jCdcError::Query(format!("scan_all_nodes: {err}")))?;
+
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|err| Neo4jCdcError::Query(format!("scan_all_nodes iter: {err}")))?
+    {
+        let eid = row
+            .get::<String>("eid")
+            .map_err(|err| Neo4jCdcError::Query(format!("scan_all_nodes eid: {err}")))?;
+        let labels_bolt: BoltType = row
+            .get("labels")
+            .map_err(|err| Neo4jCdcError::Query(format!("scan_all_nodes labels: {err}")))?;
+        let props_bolt: BoltType = row
+            .get("props")
+            .map_err(|err| Neo4jCdcError::Query(format!("scan_all_nodes props: {err}")))?;
+
+        // BoltType::List<String> → Vec<String> for canonicalisation.
+        let labels_vec = labels_to_vec(&labels_bolt);
+        let Some(canonical) = config.canonical_label(&labels_vec) else {
+            // No labels on the node — Neo4j 5 generally requires a
+            // label per node, so this is anomalous. Skip + warn
+            // rather than crash.
+            warn!(element_id = %eid, "neo4j bootstrap: node has no labels, skipping");
+            continue;
         };
-        let mut q = query(cypher).param("batch", batch_size);
-        if let Some(last) = &last_eid {
-            q = q.param("last", last.as_str());
+        if !config.label_allowed(canonical) {
+            continue;
         }
-        let mut rows = graph
-            .execute(q)
+        let table = config.resolve_label_table(canonical);
+
+        let payload = synthesize_node_payload(&eid, &labels_bolt, &props_bolt);
+        let event = event_mapper::synth_node_insert(config, &table, payload)?;
+        ctx.sender
+            .send(event, &ctx.shutdown)
             .await
-            .map_err(|err| Neo4jCdcError::Query(format!("scan_all_nodes: {err}")))?;
-
-        let mut page_count: i64 = 0;
-        // Advance the keyset cursor past EVERY row the page returned —
-        // including nodes filtered out below. A filtered-out last row must
-        // still move the cursor, else the next page would re-query from it.
-        let mut page_last_eid: Option<String> = None;
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|err| Neo4jCdcError::Query(format!("scan_all_nodes iter: {err}")))?
-        {
-            let eid = row
-                .get::<String>("eid")
-                .map_err(|err| Neo4jCdcError::Query(format!("scan_all_nodes eid: {err}")))?;
-            page_count += 1;
-            page_last_eid = Some(eid.clone());
-            let labels_bolt: BoltType = row
-                .get("labels")
-                .map_err(|err| Neo4jCdcError::Query(format!("scan_all_nodes labels: {err}")))?;
-            let props_bolt: BoltType = row
-                .get("props")
-                .map_err(|err| Neo4jCdcError::Query(format!("scan_all_nodes props: {err}")))?;
-
-            // BoltType::List<String> → Vec<String> for canonicalisation.
-            let labels_vec = labels_to_vec(&labels_bolt);
-            let Some(canonical) = config.canonical_label(&labels_vec) else {
-                // No labels on the node — Neo4j 5 generally requires a
-                // label per node, so this is anomalous. Skip + warn
-                // rather than crash.
-                warn!(element_id = %eid, "neo4j bootstrap: node has no labels, skipping");
-                continue;
-            };
-            if !config.label_allowed(canonical) {
-                continue;
-            }
-            let table = config.resolve_label_table(canonical);
-
-            let payload = synthesize_node_payload(&eid, &labels_bolt, &props_bolt);
-            let event = event_mapper::synth_node_insert(config, &table, payload)?;
-            ctx.sender
-                .send(event, &ctx.shutdown)
-                .await
-                .map_err(|err| Neo4jCdcError::Internal(format!("publish failed: {err}")))?;
-            *counts.entry(table).or_insert(0) += 1;
-        }
-        if page_count < batch_size {
-            break;
-        }
-        // Full page — resume strictly after its last elementId. A full
-        // page with no captured id can't happen (every row sets it), but
-        // stop rather than risk an infinite loop if it ever did.
-        match page_last_eid {
-            Some(eid) => last_eid = Some(eid),
-            None => break,
-        }
+            .map_err(|err| Neo4jCdcError::Internal(format!("publish failed: {err}")))?;
+        *counts.entry(table).or_insert(0) += 1;
     }
     Ok(counts)
 }
@@ -277,91 +246,63 @@ async fn scan_relationships(
     config: &Neo4jCdcConfig,
     reltype: &str,
     table: &str,
-    batch_size: i64,
+    _batch_size: i64,
     ctx: &SourceContext,
 ) -> Result<u64, Neo4jCdcError> {
     let mut emitted: u64 = 0;
-    // Keyset pagination over elementId(r) — same store-seek win as the
-    // node scan (see scan_all_nodes). SKIP/LIMIT was O(skip) per page.
-    let mut last_eid: Option<String> = None;
-    loop {
-        let cypher = if last_eid.is_some() {
-            format!(
-                "MATCH (a)-[r:`{reltype}`]->(b) WHERE elementId(r) > $last RETURN \
-                   elementId(r) AS eid, type(r) AS rtype, properties(r) AS props, \
-                   elementId(a) AS start_eid, labels(a) AS start_labels, \
-                   elementId(b) AS end_eid,   labels(b) AS end_labels \
-                 ORDER BY elementId(r) LIMIT $batch"
-            )
-        } else {
-            format!(
-                "MATCH (a)-[r:`{reltype}`]->(b) RETURN \
-                   elementId(r) AS eid, type(r) AS rtype, properties(r) AS props, \
-                   elementId(a) AS start_eid, labels(a) AS start_labels, \
-                   elementId(b) AS end_eid,   labels(b) AS end_labels \
-                 ORDER BY elementId(r) LIMIT $batch"
-            )
-        };
-        let mut q = query(&cypher).param("batch", batch_size);
-        if let Some(last) = &last_eid {
-            q = q.param("last", last.as_str());
-        }
-        let mut rows = graph.execute(q).await.map_err(|err| {
-            Neo4jCdcError::Query(format!("scan_relationships reltype={reltype}: {err}"))
-        })?;
+    // One streamed scan per relationship type — same reasoning as
+    // scan_all_nodes: elementId(r) keyset paging re-planned a full
+    // expand + sort per page, quadratic in total. The Bolt cursor
+    // streams in fetch-size batches, keeping memory bounded.
+    let cypher = format!(
+        "MATCH (a)-[r:`{reltype}`]->(b) RETURN \
+           elementId(r) AS eid, type(r) AS rtype, properties(r) AS props, \
+           elementId(a) AS start_eid, labels(a) AS start_labels, \
+           elementId(b) AS end_eid,   labels(b) AS end_labels"
+    );
+    let mut rows = graph.execute(query(&cypher)).await.map_err(|err| {
+        Neo4jCdcError::Query(format!("scan_relationships reltype={reltype}: {err}"))
+    })?;
 
-        let mut page_count: i64 = 0;
-        let mut page_last_eid: Option<String> = None;
-        while let Some(row) = rows
-            .next()
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|err| Neo4jCdcError::Query(format!("scan_relationships iter: {err}")))?
+    {
+        let eid = row
+            .get::<String>("eid")
+            .map_err(|err| Neo4jCdcError::Query(format!("scan_rel eid: {err}")))?;
+        let props_bolt: BoltType = row
+            .get("props")
+            .map_err(|err| Neo4jCdcError::Query(format!("scan_rel props: {err}")))?;
+        let start_eid = row
+            .get::<String>("start_eid")
+            .map_err(|err| Neo4jCdcError::Query(format!("scan_rel start_eid: {err}")))?;
+        let start_labels_bolt: BoltType = row
+            .get("start_labels")
+            .map_err(|err| Neo4jCdcError::Query(format!("scan_rel start_labels: {err}")))?;
+        let end_eid = row
+            .get::<String>("end_eid")
+            .map_err(|err| Neo4jCdcError::Query(format!("scan_rel end_eid: {err}")))?;
+        let end_labels_bolt: BoltType = row
+            .get("end_labels")
+            .map_err(|err| Neo4jCdcError::Query(format!("scan_rel end_labels: {err}")))?;
+
+        let payload = synthesize_rel_payload(
+            &eid,
+            reltype,
+            &props_bolt,
+            &start_eid,
+            &start_labels_bolt,
+            &end_eid,
+            &end_labels_bolt,
+        );
+        let event = event_mapper::synth_rel_insert(config, table, payload, &start_eid, &end_eid)?;
+        ctx.sender
+            .send(event, &ctx.shutdown)
             .await
-            .map_err(|err| Neo4jCdcError::Query(format!("scan_relationships iter: {err}")))?
-        {
-            let eid = row
-                .get::<String>("eid")
-                .map_err(|err| Neo4jCdcError::Query(format!("scan_rel eid: {err}")))?;
-            page_last_eid = Some(eid.clone());
-            let props_bolt: BoltType = row
-                .get("props")
-                .map_err(|err| Neo4jCdcError::Query(format!("scan_rel props: {err}")))?;
-            let start_eid = row
-                .get::<String>("start_eid")
-                .map_err(|err| Neo4jCdcError::Query(format!("scan_rel start_eid: {err}")))?;
-            let start_labels_bolt: BoltType = row
-                .get("start_labels")
-                .map_err(|err| Neo4jCdcError::Query(format!("scan_rel start_labels: {err}")))?;
-            let end_eid = row
-                .get::<String>("end_eid")
-                .map_err(|err| Neo4jCdcError::Query(format!("scan_rel end_eid: {err}")))?;
-            let end_labels_bolt: BoltType = row
-                .get("end_labels")
-                .map_err(|err| Neo4jCdcError::Query(format!("scan_rel end_labels: {err}")))?;
-
-            let payload = synthesize_rel_payload(
-                &eid,
-                reltype,
-                &props_bolt,
-                &start_eid,
-                &start_labels_bolt,
-                &end_eid,
-                &end_labels_bolt,
-            );
-            let event =
-                event_mapper::synth_rel_insert(config, table, payload, &start_eid, &end_eid)?;
-            ctx.sender
-                .send(event, &ctx.shutdown)
-                .await
-                .map_err(|err| Neo4jCdcError::Internal(format!("publish failed: {err}")))?;
-            emitted += 1;
-            page_count += 1;
-        }
-        if page_count < batch_size {
-            break;
-        }
-        match page_last_eid {
-            Some(eid) => last_eid = Some(eid),
-            None => break,
-        }
+            .map_err(|err| Neo4jCdcError::Internal(format!("publish failed: {err}")))?;
+        emitted += 1;
     }
     Ok(emitted)
 }
