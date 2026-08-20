@@ -1809,20 +1809,19 @@ mod tests {
     }
 
     #[test]
-    fn keyset_cypher_paginates_primaries_independently_of_body() {
-        // First page: no WHERE, ordered LIMIT on the PRIMARY keyset.
-        let first = build_keyset_cypher("Author", false);
-        assert!(first.contains("MATCH (p:`Author`)"));
-        assert!(!first.contains("WHERE"), "first page has no keyset filter");
-        assert!(first.contains("RETURN elementId(p) AS eid"));
-        assert!(first.contains("ORDER BY elementId(p) LIMIT $batch"));
+    fn keys_cypher_is_one_unsorted_streaming_scan() {
+        let keys = build_keys_cypher("Author");
+        assert!(keys.contains("MATCH (p:`Author`)"));
+        assert!(keys.contains("RETURN elementId(p) AS eid"));
+        // One streamed scan: no per-page re-planning. ORDER BY / LIMIT over
+        // elementId() forced a full label scan + top-K sort per page —
+        // quadratic at scale (see build_keys_cypher docs).
+        assert!(!keys.contains("ORDER BY"), "key scan must not sort");
+        assert!(!keys.contains("LIMIT"), "key scan must not paginate");
+        assert!(!keys.contains("WHERE"), "key scan has no keyset filter");
         // It must NOT contain any user body / doc projection — it's a pure
         // primary scan, so its row count == primary count.
-        assert!(!first.contains("AS doc"));
-
-        // Subsequent pages add the keyset filter.
-        let next = build_keyset_cypher("Author", true);
-        assert!(next.contains("WHERE elementId(p) > $lastEid"));
+        assert!(!keys.contains("AS doc"));
     }
 
     #[test]
