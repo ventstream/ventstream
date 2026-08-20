@@ -711,6 +711,10 @@ async fn run(
         cdc.runtime.sink.attach_health(health.clone());
         health
     });
+    let cdc_pipeline_health = cfg
+        .cdc
+        .as_ref()
+        .map(|cdc| cdc.runtime.pipeline_health.clone());
 
     // Shared established-connection counter for the WS gateway. The gateway
     // mutates it; the health server reads it for capacity readiness.
@@ -735,6 +739,7 @@ async fn run(
         graphql_enabled.then(|| graphql_role_readiness.clone()),
         ws_capacity,
         cdc_sink_health,
+        cdc_pipeline_health,
     );
 
     // Single, always-on health server shared by every role — one
@@ -2167,7 +2172,8 @@ async fn build_and_run_pg_sql_denormalize_engine(
     )? as i64;
     let mut denorm = sql_denormalize::SqlDenormalizer::connect(&pg, &pg.publication, joins, chunk)
         .await
-        .context("building SQL denormalizer")?;
+        .context("building SQL denormalizer")?
+        .with_pipeline_health(runtime.pipeline_health.clone());
     if matches!(runtime.sink.kind(), "redis" | "meilisearch" | "surrealdb") {
         denorm = denorm.with_target_clears();
     }
@@ -3035,6 +3041,9 @@ impl CdcBundle {
 #[derive(Clone)]
 struct CdcRuntime {
     sink: SinkRuntimeConfig,
+    /// Health channel for the source-side transform stage (denormalizer tail
+    /// loop). A sustained stall flips `/readyz` via the readiness gate.
+    pipeline_health: ventstream_core::SinkHealth,
     engine_config: EngineConfig,
     engine_file_config: Option<EngineFileConfig>,
 }
@@ -5298,6 +5307,7 @@ fn load_cdc_bundle_mongodb(engine_config: Option<&EngineFileConfig>) -> Result<C
         source: CdcSourceConfig::Mongo(Box::new(config)),
         runtime: CdcRuntime {
             sink,
+            pipeline_health: ventstream_core::SinkHealth::new(),
             engine_config: engine_runtime,
             engine_file_config: engine_config.cloned(),
         },
@@ -5417,6 +5427,7 @@ fn load_cdc_bundle_mysql(
         source: CdcSourceConfig::Mysql(Box::new(config)),
         runtime: CdcRuntime {
             sink,
+            pipeline_health: ventstream_core::SinkHealth::new(),
             engine_config: engine_runtime,
             engine_file_config: engine_config.cloned(),
         },
@@ -5514,6 +5525,7 @@ fn load_cdc_bundle_kafka(engine_config: Option<&EngineFileConfig>) -> Result<Cdc
         source: CdcSourceConfig::Kafka(Box::new(config)),
         runtime: CdcRuntime {
             sink,
+            pipeline_health: ventstream_core::SinkHealth::new(),
             engine_config: engine_runtime,
             engine_file_config: engine_config.cloned(),
         },
@@ -5742,6 +5754,7 @@ fn load_cdc_bundle_neo4j(
         source: CdcSourceConfig::Neo4j(Box::new(neo)),
         runtime: CdcRuntime {
             sink,
+            pipeline_health: ventstream_core::SinkHealth::new(),
             engine_config: engine_runtime,
             engine_file_config: engine_config.cloned(),
         },
@@ -5906,6 +5919,7 @@ fn load_cdc_bundle_postgres(
         source: CdcSourceConfig::Postgres(Box::new(pg)),
         runtime: CdcRuntime {
             sink,
+            pipeline_health: ventstream_core::SinkHealth::new(),
             engine_config: engine_runtime,
             engine_file_config: engine_config.cloned(),
         },

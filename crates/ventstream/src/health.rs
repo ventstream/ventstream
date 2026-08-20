@@ -46,16 +46,26 @@ pub(crate) struct ReadinessGate {
     ws_capacity: Option<WsCapacityGate>,
     sink_health: Option<SinkHealth>,
     sink_failure_grace: Duration,
+    /// Source-side pipeline stall channel (e.g. the SQL denormalizer's tail
+    /// loop retrying a failed batch). A stall past the grace flips readiness
+    /// so orchestrators and operators see the pipeline is not making
+    /// progress even though the process is alive.
+    pipeline_health: Option<SinkHealth>,
+    pipeline_stall_grace: Duration,
 }
 
 impl ReadinessGate {
     const DEFAULT_SINK_FAILURE_GRACE: Duration = Duration::from_secs(30);
+    /// Longer than the sink grace: one tail batch retry is routine; a stall
+    /// that persists for a minute is not.
+    const DEFAULT_PIPELINE_STALL_GRACE: Duration = Duration::from_secs(60);
 
     pub(crate) fn new(
         ws: Option<ReadinessSignal>,
         graphql: Option<ReadinessSignal>,
         ws_capacity: Option<(Arc<AtomicUsize>, usize)>,
         sink_health: Option<SinkHealth>,
+        pipeline_health: Option<SinkHealth>,
     ) -> Self {
         Self {
             ws,
@@ -64,6 +74,8 @@ impl ReadinessGate {
             ws_capacity: ws_capacity.map(|(active, max)| WsCapacityGate { active, max }),
             sink_health,
             sink_failure_grace: Self::DEFAULT_SINK_FAILURE_GRACE,
+            pipeline_health,
+            pipeline_stall_grace: Self::DEFAULT_PIPELINE_STALL_GRACE,
         }
     }
 
@@ -76,6 +88,8 @@ impl ReadinessGate {
             ws_capacity: None,
             sink_health: None,
             sink_failure_grace: Self::DEFAULT_SINK_FAILURE_GRACE,
+            pipeline_health: None,
+            pipeline_stall_grace: Self::DEFAULT_PIPELINE_STALL_GRACE,
         }
     }
 
@@ -118,6 +132,19 @@ impl ReadinessGate {
                 SinkHealthSnapshot::Healthy | SinkHealthSnapshot::Degraded { .. } => {}
             }
         }
+        if let Some(health) = &self.pipeline_health {
+            match health.snapshot() {
+                SinkHealthSnapshot::Blocked { duration, reason } => {
+                    return ReadinessStatus::PipelineStalled { duration, reason };
+                }
+                SinkHealthSnapshot::Degraded { duration, reason }
+                    if duration >= self.pipeline_stall_grace =>
+                {
+                    return ReadinessStatus::PipelineStalled { duration, reason };
+                }
+                SinkHealthSnapshot::Healthy | SinkHealthSnapshot::Degraded { .. } => {}
+            }
+        }
         if self
             .ws_capacity
             .as_ref()
@@ -146,6 +173,12 @@ enum ReadinessStatus {
     Starting(Vec<&'static str>),
     SinkUnavailable {
         state: &'static str,
+        duration: Duration,
+        reason: String,
+    },
+    /// The CDC transform stage has been retrying the same batch past the
+    /// stall grace — the process is alive but not making progress.
+    PipelineStalled {
         duration: Duration,
         reason: String,
     },
@@ -236,6 +269,17 @@ fn readyz(gate: &ReadinessGate) -> axum::response::Response {
             })),
         )
             .into_response(),
+        ReadinessStatus::PipelineStalled { duration, reason } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "status": "not_ready",
+                "dependency": "pipeline",
+                "state": "stalled",
+                "failing_for_ms": u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                "reason": reason,
+            })),
+        )
+            .into_response(),
         ReadinessStatus::Ready => (
             StatusCode::OK,
             axum::Json(serde_json::json!({ "status": "ready" })),
@@ -261,7 +305,7 @@ mod tests {
     fn waits_for_every_enabled_gateway() {
         let ws = ReadinessSignal::new();
         let graphql = ReadinessSignal::new();
-        let gate = ReadinessGate::new(Some(ws.clone()), Some(graphql.clone()), None, None);
+        let gate = ReadinessGate::new(Some(ws.clone()), Some(graphql.clone()), None, None, None);
 
         assert_eq!(
             gate.status(),
@@ -280,7 +324,13 @@ mod tests {
     fn applies_capacity_only_after_gateway_startup() {
         let ws = ReadinessSignal::new();
         let active = Arc::new(AtomicUsize::new(9));
-        let gate = ReadinessGate::new(Some(ws.clone()), None, Some((Arc::clone(&active), 9)), None);
+        let gate = ReadinessGate::new(
+            Some(ws.clone()),
+            None,
+            Some((Arc::clone(&active), 9)),
+            None,
+            None,
+        );
 
         assert_eq!(gate.status(), ReadinessStatus::Starting(vec!["ws"]));
         ws.mark_ready();
@@ -291,7 +341,7 @@ mod tests {
 
     #[test]
     fn cdc_only_process_has_no_gateway_startup_gate() {
-        let gate = ReadinessGate::new(None, None, None, Some(SinkHealth::new()));
+        let gate = ReadinessGate::new(None, None, None, Some(SinkHealth::new()), None);
         assert_eq!(gate.status(), ReadinessStatus::Ready);
     }
 
@@ -299,7 +349,7 @@ mod tests {
     fn brief_sink_failure_stays_ready_but_sustained_failure_does_not() {
         let health = SinkHealth::new();
         let _failure = health.begin_transient_failure("HTTP 503");
-        let mut gate = ReadinessGate::new(None, None, None, Some(health));
+        let mut gate = ReadinessGate::new(None, None, None, Some(health), None);
 
         assert_eq!(gate.status(), ReadinessStatus::Ready);
         gate.sink_failure_grace = Duration::ZERO;
@@ -314,10 +364,39 @@ mod tests {
     }
 
     #[test]
+    fn brief_pipeline_stall_stays_ready_but_sustained_stall_does_not() {
+        let health = SinkHealth::new();
+        let _stall = health.begin_transient_failure("recompose for public.orders");
+        let mut gate = ReadinessGate::new(None, None, None, None, Some(health));
+
+        assert_eq!(gate.status(), ReadinessStatus::Ready);
+        gate.pipeline_stall_grace = Duration::ZERO;
+        assert!(matches!(
+            gate.status(),
+            ReadinessStatus::PipelineStalled { ref reason, .. }
+                if reason == "recompose for public.orders"
+        ));
+    }
+
+    #[test]
+    fn recovered_pipeline_returns_to_ready() {
+        let health = SinkHealth::new();
+        let stall = health.begin_transient_failure("recompose for public.orders");
+        let mut gate = ReadinessGate::new(None, None, None, None, Some(health));
+        gate.pipeline_stall_grace = Duration::ZERO;
+        assert!(matches!(
+            gate.status(),
+            ReadinessStatus::PipelineStalled { .. }
+        ));
+        drop(stall);
+        assert_eq!(gate.status(), ReadinessStatus::Ready);
+    }
+
+    #[test]
     fn blocked_sink_is_immediately_not_ready() {
         let health = SinkHealth::new();
         health.mark_blocked("authentication failed");
-        let gate = ReadinessGate::new(None, None, None, Some(health));
+        let gate = ReadinessGate::new(None, None, None, Some(health), None);
 
         assert!(matches!(
             gate.status(),
