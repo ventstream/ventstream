@@ -94,6 +94,11 @@ What that buys you in practice:
 - **Bootstrap + tail, one motion.** A keyset-paginated snapshot seeds the
   target, then the live tail takes over from the exact watermark — same
   document shapes, same ids.
+- **One-time data migration.** Not every copy needs to live forever: seed a
+  new index, a cache, or a SurrealDB database once — bootstrap at bulk speed,
+  let the tail catch up so mid-copy writes are included, stop. Interrupted
+  runs resume where they left off. See the
+  [one-time migration guide](docs-site/guides/one-time-migration.mdx).
 - **One-time migration too.** Not every copy needs to live forever: bootstrap
   at bulk speed, let the tail catch up so mid-copy writes are included, stop —
   a complete, consistent copy that resumes where it left off if interrupted.
