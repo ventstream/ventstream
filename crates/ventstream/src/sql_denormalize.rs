@@ -290,6 +290,12 @@ impl PreparedDef {
 /// recomposes by re-querying Postgres rather than holding join state.
 pub struct SqlDenormalizer {
     client: Client,
+    /// Source config retained so the tail loop can rebuild `client` after a
+    /// connection loss. A `tokio_postgres::Client` never recovers once its
+    /// connection task ends, so retrying queries on it stalls the pipeline
+    /// until process restart; redialing also re-resolves DNS, surviving a
+    /// database failover to a new address.
+    source: PostgresCdcConfig,
     defs: Vec<PreparedDef>,
     chunk_size: i64,
     emit_target_clears: bool,
@@ -302,6 +308,10 @@ pub struct SqlDenormalizer {
     /// Holds a pooled HTTP client so a stream of child deletes reuses
     /// connections rather than handshaking per lookup.
     sink_lookup: Option<ReverseLookup>,
+    /// When set, the tail loop reports sustained batch-retry stalls so the
+    /// readiness gate can flip `/readyz` instead of the process looking
+    /// healthy while making no progress.
+    pipeline_health: Option<ventstream_core::SinkHealth>,
 }
 
 impl SqlDenormalizer {
@@ -402,11 +412,20 @@ impl SqlDenormalizer {
         }
         Ok(Self {
             client,
+            source: source.clone(),
             defs,
             chunk_size,
             emit_target_clears: false,
             sink_lookup: None,
+            pipeline_health: None,
         })
+    }
+
+    /// Report tail-loop stalls on this health channel.
+    #[must_use]
+    pub fn with_pipeline_health(mut self, health: ventstream_core::SinkHealth) -> Self {
+        self.pipeline_health = Some(health);
+        self
     }
 
     /// Emit target-scoped clear events for sinks that support them.
@@ -1108,6 +1127,33 @@ impl SqlDenormalizer {
         }
     }
 
+    /// Rebuild the query connection if the current one's connection task has
+    /// ended. `tokio_postgres::Client` is unusable forever after that — every
+    /// query fails instantly — so without this the tail retry loop would spin
+    /// on a dead handle until the process is restarted (observed in production
+    /// as a multi-hour stall that a 1s restart healed). `PreparedDef` holds
+    /// only SQL text and catalog type maps, so nothing else needs rebuilding.
+    /// Redial failures are logged and left for the next retry pass; each
+    /// attempt dials fresh (re-resolving DNS), so a database that comes back
+    /// on a new address is picked up too.
+    async fn reconnect_if_dead(&mut self) {
+        if !self.client.is_closed() {
+            return;
+        }
+        match connect_client(&self.source, "sql-denormalize reconnect").await {
+            Ok(client) => {
+                self.client = client;
+                info!("sql-denormalize: rebuilt postgres query connection after loss");
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "sql-denormalize: postgres reconnect failed; retrying with next backoff"
+                );
+            }
+        }
+    }
+
     pub async fn run(
         mut self,
         mut receiver: EventReceiver,
@@ -1143,6 +1189,9 @@ impl SqlDenormalizer {
         }
         info!("sql-denormalize: bootstrap done, entering tail");
         let mut retry = TailRetry::default();
+        // Held while a batch is failing; dropped on the first success so the
+        // readiness gate sees the stall's true duration.
+        let mut stall_guard: Option<ventstream_core::SinkFailureGuard> = None;
         'tail: loop {
             tokio::select! {
                 biased;
@@ -1178,6 +1227,7 @@ impl SqlDenormalizer {
 
                         match result {
                             Ok(true) => {
+                                stall_guard = None;
                                 if let Some(attempts) = retry.record_success() {
                                     ventstream_telemetry::clear_error();
                                     ventstream_telemetry::set_phase(
@@ -1194,6 +1244,12 @@ impl SqlDenormalizer {
                             Ok(false) => break 'tail,
                             Err(err) => {
                                 let (attempt, backoff) = retry.record_failure();
+                                if stall_guard.is_none() {
+                                    if let Some(health) = &self.pipeline_health {
+                                        stall_guard =
+                                            Some(health.begin_transient_failure(format!("{err:#}")));
+                                    }
+                                }
                                 warn!(
                                     error = %err,
                                     attempt,
@@ -1209,6 +1265,7 @@ impl SqlDenormalizer {
                                     () = shutdown.cancelled() => break 'tail,
                                     () = tokio::time::sleep(backoff) => {}
                                 }
+                                self.reconnect_if_dead().await;
                             }
                         }
                     }

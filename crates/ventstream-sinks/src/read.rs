@@ -19,7 +19,7 @@ use crate::redis::keyspace::{
     encode_key_segment, encoded_key_len, key_from_parts, validate_target_segment,
     PROJECTION_TARGET_HEADER,
 };
-use crate::redis::topology::{build_connector, connect_raw, RedisConnection};
+use crate::redis::topology::{build_connector, connect_raw, RedisConnection, RedisConnector};
 use crate::redis::{RedisConfig, RedisDocumentFormat};
 
 /// Sink configuration accepted by [`SinkReader::connect`].
@@ -35,7 +35,7 @@ pub enum SinkReaderConfig {
 /// Read-only client over one sink's materialized documents.
 pub enum SinkReader {
     /// Redis keyspace reader.
-    Redis(RedisReader),
+    Redis(Box<RedisReader>),
     /// OpenSearch / Elasticsearch reader.
     OpenSearch(OpenSearchReader),
     /// Meilisearch reader.
@@ -50,10 +50,11 @@ impl SinkReader {
             SinkReaderConfig::Redis(config) => {
                 let connector = build_connector(&config).await?;
                 let connection = connect_raw(&connector, &config).await?;
-                Ok(Self::Redis(RedisReader {
+                Ok(Self::Redis(Box::new(RedisReader {
                     config,
+                    connector,
                     connection: Mutex::new(connection),
-                }))
+                })))
             }
             SinkReaderConfig::OpenSearch(config) => {
                 let client = build_http_client(&config)
@@ -132,10 +133,44 @@ impl SinkReader {
 /// Reader over a Redis materialization keyspace.
 pub struct RedisReader {
     config: Box<RedisConfig>,
+    /// Kept so a lost connection can be redialed in place. The sentinel and
+    /// cluster variants of [`RedisConnection`] do not self-heal (only the
+    /// standalone `ConnectionManager` does), so without a rebuild every read
+    /// after an endpoint change fails until process restart.
+    connector: RedisConnector,
     connection: Mutex<RedisConnection>,
 }
 
 impl RedisReader {
+    /// Run one command on the primary; on failure, redial and retry once.
+    /// The redial dials fresh (re-resolving DNS), so a primary that moved
+    /// behind a stable address heals here instead of degrading forever.
+    async fn query_with_reconnect<T: redis::FromRedisValue>(
+        &self,
+        connection: &mut RedisConnection,
+        command: redis::Cmd,
+        routing_key: &str,
+        label: &'static str,
+    ) -> Result<T, SinkError> {
+        let first_err = match connection.query_on_primary(command.clone(), routing_key).await {
+            Ok(value) => return Ok(value),
+            Err(err) => err,
+        };
+        *connection = connect_raw(&self.connector, &self.config)
+            .await
+            .map_err(|err| {
+                SinkError::Connection(format!(
+                    "{label} failed: {first_err}; reconnect also failed: {err}"
+                ))
+            })?;
+        connection
+            .query_on_primary(command, routing_key)
+            .await
+            .map_err(|err| {
+                SinkError::Connection(format!("{label} failed after reconnect: {err}"))
+            })
+    }
+
     async fn get_document(&self, target: &str, doc_id: &str) -> Result<Option<Value>, SinkError> {
         let key = redis_data_key(&self.config, target, doc_id)?;
         let mut command = match self.config.document_format {
@@ -144,10 +179,9 @@ impl RedisReader {
         };
         command.arg(&key);
         let mut connection = self.connection.lock().await;
-        let raw: Option<String> = connection
-            .query_on_primary(command, &key)
-            .await
-            .map_err(|err| SinkError::Connection(format!("redis read failed: {err}")))?;
+        let raw: Option<String> = self
+            .query_with_reconnect(&mut connection, command, &key, "redis read")
+            .await?;
         let Some(raw) = raw else {
             return Ok(None);
         };
@@ -193,10 +227,9 @@ impl RedisReader {
                 .arg(&match_pattern)
                 .arg("COUNT")
                 .arg(SCAN_COUNT);
-            let (next_cursor, keys): (u64, Vec<String>) = connection
-                .query_on_primary(command, &base)
-                .await
-                .map_err(|err| SinkError::Connection(format!("redis scan failed: {err}")))?;
+            let (next_cursor, keys): (u64, Vec<String>) = self
+                .query_with_reconnect(&mut connection, command, &base, "redis scan")
+                .await?;
             for key in keys {
                 if let Some(encoded) = key.strip_prefix(&base) {
                     doc_ids.push(percent_decode(encoded));
