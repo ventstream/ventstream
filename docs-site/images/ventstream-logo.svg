@@ -1,16 +1,16 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 168" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif" role="img" aria-label="VentStream">
   <defs>
     <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#0b1220"/>
-      <stop offset="1" stop-color="#0e2140"/>
+      <stop offset="0" stop-color="#0b120f"/>
+      <stop offset="1" stop-color="#10231a"/>
     </linearGradient>
     <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#38bdf8"/>
-      <stop offset="1" stop-color="#2563eb"/>
+      <stop offset="0" stop-color="#50dca0"/>
+      <stop offset="1" stop-color="#24b978"/>
     </linearGradient>
   </defs>
 
-  <rect x="6" y="6" width="548" height="156" rx="30" fill="url(#panel)" stroke="#1e293b" stroke-width="1.5"/>
+  <rect x="6" y="6" width="548" height="156" rx="30" fill="url(#panel)" stroke="#233b30" stroke-width="1.5"/>
 
   <!-- stream mark: one source → many subscribers -->
   <g fill="none" stroke="url(#accent)" stroke-width="5" stroke-linecap="round">
@@ -19,13 +19,13 @@
     <path d="M64 84 Q98 112 132 116"/>
   </g>
   <circle cx="64" cy="84" r="7" fill="url(#accent)"/>
-  <circle cx="134" cy="52" r="5" fill="#7dd3fc"/>
-  <circle cx="134" cy="84" r="5" fill="#7dd3fc"/>
-  <circle cx="134" cy="116" r="5" fill="#7dd3fc"/>
+  <circle cx="134" cy="52" r="5" fill="#8ee7bd"/>
+  <circle cx="134" cy="84" r="5" fill="#8ee7bd"/>
+  <circle cx="134" cy="116" r="5" fill="#8ee7bd"/>
 
   <!-- wordmark -->
   <text x="172" y="102" font-size="52" font-weight="800" letter-spacing="-0.5">
     <tspan fill="#e6edf3">Vent</tspan><tspan fill="url(#accent)">Stream</tspan>
   </text>
-  <text x="174" y="130" font-size="15" letter-spacing="0.4" fill="#7f93ad">real-time data streaming</text>
+  <text x="174" y="130" font-size="15" letter-spacing="0.4" fill="#7f948a">real-time data streaming</text>
 </svg>
