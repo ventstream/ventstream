@@ -94,6 +94,17 @@ What that buys you in practice:
 - **Bootstrap + tail, one motion.** A keyset-paginated snapshot seeds the
   target, then the live tail takes over from the exact watermark — same
   document shapes, same ids.
+- **Database-to-database migration.** Move a dataset out of one database and
+  into another — today from any supported source into SurrealDB or Redis —
+  as a one-time copy: bootstrap at bulk speed, let the tail catch up so
+  mid-copy writes are included, stop. Interrupted runs resume where they
+  left off. A PostgreSQL sink for relational-to-relational moves is on the
+  roadmap. See the
+  [one-time migration guide](docs-site/guides/one-time-migration.mdx).
+- **One-time migration too.** Not every copy needs to live forever: bootstrap
+  at bulk speed, let the tail catch up so mid-copy writes are included, stop —
+  a complete, consistent copy that resumes where it left off if interrupted.
+  See the [one-time migration guide](docs-site/guides/one-time-migration.mdx).
 - **Fail closed.** Undeliverable events block the cursor rather than being
   silently dropped; poison events go to a JSONL dead-letter queue with the
   reason attached.
