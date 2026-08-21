@@ -73,6 +73,22 @@ start_elasticsearch() {
     -d '{"persistent":{"cluster.routing.allocation.disk.threshold_enabled":false}}' >/dev/null
 }
 
+REDIS=vsbench-redis
+
+# Redis is RAM-resident: size runs with VS_BENCH_RECORDS to fit the local
+# VM (the sink stores one doc key + one version key per document).
+start_redis() {
+  remove_container "$REDIS"
+  docker run -d --name "$REDIS" --network "$NETWORK" \
+    --cpus 2 --memory "${VS_BENCH_REDIS_MEMORY:-4608m}" \
+    -p 127.0.0.1::6379 \
+    redis:7.4-alpine redis-server --save '' --appendonly no >/dev/null
+  local port
+  port=$(docker port "$REDIS" 6379/tcp | awk -F: 'NR==1 {print $NF}')
+  wait_for Redis docker exec "$REDIS" redis-cli ping
+  printf '%s\n' "$port"
+}
+
 MEILI=vsbench-meili
 
 start_meilisearch() {
@@ -92,12 +108,16 @@ boot_prepare() {
     SURREAL_PORT=$(start_surrealdb)
   elif [[ $SINK == meilisearch ]]; then
     MEILI_PORT=$(start_meilisearch)
+  elif [[ $SINK == redis ]]; then
+    REDIS_PORT=$(start_redis)
   fi
 }
 
 reset_target() {
   local target=$1
-  if [[ $SINK == surrealdb ]]; then
+  if [[ $SINK == redis ]]; then
+    docker exec "$REDIS" redis-cli flushall >/dev/null 2>&1 || true
+  elif [[ $SINK == surrealdb ]]; then
     surreal_rpc "$SURREAL_PORT" "REMOVE TABLE IF EXISTS ${target//-/_};" >/dev/null 2>&1 || true
   elif [[ $SINK == meilisearch ]]; then
     curl -fsS -X DELETE "http://127.0.0.1:$MEILI_PORT/indexes/vs_$target" \
@@ -133,6 +153,8 @@ if isinstance(r, list) and r and isinstance(r[0], dict):
 else:
     print(0)
     print(f'surreal count query returned: {r!r}', file=sys.stderr)"
+  elif [[ $SINK == redis ]]; then
+    docker exec "$REDIS" sh -c "redis-cli --scan --pattern 'vs:*' | grep -cv ':__ventstream:'"
   elif [[ $SINK == meilisearch ]]; then
     local stats
     stats=$(curl -fsS "http://127.0.0.1:$MEILI_PORT/indexes/vs_$target/stats" \
@@ -151,6 +173,13 @@ else:
 
 sink_env_args() {
   local target=$1
+  if [[ $SINK == redis ]]; then
+    printf '%s\n' \
+      "-e" "VS_SINK=redis" \
+      "-e" "VS_REDIS_SINK_URL=redis://$REDIS:6379" \
+      "-e" "VS_REDIS_SINK_KEY_PREFIX=vs"
+    return
+  fi
   if [[ $SINK == elasticsearch ]]; then
     printf '%s\n' "-e" "VS_SINK=elasticsearch"
     return
@@ -454,6 +483,7 @@ boot_main() {
 
 cleanup_all_with_sink() {
   remove_container "$SURREAL"
+  remove_container "$REDIS"
   remove_container "$MEILI"
   cleanup_all
 }
