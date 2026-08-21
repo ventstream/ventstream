@@ -3958,6 +3958,25 @@ fn load_meilisearch_config_from_env() -> Result<MeilisearchConfig> {
     if opt("VS_INSECURE_TLS")?.as_deref() == Some("true") {
         config.verify_tls = false;
     }
+    // Batch and task knobs: without these the env-only deployment path was
+    // structurally stuck at the 2000-doc default — bulk bootstraps pay the
+    // per-task fixed cost thousands of times more than a tuned run needs.
+    if let Some(docs) = opt("VS_MEILI_MAX_BATCH_DOCS")? {
+        config.batching.max_docs = docs
+            .parse()
+            .map_err(|err| anyhow!("VS_MEILI_MAX_BATCH_DOCS: {err}"))?;
+    }
+    if let Some(bytes) = opt("VS_MEILI_MAX_BATCH_BYTES")? {
+        config.batching.max_bytes = bytes
+            .parse()
+            .map_err(|err| anyhow!("VS_MEILI_MAX_BATCH_BYTES: {err}"))?;
+    }
+    if let Some(deadline) = opt("VS_MEILI_TASK_DEADLINE_MS")? {
+        let millis: u64 = deadline
+            .parse()
+            .map_err(|err| anyhow!("VS_MEILI_TASK_DEADLINE_MS: {err}"))?;
+        config.task.deadline = std::time::Duration::from_millis(millis);
+    }
     Ok(config)
 }
 
