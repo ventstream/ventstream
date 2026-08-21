@@ -56,6 +56,23 @@ start_surrealdb() {
   printf '%s\n' "$port"
 }
 
+# Elasticsearch runs under the same container name as OpenSearch: the
+# bulk API, index helpers, and the engine's VS_OS_ENDPOINT are identical.
+start_elasticsearch() {
+  remove_container "$OS"
+  docker run -d --name "$OS" --network "$NETWORK" \
+    --cpus 2 --memory 2304m \
+    -e discovery.type=single-node \
+    -e xpack.security.enabled=false \
+    -e bootstrap.memory_lock=false \
+    -e ES_JAVA_OPTS='-Xms1024m -Xmx1024m' \
+    docker.elastic.co/elasticsearch/elasticsearch:8.15.2 >/dev/null
+  wait_for Elasticsearch docker exec "$OS" curl -fsS http://127.0.0.1:9200/_cluster/health
+  docker exec "$OS" curl -fsS -XPUT http://127.0.0.1:9200/_cluster/settings \
+    -H 'content-type: application/json' \
+    -d '{"persistent":{"cluster.routing.allocation.disk.threshold_enabled":false}}' >/dev/null
+}
+
 MEILI=vsbench-meili
 
 start_meilisearch() {
@@ -134,6 +151,10 @@ else:
 
 sink_env_args() {
   local target=$1
+  if [[ $SINK == elasticsearch ]]; then
+    printf '%s\n' "-e" "VS_SINK=elasticsearch"
+    return
+  fi
   if [[ $SINK == meilisearch ]]; then
     printf '%s\n' \
       "-e" "VS_SINK=meilisearch" \
@@ -409,6 +430,8 @@ boot_main() {
   ensure_network
   if [[ $SINK == opensearch ]]; then
     start_opensearch
+  elif [[ $SINK == elasticsearch ]]; then
+    start_elasticsearch
   fi
   local requested=${1:-all}
   case "$requested" in

@@ -77,3 +77,22 @@ With 250k-doc bulk payloads in flight the engine runs at its 1 GiB cgroup
 ceiling; the memory controller held every run inside the limit with no
 OOM. For 1 GiB pods that want more headroom, `VS_MEILI_MAX_BATCH_DOCS=100000`
 trades a little throughput for a much lower RSS peak.
+
+## Elasticsearch sink — 2026-08-21
+
+Same harness, `VS_BENCH_SINK=elasticsearch` (Elasticsearch 8.15.2,
+2 vCPU / 2.3 GiB, single node, 1 GiB heap). The engine's bulk writer is
+shared with OpenSearch, so Elasticsearch is a peer sink with no separate
+code path — these runs confirm the parity at scale.
+
+| source | seed_s | bootstrap_s | throughput (docs/s) | cpu mean/p95/peak % | rss peak MiB | verified |
+|---|---|---|---|---|---|---|
+| postgres | 75.0 | 444.2 | 112,572 | 34.9 / 49.4 / 58.6 | 248 | 50,000,000 |
+| mysql | 108.6 | 555.2 | 90,065 | 24.6 / 31.5 / 33.4 | 111 | 50,000,000 |
+| mongodb | 191.1 | 400.7 | 124,773 | 39.6 / 55.7 / 72.6 | 236 | 50,000,000 |
+| kafka | 117.1 | 463.9 | 107,778 | 41.2 / 48.9 / 56.8 | 375 | 50,000,000 |
+| neo4j | 1772.5 | 540.4 | 92,516 | 51.4 / 66.5 / 85.8 | 342 | 50,000,000 |
+
+Numbers track the OpenSearch campaign closely, as the shared writer
+predicts: 90–125k docs/s across every source, engine RSS well under half
+the 1 GiB cap.
