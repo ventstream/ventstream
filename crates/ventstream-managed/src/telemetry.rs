@@ -123,6 +123,10 @@ impl EngineTelemetrySampler {
                 .filter(|value| *value > 0),
             queue_depth: metric_u64(&metrics, "vs_bus_depth"),
             queue_capacity: metric_u64(&metrics, "vs_bus_capacity"),
+            cpu_percent: metric_f64(&metrics, "vs_process_cpu_percent"),
+            rss_bytes: metric_u64(&metrics, "vs_process_rss_bytes"),
+            memory_limit_bytes: metric_u64(&metrics, "vs_resource_memory_limit_bytes"),
+            cpu_limit_millicores: metric_u64(&metrics, "vs_resource_cpu_limit_millicores"),
             active_connections: metric_u64(&metrics, "vs_realtime_connections_active")
                 .or_else(|| metric_u64(&metrics, "vs_ws_active_connections")),
             active_subscriptions: metric_u64(&metrics, "vs_realtime_operations_active"),
@@ -263,6 +267,21 @@ fn drift_detail(exposition: &str) -> String {
     }
     out.truncate(256);
     out
+}
+
+fn metric_f64(exposition: &str, name: &str) -> Option<f64> {
+    exposition.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let mut fields = line.split_ascii_whitespace();
+        let metric = fields.next()?.split('{').next()?;
+        if metric != name {
+            return None;
+        }
+        fields.next()?.parse::<f64>().ok().filter(|v| v.is_finite())
+    })
 }
 
 fn metric_u64(exposition: &str, name: &str) -> Option<u64> {

@@ -43,6 +43,7 @@ mod health;
 mod mcp;
 mod memory_controller;
 mod mysql_sql_denormalize;
+mod resources;
 mod sql_denormalize;
 mod yaml_fingerprint;
 
@@ -770,6 +771,10 @@ async fn run(
         };
         let shutdown = shutdown.clone();
         let readiness = readiness.clone();
+        // Resource sampler lives alongside the health server: it only
+        // matters when /metrics can be scraped, and it shares the
+        // process-lifetime shutdown.
+        handles.push(resources::spawn(shutdown.clone()));
         handles.push(tokio::spawn(async move {
             if let Err(err) = health::run(listen, prometheus, readiness, shutdown).await {
                 error!(error = %err, "health server stopped; continuing without it");

@@ -70,6 +70,15 @@ pub struct AgentRuntimeStatus {
     pub queue_depth: Option<u64>,
     /// Configured engine queue capacity.
     pub queue_capacity: Option<u64>,
+    /// Engine process CPU as percent of one core over the latest sample
+    /// window (may exceed 100 on multicore). Computed engine-side.
+    pub cpu_percent: Option<f64>,
+    /// Engine process resident set size in bytes.
+    pub rss_bytes: Option<u64>,
+    /// Container memory limit in bytes, when one is imposed.
+    pub memory_limit_bytes: Option<u64>,
+    /// Container CPU quota in millicores, when one is imposed.
+    pub cpu_limit_millicores: Option<u64>,
     /// Realtime connection and subscription gauges.
     pub active_connections: Option<u64>,
     /// Current realtime subscriptions.
