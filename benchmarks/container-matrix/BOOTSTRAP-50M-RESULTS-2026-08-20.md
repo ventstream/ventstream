@@ -96,3 +96,25 @@ code path — these runs confirm the parity at scale.
 Numbers track the OpenSearch campaign closely, as the shared writer
 predicts: 90–125k docs/s across every source, engine RSS well under half
 the 1 GiB cap.
+
+## Redis sink — 2026-08-21 (10M per source)
+
+Same harness, `VS_SINK=redis` (Redis 7.4, materialized-view contract:
+one document key + one source-version key per doc, string values). Redis
+holds the whole dataset in RAM — measured 217 bytes/doc — so this campaign
+runs 10,000,000 documents per source, the size that fits the local VM's
+memory alongside each source database. Counts verified by scanning
+document keys (internal `__ventstream` keys excluded).
+
+| source | seed_s | bootstrap_s | throughput (docs/s) | cpu mean/p95/peak % | rss peak MiB | verified |
+|---|---|---|---|---|---|---|
+| postgres | 15.0 | 52.3 | 191,102 | 52.7 / 61.4 / 63.6 | 102 | 10,000,000 |
+| mysql | 20.8 | 53.2 | 187,885 | 52.1 / 58.9 / 64.6 | 101 | 10,000,000 |
+| mongodb | 35.8 | 52.3 | 191,380 | 58.0 / 66.4 / 71.9 | 99 | 10,000,000 |
+| kafka | 23.7 | 91.6 | 109,211 | 40.7 / 47.9 / 53.4 | 184 | 10,000,000 |
+| neo4j | 332.5 | 97.3 | 102,777 | 47.0 / 65.4 / 65.9 | 86 | 10,000,000 |
+
+Redis is the fastest sink in the campaign — ~190k docs/s from the database
+sources, at which point the source read path (Kafka consumer fetch, Neo4j
+graph scan) becomes the limiter rather than the sink. Engine RSS stayed
+in the 86–184 MiB range, a tenth of its 1 GiB cap.
