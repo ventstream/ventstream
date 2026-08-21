@@ -253,4 +253,13 @@ message AgentStatus {
   optional uint64 schema_casualties_total = 33;
   optional uint64 truncate_events_total = 34;
   string schema_drift_detail = 35;
+  // Engine process CPU as percent of one core over the latest sample
+  // window (may exceed 100 on multicore); computed engine-side.
+  optional double cpu_percent = 36;
+  // Engine process resident set size in bytes.
+  optional uint64 rss_bytes = 37;
+  // Container memory limit in bytes, when one is imposed.
+  optional uint64 memory_limit_bytes = 38;
+  // Container CPU quota in millicores, when one is imposed.
+  optional uint64 cpu_limit_millicores = 39;
 }
