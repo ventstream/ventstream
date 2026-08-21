@@ -56,9 +56,25 @@ start_surrealdb() {
   printf '%s\n' "$port"
 }
 
+MEILI=vsbench-meili
+
+start_meilisearch() {
+  remove_container "$MEILI"
+  docker run -d --name "$MEILI" --network "$NETWORK" \
+    --cpus 2 --memory 2304m \
+    -p 127.0.0.1::7700 \
+    getmeili/meilisearch:v1.12 meilisearch --master-key vsbenchmaster --no-analytics >/dev/null
+  local port
+  port=$(docker port "$MEILI" 7700/tcp | awk -F: 'NR==1 {print $NF}')
+  wait_for Meilisearch curl -fsS "http://127.0.0.1:$port/health"
+  printf '%s\n' "$port"
+}
+
 boot_prepare() {
   if [[ $SINK == surrealdb ]]; then
     SURREAL_PORT=$(start_surrealdb)
+  elif [[ $SINK == meilisearch ]]; then
+    MEILI_PORT=$(start_meilisearch)
   fi
 }
 
@@ -66,6 +82,21 @@ reset_target() {
   local target=$1
   if [[ $SINK == surrealdb ]]; then
     surreal_rpc "$SURREAL_PORT" "REMOVE TABLE IF EXISTS ${target//-/_};" >/dev/null 2>&1 || true
+  elif [[ $SINK == meilisearch ]]; then
+    curl -fsS -X DELETE "http://127.0.0.1:$MEILI_PORT/indexes/vs_$target" \
+      -H "Authorization: Bearer vsbenchmaster" >/dev/null 2>&1 || true
+    sleep 2
+    # Pre-create with lean searchable attributes: default ["*"] tokenizes
+    # the unique _vs_pk/_vs_id of every doc — a 50M-entry word dictionary
+    # that pins one core. Realistic deployments restrict searchables.
+    curl -fsS -X POST "http://127.0.0.1:$MEILI_PORT/indexes" \
+      -H "Authorization: Bearer vsbenchmaster" -H 'Content-Type: application/json' \
+      -d "{\"uid\":\"vs_$target\",\"primaryKey\":\"_vs_pk\"}" >/dev/null 2>&1 || true
+    sleep 1
+    curl -fsS -X PUT "http://127.0.0.1:$MEILI_PORT/indexes/vs_$target/settings/searchable-attributes" \
+      -H "Authorization: Bearer vsbenchmaster" -H 'Content-Type: application/json' \
+      -d '["value"]' >/dev/null 2>&1 || true
+    sleep 2
   else
     delete_index "$target"
     create_index "$target"
@@ -85,6 +116,17 @@ if isinstance(r, list) and r and isinstance(r[0], dict):
 else:
     print(0)
     print(f'surreal count query returned: {r!r}', file=sys.stderr)"
+  elif [[ $SINK == meilisearch ]]; then
+    local stats
+    stats=$(curl -fsS "http://127.0.0.1:$MEILI_PORT/indexes/vs_$target/stats" \
+      -H "Authorization: Bearer vsbenchmaster" 2>/dev/null) || {
+      echo "meili stats failed for '$target'; existing indexes:" >&2
+      curl -fsS "http://127.0.0.1:$MEILI_PORT/indexes" \
+        -H "Authorization: Bearer vsbenchmaster" >&2 || true
+      echo 0
+      return
+    }
+    printf '%s' "$stats" | python3 -c "import json,sys;print(json.load(sys.stdin).get('numberOfDocuments',0))"
   else
     verified_count "$target"
   fi
@@ -92,6 +134,20 @@ else:
 
 sink_env_args() {
   local target=$1
+  if [[ $SINK == meilisearch ]]; then
+    printf '%s\n' \
+      "-e" "VS_SINK=meilisearch" \
+      "-e" "VS_MEILI_ENDPOINT=http://$MEILI:7700" \
+      "-e" "VS_MEILI_API_KEY=vsbenchmaster" \
+      "-e" "VS_MEILI_INDEX=$target" \
+      "-e" "VS_MEILI_MAX_BATCH_DOCS=250000" \
+      "-e" "VS_MEILI_MAX_BATCH_BYTES=100000000" \
+      "-e" "VS_MEILI_TASK_DEADLINE_MS=1800000" \
+      "-e" "VS_DISPATCH_MAX_EVENTS=250000" \
+      "-e" "VS_DISPATCH_MAX_BATCH_BYTES=104857600" \
+      "-e" "VS_BUS_CAPACITY=400000"
+    return
+  fi
   if [[ $SINK == surrealdb ]]; then
     printf '%s\n' \
       "-e" "VS_SINK=surrealdb" \
@@ -135,6 +191,8 @@ boot_measure() {
   cleanup_engine
   if [[ $SINK == surrealdb ]]; then
     remove_container "$SURREAL"
+  elif [[ $SINK == meilisearch ]]; then
+    remove_container "$MEILI"
   else
     delete_index "$index"
   fi
@@ -349,7 +407,7 @@ boot_neo4j() {
 
 boot_main() {
   ensure_network
-  if [[ $SINK != surrealdb ]]; then
+  if [[ $SINK == opensearch ]]; then
     start_opensearch
   fi
   local requested=${1:-all}
@@ -373,6 +431,7 @@ boot_main() {
 
 cleanup_all_with_sink() {
   remove_container "$SURREAL"
+  remove_container "$MEILI"
   cleanup_all
 }
 trap cleanup_all_with_sink EXIT INT TERM
