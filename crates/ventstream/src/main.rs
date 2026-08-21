@@ -42,8 +42,8 @@ mod fleet_config;
 mod health;
 mod mcp;
 mod memory_controller;
-mod resources;
 mod mysql_sql_denormalize;
+mod resources;
 mod sql_denormalize;
 mod yaml_fingerprint;
 

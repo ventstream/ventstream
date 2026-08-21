@@ -165,6 +165,10 @@ fn cgroup_candidates(v2_file: &str, v1_controller: &str, v1_file: &str) -> Vec<S
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "test assertions may panic to fail the test"
+)]
 mod tests {
     use super::*;
 
@@ -183,6 +187,9 @@ mod tests {
             process.memory()
         );
         let cpu = f64::from(process.cpu_usage());
-        assert!(cpu.is_finite() && cpu >= 0.0, "cpu usage must be a sane percent");
+        assert!(
+            cpu.is_finite() && cpu >= 0.0,
+            "cpu usage must be a sane percent"
+        );
     }
 }
