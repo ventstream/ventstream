@@ -11,8 +11,9 @@ source "$BOOT_ROOT/benchmarks/container-matrix/run-sources.sh"
 
 RECORDS=${VS_BENCH_RECORDS:-50000000}
 PROFILE=${VS_BENCH_PROFILE:-throughput}
+SINK=${VS_BENCH_SINK:-opensearch}
 MIN_FREE_GB=${VS_BENCH_MIN_FREE_GB:-12}
-BOOT_CSV="$RESULTS/bootstrap.csv"
+BOOT_CSV="$RESULTS/bootstrap-$SINK.csv"
 printf '%s\n' 'source,records,payload_bytes,seed_s,bootstrap_s,throughput_eps,cpu_mean_pct,cpu_p95_pct,cpu_peak_pct,cgroup_peak_mib,rss_peak_mib,rss_hwm_mib,verified_docs' >"$BOOT_CSV"
 
 now_ns() { perl -MTime::HiRes=time -e 'printf "%.0f\n", time * 1000000000'; }
@@ -30,14 +31,86 @@ check_disk() {
 
 log() { printf '[%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*" >&2; }
 
+SURREAL=vsbench-surreal
+
+surreal_rpc() {
+  local port=$1 sql=$2
+  curl -fsS -X POST "http://127.0.0.1:$port/rpc" -u root:root \
+    -H 'Accept: application/json' -H 'Content-Type: application/json' \
+    -H 'surreal-ns: bench' -H 'surreal-db: bench' \
+    --data-binary @<(python3 -c 'import json,sys; print(json.dumps({"method":"query","params":[sys.argv[1]]}))' "$sql")
+}
+
+start_surrealdb() {
+  remove_container "$SURREAL"
+  docker run -d --name "$SURREAL" --network "$NETWORK" \
+    --cpus "${VS_BENCH_SURREAL_CPUS:-2}" --memory 2304m \
+    -p 127.0.0.1::8000 \
+    surrealdb/surrealdb:v3.2.4 start --user root --pass root rocksdb:/tmp/bench.db >/dev/null
+  local port
+  port=$(docker port "$SURREAL" 8000/tcp | awk -F: 'NR==1 {print $NF}')
+  wait_for SurrealDB curl -fsS "http://127.0.0.1:$port/health"
+  curl -fsS -X POST "http://127.0.0.1:$port/rpc" -u root:root \
+    -H 'Accept: application/json' -H 'Content-Type: application/json' \
+    -d "{\"method\":\"query\",\"params\":[\"DEFINE NAMESPACE bench; USE NS bench; DEFINE DATABASE bench; USE DB bench; DEFINE USER vs ON DATABASE PASSWORD 'vs' ROLES OWNER;\"]}" >/dev/null
+  printf '%s\n' "$port"
+}
+
+boot_prepare() {
+  if [[ $SINK == surrealdb ]]; then
+    SURREAL_PORT=$(start_surrealdb)
+  fi
+}
+
+reset_target() {
+  local target=$1
+  if [[ $SINK == surrealdb ]]; then
+    surreal_rpc "$SURREAL_PORT" "REMOVE TABLE IF EXISTS ${target//-/_};" >/dev/null 2>&1 || true
+  else
+    delete_index "$target"
+    create_index "$target"
+  fi
+}
+
+verified_target() {
+  local target=$1
+  if [[ $SINK == surrealdb ]]; then
+    surreal_rpc "$SURREAL_PORT" "SELECT count() FROM ${target//-/_} GROUP ALL;" \
+      | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+r = d.get('result', [{}])[0].get('result')
+if isinstance(r, list) and r and isinstance(r[0], dict):
+    print(r[0].get('count', 0))
+else:
+    print(0)
+    print(f'surreal count query returned: {r!r}', file=sys.stderr)"
+  else
+    verified_count "$target"
+  fi
+}
+
+sink_env_args() {
+  local target=$1
+  if [[ $SINK == surrealdb ]]; then
+    printf '%s\n' \
+      "-e" "VS_SINK=surrealdb" \
+      "-e" "VS_SURREAL_ENDPOINT=http://$SURREAL:8000" \
+      "-e" "VS_SURREAL_NAMESPACE=bench" \
+      "-e" "VS_SURREAL_DATABASE=bench" \
+      "-e" "VS_SURREAL_USERNAME=vs" \
+      "-e" "VS_SURREAL_PASSWORD=vs" \
+      "-e" "VS_SURREAL_TABLE=${target//-/_}"
+  fi
+}
+
 boot_measure() {
   local source=$1 index=$2 seed_s=$3 start_engine_fn=$4
   local result_dir="$RESULTS/$source-bootstrap"
   mkdir -p "$result_dir"
   local t0 t1 boots tput docs samples port
   cleanup_engine
-  delete_index "$index"
-  create_index "$index"
+  reset_target "$index"
   t0=$(now_ns)
   "$start_engine_fn"
   "$BENCH_DIR/sample-container.sh" "$ENGINE" "$result_dir" &
@@ -49,7 +122,7 @@ boot_measure() {
   wait "$monitor_pid" >/dev/null 2>&1 || true
   boots=$(elapsed_s "$t0" "$t1")
   tput=$(awk -v n="$RECORDS" -v s="$boots" 'BEGIN {printf "%.2f", n/s}')
-  docs=$(verified_count "$index")
+  docs=$(verified_target "$index")
   docker logs "$ENGINE" >"$result_dir/engine.log" 2>&1 || true
   if [[ "$docs" != "$RECORDS" ]]; then
     echo "$source bootstrap correctness failure: expected $RECORDS docs, got $docs" >&2
@@ -60,7 +133,11 @@ boot_measure() {
     "$source" "$RECORDS" "$PAYLOAD_BYTES" "$seed_s" "$boots" "$tput" "$samples" "$docs" \
     | tee -a "$BOOT_CSV"
   cleanup_engine
-  delete_index "$index"
+  if [[ $SINK == surrealdb ]]; then
+    remove_container "$SURREAL"
+  else
+    delete_index "$index"
+  fi
 }
 
 # ── postgres ──
@@ -80,6 +157,7 @@ seed_postgres() {
 
 boot_postgres() {
   check_disk postgres
+  boot_prepare
   remove_container vsbench-postgres
   docker run -d --name vsbench-postgres --network "$NETWORK" \
     --cpus 2 --memory 2g \
@@ -93,7 +171,8 @@ boot_postgres() {
   log "postgres seed done in ${seed_s}s"
   read -r _ _ _ _ _ chunk _ <<<"$(profile_values "$PROFILE")"
   engine_pg() {
-    start_engine postgres "$PROFILE" \
+    local sink_envs=(); while IFS= read -r line; do sink_envs+=("$line"); done < <(sink_env_args vsbench-postgres)
+    start_engine postgres "$PROFILE" "${sink_envs[@]}" \
       -e VS_PG_HOST=vsbench-postgres -e VS_PG_PORT=5432 \
       -e VS_PG_USER=ventstream -e VS_PG_PASSWORD=ventstream -e VS_PG_DATABASE=bench \
       -e VS_PG_PUBLICATION=vsbench_pub -e VS_PG_SLOT=vsbench_slot \
@@ -122,6 +201,7 @@ seed_mysql() {
 
 boot_mysql() {
   check_disk mysql
+  boot_prepare
   remove_container vsbench-mysql
   docker run -d --name vsbench-mysql --network "$NETWORK" \
     --cpus 2 --memory 2g \
@@ -135,7 +215,8 @@ boot_mysql() {
   log "mysql seed done in ${seed_s}s"
   read -r _ _ _ _ _ chunk concurrency <<<"$(profile_values "$PROFILE")"
   engine_my() {
-    start_engine mysql "$PROFILE" \
+    local sink_envs=(); while IFS= read -r line; do sink_envs+=("$line"); done < <(sink_env_args vsbench-mysql)
+    start_engine mysql "$PROFILE" "${sink_envs[@]}" \
       -e VS_MYSQL_HOST=vsbench-mysql -e VS_MYSQL_PORT=3306 \
       -e VS_MYSQL_USER=ventstream -e VS_MYSQL_PASSWORD=ventstream -e VS_MYSQL_DATABASE=bench \
       -e VS_MYSQL_TABLES=events -e VS_MYSQL_SERVER_ID=4000000001 \
@@ -165,6 +246,7 @@ seed_mongodb() {
 
 boot_mongodb() {
   check_disk mongodb
+  boot_prepare
   remove_container vsbench-mongo
   docker run -d --name vsbench-mongo --network "$NETWORK" --hostname vsbench-mongo \
     --cpus 2 --memory 2g mongo:7.0 mongod --replSet rs0 --bind_ip_all --wiredTigerCacheSizeGB 0.5 >/dev/null
@@ -177,7 +259,8 @@ boot_mongodb() {
   log "mongodb seed done in ${seed_s}s"
   read -r _ _ _ _ _ chunk _ <<<"$(profile_values "$PROFILE")"
   engine_mg() {
-    start_engine mongodb "$PROFILE" \
+    local sink_envs=(); while IFS= read -r line; do sink_envs+=("$line"); done < <(sink_env_args vsbench-mongodb)
+    start_engine mongodb "$PROFILE" "${sink_envs[@]}" \
       -e 'VS_MONGO_URI=mongodb://vsbench-mongo:27017/?replicaSet=rs0' \
       -e VS_MONGO_DATABASE=bench -e VS_MONGO_COLLECTIONS=events \
       -e VS_MONGO_BOOTSTRAP_MODE=snapshot -e "VS_MONGO_BOOTSTRAP_CHUNK_SIZE=$chunk" \
@@ -200,11 +283,13 @@ seed_kafka() {
 
 boot_kafka() {
   check_disk kafka
+  boot_prepare
   start_redpanda
   local seed_s; seed_s=$(seed_kafka)
   log "kafka seed done in ${seed_s}s"
   engine_kf() {
-    start_engine kafka "$PROFILE" \
+    local sink_envs=(); while IFS= read -r line; do sink_envs+=("$line"); done < <(sink_env_args vsbench-kafka)
+    start_engine kafka "$PROFILE" "${sink_envs[@]}" \
       -e VS_KAFKA_BROKERS=vsbench-redpanda:9092 -e VS_KAFKA_TOPICS=events \
       -e VS_KAFKA_GROUP_ID=vsbench-bootstrap -e VS_KAFKA_NAMESPACE=bench \
       -e VS_KAFKA_UNWRAP=raw -e VS_KAFKA_RAW_KEY_FIELD=id \
@@ -231,12 +316,14 @@ seed_neo4j() {
 
 boot_neo4j() {
   check_disk neo4j
+  boot_prepare
   remove_container vsbench-neo4j
   docker run -d --name vsbench-neo4j --network "$NETWORK" --hostname vsbench-neo4j \
     --cpus 2 --memory 3g \
     -e NEO4J_ACCEPT_LICENSE_AGREEMENT=yes -e NEO4J_AUTH=neo4j/ventstream \
     -e NEO4J_server_memory_heap_initial__size=1g -e NEO4J_server_memory_heap_max__size=1g \
     -e NEO4J_server_memory_pagecache_size=1g \
+    -e NEO4J_db_tx__log_rotation_retention__policy="100M size" \
     neo4j:5.26-enterprise >/dev/null
   wait_for Neo4j docker exec vsbench-neo4j cypher-shell -u neo4j -p ventstream 'RETURN 1'
   docker exec vsbench-neo4j cypher-shell -u neo4j -p ventstream -d system \
@@ -247,7 +334,8 @@ boot_neo4j() {
   log "neo4j seed done in ${seed_s}s"
   read -r _ _ _ _ _ chunk concurrency <<<"$(profile_values "$PROFILE")"
   engine_n4() {
-    start_engine neo4j "$PROFILE" \
+    local sink_envs=(); while IFS= read -r line; do sink_envs+=("$line"); done < <(sink_env_args vsbench-neo4j)
+    start_engine neo4j "$PROFILE" "${sink_envs[@]}" \
       -e VS_NEO4J_URI=bolt://vsbench-neo4j:7687 -e VS_NEO4J_USER=neo4j \
       -e VS_NEO4J_PASSWORD=ventstream -e VS_NEO4J_DATABASE=neo4j \
       -e VS_NEO4J_BOOTSTRAP_MODE=snapshot -e VS_NEO4J_POLL_INTERVAL_MS=10 \
@@ -261,7 +349,9 @@ boot_neo4j() {
 
 boot_main() {
   ensure_network
-  start_opensearch
+  if [[ $SINK != surrealdb ]]; then
+    start_opensearch
+  fi
   local requested=${1:-all}
   case "$requested" in
     postgres) boot_postgres ;;
@@ -281,5 +371,9 @@ boot_main() {
   echo "bootstrap benchmark results: $BOOT_CSV"
 }
 
-trap cleanup_all EXIT INT TERM
+cleanup_all_with_sink() {
+  remove_container "$SURREAL"
+  cleanup_all
+}
+trap cleanup_all_with_sink EXIT INT TERM
 boot_main "$@"
