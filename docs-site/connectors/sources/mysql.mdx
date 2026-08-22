@@ -251,3 +251,13 @@ any over-match is harmless since the parent is recomposed from current DB truth.
   drain/reset before bootstrap (see [How it works](#how-it-works)).
 - **MySQL 8.4+ compatible.** Uses `SHOW BINARY LOG STATUS` where available,
   falling back to the deprecated `SHOW MASTER STATUS` on older MySQL / MariaDB.
+
+## ENUM and SET columns
+
+Binlog row events carry ENUM values as indexes and SET values as
+bitmasks; VentStream normalizes both to their labels so documents and
+doc ids match the SELECT paths exactly. One operational rule: **don't
+reorder ENUM/SET labels with `ALTER TABLE` while the engine is behind
+on the binlog** — the label definition is cached, and replaying
+pre-ALTER events against a reordered definition mis-addresses
+documents. Appending new labels is always safe.

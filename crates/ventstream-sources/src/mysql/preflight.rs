@@ -96,6 +96,40 @@ pub(super) async fn warn_divergent_pk_types(
              or string surrogate keys for CDC-published tables"
         );
     }
+
+    // ENUM/SET PKs are label-normalized from the INFORMATION_SCHEMA
+    // cache, which leaves an ALTER-drift window: replaying pre-ALTER
+    // binlog after `ALTER TABLE … ENUM(…)` REORDERS labels maps old
+    // indexes onto new labels — wrong doc ids, the orphan bug class
+    // reintroduced via staleness. Appends are safe; removals hit the
+    // raw-number fallback; reorders are the hazard. The full fix is
+    // TABLE_MAP optional metadata (binlog_row_metadata=FULL); until
+    // then, warn so operators avoid reorder ALTERs on published tables.
+    let enum_rows: Vec<(String, String)> = conn
+        .exec(
+            "SELECT c.table_name, c.column_name \
+             FROM information_schema.columns c \
+             JOIN information_schema.key_column_usage k \
+               ON k.table_schema = c.table_schema \
+              AND k.table_name = c.table_name \
+              AND k.column_name = c.column_name \
+              AND k.constraint_name = 'PRIMARY' \
+             WHERE c.table_schema = ? \
+               AND c.data_type IN ('enum', 'set')",
+            (database,),
+        )
+        .await
+        .map_err(|e| MySqlCdcError::Connection(format!("preflight enum pk scan: {e}")))?;
+    for (table, column) in enum_rows {
+        warn!(
+            table = %table,
+            column = %column,
+            "ENUM/SET primary key: label normalization uses a cached definition — do not \
+             REORDER labels with ALTER TABLE while the engine is behind on the binlog \
+             (append-only changes are safe). A reorder during replay maps old indexes to \
+             new labels and mis-addresses documents"
+        );
+    }
     Ok(())
 }
 
