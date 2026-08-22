@@ -83,6 +83,42 @@ pub async fn run(config: &PostgresCdcConfig) -> Result<(), PostgresCdcError> {
         }
     }
 
+    // Partitioned tables: leaf partitions decode as separate relations
+    // unless the publication routes changes through the root
+    // (`publish_via_partition_root = true`). Without it, join specs
+    // written against the parent never match, and a cross-partition
+    // row move emits delete+insert under two different relation names
+    // — stranding the old doc. Definitive misconfiguration: fail with
+    // the fix.
+    match client
+        .query_opt(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM pg_publication_tables pt \
+                 JOIN pg_class c ON c.relname = pt.tablename \
+                 JOIN pg_namespace n \
+                   ON n.oid = c.relnamespace AND n.nspname = pt.schemaname \
+                 WHERE pt.pubname = $1 AND c.relispartition \
+             ) AND NOT ( \
+                 SELECT pubviaroot FROM pg_publication WHERE pubname = $1 \
+             )",
+            &[&config.publication],
+        )
+        .await
+    {
+        Ok(Some(row)) if row.get::<_, bool>(0) => {
+            return Err(PostgresCdcError::Connection(format!(
+                "publication \"{pub_name}\" includes partitioned tables but \
+                 publish_via_partition_root is off — leaf partitions would arrive as \
+                 separate relations and cross-partition row moves would strand stale \
+                 documents. Fix: ALTER PUBLICATION {pub_name} SET \
+                 (publish_via_partition_root = true);",
+                pub_name = config.publication
+            )));
+        }
+        Ok(_) => {}
+        Err(err) => warn!(error = %err, "postgres preflight — partition check failed"),
+    }
+
     // REPLICATION is a role attribute, not inherited via membership, so
     // current_user's own flags are what the walsender will check. Some
     // setups still pass differently — warn, don't fail.

@@ -68,9 +68,16 @@ pub async fn resync_tables(
         tables: tables.to_vec(),
         chunk_size,
     };
+    // Version floor: the WAL position at scan start. Every row read by
+    // this scan reflects at least this LSN, and any concurrent WAL
+    // write commits past it — stamping it as the row's external_gte
+    // version means a racing newer WAL write can never be clobbered by
+    // a stale resync read landing late (the sink drops the stale write
+    // on version conflict instead).
+    let version_floor = capture_version_floor(&client).await?;
     let mut total = 0usize;
     for table in tables {
-        total += snapshot_table(&client, config, &bootstrap, table, ctx).await?;
+        total += snapshot_table(&client, config, &bootstrap, table, version_floor, ctx).await?;
     }
     let elapsed_ms = start.elapsed().as_millis() as u64;
     info!(total, elapsed_ms, "resync complete");
@@ -140,8 +147,9 @@ pub(crate) async fn maybe_bootstrap(
         create_slot(&client, &config.slot_name).await?;
     }
 
+    let version_floor = capture_version_floor(&client).await?;
     for table in &bootstrap.tables {
-        let _ = snapshot_table(&client, config, &bootstrap, table, ctx).await?;
+        let _ = snapshot_table(&client, config, &bootstrap, table, version_floor, ctx).await?;
     }
 
     // Sentinel event marking the end of the snapshot phase. The join
@@ -286,6 +294,7 @@ async fn snapshot_table(
     config: &PostgresCdcConfig,
     bootstrap: &SnapshotBootstrap,
     table: &SnapshotTable,
+    version_floor: u64,
     ctx: &SourceContext,
 ) -> Result<usize, PostgresCdcError> {
     if table.primary_key.is_empty() {
@@ -322,6 +331,17 @@ async fn snapshot_table(
     // rows / ends early (e.g. id 10000 sorts before '5000' as text).
     let pk_types = fetch_pk_types(client, &qualified, &table.primary_key).await?;
 
+    // Column-level source list: numeric / array / timestamp-family
+    // columns are cast ::text inside a derived table so Postgres
+    // renders them with its own output functions — exactly the text
+    // forms pgoutput ships on the WAL path. Left as to_jsonb defaults
+    // they diverge: numerics round-trip through JSON as f64 (precision
+    // loss), arrays render `[\"a\",\"b\"]` instead of `{a,b}`, and
+    // timestamptz gains a `:00` offset suffix. PK columns are never
+    // cast — the keyset ORDER BY/filter must run in native types.
+    let source_select = build_cast_select(client, &qualified, &table.primary_key).await?;
+    let from_clause = format!("(SELECT {source_select} FROM {qualified}) t");
+
     let mut total: u64 = 0;
     let mut chunks: u64 = 0;
     let mut last_pk: Option<Vec<String>> = None;
@@ -331,7 +351,7 @@ async fn snapshot_table(
         let sql = match &last_pk {
             None => format!(
                 "SELECT to_jsonb(t.*), {pk_select} \
-                 FROM {qualified} t \
+                 FROM {from_clause} \
                  ORDER BY {pk_order} \
                  LIMIT {chunk}",
                 chunk = bootstrap.chunk_size,
@@ -340,7 +360,7 @@ async fn snapshot_table(
                 let where_clause = build_pk_gt_clause(&table.primary_key, &pk_types);
                 format!(
                     "SELECT to_jsonb(t.*), {pk_select} \
-                     FROM {qualified} t \
+                     FROM {from_clause} \
                      WHERE {where_clause} \
                      ORDER BY {pk_order} \
                      LIMIT {chunk}",
@@ -374,7 +394,7 @@ async fn snapshot_table(
 
         for row in &rows {
             let json: Value = row.get(0);
-            let event = build_synthetic_insert(config, table, &json)?;
+            let event = build_synthetic_insert(config, table, &json, version_floor)?;
             ctx.sender
                 .send(event, &ctx.shutdown)
                 .await
@@ -449,7 +469,7 @@ fn build_pk_gt_clause(pk: &[String], types: &[String]) -> String {
 /// back to the right type. Returns a placeholder `text` per column when
 /// the table is empty — in that case the first chunk returns no rows and
 /// the keyset clause is never built, so the value is unused.
-async fn fetch_pk_types(
+pub(crate) async fn fetch_pk_types(
     client: &Client,
     qualified: &str,
     pk: &[String],
@@ -472,7 +492,7 @@ async fn fetch_pk_types(
 
 /// Build the SQL identifier-quoted form: `"my_table"` for a table
 /// named `my_table`. Doubles any embedded `"` per SQL spec.
-fn quote_ident(s: &str) -> String {
+pub(crate) fn quote_ident(s: &str) -> String {
     let escaped = s.replace('"', "\"\"");
     format!("\"{escaped}\"")
 }
@@ -484,6 +504,7 @@ fn build_synthetic_insert(
     config: &PostgresCdcConfig,
     table: &SnapshotTable,
     row_json: &Value,
+    version_floor: u64,
 ) -> Result<Event, PostgresCdcError> {
     let source = SourceUri::new(format!(
         "postgres://{publication}/{namespace}/{relation}",
@@ -520,6 +541,13 @@ fn build_synthetic_insert(
         config.publication.clone(),
     );
     headers.insert("ventstream.cdc.bootstrap".to_owned(), "snapshot".to_owned());
+    // The scan-start WAL position doubles as the row's external_gte
+    // version: newer concurrent WAL writes (higher LSN) always win,
+    // and a stale snapshot read landing after one is dropped by the
+    // sink's version conflict instead of clobbering it.
+    if version_floor > 0 {
+        headers.insert("ventstream.cdc.lsn".to_owned(), version_floor.to_string());
+    }
     // Stable doc id from the discovered primary key, matching the WAL path
     // and the SQL-denormalize path byte for byte. Values were text-normalized
     // above, so snapshot and WAL ids for the same row agree.
@@ -554,6 +582,78 @@ fn build_synthetic_insert(
         .build())
 }
 
+/// Build the derived-table column list: every column of `qualified`,
+/// with numeric, array, and timestamp-family columns cast `::text` so
+/// their values arrive in Postgres's canonical output-function forms
+/// (the same renderings pgoutput uses on the WAL path). PK columns are
+/// excluded from casting — keyset pagination orders and filters on
+/// them in their native types.
+pub(crate) async fn build_cast_select(
+    client: &Client,
+    qualified: &str,
+    primary_key: &[String],
+) -> Result<String, PostgresCdcError> {
+    let rows = client
+        .query(
+            "SELECT a.attname, t.typname, t.typcategory::text \
+             FROM pg_attribute a \
+             JOIN pg_type t ON t.oid = a.atttypid \
+             WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped \
+             ORDER BY a.attnum",
+            &[&qualified],
+        )
+        .await
+        .map_err(|err| PostgresCdcError::Connection(format!("column type discovery: {err}")))?;
+    if rows.is_empty() {
+        return Err(PostgresCdcError::Internal(format!(
+            "no columns discovered for {qualified}"
+        )));
+    }
+    let mut parts = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name: String = row.get(0);
+        let typname: String = row.get(1);
+        let category: String = row.get(2);
+        let is_pk = primary_key.iter().any(|pk| pk == &name);
+        let needs_cast = !is_pk
+            && (category == "A"
+                || matches!(
+                    typname.as_str(),
+                    "numeric" | "timestamptz" | "timestamp" | "timetz" | "time" | "interval"
+                ));
+        let ident = quote_ident(&name);
+        if needs_cast {
+            parts.push(format!("{ident}::text AS {ident}"));
+        } else {
+            parts.push(ident);
+        }
+    }
+    Ok(parts.join(", "))
+}
+
+/// The current WAL insert position, captured on the snapshot's own
+/// connection at scan start. `0` (never produced by a live server)
+/// would mean "unversioned"; the query always returns a real LSN.
+async fn capture_version_floor(client: &Client) -> Result<u64, PostgresCdcError> {
+    let row = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await
+        .map_err(|err| PostgresCdcError::Connection(format!("capture wal position: {err}")))?;
+    let text: String = row.get(0);
+    parse_lsn(&text).ok_or_else(|| {
+        PostgresCdcError::Internal(format!("unparseable pg_current_wal_lsn `{text}`"))
+    })
+}
+
+/// Parse Postgres's `XXXXXXXX/XXXXXXXX` LSN text form into the u64 the
+/// WAL stream's `ventstream.cdc.lsn` headers use.
+fn parse_lsn(text: &str) -> Option<u64> {
+    let (hi, lo) = text.split_once('/')?;
+    let hi = u64::from_str_radix(hi, 16).ok()?;
+    let lo = u64::from_str_radix(lo, 16).ok()?;
+    Some((hi << 32) | lo)
+}
+
 /// Stringify the top-level fields of a JSON object so values match
 /// the text-form convention pgoutput uses. Nested structures stay
 /// untouched — this only normalizes scalars at depth 1.
@@ -566,7 +666,7 @@ fn build_synthetic_insert(
 /// sees and rejects all subsequent rows that don't match. We rewrite
 /// the snapshot output to pgoutput's space form so dynamic mapping
 /// stays consistent across snapshot and WAL inputs.
-fn stringify_top_level(value: Value) -> Value {
+pub(crate) fn stringify_top_level(value: Value) -> Value {
     match value {
         Value::Object(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
@@ -676,6 +776,18 @@ fn sanitize_segment(input: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
+    #[test]
+    fn parse_lsn_matches_wal_header_encoding() {
+        // 16/B374D848 = (0x16 << 32) | 0xB374D848 — the same u64 the
+        // WAL path stamps in `ventstream.cdc.lsn`.
+        assert_eq!(
+            super::parse_lsn("16/B374D848"),
+            Some((0x16u64 << 32) | 0xB374_D848)
+        );
+        assert_eq!(super::parse_lsn("0/0"), Some(0));
+        assert_eq!(super::parse_lsn("junk"), None);
+    }
+
     use super::*;
     use serde_json::json;
 
