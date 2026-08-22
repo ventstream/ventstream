@@ -23,7 +23,7 @@ use super::config::MySqlCdcConfig;
 use super::cursor::{BinlogPos, CursorFile, IncompleteKind};
 use super::ddl::{parse_ddl, DdlKind};
 use super::event_mapper::{self, Op};
-use super::schema::{detect_drift, SchemaCache};
+use super::schema::{detect_drift, SchemaCache, TableSchema};
 use super::value::value_to_json;
 use crate::credential::{exhausted_message, CredentialFailureBudget};
 use crate::error::MySqlCdcError;
@@ -621,11 +621,7 @@ impl MySqlCdcSource {
         }
         let mut emitted = false;
         for change in rows {
-            let before_doc = row_image_to_json(
-                change.before.as_deref(),
-                &schema.column_names,
-                &schema.json_columns,
-            );
+            let before_doc = row_image_to_json(change.before.as_deref(), &schema);
             let pk_values: Vec<Value> = schema
                 .pk_ordinals
                 .iter()
@@ -635,7 +631,7 @@ impl MySqlCdcSource {
                         .unwrap_or(Value::NULL)
                 })
                 .collect();
-            let pk = pk_components(&pk_values);
+            let pk = pk_components_binlog(&pk_values, &schema.pk_ordinals, &schema);
             let ev = if op.is_delete() {
                 event_mapper::change_event(&self.config, &table, op, &pk, Some(before_doc))?
             } else {
@@ -837,6 +833,51 @@ fn pk_components(values: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// PK components from binlog values, with ENUM/SET indexes normalized
+/// to their labels so binlog-path doc ids match the SELECT-path ids
+/// byte for byte (a diverging PK text means deletes orphan documents).
+fn pk_components_binlog(values: &[Value], ordinals: &[usize], schema: &TableSchema) -> Vec<String> {
+    values
+        .iter()
+        .zip(ordinals.iter())
+        .map(|(value, &ordinal)| {
+            let normalized = normalize_binlog_value(value, ordinal, schema);
+            doc_id::component_text(&value_to_json(&normalized, false))
+        })
+        .collect()
+}
+
+/// Rewrite a binlog ENUM index (1-based; 0 = the empty invalid value)
+/// or SET bitmask into the label text the SELECT paths return. Other
+/// values pass through untouched. Out-of-range indexes (drifted enum
+/// definition) fall back to the raw number rather than guessing.
+fn normalize_binlog_value(value: &Value, ordinal: usize, schema: &TableSchema) -> Value {
+    let index = match value {
+        Value::Int(i) if *i >= 0 => *i as u64,
+        Value::UInt(u) => *u,
+        _ => return value.clone(),
+    };
+    if let Some(labels) = schema.enum_labels.get(&ordinal) {
+        if index == 0 {
+            return Value::Bytes(Vec::new());
+        }
+        if let Some(label) = labels.get((index - 1) as usize) {
+            return Value::Bytes(label.clone().into_bytes());
+        }
+        return value.clone();
+    }
+    if let Some(labels) = schema.set_labels.get(&ordinal) {
+        let mut parts = Vec::new();
+        for (bit, label) in labels.iter().enumerate() {
+            if bit < 64 && index & (1u64 << bit) != 0 {
+                parts.push(label.as_str());
+            }
+        }
+        return Value::Bytes(parts.join(",").into_bytes());
+    }
+    value.clone()
+}
+
 fn row_change_value(change: &RowChange, op: Op, ordinal: usize) -> Option<&Value> {
     let before = || {
         change
@@ -859,25 +900,22 @@ fn row_change_value(change: &RowChange, op: Op, ordinal: usize) -> Option<&Value
     }
 }
 
-fn row_image_to_json(
-    image: Option<&[Option<Value>]>,
-    column_names: &[String],
-    json_columns: &std::collections::HashSet<String>,
-) -> Json {
+fn row_image_to_json(image: Option<&[Option<Value>]>, schema: &TableSchema) -> Json {
     let mut map = Map::new();
     let Some(image) = image else {
         return Json::Object(map);
     };
     for (ordinal, value) in image.iter().enumerate() {
-        let (Some(value), Some(name)) = (value.as_ref(), column_names.get(ordinal)) else {
+        let (Some(value), Some(name)) = (value.as_ref(), schema.column_names.get(ordinal)) else {
             continue;
         };
         if name.is_empty() {
             continue;
         }
+        let normalized = normalize_binlog_value(value, ordinal, schema);
         map.insert(
             name.clone(),
-            value_to_json(value, json_columns.contains(name)),
+            value_to_json(&normalized, schema.json_columns.contains(name)),
         );
     }
     Json::Object(map)
@@ -1046,8 +1084,9 @@ fn is_credential_error(error: &MySqlCdcError) -> bool {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::{
-        allocate_ack_sequence, flush_confirmed_positions, jittered_delay, row_change_value,
-        row_image_to_json, sanitize_binlog_filename, BinlogPos, CursorFile, Op, RowChange,
+        allocate_ack_sequence, flush_confirmed_positions, jittered_delay, pk_components_binlog,
+        row_change_value, row_image_to_json, sanitize_binlog_filename, BinlogPos, CursorFile, Op,
+        RowChange, TableSchema,
     };
     use mysql_async::Value;
     use std::collections::{HashSet, VecDeque};
@@ -1156,6 +1195,48 @@ mod tests {
         );
     }
 
+    fn test_schema(columns: &[&str]) -> TableSchema {
+        TableSchema {
+            column_names: columns.iter().map(|c| (*c).to_owned()).collect(),
+            column_types: vec![String::new(); columns.len()],
+            pk_names: Vec::new(),
+            pk_ordinals: Vec::new(),
+            json_columns: HashSet::new(),
+            enum_labels: std::collections::HashMap::new(),
+            set_labels: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn enum_and_set_binlog_indexes_render_as_labels() {
+        let mut schema = test_schema(&["id", "color", "tags"]);
+        schema
+            .enum_labels
+            .insert(1, vec!["red".into(), "blue".into()]);
+        schema
+            .set_labels
+            .insert(2, vec!["a".into(), "b".into(), "c".into()]);
+        let image = vec![
+            Some(Value::Bytes(b"7".to_vec())),
+            Some(Value::Int(2)),  // enum index 2 -> "blue"
+            Some(Value::UInt(5)), // set bits 0+2 -> "a,c"
+        ];
+        let document = row_image_to_json(Some(&image), &schema);
+        assert_eq!(
+            document,
+            serde_json::json!({"id": "7", "color": "blue", "tags": "a,c"})
+        );
+        // PK components match the SELECT path's label text.
+        let pk = pk_components_binlog(&[Value::Int(2)], &[1], &schema);
+        assert_eq!(pk, vec!["blue".to_owned()]);
+        // Out-of-range index (drifted definition): raw number, no guess.
+        let pk = pk_components_binlog(&[Value::Int(9)], &[1], &schema);
+        assert_eq!(pk, vec!["9".to_owned()]);
+        // Enum index 0 is MySQL's empty invalid value.
+        let pk = pk_components_binlog(&[Value::Int(0)], &[1], &schema);
+        assert_eq!(pk, vec![String::new()]);
+    }
+
     #[test]
     fn delete_before_image_preserves_present_columns_and_omits_missing_ones() {
         let image = vec![
@@ -1165,8 +1246,7 @@ mod tests {
         ];
         let document = row_image_to_json(
             Some(&image),
-            &["id".into(), "order_id".into(), "description".into()],
-            &HashSet::new(),
+            &test_schema(&["id", "order_id", "description"]),
         );
         assert_eq!(
             document,
