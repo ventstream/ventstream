@@ -331,8 +331,18 @@ pub struct PostgresCdcSource {
 #[derive(Default)]
 struct ToastRefetchState {
     client: Option<tokio_postgres::Client>,
-    /// Per-qualified-table: (pk column names, pk types, cast select list).
-    tables: std::collections::HashMap<String, (Vec<String>, Vec<String>, String)>,
+    /// Per-qualified-table refetch metadata, resolved once.
+    tables: std::collections::HashMap<String, TableRefetchMeta>,
+}
+
+/// Cached per-table metadata for TOAST refetch queries.
+struct TableRefetchMeta {
+    /// Primary-key column names, index order.
+    pk: Vec<String>,
+    /// The PK columns' Postgres types, for `CAST($n::text AS type)`.
+    pk_types: Vec<String>,
+    /// Canonical-text column select list (see `build_cast_select`).
+    cast_select: String,
 }
 
 /// Tolerated run of consecutive unknown-relation skips before the
@@ -1211,16 +1221,22 @@ async fn fetch_full_row(
                 "{qualified} has no primary key for toast refetch"
             )));
         }
-        let types = snapshot::fetch_pk_types(client, qualified, &pk).await?;
+        let pk_types = snapshot::fetch_pk_types(client, qualified, &pk).await?;
         let cast_select = snapshot::build_cast_select(client, qualified, &pk).await?;
-        state
-            .tables
-            .insert(qualified.to_owned(), (pk, types, cast_select));
+        state.tables.insert(
+            qualified.to_owned(),
+            TableRefetchMeta {
+                pk,
+                pk_types,
+                cast_select,
+            },
+        );
     }
-    let (pk, types, cast_select) = state
+    let meta = state
         .tables
         .get(qualified)
         .ok_or_else(|| PostgresCdcError::Internal("pk cache miss".into()))?;
+    let (pk, types, cast_select) = (&meta.pk, &meta.pk_types, &meta.cast_select);
     if pk.len() != components.len() {
         return Err(PostgresCdcError::Internal(format!(
             "doc id arity {} != pk arity {} for {qualified}",
