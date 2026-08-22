@@ -37,6 +37,36 @@ pub struct KafkaCdcSource {
     unmappable_streak: AtomicU64,
 }
 
+/// Engine-side consumer lag: sum over assigned partitions of
+/// (high watermark - current position). Broker-side lag exists too,
+/// but an engine-side gauge means the operator sees a stuck pipeline
+/// from VentStream's own metrics without broker tooling.
+fn record_consumer_lag(consumer: &StreamConsumer) {
+    let Ok(assignment) = consumer.assignment() else {
+        return;
+    };
+    let mut total: i64 = 0;
+    for element in assignment.elements() {
+        let Ok((_, high)) = consumer.fetch_watermarks(
+            element.topic(),
+            element.partition(),
+            std::time::Duration::from_secs(2),
+        ) else {
+            return; // transient broker hiccup — skip this tick
+        };
+        let position = match consumer.position() {
+            Ok(list) => list
+                .find_partition(element.topic(), element.partition())
+                .and_then(|p| p.offset().to_raw()),
+            Err(_) => None,
+        };
+        if let Some(position) = position {
+            total += (high - position).max(0);
+        }
+    }
+    metrics::gauge!("vs_kafka_consumer_lag_messages").set(total as f64);
+}
+
 /// Tolerated run of consecutive unmappable messages before the source
 /// halts. Far above any real poison-record cluster; far below a whole
 /// topic misdecoding.
@@ -105,6 +135,36 @@ impl KafkaCdcSource {
                 "no topics configured (VS_KAFKA_TOPICS)".to_owned(),
             ));
         }
+        // Preflight: prove the brokers are reachable and every
+        // configured topic exists BEFORE subscribing. Without this, a
+        // typo'd topic or dead broker list is an eternal warn-loop that
+        // looks like an idle-but-healthy pipeline.
+        {
+            let consumer = &consumer;
+            let metadata = tokio::task::block_in_place(|| {
+                consumer.fetch_metadata(None, std::time::Duration::from_secs(15))
+            })
+            .map_err(|e| {
+                KafkaCdcError::Connection(format!(
+                    "preflight metadata fetch failed — brokers unreachable or refusing \
+                     the configured security settings ({}): {e}",
+                    self.config.brokers
+                ))
+            })?;
+            let known: std::collections::HashSet<&str> =
+                metadata.topics().iter().map(|topic| topic.name()).collect();
+            let missing: Vec<&&str> = topics
+                .iter()
+                .filter(|topic| !known.contains(**topic))
+                .collect();
+            if !missing.is_empty() {
+                return Err(KafkaCdcError::Connection(format!(
+                    "configured topic(s) {missing:?} do not exist on the brokers — \
+                     check VS_KAFKA_TOPICS for typos, or create the topic(s) first \
+                     (auto-creation may be disabled)"
+                )));
+            }
+        }
         consumer
             .subscribe(&topics)
             .map_err(|e| KafkaCdcError::Connection(format!("subscribe failed: {e}")))?;
@@ -132,6 +192,7 @@ impl KafkaCdcSource {
                 }
                 _ = commit.tick() => {
                     self.commit_now(&consumer, &mut tracker, CommitMode::Async);
+                    record_consumer_lag(&consumer);
                 }
                 recv = consumer.recv() => {
                     let owned = match recv {

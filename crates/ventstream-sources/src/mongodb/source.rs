@@ -153,6 +153,25 @@ impl MongoCdcSource {
         }
         // `full_document` is only set when we want post-images (update-lookup);
         // the builder takes the value directly, so we chain conditionally.
+        // Topology preflight: change streams need a replica set (or
+        // mongos). A standalone mongod fails `watch` with an error
+        // that is easy to misread — and under the old substring
+        // classifier could even have been mistaken for a resume
+        // failure, wiping a valid cursor. Definitive misconfiguration:
+        // fail with the fix.
+        let hello = db
+            .run_command(mongodb::bson::doc! {"hello": 1})
+            .await
+            .map_err(|e| MongoCdcError::Connection(format!("preflight hello: {e}")))?;
+        let is_replset = hello.get("setName").is_some();
+        let is_mongos = hello.get_str("msg").is_ok_and(|msg| msg == "isdbgrid");
+        if !is_replset && !is_mongos {
+            return Err(MongoCdcError::Connection(
+                "this MongoDB is a standalone server — change streams require a replica                  set or sharded cluster. A single node works fine as a one-member replica                  set: restart mongod with --replSet rs0 and run rs.initiate() once"
+                    .to_owned(),
+            ));
+        }
+
         let mut watch = db.watch().resume_after(resume_token.clone());
         if matches!(self.config.full_document, FullDocument::UpdateLookup) {
             watch = watch.full_document(FullDocumentType::UpdateLookup);
@@ -345,6 +364,19 @@ impl MongoCdcSource {
                             return Err(MongoCdcError::Operation(format!("change stream: {e}")));
                         }
                         Some(Ok(event)) => {
+                            // Cursor age: how far behind the cluster's
+                            // clock this event is. Rising age = the
+                            // pipeline is falling behind the oplog.
+                            if let Some(cluster_time) = &event.cluster_time {
+                                let event_ms = u64::from(cluster_time.time) * 1000;
+                                let now_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                ventstream_telemetry::record_cursor_age(
+                                    now_ms.saturating_sub(event_ms),
+                                );
+                            }
                             let token = event.id.clone();
                             let seq = next_ack_seq;
                             match self.handle_event(ctx, event, seq).await? {
@@ -600,12 +632,23 @@ fn token_from_string(s: &str) -> Result<ResumeToken, MongoCdcError> {
 /// Heuristic: does this driver error indicate the resume token is no longer
 /// usable (oplog rotated past it / change-stream history lost)? When true,
 /// the source wipes the cursor and re-bootstraps instead of crash-looping.
+/// True when the server says the resume point itself is unusable —
+/// classified by server error CODE, not message text. Substring
+/// matching here was dangerous: wiping a valid cursor because an
+/// unrelated error merely mentioned "oplog" turns a transient fault
+/// into a full re-bootstrap.
+///
+/// - 286 `ChangeStreamHistoryLost` — oplog rotated past the token
+/// - 280 `ChangeStreamFatalError` — stream cannot continue
+/// - 136 `CappedPositionLost` — capped-collection read position lost
 fn looks_like_resume_failure(e: &mongodb::error::Error) -> bool {
-    let msg = e.to_string().to_ascii_lowercase();
-    msg.contains("resume")
-        || msg.contains("changestreamhistorylost")
-        || msg.contains("history lost")
-        || msg.contains("oplog")
+    match e.kind.as_ref() {
+        mongodb::error::ErrorKind::Command(command) => {
+            matches!(command.code, 286 | 280 | 136)
+                || command.code_name == "ChangeStreamHistoryLost"
+        }
+        _ => false,
+    }
 }
 
 /// Mongo auth failures that cannot heal in-process: server error code 18

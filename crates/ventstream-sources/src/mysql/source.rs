@@ -449,6 +449,9 @@ impl MySqlCdcSource {
         let mut pos = start;
         let mut pending_gated: VecDeque<(u64, BinlogPos)> = VecDeque::new();
         let mut pending_write: Option<BinlogPos> = None;
+        // Newest processed binlog position, for the lag gauge only
+        // (durability rides pending_gated/pending_write as before).
+        let mut lag_probe_pos: Option<BinlogPos> = None;
         let mut flush = tokio::time::interval(self.config.pos_flush_interval);
         flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -471,6 +474,9 @@ impl MySqlCdcSource {
                         &mut pending_gated,
                         &mut pending_write,
                     )?;
+                    if let Some(current) = &lag_probe_pos {
+                        record_binlog_lag(pool, current).await;
+                    }
                 }
                 next = tokio::time::timeout(READ_IDLE_TIMEOUT, stream.next()) => {
                     let Ok(next) = next else {
@@ -580,6 +586,7 @@ impl MySqlCdcSource {
                                     )?;
                                     return Ok(());
                                 }
+                                lag_probe_pos = Some(pos.clone());
                                 pending_gated.push_back((ack_sequence, pos.clone()));
                             } else if let Some((_, pending_position)) = pending_gated.back_mut() {
                                 // No sink work for this record. Its position can
@@ -587,9 +594,11 @@ impl MySqlCdcSource {
                                 // that barrier follows every earlier output.
                                 *pending_position = pos.clone();
                             } else {
+                                lag_probe_pos = Some(pos.clone());
                                 pending_write = Some(pos.clone());
                             }
                         } else {
+                            lag_probe_pos = Some(pos.clone());
                             pending_write = Some(pos.clone());
                         }
                     }
@@ -930,6 +939,30 @@ fn row_to_json(row: &Row, json_columns: &std::collections::HashSet<String>) -> J
         map.insert(name, value_to_json(&v, is_json));
     }
     Json::Object(map)
+}
+
+/// Binlog lag gauges, best-effort on the flush cadence. Within one
+/// file the byte distance is exact; across files only the file count
+/// is knowable without reading server file sizes, so the byte gauge
+/// reports the in-file distance and `files_behind` carries the rest.
+async fn record_binlog_lag(pool: &Pool, current: &BinlogPos) {
+    let Ok(master) = master_pos(pool).await else {
+        return; // transient — skip this tick
+    };
+    let files_behind = binlog_file_seq(&master.file)
+        .zip(binlog_file_seq(&current.file))
+        .map(|(m, c)| m.saturating_sub(c))
+        .unwrap_or(0);
+    metrics::gauge!("vs_mysql_binlog_files_behind").set(files_behind as f64);
+    if files_behind == 0 {
+        metrics::gauge!("vs_mysql_binlog_lag_bytes")
+            .set(master.pos.saturating_sub(current.pos) as f64);
+    }
+}
+
+/// Numeric suffix of a binlog file name (`mysql-bin.000042` → 42).
+fn binlog_file_seq(file: &str) -> Option<u64> {
+    file.rsplit('.').next()?.parse().ok()
 }
 
 async fn master_pos(pool: &Pool) -> Result<BinlogPos, MySqlCdcError> {
