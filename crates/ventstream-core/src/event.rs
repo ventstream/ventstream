@@ -309,6 +309,14 @@ impl Headers {
         self
     }
 
+    /// Return these headers with one key removed. Same
+    /// [`Arc::make_mut`] in-place behavior as [`Self::with_header`].
+    #[must_use]
+    pub fn without_header(mut self, key: &str) -> Self {
+        Arc::make_mut(&mut self.0).remove(key);
+        self
+    }
+
     /// Look up a header by name.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.0.get(key).map(String::as_str)

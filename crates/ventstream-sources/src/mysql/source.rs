@@ -52,6 +52,12 @@ struct ProcessOutcome {
     emitted: bool,
 }
 
+/// Reconnect the binlog stream after this long with zero bytes read.
+/// Long enough that real idle databases reconnect rarely; short enough
+/// that a NAT-killed connection is detected the same operational day
+/// it happens, not when someone notices missing data.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 impl MySqlCdcSource {
     /// Construct from configuration.
     pub fn new(config: MySqlCdcConfig) -> Self {
@@ -100,6 +106,16 @@ impl MySqlCdcSource {
 
     async fn run_inner(&self, ctx: SourceContext) -> Result<(), MySqlCdcError> {
         let pool = Pool::new(self.opts());
+        // Fail fast on the one server setting that turns this source
+        // into a silent no-op (binlog_format != ROW).
+        {
+            let mut conn = pool
+                .get_conn()
+                .await
+                .map_err(|e| MySqlCdcError::Connection(format!("preflight connect: {e}")))?;
+            super::preflight::check(&mut conn).await?;
+            super::preflight::warn_divergent_pk_types(&mut conn, &self.config.database).await?;
+        }
         let cursor_file = CursorFile::new(&self.config.state_dir)?;
         let mut next_ack_sequence = 1u64;
 
@@ -208,6 +224,16 @@ impl MySqlCdcSource {
             {
                 Ok(()) => return Ok(()),
                 Err(error @ MySqlCdcError::Connection(_)) => {
+                    if is_preflight_misconfig(&error) {
+                        // A definitive server misconfiguration (e.g. a live
+                        // flip to binlog_format=STATEMENT) can't be retried
+                        // away — halting mirrors the credential-exhaustion
+                        // path so the operator sees it instead of an
+                        // infinite backoff loop.
+                        error!(source = %self.config.id, error = %error,
+                               "server misconfiguration detected on reconnect; halting");
+                        return Err(error);
+                    }
                     if connected_at.elapsed() >= HEALTHY_THRESHOLD {
                         consecutive_failures = 0;
                         backoff = INITIAL_BACKOFF;
@@ -395,6 +421,15 @@ impl MySqlCdcSource {
         ctx: &SourceContext,
         next_ack_sequence: &mut u64,
     ) -> Result<(), MySqlCdcError> {
+        // Re-checked per (re)connect: a live `SET GLOBAL binlog_format`
+        // flip must not silently starve the stream.
+        {
+            let mut conn = pool
+                .get_conn()
+                .await
+                .map_err(|e| MySqlCdcError::Connection(format!("preflight connect: {e}")))?;
+            super::preflight::check(&mut conn).await?;
+        }
         info!(
             source = %self.config.id,
             file = %start.file, pos = start.pos,
@@ -437,7 +472,22 @@ impl MySqlCdcSource {
                         &mut pending_write,
                     )?;
                 }
-                next = stream.next() => {
+                next = tokio::time::timeout(READ_IDLE_TIMEOUT, stream.next()) => {
+                    let Ok(next) = next else {
+                        // No bytes for the whole window: either the DB is
+                        // truly idle (we do not request MASTER_HEARTBEAT,
+                        // so silence is expected there — the reconnect is
+                        // cheap and the backoff resets each healthy cycle)
+                        // or a NAT/LB silently killed the TCP stream —
+                        // which otherwise hangs this loop forever with the
+                        // source looking healthy. Reconnect through the
+                        // normal path either way.
+                        return Err(MySqlCdcError::Connection(format!(
+                            "no binlog traffic for {}s; reconnecting (idle stream or dead \
+                             connection)",
+                            READ_IDLE_TIMEOUT.as_secs()
+                        )));
+                    };
                     let Some(event) = next else {
                         flush_confirmed_positions(
                             self.sink_progress.as_ref(),
@@ -866,6 +916,15 @@ async fn master_pos(pool: &Pool) -> Result<BinlogPos, MySqlCdcError> {
         .get("Position")
         .ok_or_else(|| MySqlCdcError::Operation("binary log status missing Position".to_owned()))?;
     Ok(BinlogPos { file, pos })
+}
+
+/// True when a Connection error is really a definitive server
+/// misconfiguration surfaced by preflight (same string-classification
+/// idiom as `is_credential_error`).
+fn is_preflight_misconfig(error: &MySqlCdcError) -> bool {
+    error
+        .to_string()
+        .contains("row-based replication requires 'ROW'")
 }
 
 fn allocate_ack_sequence(next: &mut u64) -> Result<u64, MySqlCdcError> {

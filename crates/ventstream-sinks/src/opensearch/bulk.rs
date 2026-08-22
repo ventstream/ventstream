@@ -48,10 +48,11 @@ const TX_ID_HEADER: &str = "ventstream.cdc.tx_id";
 const SOURCE_VERSION_HEADER: &str = "ventstream.cdc.source_version";
 
 /// The source watermark to stamp as the OpenSearch external doc version,
-/// if the event carries one. Bootstrap/snapshot events have no watermark
-/// header → `None` → an unversioned (internal-versioning) write, which
-/// is correct: a snapshot row is written once, before any tail event for
-/// the same doc can exist, so it never needs cross-batch ordering.
+/// if the event carries one. Postgres snapshot/resync rows carry their
+/// scan-start WAL position in the source-version header so a stale
+/// snapshot read can never clobber a newer live write; events with
+/// neither header (other sources' bootstraps) fall back to unversioned
+/// internal-versioning writes.
 fn external_version(event: &Event) -> Option<u64> {
     event
         .headers

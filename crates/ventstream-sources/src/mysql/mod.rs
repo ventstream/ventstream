@@ -11,6 +11,7 @@ mod cursor;
 mod ddl;
 mod event_mapper;
 mod fetcher;
+mod preflight;
 mod schema;
 mod source;
 mod value;

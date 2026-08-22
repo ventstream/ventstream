@@ -213,6 +213,49 @@ eventually fills. When you retire an engine, drop its slot:
 `SELECT pg_drop_replication_slot('ventstream_orders_slot');`
 </Note>
 
+## WAL retention and slot health
+
+A logical slot pins WAL until the engine confirms it — that's what makes
+restarts lossless. Three things keep it healthy:
+
+- **Idle databases advance too.** The engine acknowledges the server's
+  keepalives whenever everything it has emitted is durably written, so
+  a quiet publication (or traffic only on unpublished tables) doesn't
+  pin WAL behind the slot.
+- **Watch `vs_pg_slot_lag_bytes`.** The engine polls
+  `pg_replication_slots` every 30 seconds and exports retained-WAL lag
+  as a gauge. Sustained growth means the sink can't keep up or the
+  engine is down.
+- **Set a server-side backstop.** `max_slot_wal_keep_size` (e.g.
+  `10GB`) caps how much WAL any slot may retain. If the cap is hit the
+  slot is invalidated and the engine re-bootstraps — a full resync, but
+  the database never fills its disk.
+
+## Partitioned tables
+
+Publish partitioned tables **through the root**:
+
+```sql
+ALTER PUBLICATION vs_pub SET (publish_via_partition_root = true);
+```
+
+Without it, leaf partitions decode as separate relations — projections
+written against the parent never match, and a cross-partition row move
+(delete from one leaf, insert into another) strands the old document.
+The engine's preflight detects partitions in a publication without
+`publish_via_partition_root` and fails with this exact fix.
+
+## Large values (TOAST)
+
+Postgres omits unchanged TOASTed columns (large text/jsonb values) from
+UPDATE images. Since flat sync full-replaces documents, the engine
+detects these partial images and transparently re-reads the complete
+row on a side connection before shipping the event — large fields never
+silently vanish from destination documents. The refetch is visible as
+`vs_pg_toast_refetch_total`; if a table updates TOASTed rows heavily,
+`ALTER TABLE t REPLICA IDENTITY FULL` avoids the extra reads by putting
+full images on the WAL.
+
 ## The projection
 
 ```yaml

@@ -80,8 +80,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Event header carrying the wal_end LSN (u64) of the WAL record
-/// that produced this event. Snapshot events do not set it.
+/// Event header carrying the LSN (u64) the event is acknowledged
+/// under: the producing record's wal_start, except a transaction's
+/// final event, which carries the commit end LSN so sink progress can
+/// reach the ack high-water mark. Snapshot events do not set it.
 pub const LSN_HEADER: &str = "ventstream.cdc.lsn";
 
 /// Default cadence for `standby_status_update` pushes. Operators can
@@ -92,11 +94,13 @@ const DEFAULT_LSN_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 const TRANSACTION_MEMORY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 static TRANSACTION_SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 use tracing::{debug, error, info, warn};
+use ventstream_core::event::Payload;
 use ventstream_core::{Event, Source, SourceContext, SourceError};
 
 use crate::credential::{exhausted_message, CredentialFailureBudget};
 
 use super::config::PostgresCdcConfig;
+use super::connection::connect_client;
 use super::event_mapper;
 use super::pgoutput::{self, LogicalMessage};
 use super::preflight;
@@ -315,7 +319,38 @@ pub struct PostgresCdcSource {
     /// replication slot for subsequent WAL replay.
     bootstrap_existing_slot: bool,
     transaction_spool_dir: PathBuf,
+    /// Consecutive WAL messages skipped for uncached relations; reset
+    /// by any successfully decoded payload. Bounded by
+    /// [`MAX_UNKNOWN_RELATION_STREAK`].
+    unknown_relation_streak: AtomicU64,
+    /// Lazy auxiliary SQL connection + per-table metadata caches for
+    /// TOAST refetch. Never the replication connection.
+    toast_refetch: tokio::sync::Mutex<ToastRefetchState>,
 }
+
+/// Cached state for re-reading full rows when an UPDATE's new image
+/// omitted unchanged TOAST columns (see `TOAST_INCOMPLETE_HEADER`).
+#[derive(Default)]
+struct ToastRefetchState {
+    client: Option<tokio_postgres::Client>,
+    /// Per-qualified-table refetch metadata, resolved once.
+    tables: std::collections::HashMap<String, TableRefetchMeta>,
+}
+
+/// Cached per-table metadata for TOAST refetch queries.
+struct TableRefetchMeta {
+    /// Primary-key column names, index order.
+    pk: Vec<String>,
+    /// The PK columns' Postgres types, for `CAST($n::text AS type)`.
+    pk_types: Vec<String>,
+    /// Canonical-text column select list (see `build_cast_select`).
+    cast_select: String,
+}
+
+/// Tolerated run of consecutive unknown-relation skips before the
+/// source halts. Generous for the reconnect race (a handful of stale
+/// messages), far below anything a broken relation cache produces.
+const MAX_UNKNOWN_RELATION_STREAK: u64 = 64;
 
 impl PostgresCdcSource {
     /// Construct a new source from configuration. Connection setup
@@ -332,6 +367,8 @@ impl PostgresCdcSource {
             lsn_flush_interval: DEFAULT_LSN_FLUSH_INTERVAL,
             bootstrap_existing_slot: false,
             transaction_spool_dir,
+            unknown_relation_streak: AtomicU64::new(0),
+            toast_refetch: tokio::sync::Mutex::new(ToastRefetchState::default()),
         }
     }
 
@@ -551,9 +588,62 @@ impl PostgresCdcSource {
             return Err(err);
         }
 
+        // Slot-lag observability: a low-frequency poll on its own plain
+        // connection (never the replication link). Retained-WAL growth
+        // behind the slot is the operator's first sign of a stuck or
+        // slow consumer; without this gauge it is invisible until the
+        // disk fills. `max_slot_wal_keep_size` remains the server-side
+        // backstop — see the postgres connector docs.
+        let lag_task = {
+            let config = self.config.clone();
+            let shutdown = ctx.shutdown.clone();
+            tokio::spawn(async move {
+                let mut poll = tokio::time::interval(Duration::from_secs(30));
+                poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // One connection reused across ticks; rebuilt only after
+                // an error — not a fresh TCP+TLS+auth every 30s.
+                let mut client: Option<tokio_postgres::Client> = None;
+                loop {
+                    tokio::select! {
+                        () = shutdown.cancelled() => return,
+                        _ = poll.tick() => {}
+                    }
+                    if client.as_ref().is_none_or(|c| c.is_closed()) {
+                        client = connect_client(&config, "slot lag poll").await.ok();
+                    }
+                    let Some(conn) = client.as_ref() else {
+                        continue;
+                    };
+                    let lag = conn
+                        .query_opt(
+                            "SELECT COALESCE(\
+                                 pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn), \
+                                 0)::bigint \
+                             FROM pg_replication_slots WHERE slot_name = $1",
+                            &[&config.slot_name],
+                        )
+                        .await;
+                    match lag {
+                        Ok(Some(row)) => {
+                            let bytes: i64 = row.get(0);
+                            metrics::gauge!(
+                                "vs_pg_slot_lag_bytes",
+                                "slot" => config.slot_name.clone()
+                            )
+                            .set(bytes as f64);
+                        }
+                        Ok(None) => {}
+                        Err(_) => client = None,
+                    }
+                }
+            })
+        };
+
         // Bootstrap done (or skipped). Drive the replication stream,
         // reconnecting in-process on transient connection drops.
-        self.drive_with_reconnect(&ctx).await
+        let outcome = self.drive_with_reconnect(&ctx).await;
+        lag_task.abort();
+        outcome
     }
 
     /// Connect and drive the replication stream, reconnecting in-process
@@ -759,7 +849,6 @@ impl PostgresCdcSource {
                         Some(ReplicationEvent::XLogData { wal_start, wal_end, data, .. }) => {
                             let events = self.decode_payload_or_skip_unknown(&data)?;
                             let wal_start_u64 = wal_start.as_u64();
-                            let wal_end_u64 = wal_end.as_u64();
                             // Per-payload breadcrumb — operators chasing
                             // "did this row get emitted?" want to see
                             // each WAL message's event count + LSN.
@@ -790,9 +879,12 @@ impl PostgresCdcSource {
                                     })?;
                             } else {
                                 self.publish_events(events, wal_start_u64, ctx).await?;
-                                let bound = wal_end_u64.max(wal_start_u64);
-                                if bound > wal_high_water {
-                                    wal_high_water = bound;
+                                // Bound by the LSN actually stamped on the
+                                // events — a wal_end bound could never be
+                                // reached by sink progress, making the
+                                // drained comparison unsatisfiable.
+                                if wal_start_u64 > wal_high_water {
+                                    wal_high_water = wal_start_u64;
                                 }
                                 let advance_to = self.compute_safe_ack(wal_high_water);
                                 if advance_to > last_acked {
@@ -826,14 +918,41 @@ impl PostgresCdcSource {
                             );
                         }
                         Some(ReplicationEvent::Commit { lsn, end_lsn, .. }) => {
+                            let end_u64 = end_lsn.as_u64();
+                            // Hold back the last non-empty record so exactly ONE
+                            // event carries the commit end LSN. Sink progress can
+                            // then actually REACH wal_high_water — and because the
+                            // committer only advances over a contiguous durable
+                            // prefix, reaching it proves the whole transaction is
+                            // durable. (Stamping several events with end_lsn would
+                            // reopen an equal-LSN batch-boundary race.)
+                            let mut published_any = false;
                             if let Some(mut buffered) = transaction.take() {
+                                let mut pending: Option<(Vec<Event>, u64)> = None;
                                 while let Some(record) = buffered.next_record().map_err(|error| {
                                     PostgresCdcError::Internal(format!(
                                         "reading buffered PostgreSQL transaction: {error}"
                                     ))
                                 })? {
                                     let events = self.decode_payload_or_skip_unknown(&record.data)?;
-                                    self.publish_events(events, record.wal_start, ctx).await?;
+                                    if events.is_empty() {
+                                        continue;
+                                    }
+                                    if let Some((prev, prev_lsn)) = pending.take() {
+                                        self.publish_events(prev, prev_lsn, ctx).await?;
+                                        published_any = true;
+                                    }
+                                    pending = Some((events, record.wal_start));
+                                }
+                                if let Some((mut last_events, last_lsn)) = pending.take() {
+                                    let final_event = last_events.pop();
+                                    if !last_events.is_empty() {
+                                        self.publish_events(last_events, last_lsn, ctx).await?;
+                                    }
+                                    if let Some(event) = final_event {
+                                        self.publish_events(vec![event], end_u64, ctx).await?;
+                                    }
+                                    published_any = true;
                                 }
                             }
                             debug!(
@@ -842,9 +961,27 @@ impl PostgresCdcSource {
                                 metric = "pg.replication.txn_commit",
                                 "txn commit"
                             );
-                            let end_u64 = end_lsn.as_u64();
-                            if end_u64 > wal_high_water {
-                                wal_high_water = end_u64;
+                            if published_any {
+                                if end_u64 > wal_high_water {
+                                    wal_high_water = end_u64;
+                                }
+                            } else if self.compute_safe_ack(wal_high_water) == wal_high_water
+                                && end_u64 > last_acked
+                            {
+                                // A transaction touching only unpublished
+                                // tables: nothing for the sink to confirm, so
+                                // when all previously published work is
+                                // durable this commit is directly ackable —
+                                // unpublished-table traffic must not pin WAL.
+                                // wal_high_water stays put: it tracks
+                                // published work only.
+                                debug!(
+                                    end_lsn = end_u64,
+                                    metric = "pg.replication.empty_txn_advance",
+                                    "advancing replication slot (empty transaction)"
+                                );
+                                client.update_applied_lsn(PgwLsn(end_u64));
+                                last_acked = end_u64;
                             }
                             // Same deferral logic as XLogData — the
                             // commit LSN bounds how far we *could*
@@ -863,11 +1000,45 @@ impl PostgresCdcSource {
                             }
                         }
                         Some(ReplicationEvent::KeepAlive { wal_end, .. }) => {
-                            debug!(
-                                wal_end = %wal_end,
-                                metric = "pg.replication.keepalive",
-                                "server keepalive"
-                            );
+                            // Idle-advance: when every emitted event has been
+                            // durably handled by the sink (or nothing was
+                            // emitted at all), the keepalive's wal_end is a
+                            // safe ack point. Without this, an idle
+                            // publication — or a restart on a quiet database
+                            // — never advances confirmed_flush and WAL
+                            // retention grows behind the slot indefinitely.
+                            //
+                            // Safe because streaming of in-progress
+                            // transactions is off (proto_version '1'):
+                            // transactions arrive whole after commit, and
+                            // pgoutput delivers all decodable content up to
+                            // wal_end before the keepalive carrying it, so
+                            // any transaction not yet received commits past
+                            // wal_end and will still be replayed on restart.
+                            let wal_end_u64 = u64::from(wal_end);
+                            // An open TransactionBuffer holds decoded rows the
+                            // sink has never seen — wal_end can lie past its
+                            // commit, so acking here would lose the whole
+                            // transaction on a crash before Commit.
+                            let drained = transaction.is_none()
+                                && (wal_high_water == 0
+                                    || self.compute_safe_ack(wal_high_water) == wal_high_water);
+                            if drained && wal_end_u64 > last_acked {
+                                debug!(
+                                    wal_end = %wal_end,
+                                    last_acked,
+                                    metric = "pg.replication.idle_advance",
+                                    "advancing replication slot (idle keepalive)"
+                                );
+                                client.update_applied_lsn(PgwLsn(wal_end_u64));
+                                last_acked = wal_end_u64;
+                            } else {
+                                debug!(
+                                    wal_end = %wal_end,
+                                    metric = "pg.replication.keepalive",
+                                    "server keepalive"
+                                );
+                            }
                         }
                         Some(ReplicationEvent::Message { prefix, content, .. }) => {
                             // Logs the prefix (schema-like, safe) and
@@ -897,10 +1068,33 @@ impl PostgresCdcSource {
 
     fn decode_payload_or_skip_unknown(&self, data: &[u8]) -> Result<Vec<Event>, PostgresCdcError> {
         match self.process_payload(data) {
-            Ok(events) => Ok(events),
+            Ok(events) => {
+                if !events.is_empty() {
+                    self.unknown_relation_streak.store(0, Ordering::Relaxed);
+                }
+                Ok(events)
+            }
             Err(PostgresCdcError::UnknownRelation(oid)) => {
+                // Tolerating a bounded run of unknown relations covers the
+                // restart race this path exists for (RELATION messages the
+                // server already sent before we reconnected). An unbounded
+                // streak means the relation cache itself is broken and every
+                // skip is silent data loss — halt so the supervisor restarts
+                // with a fresh cache instead.
+                let streak = self
+                    .unknown_relation_streak
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                if streak > MAX_UNKNOWN_RELATION_STREAK {
+                    return Err(PostgresCdcError::Internal(format!(
+                        "{streak} consecutive WAL messages referenced uncached relations \
+                         (last oid {oid}); halting instead of silently skipping — \
+                         restart rebuilds the relation cache"
+                    )));
+                }
                 warn!(
                     relation_oid = oid,
+                    streak,
                     metric = "pg.replication.unknown_relation_skipped",
                     "skipping WAL message for an uncached relation; advancing past it"
                 );
@@ -925,6 +1119,15 @@ impl PostgresCdcSource {
         ctx: &SourceContext,
     ) -> Result<(), PostgresCdcError> {
         for event in events {
+            let event = if event
+                .headers
+                .get(event_mapper::TOAST_INCOMPLETE_HEADER)
+                .is_some()
+            {
+                self.refetch_toasted_row(event).await
+            } else {
+                event
+            };
             // Truncate visibility (A4): counted here, not at decode, because
             // a buffered transaction decodes each payload twice.
             if let Some(qualified) = event.subject.as_str().strip_suffix(".truncate") {
@@ -953,6 +1156,66 @@ impl PostgresCdcSource {
     /// progress tracker attached, returns `min(wal_high_water,
     /// sink_progress)` — never advancing past durable events.
     /// Without one, returns `wal_high_water` (legacy behavior).
+    /// Re-read the complete row for an UPDATE whose new image omitted
+    /// unchanged TOAST columns, and splice it into the event's `new`
+    /// payload. Flat sinks full-replace documents, so shipping the
+    /// partial image would silently drop the omitted fields. Best
+    /// effort: on any failure (row deleted meanwhile, connection
+    /// trouble) the original event ships unchanged — a later WAL event
+    /// converges the document — and the header is dropped either way.
+    async fn refetch_toasted_row(&self, event: Event) -> Event {
+        let (Some(namespace), Some(relation), Some(doc_id)) = (
+            event.headers.get("ventstream.cdc.namespace"),
+            event.headers.get("ventstream.cdc.relation"),
+            event.headers.get("ventstream.doc.id"),
+        ) else {
+            return strip_toast_header(event);
+        };
+        let components: Vec<String> = match doc_id
+            .split_once(':')
+            .and_then(|(_, suffix)| serde_json::from_str(suffix).ok())
+        {
+            Some(components) => components,
+            None => return strip_toast_header(event),
+        };
+        let qualified = format!(
+            "{}.{}",
+            snapshot::quote_ident(namespace),
+            snapshot::quote_ident(relation)
+        );
+
+        let mut state = self.toast_refetch.lock().await;
+        if state.client.as_ref().is_none_or(|c| c.is_closed()) {
+            match connect_client(&self.config, "toast refetch").await {
+                Ok(client) => state.client = Some(client),
+                Err(err) => {
+                    warn!(error = %err, metric = "pg.toast_refetch.connect_failed",
+                          "toast refetch connect failed; shipping partial row");
+                    metrics::counter!("vs_pg_toast_refetch_failed_total").increment(1);
+                    return strip_toast_header(event);
+                }
+            }
+        }
+        let fetched = fetch_full_row(&mut state, &qualified, &components).await;
+        drop(state);
+        match fetched {
+            Ok(Some(row)) => {
+                metrics::counter!("vs_pg_toast_refetch_total").increment(1);
+                splice_new_row(strip_toast_header(event), row)
+            }
+            Ok(None) => {
+                // Row already gone — the delete is behind us in the WAL.
+                strip_toast_header(event)
+            }
+            Err(err) => {
+                warn!(error = %err, metric = "pg.toast_refetch.failed",
+                      "toast refetch failed; shipping partial row");
+                metrics::counter!("vs_pg_toast_refetch_failed_total").increment(1);
+                strip_toast_header(event)
+            }
+        }
+    }
+
     fn compute_safe_ack(&self, wal_high_water: u64) -> u64 {
         match &self.sink_progress {
             Some(progress) => wal_high_water.min(progress.load(Ordering::Relaxed)),
@@ -972,6 +1235,112 @@ fn stamp_lsn(event: Event, lsn: u64) -> Event {
             .with_header(LSN_HEADER.to_owned(), lsn.to_string()),
         ..event
     }
+}
+
+/// Drop the toast-incomplete marker so it never leaks downstream.
+fn strip_toast_header(event: Event) -> Event {
+    Event {
+        headers: event
+            .headers
+            .without_header(event_mapper::TOAST_INCOMPLETE_HEADER),
+        ..event
+    }
+}
+
+/// Replace the `new` object of an update envelope with the freshly
+/// fetched full row (already canonical-text-normalized).
+fn splice_new_row(event: Event, row: serde_json::Value) -> Event {
+    let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(event.payload.as_slice())
+    else {
+        return event;
+    };
+    let Some(object) = payload.as_object_mut() else {
+        return event;
+    };
+    object.insert("new".to_owned(), row);
+    let Ok(bytes) = serde_json::to_vec(&payload) else {
+        return event;
+    };
+    Event {
+        payload: Payload::from_vec(bytes),
+        ..event
+    }
+}
+
+/// Fetch one full row by primary key with canonical text rendering,
+/// resolving and caching the table's PK metadata + cast list on first
+/// use. Returns `Ok(None)` when the row no longer exists.
+async fn fetch_full_row(
+    state: &mut ToastRefetchState,
+    qualified: &str,
+    components: &[String],
+) -> Result<Option<serde_json::Value>, PostgresCdcError> {
+    let client = state
+        .client
+        .as_ref()
+        .ok_or_else(|| PostgresCdcError::Internal("toast refetch client missing".into()))?;
+    if !state.tables.contains_key(qualified) {
+        let pk_rows = client
+            .query(
+                "SELECT a.attname                  FROM pg_index i                  JOIN pg_attribute a                    ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)                  WHERE i.indrelid = to_regclass($1) AND i.indisprimary                  ORDER BY array_position(i.indkey, a.attnum)",
+                &[&qualified],
+            )
+            .await
+            .map_err(|err| PostgresCdcError::Connection(format!("pk discovery: {err}")))?;
+        let pk: Vec<String> = pk_rows.into_iter().map(|row| row.get(0)).collect();
+        if pk.is_empty() {
+            return Err(PostgresCdcError::Internal(format!(
+                "{qualified} has no primary key for toast refetch"
+            )));
+        }
+        let pk_types = snapshot::fetch_pk_types(client, qualified, &pk).await?;
+        let cast_select = snapshot::build_cast_select(client, qualified, &pk).await?;
+        state.tables.insert(
+            qualified.to_owned(),
+            TableRefetchMeta {
+                pk,
+                pk_types,
+                cast_select,
+            },
+        );
+    }
+    let meta = state
+        .tables
+        .get(qualified)
+        .ok_or_else(|| PostgresCdcError::Internal("pk cache miss".into()))?;
+    let (pk, types, cast_select) = (&meta.pk, &meta.pk_types, &meta.cast_select);
+    if pk.len() != components.len() {
+        return Err(PostgresCdcError::Internal(format!(
+            "doc id arity {} != pk arity {} for {qualified}",
+            components.len(),
+            pk.len()
+        )));
+    }
+    let filter = pk
+        .iter()
+        .zip(types.iter())
+        .enumerate()
+        .map(|(i, (col, ty))| {
+            format!(
+                "{} = CAST(${}::text AS {ty})",
+                snapshot::quote_ident(col),
+                i + 1
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql = format!(
+        "SELECT to_jsonb(t.*) FROM (SELECT {cast_select} FROM {qualified}) t          WHERE {filter} LIMIT 1"
+    );
+    let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = components
+        .iter()
+        .map(|c| c as &(dyn tokio_postgres::types::ToSql + Sync))
+        .collect();
+    let row = client
+        .query_opt(&sql, &params)
+        .await
+        .map_err(|err| PostgresCdcError::Connection(format!("toast refetch: {err}")))?;
+    Ok(row.map(|row| snapshot::stringify_top_level(row.get(0))))
 }
 
 #[async_trait]
