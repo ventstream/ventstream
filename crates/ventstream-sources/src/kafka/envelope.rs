@@ -116,12 +116,25 @@ fn map_debezium(
     let body = if op.is_delete() {
         None
     } else {
-        Some(extract_body(payload, "after").ok_or_else(|| {
+        let body = extract_body(payload, "after").ok_or_else(|| {
             KafkaCdcError::MalformedEvent(format!(
                 "op {} on {topic} has no `after` image",
                 op.suffix()
             ))
-        })?)
+        })?;
+        // Debezium replaces unavailable large values (Postgres TOAST
+        // under REPLICA IDENTITY DEFAULT, and equivalents) with a
+        // string sentinel. Passing it through would full-replace the
+        // real value with placeholder garbage in every sink — reject
+        // instead so the skip path counts and surfaces it. Fix at the
+        // source database: REPLICA IDENTITY FULL for PG-fed topics.
+        if let Some(field) = find_unavailable_placeholder(&body) {
+            return Err(KafkaCdcError::MalformedEvent(format!(
+                "op {} on {topic} carries Debezium's unavailable-value placeholder in                  field `{field}` — the source omitted the real value (e.g. Postgres                  TOAST under REPLICA IDENTITY DEFAULT). Writing it would corrupt the                  destination document; set REPLICA IDENTITY FULL (or the connector's                  equivalent) on the source table",
+                op.suffix()
+            )));
+        }
+        Some(body)
     };
 
     let occurred_at_ms = source
@@ -277,6 +290,22 @@ fn relation_from_topic(topic: &str) -> Option<String> {
         .next()
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
+}
+
+/// Debezium's sentinel for values the connector could not read
+/// (`unavailable.value.placeholder`, default shown). Top-level scan:
+/// placeholders land as whole-field string values.
+const DEBEZIUM_UNAVAILABLE: &str = "__debezium_unavailable_value";
+
+fn find_unavailable_placeholder(body: &Value) -> Option<&str> {
+    let map = body.as_object()?;
+    for (key, value) in map {
+        match value {
+            Value::String(text) if text == DEBEZIUM_UNAVAILABLE => return Some(key),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_json(bytes: &[u8]) -> Result<Value, KafkaCdcError> {

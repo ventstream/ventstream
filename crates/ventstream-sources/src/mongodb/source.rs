@@ -20,9 +20,11 @@
 //! ### Crash-safety
 //!
 //! The resume token is persisted **after** each event is published to the
-//! bus (the legacy at-least-once mode; the sink upserts by `doc.id`, so a
-//! crash between publish and sink-write only causes a harmless re-emit on
-//! restart). A bootstrap is bracketed by a `mark_incomplete` sentinel: a
+//! bus. With a sink-progress watermark wired (the default in the engine),
+//! tokens are persisted only after the sink durably writes the events
+//! published before them, so a crash between token flush and sink write
+//! cannot skip events; without one (legacy), the newest token flushes on
+//! the timer and the sink's idempotent `doc.id` upserts absorb re-emits. A bootstrap is bracketed by a `mark_incomplete` sentinel: a
 //! crash mid-snapshot re-bootstraps rather than resuming from a token whose
 //! snapshot never reached the sink. An expired/invalid token (oplog rotated
 //! past it) is detected, the cursor wiped, and the source re-bootstraps —
@@ -54,12 +56,31 @@ use crate::tls::DatabaseTlsMode;
 /// MongoDB CDC source.
 pub struct MongoCdcSource {
     config: MongoCdcConfig,
+    /// Sink-confirmed ack-sequence watermark. When `Some`, tail resume
+    /// tokens are only persisted once the sink has durably written the
+    /// events published before them — a crash between token flush and
+    /// sink write can then never skip events on restart. When `None`,
+    /// legacy behavior: flush the newest token on the timer.
+    sink_progress: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl MongoCdcSource {
     /// Construct a source from its configuration.
     pub fn new(config: MongoCdcConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            sink_progress: None,
+        }
+    }
+
+    /// Attach the shared sink-progress watermark (see the field doc).
+    #[must_use]
+    pub fn with_sink_progress(
+        mut self,
+        progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        self.sink_progress = Some(progress);
+        self
     }
 
     async fn connect(&self) -> Result<Client, MongoCdcError> {
@@ -117,6 +138,17 @@ impl MongoCdcSource {
 
         // Open the change stream — from the resume point, or "now" on a cold
         // start. Done before the scan so nothing is missed in the gap.
+        if matches!(self.config.full_document, FullDocument::Default) {
+            // Raw 1:1 mode writes whole documents; delta-only change
+            // events have nothing to write, so every update would be
+            // silently skipped ("no fullDocument" warn per event).
+            // Refuse up front rather than run a pipeline that drops
+            // every update by construction.
+            return Err(MongoCdcError::Operation(
+                "VS_MONGO_FULL_DOCUMENT=default carries deltas only, and raw document                  sync has nothing to write on updates — every update would be dropped.                  Use updateLookup (the default) instead"
+                    .to_owned(),
+            ));
+        }
         // `full_document` is only set when we want post-images (update-lookup);
         // the builder takes the value directly, so we chain conditionally.
         let mut watch = db.watch().resume_after(resume_token.clone());
@@ -242,7 +274,14 @@ impl MongoCdcSource {
             token_flush_ms = self.config.token_flush_interval.as_millis() as u64,
             "tailing change stream"
         );
+        // Ungated: newest token, flushed on the timer. Gated: FIFO of
+        // (ack_seq, token) — a token is only eligible for persistence
+        // once `sink_progress` proves every event published before it
+        // is sink-durable.
         let mut pending: Option<String> = None;
+        let mut pending_gated: std::collections::VecDeque<(u64, String)> =
+            std::collections::VecDeque::new();
+        let mut next_ack_seq: u64 = 1;
         let mut flush = tokio::time::interval(self.config.token_flush_interval);
         flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -250,17 +289,17 @@ impl MongoCdcSource {
             tokio::select! {
                 biased;
                 () = ctx.shutdown.cancelled() => {
-                    flush_token(cursor_file, &mut pending)?;
+                    self.flush_confirmed(cursor_file, &mut pending, &mut pending_gated)?;
                     return Ok(());
                 }
                 _ = flush.tick() => {
-                    flush_token(cursor_file, &mut pending)?;
+                    self.flush_confirmed(cursor_file, &mut pending, &mut pending_gated)?;
                 }
                 next = stream.next() => {
                     match next {
                         None => {
                             warn!(source = %self.config.id, "change stream ended; stopping iteration");
-                            flush_token(cursor_file, &mut pending)?;
+                            self.flush_confirmed(cursor_file, &mut pending, &mut pending_gated)?;
                             return Ok(());
                         }
                         Some(Err(e)) => {
@@ -270,21 +309,52 @@ impl MongoCdcSource {
                                 return Err(MongoCdcError::Connection(message));
                             }
                             if looks_like_resume_failure(&e) {
+                                metrics::counter!("vs_mongo_rebootstraps_total").increment(1);
                                 warn!(source = %self.config.id, error = %e,
-                                    "change stream resume failure; wiping cursor to re-bootstrap");
+                                    "change stream resume failure; wiping cursor to re-bootstrap. \
+                                     If this repeats, the oplog rotates past the token before \
+                                     bootstrap finishes — grow the oplog \
+                                     (replSetResizeOplog) or reduce bootstrap time");
                                 cursor_file.delete()?;
                             }
                             return Err(MongoCdcError::Operation(format!("change stream: {e}")));
                         }
                         Some(Ok(event)) => {
                             let token = event.id.clone();
-                            if self.handle_event(ctx, event).await?.is_some_and(|sent| !sent) {
-                                // shutdown during publish — flush what we have.
-                                flush_token(cursor_file, &mut pending)?;
-                                return Ok(());
+                            let seq = next_ack_seq;
+                            match self.handle_event(ctx, event, seq).await? {
+                                Some(false) => {
+                                    // shutdown during publish — flush what's confirmed.
+                                    self.flush_confirmed(
+                                        cursor_file,
+                                        &mut pending,
+                                        &mut pending_gated,
+                                    )?;
+                                    return Ok(());
+                                }
+                                Some(true) => {
+                                    // Published: this token is durable only
+                                    // once the sink confirms `seq`.
+                                    next_ack_seq += 1;
+                                    let text = token_to_string(&token)?;
+                                    if self.sink_progress.is_some() {
+                                        pending_gated.push_back((seq, text));
+                                    } else {
+                                        pending = Some(text);
+                                    }
+                                }
+                                None => {
+                                    // Filtered/skipped: nothing new needs
+                                    // sink durability — the token advances
+                                    // at the current confirmation level.
+                                    let text = token_to_string(&token)?;
+                                    if self.sink_progress.is_some() {
+                                        pending_gated.push_back((seq.saturating_sub(1), text));
+                                    } else {
+                                        pending = Some(text);
+                                    }
+                                }
                             }
-                            // Advance the in-memory token; the timer flushes it.
-                            pending = Some(token_to_string(&token)?);
                         }
                     }
                 }
@@ -299,6 +369,7 @@ impl MongoCdcSource {
         &self,
         ctx: &SourceContext,
         event: ChangeStreamEvent<Document>,
+        ack_seq: u64,
     ) -> Result<Option<bool>, MongoCdcError> {
         let Some(op) = map_op(&event.operation_type) else {
             // Lifecycle op (drop/rename/invalidate/...) — skip, advance token.
@@ -334,7 +405,47 @@ impl MongoCdcSource {
         };
 
         let bus_event = event_mapper::change_event(&self.config, &collection, op, &id, full_doc)?;
+        // The ack sequence rides the same header the dispatcher's
+        // watermark reads for Kafka — sink progress becomes "highest
+        // contiguous ack_seq durably written", which is what gates
+        // resume-token persistence.
+        let bus_event = ventstream_core::Event {
+            headers: bus_event
+                .headers
+                .with_header("ventstream.cdc.ack_seq".to_owned(), ack_seq.to_string()),
+            ..bus_event
+        };
         Ok(Some(self.publish(ctx, bus_event).await?))
+    }
+
+    /// Persist the newest resume token that is safe to trust. Ungated:
+    /// the newest token seen. Gated: the newest token whose ack
+    /// sequence the sink has confirmed — tokens beyond the watermark
+    /// stay queued, so a crash between flush and sink write can never
+    /// resume past unpersisted events.
+    fn flush_confirmed(
+        &self,
+        cursor_file: &CursorFile,
+        pending: &mut Option<String>,
+        pending_gated: &mut std::collections::VecDeque<(u64, String)>,
+    ) -> Result<(), MongoCdcError> {
+        let Some(progress) = &self.sink_progress else {
+            return flush_token(cursor_file, pending);
+        };
+        let confirmed = progress.load(std::sync::atomic::Ordering::Relaxed);
+        let mut latest: Option<String> = None;
+        while pending_gated
+            .front()
+            .is_some_and(|(seq, _)| *seq <= confirmed)
+        {
+            if let Some((_, token)) = pending_gated.pop_front() {
+                latest = Some(token);
+            }
+        }
+        if let Some(token) = latest {
+            cursor_file.write(&token)?;
+        }
+        Ok(())
     }
 
     /// Publish to the bus. Returns `false` if shutdown cancelled the send.

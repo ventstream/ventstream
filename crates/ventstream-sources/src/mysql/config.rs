@@ -81,7 +81,13 @@ impl MySqlCdcConfig {
             .tcp_port(self.port)
             .user(Some(self.user.clone()))
             .pass(Some(self.password.clone()))
-            .db_name(Some(self.database.clone()));
+            .db_name(Some(self.database.clone()))
+            // TIMESTAMP columns render through the session time zone on
+            // SELECT (bootstrap, fetcher, TOAST-style re-reads). Pin UTC
+            // so the same row produces the same text on every host —
+            // environment-dependent renderings would give one row two
+            // doc forms depending on where the engine ran.
+            .init(vec!["SET time_zone = '+00:00'".to_owned()]);
         if let Some(tls) = &self.tls {
             match tls.mode {
                 DatabaseTlsMode::VerifyFull => {
