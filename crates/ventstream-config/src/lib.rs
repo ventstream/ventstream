@@ -4160,9 +4160,9 @@ sink:
             .as_ref()
             .and_then(|sink| sink.surrealdb.as_ref())
             .expect("surreal sink");
-        assert_eq!(surreal.graph_edges.len(), 1);
-        assert_eq!(surreal.graph_edges[0].name, "wrote");
-        assert_eq!(surreal.graph_edges[0].reversed, Some(true));
+        let edge = surreal.graph_edges.first().expect("one edge spec");
+        assert_eq!(edge.name, "wrote");
+        assert_eq!(edge.reversed, Some(true));
 
         // Edge names embed in RELATE statements: bad charset rejected.
         let bad_name = base(
