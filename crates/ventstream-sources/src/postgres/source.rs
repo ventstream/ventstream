@@ -598,15 +598,21 @@ impl PostgresCdcSource {
             tokio::spawn(async move {
                 let mut poll = tokio::time::interval(Duration::from_secs(30));
                 poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // One connection reused across ticks; rebuilt only after
+                // an error — not a fresh TCP+TLS+auth every 30s.
+                let mut client: Option<tokio_postgres::Client> = None;
                 loop {
                     tokio::select! {
                         () = shutdown.cancelled() => return,
                         _ = poll.tick() => {}
                     }
-                    let Ok(client) = connect_client(&config, "slot lag poll").await else {
+                    if client.as_ref().is_none_or(|c| c.is_closed()) {
+                        client = connect_client(&config, "slot lag poll").await.ok();
+                    }
+                    let Some(conn) = client.as_ref() else {
                         continue;
                     };
-                    let lag = client
+                    let lag = conn
                         .query_opt(
                             "SELECT COALESCE(\
                                  pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn), \
@@ -615,9 +621,17 @@ impl PostgresCdcSource {
                             &[&config.slot_name],
                         )
                         .await;
-                    if let Ok(Some(row)) = lag {
-                        let bytes: i64 = row.get(0);
-                        metrics::gauge!("vs_pg_slot_lag_bytes").set(bytes as f64);
+                    match lag {
+                        Ok(Some(row)) => {
+                            let bytes: i64 = row.get(0);
+                            metrics::gauge!(
+                                "vs_pg_slot_lag_bytes",
+                                "slot" => config.slot_name.clone()
+                            )
+                            .set(bytes as f64);
+                        }
+                        Ok(None) => {}
+                        Err(_) => client = None,
                     }
                 }
             })
@@ -864,9 +878,12 @@ impl PostgresCdcSource {
                                     })?;
                             } else {
                                 self.publish_events(events, wal_start_u64, ctx).await?;
-                                let bound = wal_end_u64.max(wal_start_u64);
-                                if bound > wal_high_water {
-                                    wal_high_water = bound;
+                                // Bound by the LSN actually stamped on the
+                                // events — a wal_end bound could never be
+                                // reached by sink progress, making the
+                                // drained comparison unsatisfiable.
+                                if wal_start_u64 > wal_high_water {
+                                    wal_high_water = wal_start_u64;
                                 }
                                 let advance_to = self.compute_safe_ack(wal_high_water);
                                 if advance_to > last_acked {
@@ -900,14 +917,41 @@ impl PostgresCdcSource {
                             );
                         }
                         Some(ReplicationEvent::Commit { lsn, end_lsn, .. }) => {
+                            let end_u64 = end_lsn.as_u64();
+                            // Hold back the last non-empty record so exactly ONE
+                            // event carries the commit end LSN. Sink progress can
+                            // then actually REACH wal_high_water — and because the
+                            // committer only advances over a contiguous durable
+                            // prefix, reaching it proves the whole transaction is
+                            // durable. (Stamping several events with end_lsn would
+                            // reopen an equal-LSN batch-boundary race.)
+                            let mut published_any = false;
                             if let Some(mut buffered) = transaction.take() {
+                                let mut pending: Option<(Vec<Event>, u64)> = None;
                                 while let Some(record) = buffered.next_record().map_err(|error| {
                                     PostgresCdcError::Internal(format!(
                                         "reading buffered PostgreSQL transaction: {error}"
                                     ))
                                 })? {
                                     let events = self.decode_payload_or_skip_unknown(&record.data)?;
-                                    self.publish_events(events, record.wal_start, ctx).await?;
+                                    if events.is_empty() {
+                                        continue;
+                                    }
+                                    if let Some((prev, prev_lsn)) = pending.take() {
+                                        self.publish_events(prev, prev_lsn, ctx).await?;
+                                        published_any = true;
+                                    }
+                                    pending = Some((events, record.wal_start));
+                                }
+                                if let Some((mut last_events, last_lsn)) = pending.take() {
+                                    let final_event = last_events.pop();
+                                    if !last_events.is_empty() {
+                                        self.publish_events(last_events, last_lsn, ctx).await?;
+                                    }
+                                    if let Some(event) = final_event {
+                                        self.publish_events(vec![event], end_u64, ctx).await?;
+                                    }
+                                    published_any = true;
                                 }
                             }
                             debug!(
@@ -916,9 +960,27 @@ impl PostgresCdcSource {
                                 metric = "pg.replication.txn_commit",
                                 "txn commit"
                             );
-                            let end_u64 = end_lsn.as_u64();
-                            if end_u64 > wal_high_water {
-                                wal_high_water = end_u64;
+                            if published_any {
+                                if end_u64 > wal_high_water {
+                                    wal_high_water = end_u64;
+                                }
+                            } else if self.compute_safe_ack(wal_high_water) == wal_high_water
+                                && end_u64 > last_acked
+                            {
+                                // A transaction touching only unpublished
+                                // tables: nothing for the sink to confirm, so
+                                // when all previously published work is
+                                // durable this commit is directly ackable —
+                                // unpublished-table traffic must not pin WAL.
+                                // wal_high_water stays put: it tracks
+                                // published work only.
+                                debug!(
+                                    end_lsn = end_u64,
+                                    metric = "pg.replication.empty_txn_advance",
+                                    "advancing replication slot (empty transaction)"
+                                );
+                                client.update_applied_lsn(PgwLsn(end_u64));
+                                last_acked = end_u64;
                             }
                             // Same deferral logic as XLogData — the
                             // commit LSN bounds how far we *could*
@@ -953,8 +1015,13 @@ impl PostgresCdcSource {
                             // any transaction not yet received commits past
                             // wal_end and will still be replayed on restart.
                             let wal_end_u64 = u64::from(wal_end);
-                            let drained = wal_high_water == 0
-                                || self.compute_safe_ack(wal_high_water) == wal_high_water;
+                            // An open TransactionBuffer holds decoded rows the
+                            // sink has never seen — wal_end can lie past its
+                            // commit, so acking here would lose the whole
+                            // transaction on a crash before Commit.
+                            let drained = transaction.is_none()
+                                && (wal_high_water == 0
+                                    || self.compute_safe_ack(wal_high_water) == wal_high_water);
                             if drained && wal_end_u64 > last_acked {
                                 debug!(
                                     wal_end = %wal_end,
@@ -1121,6 +1188,7 @@ impl PostgresCdcSource {
                 Err(err) => {
                     warn!(error = %err, metric = "pg.toast_refetch.connect_failed",
                           "toast refetch connect failed; shipping partial row");
+                    metrics::counter!("vs_pg_toast_refetch_failed_total").increment(1);
                     return strip_toast_header(event);
                 }
             }
@@ -1139,6 +1207,7 @@ impl PostgresCdcSource {
             Err(err) => {
                 warn!(error = %err, metric = "pg.toast_refetch.failed",
                       "toast refetch failed; shipping partial row");
+                metrics::counter!("vs_pg_toast_refetch_failed_total").increment(1);
                 strip_toast_header(event)
             }
         }

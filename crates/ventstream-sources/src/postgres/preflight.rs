@@ -105,7 +105,7 @@ pub async fn run(config: &PostgresCdcConfig) -> Result<(), PostgresCdcError> {
         )
         .await
     {
-        Ok(Some(row)) if row.get::<_, bool>(0) => {
+        Ok(Some(row)) if row.get::<_, Option<bool>>(0).unwrap_or(false) => {
             return Err(PostgresCdcError::Connection(format!(
                 "publication \"{pub_name}\" includes partitioned tables but \
                  publish_via_partition_root is off — leaf partitions would arrive as \

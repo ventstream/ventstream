@@ -544,9 +544,15 @@ fn build_synthetic_insert(
     // The scan-start WAL position doubles as the row's external_gte
     // version: newer concurrent WAL writes (higher LSN) always win,
     // and a stale snapshot read landing after one is dropped by the
-    // sink's version conflict instead of clobbering it.
+    // sink's version conflict instead of clobbering it. Deliberately
+    // NOT `ventstream.cdc.lsn` — that header feeds the dispatcher's
+    // slot-ack watermark, and a committed snapshot batch must never
+    // push the watermark past live events still in flight.
     if version_floor > 0 {
-        headers.insert("ventstream.cdc.lsn".to_owned(), version_floor.to_string());
+        headers.insert(
+            "ventstream.cdc.source_version".to_owned(),
+            version_floor.to_string(),
+        );
     }
     // Stable doc id from the discovered primary key, matching the WAL path
     // and the SQL-denormalize path byte for byte. Values were text-normalized
