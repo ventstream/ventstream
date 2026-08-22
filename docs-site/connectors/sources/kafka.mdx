@@ -129,3 +129,24 @@ Full list in the [engine env reference](/reference/engine-env).
   on one partition holds back commits on the others until it's durable.
   This prevents committing past unwritten data but reduces commit granularity
   during a multi-partition stall.
+
+## Debezium and unavailable values
+
+Debezium replaces values it could not read (Postgres TOAST columns under
+`REPLICA IDENTITY DEFAULT`, and equivalents) with the
+`__debezium_unavailable_value` placeholder. VentStream **rejects and
+skips** any change event carrying it — writing the placeholder would
+permanently corrupt the destination document, and unlike VentStream's
+native Postgres source there is no database connection here to re-read
+the real row.
+
+Be clear about what "skip" means: **that update is dropped entirely**,
+including its non-placeholder field changes, and the offset commits past
+it. On a PG-fed topic under `REPLICA IDENTITY DEFAULT`, every update
+touching a TOASTed row is skipped — watch
+`vs_kafka_skipped_total{reason="unmappable"}`. The fix belongs at the
+source database: `ALTER TABLE t REPLICA IDENTITY FULL;` (or the
+connector's equivalent), after which images arrive complete. If you
+cannot change the source, prefer VentStream's native Postgres source,
+which transparently re-reads TOASTed rows instead of skipping.
+

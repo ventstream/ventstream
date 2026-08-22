@@ -298,14 +298,27 @@ fn relation_from_topic(topic: &str) -> Option<String> {
 const DEBEZIUM_UNAVAILABLE: &str = "__debezium_unavailable_value";
 
 fn find_unavailable_placeholder(body: &Value) -> Option<&str> {
-    let map = body.as_object()?;
-    for (key, value) in map {
-        match value {
-            Value::String(text) if text == DEBEZIUM_UNAVAILABLE => return Some(key),
-            _ => {}
+    match body {
+        Value::Object(map) => {
+            for (key, value) in map {
+                match value {
+                    Value::String(text) if text == DEBEZIUM_UNAVAILABLE => return Some(key),
+                    // Placeholders can sit inside nested/struct columns
+                    // too — recurse, reporting the outermost field name.
+                    nested @ (Value::Object(_) | Value::Array(_)) => {
+                        if find_unavailable_placeholder(nested).is_some() {
+                            return Some(key);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
         }
+        Value::Array(items) => items.iter().find_map(find_unavailable_placeholder),
+        Value::String(text) if text == DEBEZIUM_UNAVAILABLE => Some(""),
+        _ => None,
     }
-    None
 }
 
 fn parse_json(bytes: &[u8]) -> Result<Value, KafkaCdcError> {
