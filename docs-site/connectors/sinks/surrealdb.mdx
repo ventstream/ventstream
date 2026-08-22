@@ -158,6 +158,10 @@ Details worth knowing:
 - **Direction.** The natural FK direction is owner→referenced
   (`article->authored_by->person`). Set `reversed: true` when the graph
   reads better the other way (`person->wrote->article`).
+- **FKs must target the referenced table's primary key** — edge
+  endpoints are built from the FK values as `to_table` record ids, and
+  those ids are PK-derived. FKs onto non-PK unique columns won't
+  resolve.
 - **Composite keys** work: list `fk_columns` in the referenced key's
   column order.
 - **Multiple FKs** to the same table are separate specs with distinct

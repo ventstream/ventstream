@@ -69,6 +69,15 @@ impl SurrealDbSink {
                 )));
             }
         }
+        if !config.table_prefix.is_empty() && !is_safe_identifier(&config.table_prefix) {
+            // The prefix is concatenated into ⟨⟩-escaped identifier
+            // positions (edge DDL, the RELATE arrow); a `⟩` in it would
+            // escape the quoting.
+            return Err(SurrealSinkError::Internal(format!(
+                "table_prefix `{}` uses characters outside [A-Za-z0-9_.-]",
+                config.table_prefix
+            )));
+        }
         if !config.graph_edges.is_empty()
             && matches!(
                 config.table_routing,
@@ -1170,6 +1179,19 @@ mod tests {
             serde_json::json!(["41", "52"]),
             "materialized lookup values wrong: {doc}"
         );
+    }
+
+    #[test]
+    fn unsafe_table_prefix_is_rejected_at_construction() {
+        // The prefix rides inside ⟨⟩-escaped identifiers for edge DDL
+        // and RELATE statements — `⟩` must never reach that position.
+        let mut config = SurrealDbConfig::new("s", "http://x", "vs", "app", "u", "p");
+        config.table_prefix = "evil⟩; REMOVE TABLE users; --".to_owned();
+        let err = match SurrealDbSink::new(config) {
+            Err(err) => err,
+            Ok(_) => panic!("unsafe table_prefix must be rejected"),
+        };
+        assert!(err.to_string().contains("table_prefix"), "{err}");
     }
 
     #[tokio::test]
