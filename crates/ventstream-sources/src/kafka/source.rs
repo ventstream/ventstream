@@ -158,11 +158,18 @@ impl KafkaCdcSource {
                 .filter(|topic| !known.contains(**topic))
                 .collect();
             if !missing.is_empty() {
-                return Err(KafkaCdcError::Connection(format!(
-                    "configured topic(s) {missing:?} do not exist on the brokers — \
-                     check VS_KAFKA_TOPICS for typos, or create the topic(s) first \
-                     (auto-creation may be disabled)"
-                )));
+                // NOT fatal: with auto-creation enabled the topic is
+                // born on first produce, and starting the consumer
+                // before the producer is a normal deployment order.
+                // The warn covers the typo case — a topic that never
+                // appears is visible here and in the lag gauge.
+                warn!(
+                    source = %self.config.id,
+                    missing = ?missing,
+                    "configured topic(s) not present on the brokers yet — waiting for \
+                     auto-creation; if this persists, check VS_KAFKA_TOPICS for typos or \
+                     create the topic(s) manually"
+                );
             }
         }
         consumer
@@ -181,6 +188,8 @@ impl KafkaCdcSource {
         let mut tracker = OffsetTracker::new();
         let mut commit =
             tokio::time::interval(self.config.commit_interval.max(Duration::from_millis(50)));
+        let mut lag_probe = tokio::time::interval(Duration::from_secs(30));
+        lag_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         commit.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
@@ -192,7 +201,12 @@ impl KafkaCdcSource {
                 }
                 _ = commit.tick() => {
                     self.commit_now(&consumer, &mut tracker, CommitMode::Async);
-                    record_consumer_lag(&consumer);
+                }
+                _ = lag_probe.tick() => {
+                    // Sync broker round-trips (fetch_watermarks) — keep
+                    // them off the consume path's cadence and off the
+                    // async worker thread.
+                    tokio::task::block_in_place(|| record_consumer_lag(&consumer));
                 }
                 recv = consumer.recv() => {
                     let owned = match recv {
