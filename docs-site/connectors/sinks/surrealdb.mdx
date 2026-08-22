@@ -123,6 +123,61 @@ the HNSW index at startup:
 Embedding arrays flow through documents unchanged; query with
 `WHERE embedding <|10,40|> $vec`.
 
+## Graph edges (RELATE mode)
+
+Point a flat pipeline at SurrealDB and declare your foreign keys — each
+one becomes a live-synced graph relation. A relational schema turns
+into a queryable graph: one table of documents per source table, plus
+RELATE edges you can traverse.
+
+```yaml
+    graph_edges:
+      - name: wrote            # edge table
+        from_table: articles   # the relation owning the FK
+        fk_columns: [author_id]
+        to_table: people       # the relation the FK references
+        reversed: true         # person->wrote->article
+```
+
+```surql
+-- everything this person wrote
+SELECT ->wrote->articles.title FROM people:['7'];
+-- who wrote this article
+SELECT <-wrote<-people.name FROM articles:['42'];
+```
+
+Edges follow the source in real time: inserting a row creates its edge,
+changing the FK value moves it, NULL-ing the FK removes it, and
+deleting either row cleans it up (edge tables are `TYPE RELATION`, so
+SurrealDB purges edges with their endpoints). Edge identity is
+deterministic — one edge per FK row — so re-bootstraps never duplicate
+edges, and none of it needs `REPLICA IDENTITY FULL`.
+
+Details worth knowing:
+
+- **Direction.** The natural FK direction is owner→referenced
+  (`article->authored_by->person`). Set `reversed: true` when the graph
+  reads better the other way (`person->wrote->article`).
+- **FKs must target the referenced table's primary key** — edge
+  endpoints are built from the FK values as `to_table` record ids, and
+  those ids are PK-derived. FKs onto non-PK unique columns won't
+  resolve.
+- **Composite keys** work: list `fk_columns` in the referenced key's
+  column order.
+- **Multiple FKs** to the same table are separate specs with distinct
+  edge names (`sender`/`recipient`, `parent` for self-references).
+- Requires the default `by_output_relation` table routing; `fixed` and
+  `by_projection_target` routing are rejected at validation.
+- **Edge existence tracks endpoint lifecycle.** Deleting a referenced
+  row purges its edges (correct); re-creating that row later does NOT
+  re-create edges from rows still pointing at it — they reappear when
+  the owning rows next change, or on re-bootstrap. With real FK
+  constraints in the source this cannot happen (the delete would have
+  been rejected or cascaded); it only shows up with logical-only FKs.
+- Pairs with flat pipelines. Joined pipelines already embed their
+  relationships as nested documents — use whichever consumption style
+  fits, or run both side by side from the same source.
+
 ## Large joined tables
 
 For 1:many joined pipelines, declare the embedded join paths so child

@@ -69,6 +69,84 @@ impl SurrealDbSink {
                 )));
             }
         }
+        if !config.table_prefix.is_empty() && !is_safe_identifier(&config.table_prefix) {
+            // The prefix is concatenated into ⟨⟩-escaped identifier
+            // positions (edge DDL, the RELATE arrow); a `⟩` in it would
+            // escape the quoting.
+            return Err(SurrealSinkError::Internal(format!(
+                "table_prefix `{}` uses characters outside [A-Za-z0-9_.-]",
+                config.table_prefix
+            )));
+        }
+        if !config.graph_edges.is_empty()
+            && matches!(
+                config.table_routing,
+                super::config::SurrealTableRouting::Fixed(_)
+            )
+        {
+            // Graph nodes need per-relation tables — under fixed
+            // routing every record id is fully qualified inside one
+            // table and RELATE endpoints would never resolve.
+            return Err(SurrealSinkError::Internal(
+                "graph_edges requires by_output_relation table routing, not fixed".to_owned(),
+            ));
+        }
+        if !config.graph_edges.is_empty()
+            && matches!(
+                config.table_routing,
+                super::config::SurrealTableRouting::ByProjectionTarget
+            )
+        {
+            // Edge specs match `from_table` against the CDC relation;
+            // projection-target routing names tables by a different
+            // header, so every spec would silently match nothing.
+            return Err(SurrealSinkError::Internal(
+                "graph_edges requires by_output_relation table routing; \
+                 by_projection_target routes by a header edge specs do not match"
+                    .to_owned(),
+            ));
+        }
+        let mut edge_names = std::collections::HashSet::new();
+        for spec in &config.graph_edges {
+            // Edge table names are embedded in RELATE statements as
+            // identifiers; endpoints and ids ride bind variables.
+            if !is_safe_identifier(&spec.name)
+                || !is_safe_identifier(&spec.from_table)
+                || !is_safe_identifier(&spec.to_table)
+            {
+                return Err(SurrealSinkError::Internal(format!(
+                    "graph edge `{}` ({} -> {}) uses characters outside [A-Za-z0-9_.-]",
+                    spec.name, spec.from_table, spec.to_table
+                )));
+            }
+            if spec.fk_columns.is_empty() {
+                return Err(SurrealSinkError::Internal(format!(
+                    "graph edge `{}` declares no fk_columns",
+                    spec.name
+                )));
+            }
+            if !edge_names.insert(spec.name.as_str()) {
+                return Err(SurrealSinkError::Internal(format!(
+                    "graph edge `{}` is declared more than once",
+                    spec.name
+                )));
+            }
+        }
+        for spec in &config.graph_edges {
+            // An edge table sharing a name with a routed document table
+            // would interleave edge and document runs on one table —
+            // and their lane assignments would disagree.
+            if config
+                .graph_edges
+                .iter()
+                .any(|other| spec.name == other.from_table || spec.name == other.to_table)
+            {
+                return Err(SurrealSinkError::Internal(format!(
+                    "graph edge `{}` collides with a document table name",
+                    spec.name
+                )));
+            }
+        }
         let client = crate::util::build_http_client(
             config.request_timeout,
             config.verify_tls,
@@ -136,14 +214,16 @@ impl SurrealDbSink {
                 || !is_safe_identifier(&self.config.database)
             {
                 return Err(SurrealSinkError::Internal(format!(
-                    "auto_create_database requires namespace/database names in                      [A-Za-z0-9_.-]; got `{}`/`{}`",
+                    "auto_create_database requires namespace/database names in \
+                     [A-Za-z0-9_.-]; got `{}`/`{}`",
                     self.config.namespace, self.config.database
                 )));
             }
             // Root-scoped: the target database may not exist yet, so this
             // request carries no NS/DB headers.
             let ddl = format!(
-                "DEFINE NAMESPACE IF NOT EXISTS ⟨{ns}⟩; USE NS ⟨{ns}⟩;                  DEFINE DATABASE IF NOT EXISTS ⟨{db}⟩;",
+                "DEFINE NAMESPACE IF NOT EXISTS ⟨{ns}⟩; USE NS ⟨{ns}⟩; \
+                 DEFINE DATABASE IF NOT EXISTS ⟨{db}⟩;",
                 ns = self.config.namespace,
                 db = self.config.database
             );
@@ -164,6 +244,24 @@ impl SurrealDbSink {
                 )));
             }
             return Err(err);
+        }
+        for spec in &self.config.graph_edges {
+            // TYPE RELATION makes SurrealDB purge attached edges when
+            // an endpoint record is deleted — the property the edge
+            // lifecycle relies on. Not ENFORCED: snapshot batches may
+            // RELATE endpoints whose records arrive later.
+            let ddl = format!(
+                "DEFINE TABLE IF NOT EXISTS ⟨{}{}⟩ TYPE RELATION;",
+                self.config.table_prefix, spec.name
+            );
+            self.query(&ddl, json!({})).await?;
+            debug!(
+                sink_id = %self.config.id,
+                edge = %spec.name,
+                from = %spec.from_table,
+                to = %spec.to_table,
+                "surrealdb relation table ensured"
+            );
         }
         for index in &self.config.vector_indexes {
             // Identifiers pass the safe-charset gate in `new`; ⟨⟩
@@ -361,36 +459,63 @@ impl SurrealDbSink {
             pairs: Option<&'a [Value]>,
             #[serde(skip_serializing_if = "Option::is_none")]
             rids: Option<&'a [Value]>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            atb: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            btb: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            edges: Option<&'a [Value]>,
         }
         #[derive(serde::Serialize)]
         struct Body<'a> {
             method: &'static str,
-            params: (&'static str, Vars<'a>),
+            params: (&'a str, Vars<'a>),
         }
-        type RunParts<'a> = (&'static str, Option<&'a [Value]>, Option<&'a [Value]>);
-        let (sql, pairs, rids): RunParts<'_> = match &run.kind {
-            RunKind::Upsert(pairs) => (
-                "FOR $pair IN $pairs { UPSERT type::record($tb, $pair.rid) CONTENT $pair.doc; };",
-                Some(pairs),
-                None,
-            ),
-            RunKind::Delete(rids) => (
-                "FOR $rid IN $rids { DELETE type::record($tb, $rid); };",
-                None,
-                Some(rids),
-            ),
-            RunKind::Truncate => ("DELETE type::table($tb);", None, None),
+        let mut vars = Vars {
+            tb: &run.table,
+            pairs: None,
+            rids: None,
+            atb: None,
+            btb: None,
+            edges: None,
+        };
+        // EdgeApply embeds the edge table as an identifier: RELATE's
+        // arrow position cannot be parameterized. The name passed the
+        // safe-identifier gate at construction; everything else rides
+        // bind variables. Delete-then-RELATE is split into two FOR
+        // statements because RELATE's uniqueness check does not see a
+        // delete issued in the same statement (verified on 3.2).
+        let edge_sql;
+        let sql: &str = match &run.kind {
+            RunKind::Upsert(pairs) => {
+                vars.pairs = Some(pairs);
+                "FOR $pair IN $pairs { UPSERT type::record($tb, $pair.rid) CONTENT $pair.doc; };"
+            }
+            RunKind::Delete(rids) => {
+                vars.rids = Some(rids);
+                "FOR $rid IN $rids { DELETE type::record($tb, $rid); };"
+            }
+            RunKind::Truncate => "DELETE type::table($tb);",
+            RunKind::EdgeApply {
+                a_table,
+                b_table,
+                items,
+            } => {
+                vars.atb = Some(a_table);
+                vars.btb = Some(b_table);
+                vars.edges = Some(items);
+                edge_sql = format!(
+                    "FOR $e IN $edges {{ DELETE type::record($tb, $e.eid); }}; \
+                     FOR $e IN $edges {{ RELATE (type::record($atb, $e.a))->⟨{}⟩->\
+                     (type::record($btb, $e.b)) CONTENT {{ id: type::record($tb, $e.eid) }}; }};",
+                    run.table
+                );
+                &edge_sql
+            }
         };
         let body = Body {
             method: "query",
-            params: (
-                sql,
-                Vars {
-                    tb: &run.table,
-                    pairs,
-                    rids,
-                },
-            ),
+            params: (sql, vars),
         };
         super::cbor::encode(&body)
             .map(bytes::Bytes::from)
@@ -412,10 +537,10 @@ impl SurrealDbSink {
         for run in runs {
             match lanes
                 .iter_mut()
-                .find(|(table, _)| *table == run.table.as_str())
+                .find(|(lane_key, _)| *lane_key == run.lane_key())
             {
                 Some((_, lane)) => lane.push(run),
-                None => lanes.push((run.table.as_str(), vec![run])),
+                None => lanes.push((run.lane_key(), vec![run])),
             }
         }
         if lanes.len() == 1 {
@@ -1054,6 +1179,19 @@ mod tests {
             serde_json::json!(["41", "52"]),
             "materialized lookup values wrong: {doc}"
         );
+    }
+
+    #[test]
+    fn unsafe_table_prefix_is_rejected_at_construction() {
+        // The prefix rides inside ⟨⟩-escaped identifiers for edge DDL
+        // and RELATE statements — `⟩` must never reach that position.
+        let mut config = SurrealDbConfig::new("s", "http://x", "vs", "app", "u", "p");
+        config.table_prefix = "evil⟩; REMOVE TABLE users; --".to_owned();
+        let err = match SurrealDbSink::new(config) {
+            Err(err) => err,
+            Ok(_) => panic!("unsafe table_prefix must be rejected"),
+        };
+        assert!(err.to_string().contains("table_prefix"), "{err}");
     }
 
     #[tokio::test]

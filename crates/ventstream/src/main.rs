@@ -86,8 +86,8 @@ use ventstream_sinks::{
     RedisKeyspaceOwnership, RedisSentinelTopology, RedisSink, RedisTlsConfig, RedisTopology,
     RedisView, RedisViewCondition, RedisViewConditionOperator, RedisViewFilter,
     RedisViewFilterMode, RedisViewKey, RedisViewMissingBehavior, RedisViewSource, RedisViewValue,
-    SurrealDbConfig, SurrealDbSink, SurrealLookupField, SurrealTableRouting, SurrealVectorDistance,
-    SurrealVectorIndex,
+    SurrealDbConfig, SurrealDbSink, SurrealEdgeSpec, SurrealLookupField, SurrealTableRouting,
+    SurrealVectorDistance, SurrealVectorIndex,
 };
 use ventstream_sources::kafka::{KafkaCdcConfig, KafkaCdcSource, UnwrapMode};
 use ventstream_sources::mongodb::{
@@ -4024,6 +4024,17 @@ fn load_surrealdb_config(engine_config: Option<&EngineFileConfig>) -> Result<Sur
         .map(|entry| SurrealLookupField {
             table: entry.table.clone(),
             field: entry.field.clone(),
+        })
+        .collect();
+    config.graph_edges = surreal
+        .graph_edges
+        .iter()
+        .map(|edge| SurrealEdgeSpec {
+            name: edge.name.clone(),
+            from_table: edge.from_table.clone(),
+            fk_columns: edge.fk_columns.clone(),
+            to_table: edge.to_table.clone(),
+            reversed: edge.reversed.unwrap_or(false),
         })
         .collect();
     config.vector_indexes = surreal

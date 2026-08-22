@@ -14,7 +14,7 @@ pub(crate) mod sink;
 pub(crate) mod statements;
 
 pub use config::{
-    SurrealBatchConfig, SurrealDbConfig, SurrealLookupField, SurrealTableRouting,
+    SurrealBatchConfig, SurrealDbConfig, SurrealEdgeSpec, SurrealLookupField, SurrealTableRouting,
     SurrealVectorDistance, SurrealVectorIndex,
 };
 pub use error::SurrealSinkError;
