@@ -150,6 +150,13 @@ pub fn insert_to_event(
     Ok(build_event(source, subject, payload_json, headers))
 }
 
+/// Header marking an UPDATE whose new-row image omitted one or more
+/// unchanged TOAST columns. Flat sinks full-replace documents, so the
+/// source must re-read the complete row before such an event reaches
+/// them — otherwise the omitted fields silently vanish from the
+/// destination document.
+pub const TOAST_INCOMPLETE_HEADER: &str = "ventstream.pg.toast_incomplete";
+
 /// Map an `UPDATE` pgoutput message into an [`Event`].
 pub fn update_to_event(
     publication: &str,
@@ -179,6 +186,14 @@ pub fn update_to_event(
     let payload_json = serde_json::to_vec(&serde_json::Value::Object(envelope))
         .map_err(|err| PostgresCdcError::Internal(format!("JSON encode failed: {err}")))?;
     let mut headers = default_headers(relation);
+    if update
+        .new
+        .columns
+        .iter()
+        .any(|column| matches!(column, TupleColumn::UnchangedToast))
+    {
+        headers = headers.with_header(TOAST_INCOMPLETE_HEADER.to_owned(), "1".to_owned());
+    }
     if let Some(doc_id) = tuple_doc_id(relation, &update.new.columns)? {
         // pgoutput only ships an old tuple when the key changed (or under
         // REPLICA IDENTITY FULL); a differing old key means the doc moved
@@ -433,6 +448,41 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn unchanged_toast_updates_are_flagged_for_refetch() {
+        let rel = users_relation();
+        let update = Update {
+            relation_id: rel.id,
+            old: None,
+            new: Tuple {
+                columns: vec![
+                    TupleColumn::Text(b"42".to_vec()),
+                    TupleColumn::UnchangedToast,
+                ],
+            },
+        };
+        let event = update_to_event("p", &rel, &update).expect("update");
+        assert_eq!(event.headers.get(TOAST_INCOMPLETE_HEADER), Some("1"));
+        // The omitted column must not appear as null in the payload.
+        let payload: serde_json::Value =
+            serde_json::from_slice(event.payload.as_slice()).expect("json");
+        assert!(payload["new"].get("email").is_none());
+
+        // A complete image carries no flag.
+        let complete = Update {
+            relation_id: rel.id,
+            old: None,
+            new: Tuple {
+                columns: vec![
+                    TupleColumn::Text(b"42".to_vec()),
+                    TupleColumn::Text(b"a@b.c".to_vec()),
+                ],
+            },
+        };
+        let event = update_to_event("p", &rel, &complete).expect("update");
+        assert_eq!(event.headers.get(TOAST_INCOMPLETE_HEADER), None);
     }
 
     #[test]

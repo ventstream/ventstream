@@ -31,7 +31,16 @@ const SOURCE_VERSION_HEADER: &str = "ventstream.cdc.source_version";
 pub struct KafkaCdcSource {
     config: KafkaCdcConfig,
     sink_progress: Option<Arc<AtomicU64>>,
+    /// Consecutive unmappable-message skips; reset by any message that
+    /// maps (or intentionally filters). Bounded by
+    /// [`MAX_UNMAPPABLE_STREAK`].
+    unmappable_streak: AtomicU64,
 }
+
+/// Tolerated run of consecutive unmappable messages before the source
+/// halts. Far above any real poison-record cluster; far below a whole
+/// topic misdecoding.
+const MAX_UNMAPPABLE_STREAK: u64 = 256;
 
 /// Owned copy of a message — lets us drop the borrowed message (which is
 /// `!Send`) before any `.await`.
@@ -49,6 +58,7 @@ impl KafkaCdcSource {
         Self {
             config,
             sink_progress: None,
+            unmappable_streak: AtomicU64::new(0),
         }
     }
 
@@ -164,10 +174,18 @@ impl KafkaCdcSource {
         );
         match mapping {
             Ok(Mapping::Skip) => {
+                // Intentional skip (tombstone/heartbeat/filter) — not an
+                // error; resets the unmappable streak like any healthy
+                // message would.
+                metrics::counter!("vs_kafka_skipped_total", "reason" => "filtered").increment(1);
+                self.unmappable_streak
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
                 tracker.record(&owned.topic, owned.partition, owned.offset, false);
             }
             Ok(Mapping::Event(mapped)) => match event_mapper::to_event(&mapped) {
                 Ok(event) => {
+                    self.unmappable_streak
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
                     // Record as needs-sink only once we're committed to
                     // publishing, so a build/publish failure can't leave a
                     // seq that blocks the commit prefix forever.
@@ -178,24 +196,50 @@ impl KafkaCdcSource {
                     }
                 }
                 Err(e) => {
-                    warn!(
-                        source = %self.config.id, topic = %owned.topic,
-                        partition = owned.partition, offset = owned.offset,
-                        error = %e, "unmappable message; skipping"
-                    );
+                    self.note_unmappable(&owned, &e)?;
                     tracker.record(&owned.topic, owned.partition, owned.offset, false);
                 }
             },
             Err(e) => {
-                warn!(
-                    source = %self.config.id, topic = %owned.topic,
-                    partition = owned.partition, offset = owned.offset,
-                    error = %e, "unmappable message; skipping"
-                );
+                self.note_unmappable(&owned, &e)?;
                 tracker.record(&owned.topic, owned.partition, owned.offset, false);
             }
         }
         Ok(true)
+    }
+
+    /// Count and bound unmappable skips. Isolated bad messages skip
+    /// with a warning + counter (at-least-once pipelines tolerate a
+    /// poison record); an unbroken run of them means EVERY message
+    /// fails to map — a converter/serialization misconfiguration where
+    /// "skip and commit" is 100% silent data loss on a pipeline that
+    /// looks healthy. Halt so the operator sees it immediately.
+    fn note_unmappable(
+        &self,
+        owned: &OwnedMsg,
+        error: &KafkaCdcError,
+    ) -> Result<(), KafkaCdcError> {
+        metrics::counter!("vs_kafka_skipped_total", "reason" => "unmappable").increment(1);
+        ventstream_telemetry::record_error(format!(
+            "kafka unmappable message skipped ({}/{}@{}): {error}",
+            owned.topic, owned.partition, owned.offset
+        ));
+        let streak = self
+            .unmappable_streak
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        if streak >= MAX_UNMAPPABLE_STREAK {
+            return Err(KafkaCdcError::MalformedEvent(format!(
+                "{streak} consecutive messages failed to map (last: {error}) — this is a                  converter/format misconfiguration, not poison records; halting instead of                  silently committing past the entire topic. Check the connector's                  key/value converter (JSON without schemas) and the topic's format"
+            )));
+        }
+        warn!(
+            source = %self.config.id, topic = %owned.topic,
+            partition = owned.partition, offset = owned.offset,
+            streak,
+            error = %error, "unmappable message; skipping"
+        );
+        Ok(())
     }
 
     /// Commit the sink-durable offset prefix. Errors are logged, not fatal —

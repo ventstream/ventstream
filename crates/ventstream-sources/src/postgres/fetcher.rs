@@ -189,7 +189,7 @@ impl RelatedFetcher for PostgresFetcher {
         }
 
         let table_sql = qualify_table(table);
-        let projection = projection_sql(select);
+        let projection = self.cast_projection(table, select).await?;
         let column_types = self.resolve_column_types(table, pk_columns).await?;
         let (where_sql, params) = build_typed_where(pk_columns, &pk_components, &column_types);
         let sql =
@@ -229,7 +229,7 @@ impl RelatedFetcher for PostgresFetcher {
         }
 
         let table_sql = qualify_table(table);
-        let projection = projection_sql(select);
+        let projection = self.cast_projection(table, select).await?;
         let resolved_types = self.resolve_column_types(table, fk_columns).await?;
         let column_types = resolved_types.as_slice();
         let (where_sql, params) = build_typed_where(fk_columns, &fk_components, column_types);
@@ -295,6 +295,51 @@ impl RelatedFetcher for PostgresFetcher {
 }
 
 impl PostgresFetcher {
+    /// Cast-aware projection: numeric, array, and timestamp-family
+    /// columns render `::text` so Postgres's own output functions
+    /// produce the same text forms pgoutput ships on the WAL path
+    /// (exact numerics, `{a,b}` arrays, `+00` offsets) — keeping
+    /// fetcher-composed values byte-identical to WAL- and
+    /// snapshot-composed ones. Derived from the same cached type map
+    /// `resolve_column_types` fills; no extra catalog queries.
+    async fn cast_projection(&self, table: &str, select: &[String]) -> Result<String, FetchError> {
+        // Ensure the cache is populated for this table (any column
+        // works; the resolver caches the whole table's types).
+        let _ = self.resolve_column_types(table, &[]).await?;
+        let cache = self.inner.column_types.lock().await;
+        let Some((_, table_types)) = cache.get(table) else {
+            return Ok(projection_sql(select));
+        };
+        let needs_cast = |ty: &str| {
+            ty.ends_with("[]")
+                || ty.starts_with("numeric")
+                || ty.starts_with("timestamp")
+                || ty.starts_with("time")
+                || ty.starts_with("interval")
+        };
+        let render = |name: &str| {
+            let ident = quote_ident(name);
+            match table_types.get(name) {
+                Some(ty) if needs_cast(ty) => format!("{ident}::text AS {ident}"),
+                _ => ident,
+            }
+        };
+        if select.is_empty() {
+            let mut names: Vec<&String> = table_types.keys().collect();
+            names.sort();
+            return Ok(names
+                .iter()
+                .map(|name| render(name))
+                .collect::<Vec<_>>()
+                .join(", "));
+        }
+        Ok(select
+            .iter()
+            .map(|name| render(name))
+            .collect::<Vec<_>>()
+            .join(", "))
+    }
+
     async fn resolve_column_types(
         &self,
         table: &str,

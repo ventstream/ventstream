@@ -2530,7 +2530,13 @@ async fn build_and_run_mongodb_engine(
     inner_shutdown: ShutdownToken,
     outer_shutdown: ShutdownToken,
 ) -> Result<EngineIterationOutcome> {
-    let source = MongoCdcSource::new(config);
+    // Shared watermark: the dispatcher publishes the highest ack_seq it
+    // has durably written; the source gates resume-token persistence on
+    // it (crash between token flush and sink write can then never skip
+    // events on restart).
+    let sink_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let source =
+        MongoCdcSource::new(config).with_sink_progress(std::sync::Arc::clone(&sink_progress));
     let sink = build_sink(sink_config, &inner_shutdown).await?;
 
     info!(
@@ -2542,7 +2548,7 @@ async fn build_and_run_mongodb_engine(
         "engine knobs (mongodb)"
     );
 
-    let engine = Engine::new(Box::new(source), sink, engine_cfg);
+    let engine = Engine::new(Box::new(source), sink, engine_cfg).with_sink_progress(sink_progress);
     let engine_outcome = engine.run(inner_shutdown.clone()).await;
     if let Err(err) = &engine_outcome {
         ventstream_telemetry::record_error(format!("mongodb engine run failed: {err:#}"));
