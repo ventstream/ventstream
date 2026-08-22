@@ -80,8 +80,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Event header carrying the wal_end LSN (u64) of the WAL record
-/// that produced this event. Snapshot events do not set it.
+/// Event header carrying the LSN (u64) the event is acknowledged
+/// under: the producing record's wal_start, except a transaction's
+/// final event, which carries the commit end LSN so sink progress can
+/// reach the ack high-water mark. Snapshot events do not set it.
 pub const LSN_HEADER: &str = "ventstream.cdc.lsn";
 
 /// Default cadence for `standby_status_update` pushes. Operators can
@@ -847,7 +849,6 @@ impl PostgresCdcSource {
                         Some(ReplicationEvent::XLogData { wal_start, wal_end, data, .. }) => {
                             let events = self.decode_payload_or_skip_unknown(&data)?;
                             let wal_start_u64 = wal_start.as_u64();
-                            let wal_end_u64 = wal_end.as_u64();
                             // Per-payload breadcrumb — operators chasing
                             // "did this row get emitted?" want to see
                             // each WAL message's event count + LSN.
