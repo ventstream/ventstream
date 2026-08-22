@@ -105,6 +105,45 @@ sequence. Deletes are set-oriented (`DELETE array::map($rids, …)`), one
 statement instead of an interpreted per-id loop. Request-body gzip was
 tested and is NOT accepted by SurrealDB's HTTP API (400) — closed.
 
+## Graph edges (RELATE mode)
+
+Declared `graph_edges` turn foreign keys on flat-CDC relations into
+SurrealDB graph relations, kept in sync live. Per spec: `from_table`
+(the FK owner), `fk_columns` (in the referenced key's order),
+`to_table`, an edge `name`, and optional `reversed` to point the edge
+referenced→owner (`person->wrote->article` reads better than
+`article->authored_by->person`).
+
+The correctness keystone is the deterministic edge id: the edge record
+is `edge_table:[<from-row key array>]` — one edge per FK row per spec.
+Re-bootstraps overwrite instead of duplicating; an FK value change is
+delete-then-RELATE by that id, needing no old-row image (REPLICA
+IDENTITY DEFAULT suffices); NULL FK deletes the edge; a row delete
+deletes it explicitly, and endpoint deletion is covered by the server —
+edge tables are `DEFINE TABLE … TYPE RELATION` (ensured at startup, not
+ENFORCED: snapshot batches may RELATE endpoints whose records arrive
+later, which SurrealDB accepts and resolves on traversal once they do).
+
+Apply runs are two FOR statements — a delete loop then a RELATE loop
+over the same bound items — because RELATE's uniqueness check cannot
+see a delete issued in the same statement (verified on 3.2). The edge
+table is the one identifier embedded in the statement text (RELATE's
+arrow position cannot be parameterized); it passes the safe-identifier
+gate at construction, and endpoints/ids ride bind variables as key
+arrays via `type::record`.
+
+Edge runs execute in their FROM-relation's lane, after that relation's
+document runs: a document delete auto-purges attached edges, so an edge
+RELATE racing it in a parallel lane could lose a fresh edge. During
+translation, edge ops accumulate per spec and append after the document
+runs — interleaving them would break document-run merging and double
+the round-trips.
+
+Requires per-relation routing (`by_output_relation` or
+`by_projection_target`); fixed routing is rejected at construction —
+one shared table cannot host resolvable RELATE endpoints. Pairs with
+flat pipelines; joined pipelines already embed their relationships.
+
 ## Version pin
 
 SurrealDB 3.x only: 3.0 renamed `type::thing` to `type::record`, and the

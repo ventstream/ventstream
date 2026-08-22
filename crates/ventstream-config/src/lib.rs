@@ -1136,6 +1136,9 @@ pub struct SurrealDbSinkConfig {
     /// Join paths materialized per document for cheap reverse lookups.
     #[serde(default)]
     pub lookup_fields: Vec<SurrealLookupFieldConfig>,
+    /// FK-derived graph edges materialized as RELATE relations.
+    #[serde(default)]
+    pub graph_edges: Vec<SurrealEdgeConfig>,
     /// Disable TLS certificate verification. Development only.
     #[serde(default)]
     pub insecure_tls: Option<bool>,
@@ -1182,6 +1185,37 @@ impl SurrealDbSinkConfig {
         {
             return Err(ConfigError::InvalidField(
                 "sink.surrealdb.request_timeout_ms must be between 1 and 600000",
+            ));
+        }
+        let mut edge_names = std::collections::HashSet::new();
+        for edge in &self.graph_edges {
+            let safe = |value: &str| {
+                !value.is_empty()
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
+            };
+            if !safe(&edge.name) || !safe(&edge.from_table) || !safe(&edge.to_table) {
+                return Err(ConfigError::InvalidField(
+                    "sink.surrealdb.graph_edges name/from_table/to_table must match [A-Za-z0-9_.-]",
+                ));
+            }
+            if edge.fk_columns.is_empty() || edge.fk_columns.iter().any(|c| c.is_empty()) {
+                return Err(ConfigError::InvalidField(
+                    "sink.surrealdb.graph_edges entries need at least one non-empty fk_column",
+                ));
+            }
+            if !edge_names.insert(edge.name.as_str()) {
+                return Err(ConfigError::InvalidField(
+                    "sink.surrealdb.graph_edges names must be unique",
+                ));
+            }
+        }
+        if !self.graph_edges.is_empty()
+            && matches!(self.table_routing, SurrealTableRoutingConfig::Fixed { .. })
+        {
+            return Err(ConfigError::InvalidField(
+                "sink.surrealdb.graph_edges requires by_output_relation or by_projection_target table_routing",
             ));
         }
         for entry in &self.lookup_fields {
@@ -1247,6 +1281,25 @@ pub struct SurrealLookupFieldConfig {
     pub table: String,
     /// Dotted document path of the embedded join key.
     pub field: String,
+}
+
+/// One FK-derived graph edge kept in sync as SurrealDB RELATE records.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurrealEdgeConfig {
+    /// Edge table name (pre-prefix), e.g. `wrote`.
+    pub name: String,
+    /// Source relation owning the FK (`ventstream.cdc.relation` value).
+    pub from_table: String,
+    /// FK column(s) on `from_table`, in the referenced key's order.
+    pub fk_columns: Vec<String>,
+    /// Referenced relation.
+    pub to_table: String,
+    /// Point the edge referenced -> FK-owner instead of the FK-forward
+    /// default (`person->wrote->article` rather than
+    /// `article->authored_by->person`).
+    #[serde(default)]
+    pub reversed: Option<bool>,
 }
 
 /// One HNSW vector index ensured at startup.
@@ -4065,6 +4118,79 @@ sink:
         ] {
             EngineConfig::from_yaml_str(yaml).expect("accept AWS RDS provider trust");
         }
+    }
+
+    #[test]
+    fn parses_surrealdb_graph_edges_and_rejects_bad_specs() {
+        let base = |edges: &str, routing: &str| {
+            format!(
+                r#"
+schema_version: 1
+roles: [cdc]
+source:
+  kind: postgres
+  postgres:
+    host_ref: env:H
+    user_ref: env:U
+    password_ref: env:P
+    database_ref: env:D
+    publication_ref: env:PB
+    slot_ref: env:SL
+sink:
+  kind: surrealdb
+  surrealdb:
+    endpoint_ref: env:SE
+    namespace: vs
+    database: app
+    username_ref: env:SU
+    password_ref: env:SP
+{routing}
+    graph_edges:
+{edges}
+"#
+            )
+        };
+        let good = base(
+            "      - name: wrote\n        from_table: articles\n        fk_columns: [author_id]\n        to_table: people\n        reversed: true",
+            "",
+        );
+        let config = EngineConfig::from_yaml_str(&good).expect("valid graph edges");
+        let surreal = config
+            .sink
+            .as_ref()
+            .and_then(|sink| sink.surrealdb.as_ref())
+            .expect("surreal sink");
+        assert_eq!(surreal.graph_edges.len(), 1);
+        assert_eq!(surreal.graph_edges[0].name, "wrote");
+        assert_eq!(surreal.graph_edges[0].reversed, Some(true));
+
+        // Edge names embed in RELATE statements: bad charset rejected.
+        let bad_name = base(
+            "      - name: \"wr ote\"\n        from_table: articles\n        fk_columns: [author_id]\n        to_table: people",
+            "",
+        );
+        EngineConfig::from_yaml_str(&bad_name).expect_err("space in edge name must reject");
+
+        // Duplicate edge names collide on one edge table.
+        let dup = base(
+            "      - name: wrote\n        from_table: articles\n        fk_columns: [author_id]\n        to_table: people\n      - name: wrote\n        from_table: comments\n        fk_columns: [author_id]\n        to_table: people",
+            "",
+        );
+        EngineConfig::from_yaml_str(&dup).expect_err("duplicate edge names must reject");
+
+        // Fixed routing cannot host resolvable RELATE endpoints.
+        let fixed = base(
+            "      - name: wrote\n        from_table: articles\n        fk_columns: [author_id]\n        to_table: people",
+            "    table_routing:\n      mode: fixed\n      table: everything",
+        );
+        EngineConfig::from_yaml_str(&fixed).expect_err("fixed routing + edges must reject");
+
+        // Empty fk_columns declares no relationship.
+        let empty = base(
+            "      - name: wrote\n        from_table: articles\n        fk_columns: []\n        to_table: people",
+            "",
+        );
+        EngineConfig::from_yaml_str(&empty).expect_err("empty fk_columns must reject");
     }
 
     #[test]

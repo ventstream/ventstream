@@ -73,6 +73,13 @@ pub struct SurrealDbConfig {
     /// "items.item_id"}`.
     pub lookup_fields: Vec<SurrealLookupField>,
 
+    /// Foreign-key edge specs materialized as graph relations. Each
+    /// spec turns one FK on a flat-CDC relation into RELATE edges kept
+    /// in sync live: inserts create edges, FK updates move them,
+    /// deletes remove them (SurrealDB also auto-purges edges when an
+    /// endpoint record is deleted). Empty = documents only.
+    pub graph_edges: Vec<SurrealEdgeSpec>,
+
     /// Process-local availability state shared with the health server.
     #[doc(hidden)]
     pub delivery_health: Option<SinkHealth>,
@@ -105,6 +112,7 @@ impl SurrealDbConfig {
             ca_file: None,
             vector_indexes: Vec::new(),
             lookup_fields: Vec::new(),
+            graph_edges: Vec::new(),
             delivery_health: None,
         }
     }
@@ -155,6 +163,31 @@ pub struct SurrealVectorIndex {
     pub dimension: u32,
     /// Distance function.
     pub distance: SurrealVectorDistance,
+}
+
+/// One FK-derived graph edge kept in sync as SurrealDB RELATE records.
+///
+/// The edge record id is the FK-owning row's key array — deterministic,
+/// so re-bootstraps overwrite instead of duplicating, and an FK value
+/// change moves the edge with no old-row image required (REPLICA
+/// IDENTITY DEFAULT suffices).
+#[derive(Debug, Clone)]
+pub struct SurrealEdgeSpec {
+    /// Edge table name (pre-prefix), e.g. `wrote`. Embedded in RELATE
+    /// statements as an identifier, so it must pass the safe charset.
+    pub name: String,
+    /// Source relation owning the FK, as routed (the
+    /// `ventstream.cdc.relation` header value), e.g. `public.articles`.
+    pub from_table: String,
+    /// FK column(s) on `from_table`, in the referenced key's order.
+    pub fk_columns: Vec<String>,
+    /// Referenced relation, e.g. `public.people`.
+    pub to_table: String,
+    /// Edge direction. Default (false) points FK-owner -> referenced
+    /// (`article->authored_by->person`); reversed points
+    /// referenced -> FK-owner (`person->wrote->article`), which is how
+    /// most graphs read.
+    pub reversed: bool,
 }
 
 /// One join path materialized for cheap reverse lookups.
@@ -220,6 +253,7 @@ impl std::fmt::Debug for SurrealDbConfig {
             .field("batching", &self.batching)
             .field("vector_indexes", &self.vector_indexes)
             .field("lookup_fields", &self.lookup_fields)
+            .field("graph_edges", &self.graph_edges)
             .finish_non_exhaustive()
     }
 }
