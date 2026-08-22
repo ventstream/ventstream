@@ -1087,7 +1087,9 @@ impl PostgresCdcSource {
                     .saturating_add(1);
                 if streak > MAX_UNKNOWN_RELATION_STREAK {
                     return Err(PostgresCdcError::Internal(format!(
-                        "{streak} consecutive WAL messages referenced uncached relations                          (last oid {oid}); halting instead of silently skipping —                          restart rebuilds the relation cache"
+                        "{streak} consecutive WAL messages referenced uncached relations \
+                         (last oid {oid}); halting instead of silently skipping — \
+                         restart rebuilds the relation cache"
                     )));
                 }
                 warn!(

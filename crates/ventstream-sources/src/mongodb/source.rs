@@ -145,7 +145,9 @@ impl MongoCdcSource {
             // Refuse up front rather than run a pipeline that drops
             // every update by construction.
             return Err(MongoCdcError::Operation(
-                "VS_MONGO_FULL_DOCUMENT=default carries deltas only, and raw document                  sync has nothing to write on updates — every update would be dropped.                  Use updateLookup (the default) instead"
+                "VS_MONGO_FULL_DOCUMENT=default carries deltas only, and raw document \
+                 sync has nothing to write on updates — every update would be dropped. \
+                 Use updateLookup (the default) instead"
                     .to_owned(),
             ));
         }
@@ -548,8 +550,9 @@ fn map_op(op: &OperationType) -> Option<Op> {
 
 /// Write the pending resume token to disk (atomic) and clear it. No-op when
 /// there's nothing pending.
-/// Ack sequence reserved for the bootstrap barrier. Tail sequences
-/// start above it so watermark comparisons stay strictly ordered.
+/// Ack sequence reserved for the bootstrap barrier (tail sequences
+/// start at `BOOTSTRAP_BARRIER_SEQ + 1`, so the watermark reaching
+/// this value means exactly "the bootstrap is sink-durable").
 const BOOTSTRAP_BARRIER_SEQ: u64 = 1;
 
 /// Poll the shared watermark until it reaches `expected` or shutdown.

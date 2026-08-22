@@ -230,7 +230,10 @@ impl KafkaCdcSource {
             .saturating_add(1);
         if streak >= MAX_UNMAPPABLE_STREAK {
             return Err(KafkaCdcError::MalformedEvent(format!(
-                "{streak} consecutive messages failed to map (last: {error}) — this is a                  converter/format misconfiguration, not poison records; halting instead of                  silently committing past the entire topic. Check the connector's                  key/value converter (JSON without schemas) and the topic's format"
+                "{streak} consecutive messages failed to map (last: {error}) — this is a \
+                 converter/format misconfiguration, not poison records; halting instead \
+                 of silently committing past the entire topic. Check the connector's \
+                 key/value converter (JSON without schemas) and the topic's format"
             )));
         }
         warn!(

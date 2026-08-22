@@ -130,7 +130,11 @@ fn map_debezium(
         // source database: REPLICA IDENTITY FULL for PG-fed topics.
         if let Some(field) = find_unavailable_placeholder(&body) {
             return Err(KafkaCdcError::MalformedEvent(format!(
-                "op {} on {topic} carries Debezium's unavailable-value placeholder in                  field `{field}` — the source omitted the real value (e.g. Postgres                  TOAST under REPLICA IDENTITY DEFAULT). Writing it would corrupt the                  destination document; set REPLICA IDENTITY FULL (or the connector's                  equivalent) on the source table",
+                "op {} on {topic} carries Debezium's unavailable-value placeholder in \
+                 field `{field}` — the source omitted the real value (e.g. Postgres \
+                 TOAST under REPLICA IDENTITY DEFAULT). Writing it would corrupt the \
+                 destination document; set REPLICA IDENTITY FULL (or the connector's \
+                 equivalent) on the source table",
                 op.suffix()
             )));
         }
