@@ -144,7 +144,11 @@ fn fk_components(document: &Value, fk_columns: &[String]) -> Option<Vec<String>>
     let map = document.as_object()?;
     let mut out = Vec::with_capacity(fk_columns.len());
     for column in fk_columns {
-        let field = if column == "id" { SOURCE_ID_FIELD } else { column };
+        let field = if column == "id" {
+            SOURCE_ID_FIELD
+        } else {
+            column
+        };
         match map.get(field) {
             None | Some(Value::Null) => return None,
             Some(value) => out.push(ventstream_core::doc_id::component_text(value)),
@@ -586,7 +590,12 @@ mod tests {
         assert!(out.rejects.is_empty());
         assert_eq!(out.runs.len(), 2);
         assert!(matches!(out.runs[0].kind, RunKind::Upsert(_)));
-        let RunKind::EdgeApply { a_table, b_table, items } = &out.runs[1].kind else {
+        let RunKind::EdgeApply {
+            a_table,
+            b_table,
+            items,
+        } = &out.runs[1].kind
+        else {
             panic!("expected EdgeApply, got {:?}", out.runs[1].kind);
         };
         // reversed: person -> wrote -> article
@@ -627,7 +636,10 @@ mod tests {
             .payload(Payload::from_vec(Vec::new()))
             .headers(
                 Headers::empty()
-                    .with_header("ventstream.doc.id".into(), r#"public.articles:["9"]"#.into())
+                    .with_header(
+                        "ventstream.doc.id".into(),
+                        r#"public.articles:["9"]"#.into(),
+                    )
                     .with_header("ventstream.cdc.relation".into(), "public.articles".into()),
             )
             .build()];
@@ -715,7 +727,12 @@ mod tests {
         let out = translate_batch(&config, &events);
         // articles upsert, people upsert, one edge run — people emits none.
         assert_eq!(out.runs.len(), 3);
-        let RunKind::EdgeApply { a_table, b_table, items } = &out.runs[2].kind else {
+        let RunKind::EdgeApply {
+            a_table,
+            b_table,
+            items,
+        } = &out.runs[2].kind
+        else {
             panic!("expected edge run last");
         };
         assert_eq!(a_table, "public.articles");

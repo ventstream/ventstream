@@ -70,7 +70,10 @@ impl SurrealDbSink {
             }
         }
         if !config.graph_edges.is_empty()
-            && matches!(config.table_routing, super::config::SurrealTableRouting::Fixed(_))
+            && matches!(
+                config.table_routing,
+                super::config::SurrealTableRouting::Fixed(_)
+            )
         {
             // Graph nodes need per-relation tables — under fixed
             // routing every record id is fully qualified inside one
@@ -453,7 +456,11 @@ impl SurrealDbSink {
                 "FOR $rid IN $rids { DELETE type::record($tb, $rid); };"
             }
             RunKind::Truncate => "DELETE type::table($tb);",
-            RunKind::EdgeApply { a_table, b_table, items } => {
+            RunKind::EdgeApply {
+                a_table,
+                b_table,
+                items,
+            } => {
                 vars.atb = Some(a_table);
                 vars.btb = Some(b_table);
                 vars.edges = Some(items);

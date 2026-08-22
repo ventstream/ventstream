@@ -425,7 +425,11 @@ async fn fk_edges_materialize_and_stay_consistent() {
     let state_dir2 = format!("{state_dir}-re");
     std::fs::create_dir_all(&state_dir2).expect("state dir 2");
     let config_path2 = format!("{state_dir2}/engine.yaml");
-    std::fs::write(&config_path2, relate_engine_yaml(stack.pg_port, &state_dir2)).expect("yaml");
+    std::fs::write(
+        &config_path2,
+        relate_engine_yaml(stack.pg_port, &state_dir2),
+    )
+    .expect("yaml");
     let mut env2 = env.clone();
     env2[5] = ("VS_PG_SLOT", "vs_relate_slot2".to_owned());
     let mut engine2 = common::spawn_engine_with_config(&state_dir2, &config_path2, &env2);
