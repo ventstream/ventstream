@@ -371,6 +371,7 @@ pub(super) fn translate_batch(config: &SurrealDbConfig, events: &[Event]) -> Tra
                 EdgeOp::Delete(eid) => match runs.last_mut() {
                     Some(run)
                         if run.table == *edge_table
+                            && run.lane.is_some()
                             && matches!(run.kind, RunKind::Delete(_))
                             && run.offsets.len() < config.batching.max_docs
                             && run.bytes + bytes <= config.batching.max_bytes =>

@@ -79,7 +79,21 @@ impl SurrealDbSink {
             // routing every record id is fully qualified inside one
             // table and RELATE endpoints would never resolve.
             return Err(SurrealSinkError::Internal(
-                "graph_edges requires by_output_relation or by_projection_target                  table routing, not fixed"
+                "graph_edges requires by_output_relation table routing, not fixed".to_owned(),
+            ));
+        }
+        if !config.graph_edges.is_empty()
+            && matches!(
+                config.table_routing,
+                super::config::SurrealTableRouting::ByProjectionTarget
+            )
+        {
+            // Edge specs match `from_table` against the CDC relation;
+            // projection-target routing names tables by a different
+            // header, so every spec would silently match nothing.
+            return Err(SurrealSinkError::Internal(
+                "graph_edges requires by_output_relation table routing; \
+                 by_projection_target routes by a header edge specs do not match"
                     .to_owned(),
             ));
         }
@@ -105,6 +119,21 @@ impl SurrealDbSink {
             if !edge_names.insert(spec.name.as_str()) {
                 return Err(SurrealSinkError::Internal(format!(
                     "graph edge `{}` is declared more than once",
+                    spec.name
+                )));
+            }
+        }
+        for spec in &config.graph_edges {
+            // An edge table sharing a name with a routed document table
+            // would interleave edge and document runs on one table —
+            // and their lane assignments would disagree.
+            if config
+                .graph_edges
+                .iter()
+                .any(|other| spec.name == other.from_table || spec.name == other.to_table)
+            {
+                return Err(SurrealSinkError::Internal(format!(
+                    "graph edge `{}` collides with a document table name",
                     spec.name
                 )));
             }
@@ -176,14 +205,16 @@ impl SurrealDbSink {
                 || !is_safe_identifier(&self.config.database)
             {
                 return Err(SurrealSinkError::Internal(format!(
-                    "auto_create_database requires namespace/database names in                      [A-Za-z0-9_.-]; got `{}`/`{}`",
+                    "auto_create_database requires namespace/database names in \
+                     [A-Za-z0-9_.-]; got `{}`/`{}`",
                     self.config.namespace, self.config.database
                 )));
             }
             // Root-scoped: the target database may not exist yet, so this
             // request carries no NS/DB headers.
             let ddl = format!(
-                "DEFINE NAMESPACE IF NOT EXISTS ⟨{ns}⟩; USE NS ⟨{ns}⟩;                  DEFINE DATABASE IF NOT EXISTS ⟨{db}⟩;",
+                "DEFINE NAMESPACE IF NOT EXISTS ⟨{ns}⟩; USE NS ⟨{ns}⟩; \
+                 DEFINE DATABASE IF NOT EXISTS ⟨{db}⟩;",
                 ns = self.config.namespace,
                 db = self.config.database
             );
@@ -465,7 +496,9 @@ impl SurrealDbSink {
                 vars.btb = Some(b_table);
                 vars.edges = Some(items);
                 edge_sql = format!(
-                    "FOR $e IN $edges {{ DELETE type::record($tb, $e.eid); }};                      FOR $e IN $edges {{ RELATE (type::record($atb, $e.a))->⟨{}⟩->                     (type::record($btb, $e.b)) CONTENT {{ id: type::record($tb, $e.eid) }}; }};",
+                    "FOR $e IN $edges {{ DELETE type::record($tb, $e.eid); }}; \
+                     FOR $e IN $edges {{ RELATE (type::record($atb, $e.a))->⟨{}⟩->\
+                     (type::record($btb, $e.b)) CONTENT {{ id: type::record($tb, $e.eid) }}; }};",
                     run.table
                 );
                 &edge_sql

@@ -139,10 +139,20 @@ translation, edge ops accumulate per spec and append after the document
 runs — interleaving them would break document-run merging and double
 the round-trips.
 
-Requires per-relation routing (`by_output_relation` or
-`by_projection_target`); fixed routing is rejected at construction —
-one shared table cannot host resolvable RELATE endpoints. Pairs with
-flat pipelines; joined pipelines already embed their relationships.
+Requires `by_output_relation` routing: fixed routing is rejected at
+construction (one shared table cannot host resolvable RELATE
+endpoints), and projection-target routing is rejected because edge
+specs match the CDC relation header, which that mode does not route by.
+
+Known semantic edge: edges derive from FROM-relation events only, so
+deleting and re-creating a referenced endpoint leaves edges from
+untouched FK rows purged until those rows next change or a re-bootstrap
+heals them. Real FK constraints in the source preclude the sequence;
+logical-only FKs can hit it. Re-deriving on TO-table inserts via the
+reverse-lookup machinery is the designed follow-up if partners need it.
+
+Pairs with flat pipelines; joined pipelines already embed their
+relationships.
 
 ## Version pin
 

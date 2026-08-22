@@ -162,8 +162,14 @@ Details worth knowing:
   column order.
 - **Multiple FKs** to the same table are separate specs with distinct
   edge names (`sender`/`recipient`, `parent` for self-references).
-- Requires the default per-relation table routing; `fixed` routing is
-  rejected at validation.
+- Requires the default `by_output_relation` table routing; `fixed` and
+  `by_projection_target` routing are rejected at validation.
+- **Edge existence tracks endpoint lifecycle.** Deleting a referenced
+  row purges its edges (correct); re-creating that row later does NOT
+  re-create edges from rows still pointing at it — they reappear when
+  the owning rows next change, or on re-bootstrap. With real FK
+  constraints in the source this cannot happen (the delete would have
+  been rejected or cascaded); it only shows up with logical-only FKs.
 - Pairs with flat pipelines. Joined pipelines already embed their
   relationships as nested documents — use whichever consumption style
   fits, or run both side by side from the same source.

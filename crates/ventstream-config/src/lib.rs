@@ -1212,10 +1212,22 @@ impl SurrealDbSinkConfig {
             }
         }
         if !self.graph_edges.is_empty()
-            && matches!(self.table_routing, SurrealTableRoutingConfig::Fixed { .. })
+            && !matches!(
+                self.table_routing,
+                SurrealTableRoutingConfig::ByOutputRelation
+            )
         {
             return Err(ConfigError::InvalidField(
-                "sink.surrealdb.graph_edges requires by_output_relation or by_projection_target table_routing",
+                "sink.surrealdb.graph_edges requires by_output_relation table_routing",
+            ));
+        }
+        if self.graph_edges.iter().any(|edge| {
+            self.graph_edges
+                .iter()
+                .any(|other| edge.name == other.from_table || edge.name == other.to_table)
+        }) {
+            return Err(ConfigError::InvalidField(
+                "sink.surrealdb.graph_edges names must not collide with document table names",
             ));
         }
         for entry in &self.lookup_fields {
@@ -4191,6 +4203,23 @@ sink:
             "",
         );
         EngineConfig::from_yaml_str(&empty).expect_err("empty fk_columns must reject");
+
+        // Projection-target routing names tables by a header edge specs
+        // do not match — silent zero edges, so reject.
+        let projection = base(
+            "      - name: wrote\n        from_table: articles\n        fk_columns: [author_id]\n        to_table: people",
+            "    table_routing:\n      mode: by_projection_target",
+        );
+        EngineConfig::from_yaml_str(&projection)
+            .expect_err("projection-target routing + edges must reject");
+
+        // An edge table named like a document table would interleave
+        // edge and document runs with disagreeing lanes.
+        let collide = base(
+            "      - name: people\n        from_table: articles\n        fk_columns: [author_id]\n        to_table: people",
+            "",
+        );
+        EngineConfig::from_yaml_str(&collide).expect_err("edge/doc table collision must reject");
     }
 
     #[test]
