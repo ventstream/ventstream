@@ -128,7 +128,7 @@ impl KafkaCdcSource {
     }
 
     async fn run_inner(&self, ctx: SourceContext) -> Result<(), KafkaCdcError> {
-        let consumer = self.build_consumer()?;
+        let consumer = std::sync::Arc::new(self.build_consumer()?);
         let topics: Vec<&str> = self.config.topics.iter().map(String::as_str).collect();
         if topics.is_empty() {
             return Err(KafkaCdcError::Connection(
@@ -140,23 +140,30 @@ impl KafkaCdcSource {
         // typo'd topic or dead broker list is an eternal warn-loop that
         // looks like an idle-but-healthy pipeline.
         {
+            // Per-topic metadata requests: a cluster-wide fetch pulls
+            // every topic's partition map — needlessly heavy on large
+            // clusters when only the configured few matter.
             let consumer = &consumer;
-            let metadata = tokio::task::block_in_place(|| {
-                consumer.fetch_metadata(None, std::time::Duration::from_secs(15))
-            })
-            .map_err(|e| {
-                KafkaCdcError::Connection(format!(
-                    "preflight metadata fetch failed — brokers unreachable or refusing \
-                     the configured security settings ({}): {e}",
-                    self.config.brokers
-                ))
-            })?;
-            let known: std::collections::HashSet<&str> =
-                metadata.topics().iter().map(|topic| topic.name()).collect();
-            let missing: Vec<&&str> = topics
-                .iter()
-                .filter(|topic| !known.contains(**topic))
-                .collect();
+            let mut missing: Vec<&str> = Vec::new();
+            for topic in &topics {
+                let metadata = tokio::task::block_in_place(|| {
+                    consumer.fetch_metadata(Some(topic), std::time::Duration::from_secs(15))
+                })
+                .map_err(|e| {
+                    KafkaCdcError::Connection(format!(
+                        "preflight metadata fetch failed — brokers unreachable or refusing \
+                         the configured security settings ({}): {e}",
+                        self.config.brokers
+                    ))
+                })?;
+                let exists = metadata
+                    .topics()
+                    .iter()
+                    .any(|t| t.name() == *topic && !t.partitions().is_empty());
+                if !exists {
+                    missing.push(topic);
+                }
+            }
             if !missing.is_empty() {
                 // NOT fatal: with auto-creation enabled the topic is
                 // born on first produce, and starting the consumer
@@ -203,10 +210,12 @@ impl KafkaCdcSource {
                     self.commit_now(&consumer, &mut tracker, CommitMode::Async);
                 }
                 _ = lag_probe.tick() => {
-                    // Sync broker round-trips (fetch_watermarks) — keep
-                    // them off the consume path's cadence and off the
-                    // async worker thread.
-                    tokio::task::block_in_place(|| record_consumer_lag(&consumer));
+                    // Sync broker round-trips (fetch_watermarks) on a
+                    // blocking-pool thread — block_in_place would still
+                    // stall THIS task (and consumption) on a slow
+                    // broker; spawn_blocking never does.
+                    let probe = std::sync::Arc::clone(&consumer);
+                    tokio::task::spawn_blocking(move || record_consumer_lag(&probe));
                 }
                 recv = consumer.recv() => {
                     let owned = match recv {

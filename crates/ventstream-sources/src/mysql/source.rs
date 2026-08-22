@@ -452,6 +452,7 @@ impl MySqlCdcSource {
         // Newest processed binlog position, for the lag gauge only
         // (durability rides pending_gated/pending_write as before).
         let mut lag_probe_pos: Option<BinlogPos> = None;
+        let mut lag_ticks: u64 = 0;
         let mut flush = tokio::time::interval(self.config.pos_flush_interval);
         flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -474,8 +475,16 @@ impl MySqlCdcSource {
                         &mut pending_gated,
                         &mut pending_write,
                     )?;
-                    if let Some(current) = &lag_probe_pos {
-                        record_binlog_lag(pool, current).await;
+                    // Probe every ~30s regardless of the flush cadence —
+                    // a lag gauge doesn't need sub-second freshness and
+                    // each probe costs a SHOW ... STATUS round-trip.
+                    lag_ticks = lag_ticks.saturating_add(1);
+                    let flush_ms = self.config.pos_flush_interval.as_millis().max(1) as u64;
+                    if lag_ticks * flush_ms >= 30_000 {
+                        lag_ticks = 0;
+                        if let Some(current) = &lag_probe_pos {
+                            record_binlog_lag(pool, current).await;
+                        }
                     }
                 }
                 next = tokio::time::timeout(READ_IDLE_TIMEOUT, stream.next()) => {
@@ -954,10 +963,15 @@ async fn record_binlog_lag(pool: &Pool, current: &BinlogPos) {
         .map(|(m, c)| m.saturating_sub(c))
         .unwrap_or(0);
     metrics::gauge!("vs_mysql_binlog_files_behind").set(files_behind as f64);
-    if files_behind == 0 {
-        metrics::gauge!("vs_mysql_binlog_lag_bytes")
-            .set(master.pos.saturating_sub(current.pos) as f64);
-    }
+    // Always write the bytes gauge so it can never go stale: exact
+    // in-file distance when caught up to the current file, 0 when whole
+    // files separate us (files_behind carries the signal there).
+    let bytes = if files_behind == 0 {
+        master.pos.saturating_sub(current.pos)
+    } else {
+        0
+    };
+    metrics::gauge!("vs_mysql_binlog_lag_bytes").set(bytes as f64);
 }
 
 /// Numeric suffix of a binlog file name (`mysql-bin.000042` → 42).

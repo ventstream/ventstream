@@ -178,7 +178,10 @@ impl MongoCdcSource {
         }
         let mut stream = match watch.await {
             Ok(s) => s,
-            Err(e) if persisted.is_some() && looks_like_resume_failure(&e) => {
+            Err(e)
+                if persisted.is_some()
+                    && (looks_like_resume_failure(&e) || is_token_parse_failure(&e)) =>
+            {
                 warn!(source = %self.config.id, error = %e,
                     "resume token rejected by mongodb; wiping cursor to re-bootstrap");
                 cursor_file.delete()?;
@@ -367,6 +370,9 @@ impl MongoCdcSource {
                             // Cursor age: how far behind the cluster's
                             // clock this event is. Rising age = the
                             // pipeline is falling behind the oplog.
+                            // NOTE: only updates as events arrive — a
+                            // fully stalled stream freezes the gauge at
+                            // its last value; pair with liveness alerts.
                             if let Some(cluster_time) = &event.cluster_time {
                                 let event_ms = u64::from(cluster_time.time) * 1000;
                                 let now_ms = std::time::SystemTime::now()
@@ -632,6 +638,22 @@ fn token_from_string(s: &str) -> Result<ResumeToken, MongoCdcError> {
 /// Heuristic: does this driver error indicate the resume token is no longer
 /// usable (oplog rotated past it / change-stream history lost)? When true,
 /// the source wipes the cursor and re-bootstraps instead of crash-looping.
+/// True when the server could not PARSE the supplied resume token —
+/// a corrupt/truncated persisted token (server code families 9
+/// FailedToParse / 40649 typed-document parse errors). Only consulted
+/// at watch-open when a persisted token exists: mid-stream these codes
+/// would be a driver bug, not a token problem. The old substring
+/// classifier caught this case by accident; without it a corrupt
+/// cursor file crash-loops instead of re-bootstrapping.
+fn is_token_parse_failure(e: &mongodb::error::Error) -> bool {
+    match e.kind.as_ref() {
+        mongodb::error::ErrorKind::Command(command) => {
+            matches!(command.code, 9 | 40649)
+        }
+        _ => false,
+    }
+}
+
 /// True when the server says the resume point itself is unusable —
 /// classified by server error CODE, not message text. Substring
 /// matching here was dangerous: wiping a valid cursor because an

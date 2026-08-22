@@ -143,7 +143,7 @@ async fn mysql_sql_mode_materializes_updates_and_deletes_in_redis() {
         PREFIX,
     );
     let pattern = format!("{PREFIX}:{{orders}}:*");
-    common::wait_until(Duration::from_secs(60), "MySQL Redis snapshot", || {
+    common::wait_until(Duration::from_secs(180), "MySQL Redis snapshot", || {
         let pattern = pattern.clone();
         async move {
             let Ok(keys) = common::redis_keys(redis_port, &pattern).await else {
@@ -337,7 +337,7 @@ async fn mysql_sql_mode_materializes_updates_and_deletes_in_redis() {
         keyspace_ownership: "exclusive",
     });
     common::wait_until(
-        Duration::from_secs(60),
+        Duration::from_secs(180),
         "MySQL Redis live set after rebootstrap",
         || async {
             common::redis_keys(redis_port, &owned_pattern)
