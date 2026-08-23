@@ -17,6 +17,20 @@ const INDEX: &str = "it_mysql_orders";
 const COMPOSITE_INDEX: &str = "it_mysql_composite_items";
 const MEMORY_INDEX: &str = "it_mysql_memory_orders";
 const DOC_ID: &str = r#"shop.orders:["ord-1"]"#;
+const BADGES_INDEX: &str = "it_mysql_badges";
+const BADGES_SPEC: &str = r#"
+joins:
+  - name: badges
+    primary:
+      table: shop.badges
+      pk: [kind, owner]
+    target:
+      index: it_mysql_badges
+    related: []
+    state:
+      backend: memory
+"#;
+
 const ORDERS_SPEC: &str = r#"
 joins:
   - name: orders
@@ -1108,4 +1122,100 @@ async fn mysql_memory_join_rebuilds_when_join_state_is_lost() {
         },
     )
     .await;
+}
+
+/// ENUM/SET primary keys: the bootstrap path renders labels (SELECT),
+/// the binlog path historically rendered indexes — so a DELETE's doc id
+/// never matched the INSERT's and the sink document was orphaned
+/// forever. The normalization must make both paths render labels.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "local integration: requires Docker; run explicitly"]
+async fn mysql_enum_pk_delete_matches_bootstrap_doc_id() {
+    let stack = common::start_mysql_os().await;
+    let mut mysql = common::mysql_root_conn(stack.mysql_port)
+        .await
+        .expect("mysql root connection");
+    mysql
+        .query_drop(format!(
+            "CREATE USER IF NOT EXISTS '{}'@'%' IDENTIFIED BY '{}'; \
+             GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{}'@'%'; \
+             CREATE TABLE IF NOT EXISTS {}.badges ( \
+                 kind ENUM('gold','silver','bronze') NOT NULL, \
+                 owner VARCHAR(64) NOT NULL, \
+                 perks SET('a','b','c') NOT NULL DEFAULT '', \
+                 PRIMARY KEY (kind, owner)); \
+             INSERT INTO {}.badges (kind, owner, perks) VALUES ('silver', 'ada', 'a,c') \
+             ON DUPLICATE KEY UPDATE perks=VALUES(perks)",
+            common::MYSQL_USER,
+            common::MYSQL_PASSWORD,
+            common::MYSQL_USER,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+        ))
+        .await
+        .expect("seed mysql badges");
+
+    let state_dir = common::state_dir("mysql-enum", stack.mysql_port);
+    let spec_path = common::write_spec(&state_dir, BADGES_SPEC);
+    let options = common::MySqlEngine {
+        mysql_port: stack.mysql_port,
+        os_port: stack.os_port,
+        spec_path: &spec_path,
+        state_dir: &state_dir,
+        index_template: "${header:ventstream.target.index}",
+        denormalize_mode: "sql",
+        bootstrap_mode: "snapshot",
+    };
+    let mut engine = common::spawn_mysql_engine(&options);
+
+    // Bootstrap doc id uses the LABEL text.
+    let doc_id = r#"shop.badges:["silver","ada"]"#;
+    common::wait_until(Duration::from_secs(60), "enum badge doc", || async {
+        common::os_doc(stack.os_port, BADGES_INDEX, doc_id)
+            .await
+            .is_some()
+    })
+    .await;
+
+    // Live insert through the binlog must land under a label id too —
+    // and its SET payload must render labels, not a bitmask.
+    mysql
+        .query_drop(format!(
+            "INSERT INTO {}.badges (kind, owner, perks) VALUES ('gold', 'grace', 'b')",
+            common::MYSQL_DB
+        ))
+        .await
+        .expect("live insert");
+    let live_id = r#"shop.badges:["gold","grace"]"#;
+    common::wait_until(Duration::from_secs(60), "live enum badge doc", || async {
+        common::os_doc(stack.os_port, BADGES_INDEX, live_id)
+            .await
+            .is_some()
+    })
+    .await;
+
+    // THE regression case: the DELETE's before-image doc id (binlog
+    // path) must match the bootstrap doc id (SELECT path) — pre-fix
+    // the tombstone targeted shop.badges:["2","ada"] and this doc
+    // stayed behind forever.
+    mysql
+        .query_drop(format!(
+            "DELETE FROM {}.badges WHERE kind='silver' AND owner='ada'",
+            common::MYSQL_DB
+        ))
+        .await
+        .expect("delete badge");
+    common::wait_until(
+        Duration::from_secs(60),
+        "enum badge doc deleted",
+        || async {
+            common::os_doc(stack.os_port, BADGES_INDEX, doc_id)
+                .await
+                .is_none()
+        },
+    )
+    .await;
+
+    engine.kill();
+    let _ = std::fs::remove_dir_all(&state_dir);
 }

@@ -24,9 +24,51 @@ pub(crate) struct TableSchema {
     pub(crate) pk_ordinals: Vec<usize>,
     /// Columns whose `DATA_TYPE` is `json` (parsed as nested JSON).
     pub(crate) json_columns: HashSet<String>,
+    /// ENUM label lists by 0-based ordinal (labels are 1-indexed in
+    /// binlog values). Binlog row images carry the numeric index; the
+    /// SELECT paths return the label — both must render the label or
+    /// doc ids diverge between the two paths and deletes orphan docs.
+    pub(crate) enum_labels: HashMap<usize, Vec<String>>,
+    /// SET label lists by 0-based ordinal (binlog carries a bitmask).
+    pub(crate) set_labels: HashMap<usize, Vec<String>>,
 }
 
 type SchemaMap = HashMap<(String, String), Arc<TableSchema>>;
+
+/// Parse `COLUMN_TYPE` label lists: `enum('a','b')` / `set('a','b')`.
+/// MySQL doubles embedded quotes (`'it''s'`).
+pub(crate) fn parse_labels(column_type: &str) -> Vec<String> {
+    let Some(start) = column_type.find('(') else {
+        return Vec::new();
+    };
+    let inner = column_type
+        .get(start + 1..column_type.rfind(')').unwrap_or(column_type.len()))
+        .unwrap_or("");
+    let mut labels = Vec::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\'' {
+            continue;
+        }
+        let mut label = String::new();
+        loop {
+            match chars.next() {
+                Some('\'') => {
+                    if chars.peek() == Some(&'\'') {
+                        chars.next();
+                        label.push('\'');
+                    } else {
+                        break;
+                    }
+                }
+                Some(ch) => label.push(ch),
+                None => break,
+            }
+        }
+        labels.push(label);
+    }
+    labels
+}
 
 #[derive(Default)]
 pub(crate) struct SchemaCache {
@@ -108,10 +150,10 @@ async fn load(pool: &Pool, db: &str, table: &str) -> Result<TableSchema, MySqlCd
     let op = |e: mysql_async::Error| MySqlCdcError::Operation(format!("schema lookup: {e}"));
     let mut conn = pool.get_conn().await.map_err(op)?;
 
-    // (name, 1-based ordinal, data_type)
-    let cols: Vec<(String, u32, String)> = conn
+    // (name, 1-based ordinal, data_type, column_type)
+    let cols: Vec<(String, u32, String, String)> = conn
         .exec(
-            "SELECT COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE \
+            "SELECT COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE, COLUMN_TYPE \
              FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
             (db, table),
         )
@@ -131,14 +173,16 @@ async fn load(pool: &Pool, db: &str, table: &str) -> Result<TableSchema, MySqlCd
 
     let column_count = cols
         .iter()
-        .map(|(_, ordinal, _)| *ordinal as usize)
+        .map(|(_, ordinal, _, _)| *ordinal as usize)
         .max()
         .unwrap_or(0);
     let mut column_names = vec![String::new(); column_count];
     let mut column_types = vec![String::new(); column_count];
     let mut ordinal_of: HashMap<String, usize> = HashMap::new();
     let mut json_columns = HashSet::new();
-    for (name, ord, dtype) in cols {
+    let mut enum_labels: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut set_labels: HashMap<usize, Vec<String>> = HashMap::new();
+    for (name, ord, dtype, ctype) in cols {
         let ordinal = (ord as usize).saturating_sub(1);
         if let Some(slot) = column_names.get_mut(ordinal) {
             *slot = name.clone();
@@ -148,7 +192,12 @@ async fn load(pool: &Pool, db: &str, table: &str) -> Result<TableSchema, MySqlCd
         }
         ordinal_of.insert(name.clone(), ordinal);
         if dtype.eq_ignore_ascii_case("json") {
-            json_columns.insert(name);
+            json_columns.insert(name.clone());
+        }
+        if dtype.eq_ignore_ascii_case("enum") {
+            enum_labels.insert(ordinal, parse_labels(&ctype));
+        } else if dtype.eq_ignore_ascii_case("set") {
+            set_labels.insert(ordinal, parse_labels(&ctype));
         }
     }
 
@@ -182,6 +231,8 @@ async fn load(pool: &Pool, db: &str, table: &str) -> Result<TableSchema, MySqlCd
         pk_names,
         pk_ordinals,
         json_columns,
+        enum_labels,
+        set_labels,
     })
 }
 
