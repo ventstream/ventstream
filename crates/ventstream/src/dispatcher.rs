@@ -971,8 +971,7 @@ mod tests {
         // neither the sink nor the DLQ. If that reaches the caller as a
         // clean shutdown, the supervisor treats it as a pause and
         // rebuilds the engine immediately — forever, at exit code 0.
-        let shutdown = ShutdownToken::new();
-        let mut c = OrderedCommitter::new(None, None, shutdown.clone());
+        let mut c = OrderedCommitter::new(None, None, ShutdownToken::new());
         c.commit(failed_closed(0, 100));
         assert!(
             c.fatal_reason().is_some(),
@@ -981,8 +980,7 @@ mod tests {
 
         // A cancellation during shutdown also stops the committer, but it
         // is NOT an error — the caller must still see a clean exit.
-        let shutdown = ShutdownToken::new();
-        let mut c = OrderedCommitter::new(None, None, shutdown.clone());
+        let mut c = OrderedCommitter::new(None, None, ShutdownToken::new());
         c.commit(BatchResult {
             seq: 0,
             max_watermark: 100,
@@ -995,8 +993,7 @@ mod tests {
         );
 
         // Non-durable DLQ is fatal for the same reason as failed-closed.
-        let shutdown = ShutdownToken::new();
-        let mut c = OrderedCommitter::new(None, None, shutdown.clone());
+        let mut c = OrderedCommitter::new(None, None, ShutdownToken::new());
         c.commit(non_durable(0, 100));
         assert!(c.fatal_reason().is_some());
     }
