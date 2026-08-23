@@ -292,19 +292,22 @@ fn update_row_body(event: &Event) -> Option<Vec<u8>> {
     serde_json::to_vec(row).ok()
 }
 
+/// True for the TRUNCATE-derived event that asks the sink to clear the
+/// truncated relation's documents, rather than to write or delete one.
+pub(crate) fn is_target_clear(event: &ventstream_core::Event) -> bool {
+    // Header ONLY. Matching on the `.truncate` subject would fire for raw
+    // source truncates in plain (non-denormalize) mode, which bypass the
+    // `with_target_clears` gate entirely — the sink would then issue a
+    // clear for a relation whose documents it was never asked to manage.
+    event.headers.get("ventstream.target.clear") == Some("true")
+}
+
 /// Detect whether an event is a deletion based on the CDC source's
 /// subject convention. Subjects look like `postgres.<ns>.<rel>.<op>`
 /// where `<op>` is `insert | update | delete | truncate`. A delete
 /// event in the join engine's primary path was passed through with the
 /// same subject (carrying the row's `old` payload), so we can recognize
 /// it here and emit an OS bulk `delete` action instead of `index`.
-/// True for the TRUNCATE-derived event that asks the sink to empty the
-/// whole target, rather than to write or delete one document.
-pub(crate) fn is_target_clear(event: &ventstream_core::Event) -> bool {
-    event.headers.get("ventstream.target.clear") == Some("true")
-        || event.subject.as_str().ends_with(".truncate")
-}
-
 fn is_delete_event(event: &Event) -> bool {
     event
         .subject
@@ -595,6 +598,41 @@ mod tests {
             .content_type(ContentType::Json)
             .headers(Headers::from_map(map))
             .build()
+    }
+
+    #[test]
+    fn target_clears_are_excluded_from_the_bulk_body() {
+        // A batch of only clears must produce an EMPTY body — the clear is
+        // applied out-of-band by the sink. Encoding it as an index action
+        // wrote a junk `{}` document under a generated id; posting a
+        // zero-byte body instead is a hard 400, so the sink guards on
+        // emptiness. This is the common shape: the denormalizer follows a
+        // TRUNCATE with a rebuild that reads the emptied table and emits
+        // nothing.
+        let clear = make_event_with_headers(
+            "postgres.public.orders.truncate",
+            &[
+                ("ventstream.target.clear", "true"),
+                ("ventstream.cdc.namespace", "public"),
+                ("ventstream.cdc.relation", "orders"),
+            ],
+        );
+        let (body, offsets) = build_bulk_body(
+            std::slice::from_ref(&clear),
+            "orders",
+            chrono::Utc.timestamp_opt(0, 0).single().expect("ts"),
+        )
+        .expect("build");
+        assert!(body.is_empty(), "a lone clear must not produce a bulk body");
+        assert!(offsets.is_empty());
+
+        // A raw source TRUNCATE without the header is NOT a clear: the
+        // subject alone would fire for plain (non-denormalize) pipelines
+        // that never opted into target clears.
+        let raw =
+            make_event_with_doc_id("postgres.public.orders.truncate", Some("public.orders:1"));
+        assert!(!is_target_clear(&raw));
+        assert!(is_target_clear(&clear));
     }
 
     fn make_event_with_headers(subject: &str, headers: &[(&str, &str)]) -> Event {

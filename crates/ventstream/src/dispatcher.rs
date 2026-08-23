@@ -572,7 +572,23 @@ impl OrderedCommitter {
                         "sink batch cancelled during shutdown; source progress remains unchanged"
                     );
                     self.failed = true;
-                    self.pending.clear();
+                    // Drain the rest of the pending map rather than dropping
+                    // it: a higher-seq batch already recorded as failed-closed
+                    // must still set the fatal reason, or a cancellation at a
+                    // lower seq would mask a genuine durability failure and
+                    // the caller would see a clean exit again.
+                    let pending = std::mem::take(&mut self.pending);
+                    for (seq, result) in pending {
+                        if matches!(
+                            result.outcome,
+                            BatchOutcome::FailedClosed | BatchOutcome::NonDurable { .. }
+                        ) {
+                            self.fail(format!(
+                                "batch {seq} was not durable (observed while draining after \
+                                 a cancelled batch)"
+                            ));
+                        }
+                    }
                     return;
                 }
             }

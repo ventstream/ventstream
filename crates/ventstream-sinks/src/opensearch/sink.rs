@@ -169,84 +169,85 @@ impl OpenSearchSink {
         })
     }
 
-    /// Send a dispatcher batch, bisecting only when the exact encoded body
-    /// exceeds OpenSearch's configured request limit.
+    /// Apply one target-clear (TRUNCATE) event.
     ///
-    /// Successful chunks are never re-sent. Failures retain offsets into the
-    /// original dispatcher batch so DLQ routing remains precise.
-    /// Apply target-clear (TRUNCATE) events by emptying the index.
+    /// Scoped by document-id prefix rather than `match_all`: doc ids are
+    /// `{schema}.{table}:{pk}`, so the prefix removes exactly the
+    /// truncated relation's documents. A `match_all` would wipe every
+    /// other relation sharing the index — the same hazard the Redis sink
+    /// refuses outright under shared routing.
     ///
-    /// These can't ride the bulk API — there's no "clear the index" bulk
-    /// action — and before this they fell through into the index branch
-    /// and were written as `{}` documents under generated ids, while
-    /// every pre-truncate document survived. Delete-by-query is the
-    /// documented way to empty an index in place, and it keeps the index
-    /// and its mappings intact for the rows that arrive next.
-    async fn apply_target_clears(
+    /// Clears can't ride the bulk API (there is no "empty the target"
+    /// bulk action), and before this they fell through into the index
+    /// branch and were written as `{}` documents under generated ids
+    /// while every pre-truncate document survived.
+    async fn apply_target_clear(
         &self,
-        events: &[ventstream_core::Event],
+        event: &ventstream_core::Event,
     ) -> Result<(), OpenSearchSinkError> {
         let now = chrono::Utc::now();
-        let mut cleared: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for event in events.iter().filter(|event| is_target_clear(event)) {
-            let index = index_template::render(&self.config.index_template, event, now)?;
-            if !cleared.insert(index.clone()) {
-                continue;
-            }
-            let url = format!(
-                "{}/{}/_delete_by_query?refresh=true&conflicts=proceed",
-                self.config.endpoint.trim_end_matches('/'),
-                index
-            );
-            let response = self
-                .client
-                .post(&url)
-                .json(&serde_json::json!({"query": {"match_all": {}}}))
-                .send()
-                .await
-                .map_err(|err| OpenSearchSinkError::Transport(err.to_string()))?;
-            let status = response.status();
-            if status == reqwest::StatusCode::NOT_FOUND {
-                // Nothing to clear: the index was never created.
-                continue;
-            }
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                return Err(
-                    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                    {
-                        OpenSearchSinkError::Server {
-                            status: status.as_u16(),
-                            message: body,
-                            retry_after: None,
-                        }
-                    } else {
-                        OpenSearchSinkError::Client {
-                            status: status.as_u16(),
-                            message: body,
-                        }
-                    },
-                );
-            }
-            info!(index = %index, "cleared opensearch index for source TRUNCATE");
+        let index = index_template::render(&self.config.index_template, event, now)?;
+        // Reconstruct the qualified table the doc ids were built from.
+        let (Some(namespace), Some(relation)) = (
+            event.headers.get("ventstream.cdc.namespace"),
+            event.headers.get("ventstream.cdc.relation"),
+        ) else {
+            return Err(OpenSearchSinkError::Internal(format!(
+                "target-clear event {} has no namespace/relation headers; refusing to clear \
+                 `{index}` because the delete cannot be scoped to the truncated relation",
+                event.id
+            )));
+        };
+        let prefix = format!("{namespace}.{relation}:");
+        let url = format!(
+            "{}/{}/_delete_by_query?refresh=true&conflicts=proceed",
+            self.config.endpoint.trim_end_matches('/'),
+            index
+        );
+        let response = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({"query": {"prefix": {"_id": prefix}}}))
+            .send()
+            .await
+            .map_err(|err| OpenSearchSinkError::Transport(err.to_string()))?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            // Nothing to clear: the index was never created.
+            return Ok(());
         }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(
+                if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    OpenSearchSinkError::Server {
+                        status: status.as_u16(),
+                        message: body,
+                        retry_after: None,
+                    }
+                } else {
+                    OpenSearchSinkError::Client {
+                        status: status.as_u16(),
+                        message: body,
+                    }
+                },
+            );
+        }
+        info!(index = %index, prefix = %prefix, "cleared opensearch documents for source TRUNCATE");
         Ok(())
     }
 
-    async fn send_with_retry(&self, batch: &SinkBatch) -> Result<(), OpenSearchSinkError> {
-        let events = batch.events();
-        if events.is_empty() {
-            return Ok(());
-        }
-        // TRUNCATE first, then the batch's remaining writes — a clear must
-        // never wipe rows that arrived after it in the same batch.
-        if events.iter().any(is_target_clear) {
-            self.apply_target_clears(events).await?;
-        }
-
+    /// Drain one contiguous range of non-clear events through the bulk
+    /// API, bisecting on request-size failures. Offsets in `permanent`
+    /// are absolute within the dispatcher batch.
+    async fn send_bulk_range(
+        &self,
+        events: &[ventstream_core::Event],
+        range: std::ops::Range<usize>,
+        permanent: &mut Vec<ventstream_core::FailedItem>,
+    ) -> Result<(), OpenSearchSinkError> {
         let mut ranges = VecDeque::new();
-        ranges.push_back(0..events.len());
-        let mut permanent: Vec<ventstream_core::FailedItem> = Vec::new();
+        ranges.push_back(range);
         while let Some(range) = ranges.pop_front() {
             let Some(attempt) = events.get(range.clone()) else {
                 return Err(OpenSearchSinkError::Internal(
@@ -288,7 +289,42 @@ impl OpenSearchSink {
                 }
             }
         }
+        Ok(())
+    }
 
+    /// Send a dispatcher batch, bisecting only when the exact encoded body
+    /// exceeds OpenSearch's configured request limit, and applying any
+    /// target clears at their position in the event stream.
+    ///
+    /// Successful chunks are never re-sent. Failures retain offsets into the
+    /// original dispatcher batch so DLQ routing remains precise.
+    async fn send_with_retry(&self, batch: &SinkBatch) -> Result<(), OpenSearchSinkError> {
+        let events = batch.events();
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut permanent: Vec<ventstream_core::FailedItem> = Vec::new();
+
+        // A clear must be applied exactly where it sits in the stream:
+        // writes BEFORE it are removed by it, writes AFTER it survive.
+        // Hoisting clears to the front of the batch would leave a row
+        // written before the TRUNCATE alive after it.
+        let mut segment_start = 0usize;
+        for (index, event) in events.iter().enumerate() {
+            if !is_target_clear(event) {
+                continue;
+            }
+            if index > segment_start {
+                self.send_bulk_range(events, segment_start..index, &mut permanent)
+                    .await?;
+            }
+            self.apply_target_clear(event).await?;
+            segment_start = index + 1;
+        }
+        if segment_start < events.len() {
+            self.send_bulk_range(events, segment_start..events.len(), &mut permanent)
+                .await?;
+        }
         if permanent.is_empty() {
             return Ok(());
         }
@@ -338,7 +374,18 @@ impl OpenSearchSink {
                 events
             };
             if encoded.is_none() {
-                encoded = Some(self.encode_attempt(attempt, rendered_at)?);
+                let prepared = self.encode_attempt(attempt, rendered_at)?;
+                // Nothing to send: every event in this slice was handled
+                // outside the bulk API (a target clear). Posting a
+                // zero-byte NDJSON body is a hard 400, which would fail
+                // the batch closed — and a batch consisting only of a
+                // clear is the COMMON shape, because the denormalizer
+                // follows a TRUNCATE with a rebuild that reads the
+                // just-emptied table and emits nothing.
+                if prepared.0.is_empty() {
+                    return Ok(());
+                }
+                encoded = Some(prepared);
             }
             let Some((body, item_event_offsets)) = encoded.as_ref().cloned() else {
                 return Err(OpenSearchSinkError::Internal(

@@ -236,9 +236,15 @@ impl CompiledView {
         }
     }
 
+    /// `payload` is the value to store — the CDC update envelope already
+    /// unwrapped by the caller. Taking it as a parameter (rather than
+    /// reading `event.payload` here) keeps the stored bytes identical to
+    /// the ones the caller size-checked, and stops a flat-CDC update
+    /// materializing `{"new":…,"old":…}` into the view.
     pub(super) fn materialize(
         &self,
         event: &Event,
+        payload: &bytes::Bytes,
         document: Option<&Value>,
         max_key_bytes: usize,
         max_payload_bytes: usize,
@@ -281,13 +287,13 @@ impl CompiledView {
 
         let payload = match &self.value {
             RedisViewValue::Document => {
-                if event.payload.len() > max_payload_bytes {
+                if payload.len() > max_payload_bytes {
                     return Err(format!(
                         "Redis view {} value exceeds the remaining per-event batch budget of {max_payload_bytes} bytes",
                         self.name
                     ));
                 }
-                event.payload.as_bytes()
+                payload.clone()
             }
             RedisViewValue::Pointer(path) => {
                 let selected = document
@@ -767,13 +773,56 @@ mod tests {
     }
 
     #[test]
+    fn document_views_store_the_unwrapped_update_row() {
+        // Flat CDC updates arrive as {"new":…,"old":…}. The caller unwraps
+        // and hands the row in; storing `event.payload` here would put the
+        // envelope into the view — silently wrong data, and it would also
+        // mean the size check measured different bytes than were written.
+        let mut spec = view();
+        spec.filter = None;
+        spec.value = RedisViewValue::Document;
+        let compiled = CompiledViews::compile(&[spec]).expect("compile view");
+        let row = br#"{"id":"ord-1","status":"pending"}"#;
+        let envelope =
+            r#"{"new":{"id":"ord-1","status":"pending"},"old":{"id":"ord-1","status":"new"}}"#;
+        let event = event(envelope);
+        let document: Value = serde_json::from_slice(row).expect("row JSON");
+        let selected = compiled.matching(&event).next().expect("matching view");
+        let materialization = selected
+            .materialize(
+                &event,
+                &Bytes::from_static(row),
+                Some(&document),
+                16 * 1024,
+                8 * 1024 * 1024,
+            )
+            .expect("materialize");
+        match materialization {
+            ViewMaterialization::Upsert { payload, .. } => {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&payload).expect("stored JSON"),
+                    serde_json::json!({"id":"ord-1","status":"pending"}),
+                    "the view must store the row, not the CDC envelope"
+                );
+            }
+            ViewMaterialization::Remove => unreachable!("expected an upsert"),
+        }
+    }
+
+    #[test]
     fn view_filters_renders_and_projects_fields() {
         let compiled = CompiledViews::compile(&[view()]).expect("compile view");
         let event = event(r#"{"id":"ord-1","status":"pending","ignored":true}"#);
         let document: Value = serde_json::from_slice(event.payload.as_slice()).expect("JSON");
         let selected = compiled.matching(&event).next().expect("matching view");
         let materialization = selected
-            .materialize(&event, Some(&document), 16 * 1024, 8 * 1024 * 1024)
+            .materialize(
+                &event,
+                &event.payload.as_bytes(),
+                Some(&document),
+                16 * 1024,
+                8 * 1024 * 1024,
+            )
             .expect("materialize");
         let upsert = match materialization {
             ViewMaterialization::Upsert { key_id, payload } => Some((key_id, payload)),
@@ -798,7 +847,13 @@ mod tests {
         let selected = compiled.matching(&event).next().expect("matching view");
         assert!(matches!(
             selected
-                .materialize(&event, Some(&document), 16 * 1024, 8 * 1024 * 1024)
+                .materialize(
+                    &event,
+                    &event.payload.as_bytes(),
+                    Some(&document),
+                    16 * 1024,
+                    8 * 1024 * 1024
+                )
                 .expect("materialize"),
             ViewMaterialization::Remove
         ));
@@ -831,7 +886,13 @@ mod tests {
                 .matching(&event)
                 .next()
                 .expect("matching view")
-                .materialize(&event, Some(&document), 16 * 1024, 8 * 1024 * 1024)
+                .materialize(
+                    &event,
+                    &event.payload.as_bytes(),
+                    Some(&document),
+                    16 * 1024,
+                    8 * 1024 * 1024
+                )
                 .expect("skip missing key"),
             ViewMaterialization::Remove
         ));
@@ -925,7 +986,13 @@ mod tests {
             .matching(&event)
             .next()
             .expect("matching view")
-            .materialize(&event, Some(&document), 16 * 1024, 8 * 1024 * 1024)
+            .materialize(
+                &event,
+                &event.payload.as_bytes(),
+                Some(&document),
+                16 * 1024,
+                8 * 1024 * 1024,
+            )
             .expect("materialize");
         let upsert = match materialization {
             ViewMaterialization::Upsert { key_id, payload } => Some((key_id, payload)),
@@ -977,7 +1044,13 @@ mod tests {
             .matching(&event)
             .next()
             .expect("matching view")
-            .materialize(&event, Some(&document), 128, 8 * 1024 * 1024)
+            .materialize(
+                &event,
+                &event.payload.as_bytes(),
+                Some(&document),
+                128,
+                8 * 1024 * 1024,
+            )
             .expect_err("expanded key must be bounded while rendering");
 
         assert!(error.contains("128-byte key limit"));
@@ -1000,7 +1073,13 @@ mod tests {
             .matching(&event)
             .next()
             .expect("matching view")
-            .materialize(&event, Some(&document), 16 * 1024, 128)
+            .materialize(
+                &event,
+                &event.payload.as_bytes(),
+                Some(&document),
+                16 * 1024,
+                128,
+            )
             .expect_err("duplicated fields must respect the output budget");
 
         assert!(error.contains("128 bytes"));

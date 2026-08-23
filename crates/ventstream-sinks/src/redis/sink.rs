@@ -1417,6 +1417,7 @@ fn prepare_view_batch_with_limits(
                 match view
                     .materialize(
                         event,
+                        &payload,
                         document.as_ref(),
                         config.max_key_bytes,
                         config.max_value_bytes.min(remaining_event_bytes),
@@ -1684,10 +1685,12 @@ async fn execute_fenced_pipeline(
                     return redis.error_reply('VENTSTREAM_INVALID_OPERATION')
                 end
                 if unversioned then
-                    -- No ordering information: drop any stale claim so a
-                    -- later versioned write isn't compared against a
-                    -- version this value never had.
-                    redis.call('DEL', KEYS[version_key_index])
+                    -- Apply the value but leave the stored version alone.
+                    -- Deleting it would open a stale-write window: a
+                    -- delayed lower-LSN event from a parallel bulk would
+                    -- find nil, not read as stale, and win — and for a
+                    -- tombstone that means a stale insert resurrects the
+                    -- key. Keeping the existing claim is strictly safer.
                 elseif tonumber(ttl) > 0 then
                     redis.call('SET', KEYS[version_key_index], incoming_version, 'PX', ttl)
                 else
@@ -1785,10 +1788,9 @@ async fn execute_fenced_pipeline(
                     end
                 else
                     if unversioned then
-                        -- See the string script: an unversioned write
-                        -- clears the stored version rather than leaving a
-                        -- claim this value never had.
-                        redis.call('DEL', KEYS[version_key_index])
+                        -- See the string script: leave the stored version
+                        -- untouched so a delayed lower-LSN write is still
+                        -- rejected as stale.
                     elseif tonumber(ttl) > 0 then
                         redis.call('SET', KEYS[version_key_index], incoming_version, 'PX', ttl)
                     else

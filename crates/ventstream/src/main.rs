@@ -2326,10 +2326,25 @@ async fn build_and_run_pg_sql_denormalize_engine(
         inner_shutdown.cancel();
     }
     let _ = denorm_handle.await;
-    let _ = dispatcher_handle.await;
+    // The dispatcher's verdict is NOT discardable. When it fails closed,
+    // events exist in neither the sink nor the DLQ and it cancels the
+    // inner token — which makes the source exit cleanly. Dropping this
+    // result would report that as a clean pause, and the supervisor
+    // would rebuild the engine immediately, forever, at exit code 0.
+    let dispatcher_result = dispatcher_handle.await;
     memory_shutdown.cancel();
     if let Some(handle) = memory_monitor {
         let _ = handle.await;
+    }
+
+    match dispatcher_result {
+        Ok(Err(err)) => {
+            return Err(anyhow!(err).context("pg sql-denormalize dispatcher"));
+        }
+        Err(join_err) => {
+            return Err(anyhow!(join_err).context("pg sql-denormalize dispatcher panicked"));
+        }
+        Ok(Ok(())) => {}
     }
 
     match source_result {
@@ -2949,10 +2964,25 @@ async fn build_and_run_mysql_sql_denormalize_engine(
         inner_shutdown.cancel();
     }
     let _ = denorm_handle.await;
-    let _ = dispatcher_handle.await;
+    // The dispatcher's verdict is NOT discardable. When it fails closed,
+    // events exist in neither the sink nor the DLQ and it cancels the
+    // inner token — which makes the source exit cleanly. Dropping this
+    // result would report that as a clean pause, and the supervisor
+    // would rebuild the engine immediately, forever, at exit code 0.
+    let dispatcher_result = dispatcher_handle.await;
     memory_shutdown.cancel();
     if let Some(handle) = memory_monitor {
         let _ = handle.await;
+    }
+
+    match dispatcher_result {
+        Ok(Err(err)) => {
+            return Err(anyhow!(err).context("mysql sql-denormalize dispatcher"));
+        }
+        Err(join_err) => {
+            return Err(anyhow!(join_err).context("mysql sql-denormalize dispatcher panicked"));
+        }
+        Ok(Ok(())) => {}
     }
 
     match source_result {
@@ -3487,17 +3517,29 @@ fn config_spec_path(
 /// ambiguous, and in every case the sharing is a config mistake worth
 /// naming rather than silently tolerating.
 fn validate_related_ids_unique(joins: &[JoinDefinition]) -> Result<()> {
-    let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    for def in joins {
-        let def_name = def.effective_name();
+    // Keyed on definition INDEX, not name: `effective_name()` falls back
+    // to the primary table, so two unnamed definitions over the same
+    // table report the same name — and a name-based guard would exempt
+    // exactly the case the primary-table filter also cannot separate
+    // (both share the table). Indexing also catches the same id twice
+    // inside one definition, which a name comparison permits.
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (index, def) in joins.iter().enumerate() {
         for rel in &def.related {
-            if let Some(previous) = seen.insert(rel.id.as_str(), def_name) {
-                if previous != def_name {
-                    return Err(anyhow!(
-                        "join definitions `{previous}` and `{def_name}` both declare a related                          entry with id `{}`. Related ids key the shared reverse indexes, so they                          must be unique across the whole spec — rename one of them",
-                        rel.id
-                    ));
-                }
+            if let Some(previous) = seen.insert(rel.id.as_str(), index) {
+                let previous_name = joins
+                    .get(previous)
+                    .map_or("<unknown>", |def| def.effective_name());
+                return Err(anyhow!(
+                    "related id `{}` is declared more than once (join definitions #{} `{}` and \
+                     #{} `{}`). Related ids key the shared reverse indexes, so they must be \
+                     unique across the whole spec — rename one of them",
+                    rel.id,
+                    previous + 1,
+                    previous_name,
+                    index + 1,
+                    def.effective_name()
+                ));
             }
         }
     }
@@ -7111,6 +7153,96 @@ joins:
             RealtimeBrokerProvider::RedisStreams
         );
         assert!(parse_realtime_provider("kafka").is_err());
+    }
+
+    #[test]
+    fn duplicate_related_ids_are_rejected_even_for_unnamed_definitions() {
+        // `effective_name()` falls back to the primary table, so two
+        // unnamed definitions over the same table share a name — a
+        // name-based guard exempts exactly the case the primary-table
+        // filter also cannot separate.
+        let spec = r#"
+joins:
+  - primary:
+      table: shop.orders
+      pk: id
+    target:
+      index: idx_a
+    related:
+      - id: customer
+        table: shop.customers
+        pk: customer_id
+        join_on: { from: customer_id, to: customer_id }
+        embed_as: customer
+        cardinality: one
+  - primary:
+      table: shop.orders
+      pk: id
+    target:
+      index: idx_b
+    related:
+      - id: customer
+        table: shop.people
+        pk: person_id
+        join_on: { from: person_id, to: person_id }
+        embed_as: person
+        cardinality: one
+"#;
+        let parsed: JoinsFile = serde_yaml::from_str(spec).expect("parse spec");
+        let err = validate_related_ids_unique(&parsed.joins)
+            .expect_err("duplicate related id across unnamed definitions must be rejected");
+        assert!(err.to_string().contains("customer"), "{err}");
+
+        // The same id twice inside ONE definition is equally ambiguous.
+        let same_def = r#"
+joins:
+  - name: orders
+    primary:
+      table: shop.orders
+      pk: id
+    related:
+      - id: customer
+        table: shop.customers
+        pk: customer_id
+        join_on: { from: customer_id, to: customer_id }
+        embed_as: a
+        cardinality: one
+      - id: customer
+        table: shop.people
+        pk: person_id
+        join_on: { from: person_id, to: person_id }
+        embed_as: b
+        cardinality: one
+"#;
+        let parsed: JoinsFile = serde_yaml::from_str(same_def).expect("parse spec");
+        assert!(validate_related_ids_unique(&parsed.joins).is_err());
+
+        // Distinct ids are fine.
+        let ok = r#"
+joins:
+  - primary:
+      table: shop.orders
+      pk: id
+    related:
+      - id: customer
+        table: shop.customers
+        pk: customer_id
+        join_on: { from: customer_id, to: customer_id }
+        embed_as: customer
+        cardinality: one
+  - primary:
+      table: shop.orders
+      pk: id
+    related:
+      - id: person
+        table: shop.people
+        pk: person_id
+        join_on: { from: person_id, to: person_id }
+        embed_as: person
+        cardinality: one
+"#;
+        let parsed: JoinsFile = serde_yaml::from_str(ok).expect("parse spec");
+        validate_related_ids_unique(&parsed.joins).expect("distinct ids are valid");
     }
 
     #[test]
