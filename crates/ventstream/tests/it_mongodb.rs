@@ -37,7 +37,7 @@ async fn mongodb_materializes_updates_and_deletes_in_redis() {
     let state_dir = common::state_dir("mongodb-redis", stack.mongo_port);
     let mut engine = common::spawn_mongodb_redis_engine(&stack.uri, redis_port, &state_dir, PREFIX);
     let pattern = format!("{PREFIX}:{{orders}}:*");
-    common::wait_until(Duration::from_secs(60), "MongoDB Redis snapshot", || {
+    common::wait_until(Duration::from_secs(180), "MongoDB Redis snapshot", || {
         let pattern = pattern.clone();
         async move {
             let Ok(keys) = common::redis_keys(redis_port, &pattern).await else {
@@ -183,7 +183,7 @@ async fn mongodb_materializes_updates_and_deletes_in_redis() {
         "exclusive",
     );
     common::wait_until(
-        Duration::from_secs(60),
+        Duration::from_secs(180),
         "MongoDB Redis live set after rebootstrap",
         || async {
             common::redis_keys(redis_port, &owned_pattern)

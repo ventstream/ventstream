@@ -195,6 +195,7 @@ impl KafkaCdcSource {
         let mut tracker = OffsetTracker::new();
         let mut commit =
             tokio::time::interval(self.config.commit_interval.max(Duration::from_millis(50)));
+        let lag_probe_inflight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut lag_probe = tokio::time::interval(Duration::from_secs(30));
         lag_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         commit.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -213,9 +214,18 @@ impl KafkaCdcSource {
                     // Sync broker round-trips (fetch_watermarks) on a
                     // blocking-pool thread — block_in_place would still
                     // stall THIS task (and consumption) on a slow
-                    // broker; spawn_blocking never does.
-                    let probe = std::sync::Arc::clone(&consumer);
-                    tokio::task::spawn_blocking(move || record_consumer_lag(&probe));
+                    // broker; spawn_blocking never does. The in-flight
+                    // guard drops ticks while a probe is still running,
+                    // so a broker slower than the cadence can't pile up
+                    // blocking-pool tasks.
+                    if !lag_probe_inflight.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        let probe = std::sync::Arc::clone(&consumer);
+                        let inflight = std::sync::Arc::clone(&lag_probe_inflight);
+                        tokio::task::spawn_blocking(move || {
+                            record_consumer_lag(&probe);
+                            inflight.store(false, std::sync::atomic::Ordering::Release);
+                        });
+                    }
                 }
                 recv = consumer.recv() => {
                     let owned = match recv {
