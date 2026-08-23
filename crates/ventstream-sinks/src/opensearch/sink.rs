@@ -38,17 +38,18 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use super::index_template;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
 use rand::Rng;
 use reqwest::{header, StatusCode};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use ventstream_core::{
     Sink, SinkBatch, SinkError, SinkFailureGuard, SinkHealth, SinkHealthSnapshot,
 };
 
-use super::bulk::{self, BulkResponse};
+use super::bulk::{self, is_target_clear, BulkResponse};
 use super::config::{AuthMode, OpenSearchConfig};
 use super::retry::BackoffSchedule;
 use crate::error::OpenSearchSinkError;
@@ -173,10 +174,74 @@ impl OpenSearchSink {
     ///
     /// Successful chunks are never re-sent. Failures retain offsets into the
     /// original dispatcher batch so DLQ routing remains precise.
+    /// Apply target-clear (TRUNCATE) events by emptying the index.
+    ///
+    /// These can't ride the bulk API — there's no "clear the index" bulk
+    /// action — and before this they fell through into the index branch
+    /// and were written as `{}` documents under generated ids, while
+    /// every pre-truncate document survived. Delete-by-query is the
+    /// documented way to empty an index in place, and it keeps the index
+    /// and its mappings intact for the rows that arrive next.
+    async fn apply_target_clears(
+        &self,
+        events: &[ventstream_core::Event],
+    ) -> Result<(), OpenSearchSinkError> {
+        let now = chrono::Utc::now();
+        let mut cleared: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for event in events.iter().filter(|event| is_target_clear(event)) {
+            let index = index_template::render(&self.config.index_template, event, now)?;
+            if !cleared.insert(index.clone()) {
+                continue;
+            }
+            let url = format!(
+                "{}/{}/_delete_by_query?refresh=true&conflicts=proceed",
+                self.config.endpoint.trim_end_matches('/'),
+                index
+            );
+            let response = self
+                .client
+                .post(&url)
+                .json(&serde_json::json!({"query": {"match_all": {}}}))
+                .send()
+                .await
+                .map_err(|err| OpenSearchSinkError::Transport(err.to_string()))?;
+            let status = response.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                // Nothing to clear: the index was never created.
+                continue;
+            }
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(
+                    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    {
+                        OpenSearchSinkError::Server {
+                            status: status.as_u16(),
+                            message: body,
+                            retry_after: None,
+                        }
+                    } else {
+                        OpenSearchSinkError::Client {
+                            status: status.as_u16(),
+                            message: body,
+                        }
+                    },
+                );
+            }
+            info!(index = %index, "cleared opensearch index for source TRUNCATE");
+        }
+        Ok(())
+    }
+
     async fn send_with_retry(&self, batch: &SinkBatch) -> Result<(), OpenSearchSinkError> {
         let events = batch.events();
         if events.is_empty() {
             return Ok(());
+        }
+        // TRUNCATE first, then the batch's remaining writes — a clear must
+        // never wipe rows that arrived after it in the same batch.
+        if events.iter().any(is_target_clear) {
+            self.apply_target_clears(events).await?;
         }
 
         let mut ranges = VecDeque::new();
@@ -541,6 +606,21 @@ enum SendOutcome {
 /// Pure (no I/O) so the transient/permanent split is unit-testable without a
 /// live HTTP server. Only known document-level errors are permanent. Unknown
 /// item failures fail closed instead of being misclassified into the DLQ.
+/// Collapse per-event duplicates across the three buckets, keeping each
+/// offset exactly once with the least-severe classification
+/// (transient > permanent > blocked). Also de-duplicates within a bucket.
+fn dedupe_by_offset(
+    transient: &mut Vec<ventstream_core::FailedItem>,
+    permanent: &mut Vec<ventstream_core::FailedItem>,
+    blocked: &mut Vec<ventstream_core::FailedItem>,
+) {
+    let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // Order matters: transient wins over permanent, permanent over blocked.
+    for bucket in [&mut *transient, &mut *permanent, &mut *blocked] {
+        bucket.retain(|item| claimed.insert(item.offset));
+    }
+}
+
 fn partition_bulk_items(
     parsed: &BulkResponse,
     item_event_offsets: &[usize],
@@ -594,6 +674,15 @@ fn partition_bulk_items(
             blocked.push(failed);
         }
     }
+    // One event can contribute several bulk actions (a key-changing
+    // update sends a delete plus an index), so the same offset can land
+    // in more than one bucket — and the dispatcher rejects duplicate
+    // offsets as corrupt metadata, failing the pipeline closed and doing
+    // it again on every replay. Collapse per event, and let the least
+    // severe classification win: an event with ANY retryable action must
+    // be retried, never dead-lettered, or we'd both DLQ it and write it.
+    dedupe_by_offset(&mut transient, &mut permanent, &mut blocked);
+
     if transient.is_empty() && permanent.is_empty() && blocked.is_empty() {
         // `errors: true` but every item reads as a success — defensive.
         SendOutcome::AllOk

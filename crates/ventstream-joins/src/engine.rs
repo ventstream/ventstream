@@ -948,6 +948,14 @@ impl JoinEngine {
             let state = self.state.lock();
             affected
                 .iter()
+                // The reverse index is keyed on the bare `related.id`, and
+                // that id is only unique WITHIN a join definition — two
+                // definitions that both name a relation `customer` share
+                // one bucket. Without this filter, a change to the shared
+                // relation re-emits the other definition's rows stamped
+                // with THIS definition's target index: documents written
+                // into the wrong index, with no error anywhere.
+                .filter(|(table, _)| *table == def.primary.table)
                 .filter_map(|(table, pk)| {
                     state.get_primary(table, pk).map(|stored| {
                         (

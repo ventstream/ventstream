@@ -822,7 +822,14 @@ async fn run(
                     .await
                 }
                 CdcSourceConfig::Mysql(my) => {
-                    run_cdc_mysql(*my, cdc.runtime, cdc.joins, shutdown.clone()).await
+                    run_cdc_mysql(
+                        *my,
+                        cdc.runtime,
+                        cdc.joins,
+                        cdc.joins_yaml_text,
+                        shutdown.clone(),
+                    )
+                    .await
                 }
                 CdcSourceConfig::Kafka(k) => {
                     run_cdc_kafka(
@@ -1153,6 +1160,10 @@ struct PgBackend {
     pg: PostgresCdcConfig,
     runtime: CdcRuntime,
     joins: Vec<JoinDefinition>,
+    /// Raw joins spec, folded into the persistent state identity so a
+    /// spec change makes stale state non-recoverable (see
+    /// `joins_spec_suffix`).
+    joins_yaml_text: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -1223,6 +1234,7 @@ impl CdcBackend for PgBackend {
             self.pg.clone(),
             self.runtime.clone(),
             self.joins.clone(),
+            self.joins_yaml_text.clone(),
             inner,
             outer,
         )
@@ -1343,6 +1355,9 @@ struct MysqlBackend {
     config: MySqlCdcConfig,
     runtime: CdcRuntime,
     joins: Vec<JoinDefinition>,
+    /// See `PgBackend::joins_yaml_text` — MySQL had no spec-change check
+    /// at all before this was threaded through.
+    joins_yaml_text: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -1400,6 +1415,7 @@ impl CdcBackend for MysqlBackend {
             self.config.clone(),
             self.runtime.clone(),
             self.joins.clone(),
+            self.joins_yaml_text.clone(),
             inner,
             outer,
         )
@@ -1601,7 +1617,16 @@ async fn run_cdc_postgres(
 
     // Hand off to the shared orchestrator. `pg` already carries any
     // boot-time resync decision made above.
-    run_cdc_loop(PgBackend { pg, runtime, joins }, shutdown).await
+    run_cdc_loop(
+        PgBackend {
+            pg,
+            runtime,
+            joins,
+            joins_yaml_text,
+        },
+        shutdown,
+    )
+    .await
 }
 
 /// Drive a delete-reconciliation pass against OpenSearch for every
@@ -1848,6 +1873,7 @@ async fn build_and_run_pg_engine(
     mut pg: PostgresCdcConfig,
     runtime: CdcRuntime,
     joins: Vec<JoinDefinition>,
+    joins_yaml_text: Option<String>,
     inner_shutdown: ShutdownToken,
     outer_shutdown: ShutdownToken,
 ) -> Result<EngineIterationOutcome> {
@@ -1889,7 +1915,7 @@ async fn build_and_run_pg_engine(
             "VS_PERSIST_BATCH_OPS",
             5_000,
         )?;
-        let identity = postgres_join_state_identity(&pg);
+        let identity = postgres_join_state_identity(&pg, joins_yaml_text.as_deref());
         let mut backend = PersistentBackend::open_with_batch_size(&db_path, persist_batch)
             .with_context(|| format!("opening persistent state at {}", db_path.display()))?;
         let stored_identity = backend
@@ -2179,7 +2205,14 @@ async fn build_and_run_pg_sql_denormalize_engine(
         .await
         .context("building SQL denormalizer")?
         .with_pipeline_health(runtime.pipeline_health.clone());
-    if matches!(runtime.sink.kind(), "redis" | "meilisearch" | "surrealdb") {
+    // Every sink that can express "empty this target" gets the clear
+    // event. OpenSearch was excluded, so a source TRUNCATE reached the
+    // bulk path with no doc id and was indexed as a junk document while
+    // the pre-truncate rows survived forever.
+    if matches!(
+        runtime.sink.kind(),
+        "redis" | "meilisearch" | "surrealdb" | "opensearch" | "elasticsearch"
+    ) {
         denorm = denorm.with_target_clears();
     }
     // Search sinks can serve as a reverse index when the WAL delete
@@ -2565,6 +2598,7 @@ async fn run_cdc_mysql(
     config: MySqlCdcConfig,
     runtime: CdcRuntime,
     joins: Vec<JoinDefinition>,
+    joins_yaml_text: Option<String>,
     shutdown: ShutdownToken,
 ) -> Result<()> {
     ventstream_telemetry::set_phase(ventstream_telemetry::LifecyclePhase::Starting);
@@ -2585,6 +2619,7 @@ async fn run_cdc_mysql(
             config,
             runtime,
             joins,
+            joins_yaml_text,
         },
         shutdown,
     )
@@ -2648,6 +2683,7 @@ async fn build_and_run_mysql_engine(
     config: MySqlCdcConfig,
     runtime: CdcRuntime,
     joins: Vec<JoinDefinition>,
+    joins_yaml_text: Option<String>,
     inner_shutdown: ShutdownToken,
     outer_shutdown: ShutdownToken,
 ) -> Result<EngineIterationOutcome> {
@@ -2672,7 +2708,7 @@ async fn build_and_run_mysql_engine(
             "VS_PERSIST_BATCH_OPS",
             5_000,
         )?;
-        let identity = mysql_join_state_identity(&config);
+        let identity = mysql_join_state_identity(&config, joins_yaml_text.as_deref());
         let mut backend = PersistentBackend::open_with_batch_size(&db_path, persist_batch)
             .with_context(|| format!("opening persistent state at {}", db_path.display()))?;
         let stored_identity = backend
@@ -3442,6 +3478,32 @@ fn config_spec_path(
     config.and_then(selector).cloned()
 }
 
+/// Reject specs where two join definitions reuse a `related.id`.
+///
+/// The reverse indexes are keyed on that id alone, so duplicates share a
+/// bucket across definitions. The re-emit path filters by primary table
+/// so the shared bucket can't produce wrong-index writes — but two
+/// definitions over the SAME primary table reusing an id would still be
+/// ambiguous, and in every case the sharing is a config mistake worth
+/// naming rather than silently tolerating.
+fn validate_related_ids_unique(joins: &[JoinDefinition]) -> Result<()> {
+    let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for def in joins {
+        let def_name = def.effective_name();
+        for rel in &def.related {
+            if let Some(previous) = seen.insert(rel.id.as_str(), def_name) {
+                if previous != def_name {
+                    return Err(anyhow!(
+                        "join definitions `{previous}` and `{def_name}` both declare a related                          entry with id `{}`. Related ids key the shared reverse indexes, so they                          must be unique across the whole spec — rename one of them",
+                        rel.id
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn load_joins_yaml(
     fleet_config: Option<&FleetAppliedConfig>,
     engine_config: Option<&EngineFileConfig>,
@@ -3453,6 +3515,7 @@ fn load_joins_yaml(
             if parsed.joins.is_empty() {
                 warn!("Fleet-applied joins YAML had no `joins:` entries");
             }
+            validate_related_ids_unique(&parsed.joins)?;
             return Ok((parsed.joins, Some(text.to_owned())));
         }
     }
@@ -3465,6 +3528,7 @@ fn load_joins_yaml(
         if parsed.joins.is_empty() {
             warn!(path = %path.display(), "joins YAML had no `joins:` entries");
         }
+        validate_related_ids_unique(&parsed.joins)?;
         return Ok((parsed.joins, Some(text)));
     }
 
@@ -3478,6 +3542,7 @@ fn load_joins_yaml(
             if parsed.joins.is_empty() {
                 warn!(path = %path, "joins YAML had no `joins:` entries");
             }
+            validate_related_ids_unique(&parsed.joins)?;
             Ok((parsed.joins, Some(text)))
         }
     }
@@ -5002,17 +5067,48 @@ fn join_state_dir(engine_config: Option<&EngineFileConfig>) -> Result<Option<Pat
     )
 }
 
-fn postgres_join_state_identity(config: &PostgresCdcConfig) -> String {
+/// Suffix binding a state identity to the joins spec that produced it.
+///
+/// Join state is only meaningful under the spec it was built with:
+/// reordering `join_on` columns changes the encoding of every reverse-index
+/// key, and editing a `related` entry changes what the stored rows mean.
+/// Without this, stale state is replayed verbatim against a new spec and
+/// primaries that are never touched again stay silently wrong forever.
+/// Folding the spec fingerprint into the identity makes that mismatch
+/// non-recoverable, which is the correct outcome — and gives MySQL the
+/// same protection, which it otherwise lacks entirely.
+fn joins_spec_suffix(joins_yaml_text: Option<&str>) -> String {
+    match joins_yaml_text.map(yaml_fingerprint::fingerprint) {
+        Some(Ok(fp)) => format!("#joins={fp}"),
+        // Unreadable spec: fall back to "no spec" rather than inventing a
+        // value, so behaviour matches the pre-spec case instead of
+        // silently accepting whatever state is on disk.
+        Some(Err(_)) | None => String::new(),
+    }
+}
+
+fn postgres_join_state_identity(
+    config: &PostgresCdcConfig,
+    joins_yaml_text: Option<&str>,
+) -> String {
     format!(
-        "postgres://{}:{}/{}#slot={}",
-        config.host, config.port, config.database, config.slot_name
+        "postgres://{}:{}/{}#slot={}{}",
+        config.host,
+        config.port,
+        config.database,
+        config.slot_name,
+        joins_spec_suffix(joins_yaml_text)
     )
 }
 
-fn mysql_join_state_identity(config: &MySqlCdcConfig) -> String {
+fn mysql_join_state_identity(config: &MySqlCdcConfig, joins_yaml_text: Option<&str>) -> String {
     format!(
-        "mysql://{}:{}/{}#server-id={}",
-        config.host, config.port, config.database, config.server_id
+        "mysql://{}:{}/{}#server-id={}{}",
+        config.host,
+        config.port,
+        config.database,
+        config.server_id,
+        joins_spec_suffix(joins_yaml_text)
     )
 }
 
@@ -7015,6 +7111,36 @@ joins:
             RealtimeBrokerProvider::RedisStreams
         );
         assert!(parse_realtime_provider("kafka").is_err());
+    }
+
+    #[test]
+    fn join_state_identity_changes_with_the_joins_spec() {
+        // Join state is only meaningful under the spec that built it:
+        // reordering join_on columns changes the encoding of every
+        // reverse-index key. If the identity ignores the spec, stale
+        // state is replayed verbatim and untouched primaries stay wrong
+        // forever — so a spec edit MUST make the state non-recoverable.
+        let pg = PostgresCdcConfig::new("pg", "h", "u", "p", "db", "pub", "slot");
+        let spec_a =
+            "joins:\n  - name: orders\n    primary:\n      table: public.orders\n      pk: id\n";
+        let spec_b = "joins:\n  - name: orders\n    primary:\n      table: public.orders\n      pk: [id, tenant]\n";
+
+        let id_a = postgres_join_state_identity(&pg, Some(spec_a));
+        let id_b = postgres_join_state_identity(&pg, Some(spec_b));
+        assert_ne!(id_a, id_b, "a spec change must change the state identity");
+        assert!(
+            !join_checkpoint_recoverable(Some(&id_a), &id_b, true),
+            "state built under the old spec must not be recoverable"
+        );
+        // Same spec, same identity — comments/whitespace don't count.
+        assert_eq!(id_a, postgres_join_state_identity(&pg, Some(spec_a)));
+
+        // MySQL gets the same protection; before this it had none.
+        let my = MySqlCdcConfig::new("my", "h", "u", "p", "db", std::path::PathBuf::from("/tmp"));
+        assert_ne!(
+            mysql_join_state_identity(&my, Some(spec_a)),
+            mysql_join_state_identity(&my, Some(spec_b))
+        );
     }
 
     #[test]

@@ -28,7 +28,6 @@
 //! we're just removing the stale ones before it does.
 
 use std::collections::HashSet;
-use std::time::Duration;
 
 use reqwest::{header, StatusCode};
 use serde::Deserialize;
@@ -630,15 +629,19 @@ struct BulkDeleteResult {
     error: serde_json::Value,
 }
 
-fn build_client(_config: &OpenSearchConfig) -> Result<reqwest::Client, ReconcileError> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .connect_timeout(Duration::from_secs(10))
-        .pool_idle_timeout(Duration::from_secs(30))
-        .tcp_keepalive(Duration::from_secs(30))
-        .user_agent(concat!("ventstream-reconciler/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|err| ReconcileError::Client(err.to_string()))
+fn build_client(config: &OpenSearchConfig) -> Result<reqwest::Client, ReconcileError> {
+    // Reconcile/reverse-lookup talks to the SAME cluster as the sink, so
+    // it needs the same TLS settings. Building a default client here made
+    // every lookup fail the handshake on private-CA clusters — and the
+    // caller swallows lookup failures as "this row has no parents", so
+    // child deletes silently stopped propagating while the sink looked
+    // perfectly healthy.
+    crate::util::build_http_client(
+        config.request_timeout,
+        config.verify_tls,
+        config.ca_file.as_deref(),
+    )
+    .map_err(ReconcileError::Client)
 }
 
 fn apply_auth(rb: reqwest::RequestBuilder, auth: &AuthMode) -> reqwest::RequestBuilder {
@@ -652,7 +655,14 @@ fn apply_auth(rb: reqwest::RequestBuilder, auth: &AuthMode) -> reqwest::RequestB
 async fn bad_status(status: StatusCode, response: reqwest::Response) -> ReconcileError {
     let body = response.text().await.unwrap_or_default();
     let truncated = if body.len() > 1024 {
-        format!("{}…", &body[..1024])
+        // Slice on a character boundary: `&body[..1024]` panics when byte
+        // 1024 lands mid-character, which any proxy error page or a key
+        // echoed back with non-ASCII text can produce.
+        let cut = body
+            .char_indices()
+            .nth(1024)
+            .map_or(body.len(), |(index, _)| index);
+        format!("{}…", &body[..cut])
     } else {
         body
     };

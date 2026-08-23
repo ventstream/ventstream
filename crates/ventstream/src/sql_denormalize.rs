@@ -793,9 +793,22 @@ impl SqlDenormalizer {
                     let to = related.join_on.to.columns();
                     match extract_cols(row, to) {
                         Some(to_vals) => {
+                            // An UPDATE that moves a child to a different
+                            // parent has to recompose BOTH parents: the new
+                            // one gains the row, the old one must lose it.
+                            // Without the pre-image the old parent keeps the
+                            // moved child embedded forever, because no later
+                            // event ever mentions it again.
+                            let old_vals = (op == "update")
+                                .then(|| pre_image.as_ref().and_then(|old| extract_cols(old, to)))
+                                .flatten()
+                                .filter(|old| *old != to_vals);
                             if from == pd.def.primary.pk.columns() {
                                 // FK-on-related (1:many): the related row's `to`
                                 // value *is* the primary PK — no extra query.
+                                if let Some(old_vals) = old_vals {
+                                    affected.insert(old_vals);
+                                }
                                 affected.insert(to_vals);
                             } else {
                                 // FK-on-primary (many:1): defer to one coalesced
@@ -803,7 +816,11 @@ impl SqlDenormalizer {
                                 // a burst of distinct parent changes collapses
                                 // into one indexed `= ANY($1)` query instead of
                                 // one round-trip per event.
-                                many1_buckets.entry(rel_idx).or_default().push(to_vals);
+                                let bucket = many1_buckets.entry(rel_idx).or_default();
+                                if let Some(old_vals) = old_vals {
+                                    bucket.push(old_vals);
+                                }
+                                bucket.push(to_vals);
                             }
                         }
                         None => {

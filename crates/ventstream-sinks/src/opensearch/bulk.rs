@@ -171,6 +171,13 @@ fn build_bulk_request_inner(
     };
 
     for (event_offset, event) in events.iter().enumerate() {
+        // Target clears are applied by the sink before the bulk request
+        // (delete-by-query — there's no bulk action for "empty the
+        // index"). Skipping them here is what stops them being written
+        // as junk `{}` documents under generated ids.
+        if is_target_clear(event) {
+            continue;
+        }
         let index = match static_index.as_deref() {
             Some(index) => Cow::Borrowed(index),
             None => Cow::Owned(index_template::render(template, event, now)?),
@@ -291,6 +298,13 @@ fn update_row_body(event: &Event) -> Option<Vec<u8>> {
 /// event in the join engine's primary path was passed through with the
 /// same subject (carrying the row's `old` payload), so we can recognize
 /// it here and emit an OS bulk `delete` action instead of `index`.
+/// True for the TRUNCATE-derived event that asks the sink to empty the
+/// whole target, rather than to write or delete one document.
+pub(crate) fn is_target_clear(event: &ventstream_core::Event) -> bool {
+    event.headers.get("ventstream.target.clear") == Some("true")
+        || event.subject.as_str().ends_with(".truncate")
+}
+
 fn is_delete_event(event: &Event) -> bool {
     event
         .subject
