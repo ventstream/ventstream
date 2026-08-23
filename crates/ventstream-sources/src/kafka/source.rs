@@ -37,6 +37,36 @@ pub struct KafkaCdcSource {
     unmappable_streak: AtomicU64,
 }
 
+/// Engine-side consumer lag: sum over assigned partitions of
+/// (high watermark - current position). Broker-side lag exists too,
+/// but an engine-side gauge means the operator sees a stuck pipeline
+/// from VentStream's own metrics without broker tooling.
+fn record_consumer_lag(consumer: &StreamConsumer) {
+    let Ok(assignment) = consumer.assignment() else {
+        return;
+    };
+    let mut total: i64 = 0;
+    for element in assignment.elements() {
+        let Ok((_, high)) = consumer.fetch_watermarks(
+            element.topic(),
+            element.partition(),
+            std::time::Duration::from_secs(2),
+        ) else {
+            return; // transient broker hiccup — skip this tick
+        };
+        let position = match consumer.position() {
+            Ok(list) => list
+                .find_partition(element.topic(), element.partition())
+                .and_then(|p| p.offset().to_raw()),
+            Err(_) => None,
+        };
+        if let Some(position) = position {
+            total += (high - position).max(0);
+        }
+    }
+    metrics::gauge!("vs_kafka_consumer_lag_messages").set(total as f64);
+}
+
 /// Tolerated run of consecutive unmappable messages before the source
 /// halts. Far above any real poison-record cluster; far below a whole
 /// topic misdecoding.
@@ -98,12 +128,56 @@ impl KafkaCdcSource {
     }
 
     async fn run_inner(&self, ctx: SourceContext) -> Result<(), KafkaCdcError> {
-        let consumer = self.build_consumer()?;
+        let consumer = std::sync::Arc::new(self.build_consumer()?);
         let topics: Vec<&str> = self.config.topics.iter().map(String::as_str).collect();
         if topics.is_empty() {
             return Err(KafkaCdcError::Connection(
                 "no topics configured (VS_KAFKA_TOPICS)".to_owned(),
             ));
+        }
+        // Preflight: prove the brokers are reachable and every
+        // configured topic exists BEFORE subscribing. Without this, a
+        // typo'd topic or dead broker list is an eternal warn-loop that
+        // looks like an idle-but-healthy pipeline.
+        {
+            // Per-topic metadata requests: a cluster-wide fetch pulls
+            // every topic's partition map — needlessly heavy on large
+            // clusters when only the configured few matter.
+            let consumer = &consumer;
+            let mut missing: Vec<&str> = Vec::new();
+            for topic in &topics {
+                let metadata = tokio::task::block_in_place(|| {
+                    consumer.fetch_metadata(Some(topic), std::time::Duration::from_secs(15))
+                })
+                .map_err(|e| {
+                    KafkaCdcError::Connection(format!(
+                        "preflight metadata fetch failed — brokers unreachable or refusing \
+                         the configured security settings ({}): {e}",
+                        self.config.brokers
+                    ))
+                })?;
+                let exists = metadata
+                    .topics()
+                    .iter()
+                    .any(|t| t.name() == *topic && !t.partitions().is_empty());
+                if !exists {
+                    missing.push(topic);
+                }
+            }
+            if !missing.is_empty() {
+                // NOT fatal: with auto-creation enabled the topic is
+                // born on first produce, and starting the consumer
+                // before the producer is a normal deployment order.
+                // The warn covers the typo case — a topic that never
+                // appears is visible here and in the lag gauge.
+                warn!(
+                    source = %self.config.id,
+                    missing = ?missing,
+                    "configured topic(s) not present on the brokers yet — waiting for \
+                     auto-creation; if this persists, check VS_KAFKA_TOPICS for typos or \
+                     create the topic(s) manually"
+                );
+            }
         }
         consumer
             .subscribe(&topics)
@@ -121,6 +195,9 @@ impl KafkaCdcSource {
         let mut tracker = OffsetTracker::new();
         let mut commit =
             tokio::time::interval(self.config.commit_interval.max(Duration::from_millis(50)));
+        let lag_probe_inflight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut lag_probe = tokio::time::interval(Duration::from_secs(30));
+        lag_probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         commit.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
@@ -132,6 +209,23 @@ impl KafkaCdcSource {
                 }
                 _ = commit.tick() => {
                     self.commit_now(&consumer, &mut tracker, CommitMode::Async);
+                }
+                _ = lag_probe.tick() => {
+                    // Sync broker round-trips (fetch_watermarks) on a
+                    // blocking-pool thread — block_in_place would still
+                    // stall THIS task (and consumption) on a slow
+                    // broker; spawn_blocking never does. The in-flight
+                    // guard drops ticks while a probe is still running,
+                    // so a broker slower than the cadence can't pile up
+                    // blocking-pool tasks.
+                    if !lag_probe_inflight.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        let probe = std::sync::Arc::clone(&consumer);
+                        let inflight = std::sync::Arc::clone(&lag_probe_inflight);
+                        tokio::task::spawn_blocking(move || {
+                            record_consumer_lag(&probe);
+                            inflight.store(false, std::sync::atomic::Ordering::Release);
+                        });
+                    }
                 }
                 recv = consumer.recv() => {
                     let owned = match recv {
