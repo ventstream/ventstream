@@ -130,6 +130,15 @@ pub enum DispatcherError {
     #[error("dispatcher internal error: {0}")]
     #[allow(dead_code)]
     Internal(String),
+    /// The ordered committer stopped because a batch could not be made
+    /// durable — a sink failure whose rejects could not be written to the
+    /// DLQ, or a DLQ write/fsync that failed. The source watermark was
+    /// deliberately not advanced, so the affected events will replay on
+    /// restart; this variant exists so that decision reaches the caller
+    /// as an error instead of a clean shutdown (the supervisor treats a
+    /// clean shutdown as a pause and restarts immediately, forever).
+    #[error("dispatcher failed closed: {0}")]
+    FailedClosed(String),
 }
 
 /// Drains an [`EventReceiver`] into a [`Sink`], failing closed for
@@ -278,7 +287,14 @@ impl Dispatcher {
                     if let Err(err) = self.dlq.shutdown().await {
                         warn!(error = %err, "DLQ shutdown reported error");
                     }
-                    return Ok(());
+                    // A fail-closed committer means events exist in neither
+                    // the sink nor the DLQ. Report that as an error so the
+                    // supervisor backs off and alerts, instead of treating
+                    // it as a clean pause and rebuilding immediately forever.
+                    return match committer.fatal_reason() {
+                        Some(reason) => Err(DispatcherError::FailedClosed(reason.to_owned())),
+                        None => Ok(()),
+                    };
                 }
                 // Reap a completed bulk, commit in order, and flush what
                 // accumulated meanwhile — batches grow to full size under
@@ -320,7 +336,14 @@ impl Dispatcher {
                         if let Err(err) = self.dlq.shutdown().await {
                             warn!(error = %err, "DLQ shutdown reported error");
                         }
-                        return Ok(());
+                        // See the shutdown arm above: fail-closed must not
+                        // look like a clean exit.
+                        return match committer.fatal_reason() {
+                            Some(reason) => {
+                                Err(DispatcherError::FailedClosed(reason.to_owned()))
+                            }
+                            None => Ok(()),
+                        };
                     }
 
                     for event in incoming.drain(..) {
@@ -457,6 +480,10 @@ struct OrderedCommitter {
     shutdown: ShutdownToken,
     /// Once failed, stop advancing — the prefix has a permanent hole.
     failed: bool,
+    /// Why the committer stopped, when it stopped for a reason the caller
+    /// must hear about. `None` for a clean cancellation during shutdown,
+    /// which is not an error.
+    fatal: Option<String>,
 }
 
 impl OrderedCommitter {
@@ -472,6 +499,7 @@ impl OrderedCommitter {
             transform_progress,
             shutdown,
             failed: false,
+            fatal: None,
         }
     }
 
@@ -487,7 +515,7 @@ impl OrderedCommitter {
                     error = %err,
                     "batch task panicked; stopping pipeline (watermark cannot advance safely)"
                 );
-                self.fail();
+                self.fail(format!("batch task panicked: {err}"));
             }
         }
     }
@@ -524,7 +552,10 @@ impl OrderedCommitter {
                          pipeline so the source slot is not confirmed past data that lives in \
                          neither the DLQ nor the WAL (will replay on restart)"
                     );
-                    self.fail();
+                    self.fail(format!(
+                        "DLQ not durable for batch {} (writes_ok={writes_ok}, synced={synced})",
+                        entry.seq
+                    ));
                     return;
                 }
                 BatchOutcome::FailedClosed => {
@@ -532,7 +563,7 @@ impl OrderedCommitter {
                         seq = entry.seq,
                         "sink batch failed closed; stopping pipeline without advancing source progress"
                     );
-                    self.fail();
+                    self.fail(format!("sink batch {} failed closed", entry.seq));
                     return;
                 }
                 BatchOutcome::Cancelled => {
@@ -541,16 +572,40 @@ impl OrderedCommitter {
                         "sink batch cancelled during shutdown; source progress remains unchanged"
                     );
                     self.failed = true;
-                    self.pending.clear();
+                    // Drain the rest of the pending map rather than dropping
+                    // it: a higher-seq batch already recorded as failed-closed
+                    // must still set the fatal reason, or a cancellation at a
+                    // lower seq would mask a genuine durability failure and
+                    // the caller would see a clean exit again.
+                    let pending = std::mem::take(&mut self.pending);
+                    for (seq, result) in pending {
+                        if matches!(
+                            result.outcome,
+                            BatchOutcome::FailedClosed | BatchOutcome::NonDurable { .. }
+                        ) {
+                            self.fail(format!(
+                                "batch {seq} was not durable (observed while draining after \
+                                 a cancelled batch)"
+                            ));
+                        }
+                    }
                     return;
                 }
             }
         }
     }
 
-    fn fail(&mut self) {
+    fn fail(&mut self, reason: impl Into<String>) {
         self.failed = true;
+        if self.fatal.is_none() {
+            self.fatal = Some(reason.into());
+        }
         self.shutdown.cancel();
+    }
+
+    /// The failure the caller must propagate, if any.
+    fn fatal_reason(&self) -> Option<&str> {
+        self.fatal.as_deref()
     }
 }
 
@@ -924,6 +979,39 @@ mod tests {
         // A late-arriving result after failure must not advance anything.
         c.commit(durable(3, 400));
         assert_eq!(progress.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn fail_closed_is_reported_as_fatal_but_cancellation_is_not() {
+        // The whole point of failing closed is that events exist in
+        // neither the sink nor the DLQ. If that reaches the caller as a
+        // clean shutdown, the supervisor treats it as a pause and
+        // rebuilds the engine immediately — forever, at exit code 0.
+        let mut c = OrderedCommitter::new(None, None, ShutdownToken::new());
+        c.commit(failed_closed(0, 100));
+        assert!(
+            c.fatal_reason().is_some(),
+            "a failed-closed batch must surface a reason to propagate"
+        );
+
+        // A cancellation during shutdown also stops the committer, but it
+        // is NOT an error — the caller must still see a clean exit.
+        let mut c = OrderedCommitter::new(None, None, ShutdownToken::new());
+        c.commit(BatchResult {
+            seq: 0,
+            max_watermark: 100,
+            max_transform_watermark: 0,
+            outcome: BatchOutcome::Cancelled,
+        });
+        assert!(
+            c.fatal_reason().is_none(),
+            "shutdown cancellation is a clean exit, not a failure"
+        );
+
+        // Non-durable DLQ is fatal for the same reason as failed-closed.
+        let mut c = OrderedCommitter::new(None, None, ShutdownToken::new());
+        c.commit(non_durable(0, 100));
+        assert!(c.fatal_reason().is_some());
     }
 
     #[test]

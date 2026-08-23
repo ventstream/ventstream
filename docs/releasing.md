@@ -21,6 +21,20 @@ The workflow refuses a tag whose version differs from the Cargo workspace and
 Helm chart versions, a commit not reachable from `origin/main`, placeholders or
 floating `latest` defaults, and an existing semantic-version image or chart tag.
 
+## Upgrade notes
+
+### Joins state rebuilds once on upgrade past v0.1.40
+
+The persistent join-state identity now includes a fingerprint of the
+joins spec, so state built under a different spec can no longer be
+replayed against a new one (it produced silently wrong documents for
+primaries that were never touched again). The first start after
+upgrading sees a mismatched identity and rebuilds join state from a
+snapshot — once, per agent. Plan for the extra bootstrap time on large
+joined pipelines; nothing is lost, and subsequent restarts are normal.
+
+MySQL joined pipelines gain this protection for the first time.
+
 ## Published artifacts
 
 A tag such as `v0.1.12` publishes:

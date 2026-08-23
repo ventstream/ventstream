@@ -1372,10 +1372,17 @@ fn prepare_view_batch_with_limits(
         };
         let source_version = durable_source_version(event).map_err(SinkError::Blocked)?;
         let delete = is_delete_event(event);
-        if !delete && event.payload.len() > config.max_value_bytes {
+        // Flat CDC updates arrive as a `{"new":…, "old":…}` envelope. The
+        // direct path unwraps it; the view path used to parse the payload
+        // raw, so every key template (`${json:/id}` and friends) looked
+        // for its field beside `new`/`old` and failed to resolve — which
+        // meant every UPDATE either halted the pipeline or silently
+        // deleted the view entry, depending on `on_missing`.
+        let payload = upsert_payload(event);
+        if !delete && payload.len() > config.max_value_bytes {
             return Err(SinkError::Blocked(format!(
                 "Redis view source value is {} bytes; max_value_bytes={}; delivery cannot advance while an older materialization may remain visible",
-                event.payload.len(),
+                payload.len(),
                 config.max_value_bytes
             )));
         }
@@ -1384,7 +1391,7 @@ fn prepare_view_batch_with_limits(
             && (config.document_format == RedisDocumentFormat::Json
                 || matching.iter().any(|view| view.requires_json()));
         let document = if requires_json {
-            match serde_json::from_slice::<serde_json::Value>(event.payload.as_slice()) {
+            match serde_json::from_slice::<serde_json::Value>(payload.as_ref()) {
                 Ok(document) => Some(document),
                 Err(error) => {
                     return Err(SinkError::Blocked(format!(
@@ -1410,6 +1417,7 @@ fn prepare_view_batch_with_limits(
                 match view
                     .materialize(
                         event,
+                        &payload,
                         document.as_ref(),
                         config.max_key_bytes,
                         config.max_value_bytes.min(remaining_event_bytes),
@@ -1653,9 +1661,17 @@ async fn execute_fenced_pipeline(
             if stored_version and not string.match(stored_version, '^%d+$') then
                 return redis.error_reply('VENTSTREAM_INVALID_STORED_VERSION')
             end
-            local stale = stored_version and (
-                incoming_version == '' or stored_is_newer(stored_version, incoming_version)
-            )
+            -- An event with no version is not stale, just unordered.
+            -- Treating it as stale silently dropped every snapshot row,
+            -- every Kafka event without a source version, and every SDK
+            -- write onto a key the WAL had touched: the sink returned OK
+            -- and the value never changed. Unversioned writes now win
+            -- unconditionally, and clear the stored version so the key
+            -- stops claiming an ordering it no longer has.
+            local unversioned = incoming_version == ''
+            local stale = (not unversioned)
+                and stored_version
+                and stored_is_newer(stored_version, incoming_version)
             if stale then
                 results[#results + 1] = 'STALE'
             else
@@ -1668,12 +1684,17 @@ async fn execute_fenced_pipeline(
                 else
                     return redis.error_reply('VENTSTREAM_INVALID_OPERATION')
                 end
-                if incoming_version ~= '' then
-                    if tonumber(ttl) > 0 then
-                        redis.call('SET', KEYS[version_key_index], incoming_version, 'PX', ttl)
-                    else
-                        redis.call('SET', KEYS[version_key_index], incoming_version)
-                    end
+                if unversioned then
+                    -- Apply the value but leave the stored version alone.
+                    -- Deleting it would open a stale-write window: a
+                    -- delayed lower-LSN event from a parallel bulk would
+                    -- find nil, not read as stale, and win — and for a
+                    -- tombstone that means a stale insert resurrects the
+                    -- key. Keeping the existing claim is strictly safer.
+                elseif tonumber(ttl) > 0 then
+                    redis.call('SET', KEYS[version_key_index], incoming_version, 'PX', ttl)
+                else
+                    redis.call('SET', KEYS[version_key_index], incoming_version)
                 end
                 results[#results + 1] = 'OK'
             end
@@ -1712,9 +1733,17 @@ async fn execute_fenced_pipeline(
             if stored_version and not string.match(stored_version, '^%d+$') then
                 return redis.error_reply('VENTSTREAM_INVALID_STORED_VERSION')
             end
-            local stale = stored_version and (
-                incoming_version == '' or stored_is_newer(stored_version, incoming_version)
-            )
+            -- An event with no version is not stale, just unordered.
+            -- Treating it as stale silently dropped every snapshot row,
+            -- every Kafka event without a source version, and every SDK
+            -- write onto a key the WAL had touched: the sink returned OK
+            -- and the value never changed. Unversioned writes now win
+            -- unconditionally, and clear the stored version so the key
+            -- stops claiming an ordering it no longer has.
+            local unversioned = incoming_version == ''
+            local stale = (not unversioned)
+                and stored_version
+                and stored_is_newer(stored_version, incoming_version)
             if stale then
                 results[#results + 1] = 'STALE'
             else
@@ -1758,12 +1787,14 @@ async fn execute_fenced_pipeline(
                         return redis.error_reply(result.err)
                     end
                 else
-                    if incoming_version ~= '' then
-                        if tonumber(ttl) > 0 then
-                            redis.call('SET', KEYS[version_key_index], incoming_version, 'PX', ttl)
-                        else
-                            redis.call('SET', KEYS[version_key_index], incoming_version)
-                        end
+                    if unversioned then
+                        -- See the string script: leave the stored version
+                        -- untouched so a delayed lower-LSN write is still
+                        -- rejected as stale.
+                    elseif tonumber(ttl) > 0 then
+                        redis.call('SET', KEYS[version_key_index], incoming_version, 'PX', ttl)
+                    else
+                        redis.call('SET', KEYS[version_key_index], incoming_version)
                     end
                     results[#results + 1] = 'OK'
                 end
@@ -1933,9 +1964,17 @@ async fn execute_fenced_view_pipeline(
             if stored_version and not string.match(stored_version, '^%d+$') then
                 return redis.error_reply('VENTSTREAM_INVALID_STORED_VERSION')
             end
-            local stale = stored_version and (
-                incoming_version == '' or stored_is_newer(stored_version, incoming_version)
-            )
+            -- An event with no version is not stale, just unordered.
+            -- Treating it as stale silently dropped every snapshot row,
+            -- every Kafka event without a source version, and every SDK
+            -- write onto a key the WAL had touched: the sink returned OK
+            -- and the value never changed. Unversioned writes now win
+            -- unconditionally, and clear the stored version so the key
+            -- stops claiming an ordering it no longer has.
+            local unversioned = incoming_version == ''
+            local stale = (not unversioned)
+                and stored_version
+                and stored_is_newer(stored_version, incoming_version)
             if stale then
                 accepted[command_index] = false
                 stale_count = stale_count + 1

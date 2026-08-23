@@ -38,17 +38,18 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use super::index_template;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
 use rand::Rng;
 use reqwest::{header, StatusCode};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use ventstream_core::{
     Sink, SinkBatch, SinkError, SinkFailureGuard, SinkHealth, SinkHealthSnapshot,
 };
 
-use super::bulk::{self, BulkResponse};
+use super::bulk::{self, is_target_clear, BulkResponse};
 use super::config::{AuthMode, OpenSearchConfig};
 use super::retry::BackoffSchedule;
 use crate::error::OpenSearchSinkError;
@@ -168,20 +169,85 @@ impl OpenSearchSink {
         })
     }
 
-    /// Send a dispatcher batch, bisecting only when the exact encoded body
-    /// exceeds OpenSearch's configured request limit.
+    /// Apply one target-clear (TRUNCATE) event.
     ///
-    /// Successful chunks are never re-sent. Failures retain offsets into the
-    /// original dispatcher batch so DLQ routing remains precise.
-    async fn send_with_retry(&self, batch: &SinkBatch) -> Result<(), OpenSearchSinkError> {
-        let events = batch.events();
-        if events.is_empty() {
+    /// Scoped by document-id prefix rather than `match_all`: doc ids are
+    /// `{schema}.{table}:{pk}`, so the prefix removes exactly the
+    /// truncated relation's documents. A `match_all` would wipe every
+    /// other relation sharing the index — the same hazard the Redis sink
+    /// refuses outright under shared routing.
+    ///
+    /// Clears can't ride the bulk API (there is no "empty the target"
+    /// bulk action), and before this they fell through into the index
+    /// branch and were written as `{}` documents under generated ids
+    /// while every pre-truncate document survived.
+    async fn apply_target_clear(
+        &self,
+        event: &ventstream_core::Event,
+    ) -> Result<(), OpenSearchSinkError> {
+        let now = chrono::Utc::now();
+        let index = index_template::render(&self.config.index_template, event, now)?;
+        // Reconstruct the qualified table the doc ids were built from.
+        let (Some(namespace), Some(relation)) = (
+            event.headers.get("ventstream.cdc.namespace"),
+            event.headers.get("ventstream.cdc.relation"),
+        ) else {
+            return Err(OpenSearchSinkError::Internal(format!(
+                "target-clear event {} has no namespace/relation headers; refusing to clear \
+                 `{index}` because the delete cannot be scoped to the truncated relation",
+                event.id
+            )));
+        };
+        let prefix = format!("{namespace}.{relation}:");
+        let url = format!(
+            "{}/{}/_delete_by_query?refresh=true&conflicts=proceed",
+            self.config.endpoint.trim_end_matches('/'),
+            index
+        );
+        let response = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({"query": {"prefix": {"_id": prefix}}}))
+            .send()
+            .await
+            .map_err(|err| OpenSearchSinkError::Transport(err.to_string()))?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            // Nothing to clear: the index was never created.
             return Ok(());
         }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(
+                if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    OpenSearchSinkError::Server {
+                        status: status.as_u16(),
+                        message: body,
+                        retry_after: None,
+                    }
+                } else {
+                    OpenSearchSinkError::Client {
+                        status: status.as_u16(),
+                        message: body,
+                    }
+                },
+            );
+        }
+        info!(index = %index, prefix = %prefix, "cleared opensearch documents for source TRUNCATE");
+        Ok(())
+    }
 
+    /// Drain one contiguous range of non-clear events through the bulk
+    /// API, bisecting on request-size failures. Offsets in `permanent`
+    /// are absolute within the dispatcher batch.
+    async fn send_bulk_range(
+        &self,
+        events: &[ventstream_core::Event],
+        range: std::ops::Range<usize>,
+        permanent: &mut Vec<ventstream_core::FailedItem>,
+    ) -> Result<(), OpenSearchSinkError> {
         let mut ranges = VecDeque::new();
-        ranges.push_back(0..events.len());
-        let mut permanent: Vec<ventstream_core::FailedItem> = Vec::new();
+        ranges.push_back(range);
         while let Some(range) = ranges.pop_front() {
             let Some(attempt) = events.get(range.clone()) else {
                 return Err(OpenSearchSinkError::Internal(
@@ -223,7 +289,42 @@ impl OpenSearchSink {
                 }
             }
         }
+        Ok(())
+    }
 
+    /// Send a dispatcher batch, bisecting only when the exact encoded body
+    /// exceeds OpenSearch's configured request limit, and applying any
+    /// target clears at their position in the event stream.
+    ///
+    /// Successful chunks are never re-sent. Failures retain offsets into the
+    /// original dispatcher batch so DLQ routing remains precise.
+    async fn send_with_retry(&self, batch: &SinkBatch) -> Result<(), OpenSearchSinkError> {
+        let events = batch.events();
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut permanent: Vec<ventstream_core::FailedItem> = Vec::new();
+
+        // A clear must be applied exactly where it sits in the stream:
+        // writes BEFORE it are removed by it, writes AFTER it survive.
+        // Hoisting clears to the front of the batch would leave a row
+        // written before the TRUNCATE alive after it.
+        let mut segment_start = 0usize;
+        for (index, event) in events.iter().enumerate() {
+            if !is_target_clear(event) {
+                continue;
+            }
+            if index > segment_start {
+                self.send_bulk_range(events, segment_start..index, &mut permanent)
+                    .await?;
+            }
+            self.apply_target_clear(event).await?;
+            segment_start = index + 1;
+        }
+        if segment_start < events.len() {
+            self.send_bulk_range(events, segment_start..events.len(), &mut permanent)
+                .await?;
+        }
         if permanent.is_empty() {
             return Ok(());
         }
@@ -273,7 +374,18 @@ impl OpenSearchSink {
                 events
             };
             if encoded.is_none() {
-                encoded = Some(self.encode_attempt(attempt, rendered_at)?);
+                let prepared = self.encode_attempt(attempt, rendered_at)?;
+                // Nothing to send: every event in this slice was handled
+                // outside the bulk API (a target clear). Posting a
+                // zero-byte NDJSON body is a hard 400, which would fail
+                // the batch closed — and a batch consisting only of a
+                // clear is the COMMON shape, because the denormalizer
+                // follows a TRUNCATE with a rebuild that reads the
+                // just-emptied table and emits nothing.
+                if prepared.0.is_empty() {
+                    return Ok(());
+                }
+                encoded = Some(prepared);
             }
             let Some((body, item_event_offsets)) = encoded.as_ref().cloned() else {
                 return Err(OpenSearchSinkError::Internal(
@@ -541,6 +653,21 @@ enum SendOutcome {
 /// Pure (no I/O) so the transient/permanent split is unit-testable without a
 /// live HTTP server. Only known document-level errors are permanent. Unknown
 /// item failures fail closed instead of being misclassified into the DLQ.
+/// Collapse per-event duplicates across the three buckets, keeping each
+/// offset exactly once with the least-severe classification
+/// (transient > permanent > blocked). Also de-duplicates within a bucket.
+fn dedupe_by_offset(
+    transient: &mut Vec<ventstream_core::FailedItem>,
+    permanent: &mut Vec<ventstream_core::FailedItem>,
+    blocked: &mut Vec<ventstream_core::FailedItem>,
+) {
+    let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // Order matters: transient wins over permanent, permanent over blocked.
+    for bucket in [&mut *transient, &mut *permanent, &mut *blocked] {
+        bucket.retain(|item| claimed.insert(item.offset));
+    }
+}
+
 fn partition_bulk_items(
     parsed: &BulkResponse,
     item_event_offsets: &[usize],
@@ -594,6 +721,15 @@ fn partition_bulk_items(
             blocked.push(failed);
         }
     }
+    // One event can contribute several bulk actions (a key-changing
+    // update sends a delete plus an index), so the same offset can land
+    // in more than one bucket — and the dispatcher rejects duplicate
+    // offsets as corrupt metadata, failing the pipeline closed and doing
+    // it again on every replay. Collapse per event, and let the least
+    // severe classification win: an event with ANY retryable action must
+    // be retried, never dead-lettered, or we'd both DLQ it and write it.
+    dedupe_by_offset(&mut transient, &mut permanent, &mut blocked);
+
     if transient.is_empty() && permanent.is_empty() && blocked.is_empty() {
         // `errors: true` but every item reads as a success — defensive.
         SendOutcome::AllOk
