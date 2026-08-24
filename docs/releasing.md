@@ -37,12 +37,12 @@ MySQL joined pipelines gain this protection for the first time.
 
 ## Published artifacts
 
-A tag such as `v0.1.12` publishes:
+A tag `vX.Y.Z` publishes:
 
-- `ghcr.io/ventstream/ventstream:0.1.12`
+- `ghcr.io/ventstream/ventstream:X.Y.Z`
 - `ghcr.io/ventstream/ventstream:sha-<40-character-commit>`
-- `oci://ghcr.io/ventstream/charts/ventstream-gateway` version `0.1.12`
-- `ventstream-0.1.12-{linux-amd64,linux-arm64,darwin-amd64,darwin-arm64}.tar.gz`
+- `oci://ghcr.io/ventstream/charts/ventstream-gateway` version `X.Y.Z`
+- `ventstream-X.Y.Z-{linux-amd64,linux-arm64,darwin-amd64,darwin-arm64}.tar.gz`
 - `ventstream-installer.sh`
 - a GitHub release containing those assets, the chart, image digest,
   per-platform SPDX JSON SBOMs, Trivy JSON reports, and `SHA256SUMS`
