@@ -21,6 +21,7 @@ pub mod config;
 pub mod index_template;
 pub mod reconcile;
 pub mod retry;
+pub(crate) mod scroll;
 pub mod sink;
 
 pub use config::{AuthMode, BulkConfig, OpenSearchConfig, RetryConfig};

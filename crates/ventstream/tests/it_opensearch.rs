@@ -5,7 +5,7 @@
 //! The other suites cover OpenSearch incidentally, as the sink behind a
 //! source. These cover the sink's own behaviour, and in particular the
 //! TRUNCATE path added in #164: a source truncate now issues a scoped
-//! `_delete_by_query` against the index instead of indexing the truncate
+//! the truncated relation's documents instead of indexing the truncate
 //! event as a document. That is a destructive path, so it needs coverage
 //! against a real cluster rather than unit tests over the request builder.
 //!
@@ -13,7 +13,7 @@
 //! engine handles a primary-table truncate by purging its own state and
 //! emitting per-row tombstones, so the documents disappear whether or not
 //! the sink supports target clears — a truncate test in that mode passes
-//! against a build that has no `_delete_by_query` at all. Only the
+//! against a build that has no clear path at all. Only the
 //! sql-denormalize path emits the target-clear event the sink acts on.
 #![allow(
     clippy::expect_used,
@@ -72,8 +72,9 @@ fn customer_id(id: &str) -> String {
     format!("os_it.customers:[\"{id}\"]")
 }
 
-/// #112: TRUNCATE clears the target, and the clear is scoped by document-id
-/// prefix so co-tenant relations in a shared index are untouched. Before the
+/// #112: TRUNCATE clears the target, scoped to the truncated relation so
+/// co-tenant relations in a shared index are untouched. `_id` cannot be
+/// prefix-matched server side, so the sink scans and filters locally. Before the
 /// fix the truncate event was indexed as a junk document and nothing was
 /// ever removed; a naive fix would have used match_all and destroyed the
 /// customers alongside the orders.
@@ -206,8 +207,8 @@ async fn a_write_after_a_truncate_in_one_transaction_survives() {
 }
 
 /// A truncate against an index that was never created must be a no-op. The
-/// sink issues `_delete_by_query` against a missing index, which answers
-/// 404; treating that as an error would kill the pipeline on an empty table.
+/// sink's first request against a missing index answers 404; treating that
+/// as an error would kill the pipeline on an empty table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "local integration: requires Docker"]
 async fn truncating_an_empty_relation_does_not_stall_the_pipeline() {
