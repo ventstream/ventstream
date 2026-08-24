@@ -87,12 +87,16 @@ pub fn is_crash_fast_text(text: &str) -> bool {
 /// True for server refusals that describe a configuration value the server
 /// will never accept, so no retry can clear them.
 ///
-/// Postgres reports an out-of-charset replication slot name as SQLSTATE
-/// 42602 (invalid_name) and a reserved one as 42939. Retrying either loops
-/// forever on a fixed mistake, burning the operator's time on an error the
-/// backoff message keeps repeating.
+/// Only SQLSTATE 42602 (invalid_name) is listed, and only because it was
+/// reproduced: Postgres 16 raises it for a replication slot name outside
+/// the allowed charset. Reserved-prefix and over-length names were tried
+/// and do NOT raise it — `pg_`-prefixed and over-long slot names are both
+/// accepted — so nothing else is claimed here.
+///
+/// Keep this list to codes someone has actually produced. Over-terminalising
+/// is the worse failure: it halts a pipeline that would have recovered.
 pub fn is_unrecoverable_config_text(text: &str) -> bool {
-    text.contains("SQLSTATE 42602") || text.contains("SQLSTATE 42939")
+    text.contains("SQLSTATE 42602")
 }
 
 /// Terminal text for sources with no in-process reconnect loop, where a
@@ -221,13 +225,6 @@ mod unrecoverable_config_tests {
             is_crash_fast_text(text),
             "the supervisor loop must see this as terminal"
         );
-    }
-
-    #[test]
-    fn a_reserved_name_is_terminal() {
-        assert!(is_unrecoverable_config_text(
-            "db error (SQLSTATE 42939): reserved"
-        ));
     }
 
     /// A transient connection failure must stay retryable — this is the
