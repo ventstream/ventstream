@@ -131,7 +131,7 @@ impl CursorFile {
 mod tests {
     use super::*;
 
-    /// A directory unique to this call.
+    /// A directory unique to this call, removed when the guard drops.
     ///
     /// Keying on the clock alone is not enough: unit tests run in parallel
     /// and the timer is coarse enough on macOS that two calls can land on
@@ -139,7 +139,26 @@ mod tests {
     /// overwrite each other's cursor files. The counter makes uniqueness
     /// independent of timer resolution; the pid keeps concurrent test
     /// binaries apart, matching the pattern used elsewhere in the tree.
-    fn tempdir() -> PathBuf {
+    ///
+    /// Cleanup matters more now than it did: guaranteeing a fresh directory
+    /// per call removes the accidental reuse that used to cap how many of
+    /// these accumulated in the temp dir.
+    struct TempDir(PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    fn tempdir() -> TempDir {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
@@ -151,25 +170,28 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&path).expect("mkdir");
-        path
+        TempDir(path)
     }
 
     #[test]
     fn read_missing_returns_none() {
-        let cf = CursorFile::new(&tempdir()).expect("create");
+        let dir = tempdir();
+        let cf = CursorFile::new(&dir).expect("create");
         assert!(cf.read().expect("read").is_none());
     }
 
     #[test]
     fn write_then_read_round_trips() {
-        let cf = CursorFile::new(&tempdir()).expect("create");
+        let dir = tempdir();
+        let cf = CursorFile::new(&dir).expect("create");
         cf.write("826...hex").expect("write");
         assert_eq!(cf.read().expect("read"), Some("826...hex".to_owned()));
     }
 
     #[test]
     fn delete_then_cold_start() {
-        let cf = CursorFile::new(&tempdir()).expect("create");
+        let dir = tempdir();
+        let cf = CursorFile::new(&dir).expect("create");
         cf.write("tok").expect("write");
         cf.delete().expect("delete");
         assert!(cf.read().expect("read").is_none());
@@ -178,7 +200,8 @@ mod tests {
 
     #[test]
     fn incomplete_sentinel_independent_of_token() {
-        let cf = CursorFile::new(&tempdir()).expect("create");
+        let dir = tempdir();
+        let cf = CursorFile::new(&dir).expect("create");
         assert!(!cf.is_incomplete());
         cf.mark_incomplete().expect("mark");
         cf.write("tok").expect("write");
