@@ -30,7 +30,7 @@ container image for Kafka pipelines.
     Pin a version or change the location with env vars:
 
     ```bash
-    VENTSTREAM_VERSION=0.1.28 VENTSTREAM_INSTALL_DIR=/usr/local/bin \
+    VENTSTREAM_VERSION=0.1.42 VENTSTREAM_INSTALL_DIR=/usr/local/bin \
       curl -fsSL https://ventstream.dev/install.sh | sh
     ```
   </Tab>
@@ -46,7 +46,7 @@ container image for Kafka pipelines.
     Pin a version with an env var:
 
     ```powershell
-    $env:VENTSTREAM_VERSION = "0.1.28"; irm https://ventstream.dev/install.ps1 | iex
+    $env:VENTSTREAM_VERSION = "0.1.42"; irm https://ventstream.dev/install.ps1 | iex
     ```
 
     The Kafka source is not included in the Windows build — use WSL2 or
@@ -57,7 +57,7 @@ container image for Kafka pipelines.
     depending only on whether an agent key is present:
 
     ```bash
-    docker run ghcr.io/ventstream/ventstream:0.1.41
+    docker run ghcr.io/ventstream/ventstream:0.1.42
     ```
 
     See [Deploy](/deploy/kubernetes-managed-engine) for Kubernetes.
