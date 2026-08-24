@@ -36,7 +36,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: engine
-          image: ghcr.io/ventstream/ventstream:0.1.42
+          image: ghcr.io/ventstream/ventstream:0.1.43
           ports:
             # Always-on health endpoint (VS_HEALTH_LISTEN, default :4043).
             - name: health
