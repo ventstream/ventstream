@@ -131,12 +131,25 @@ impl CursorFile {
 mod tests {
     use super::*;
 
+    /// A directory unique to this call.
+    ///
+    /// Keying on the clock alone is not enough: unit tests run in parallel
+    /// and the timer is coarse enough on macOS that two calls can land on
+    /// the same value, at which point two tests share a directory and
+    /// overwrite each other's cursor files. The counter makes uniqueness
+    /// independent of timer resolution; the pid keeps concurrent test
+    /// binaries apart, matching the pattern used elsewhere in the tree.
     fn tempdir() -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("vs-mongo-cursor-test-{nanos}"));
+        let path = std::env::temp_dir().join(format!(
+            "vs-mongo-cursor-test-{}-{nanos}-{seq}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&path).expect("mkdir");
         path
     }
