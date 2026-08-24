@@ -277,10 +277,15 @@ boot_postgres() {
     "CREATE SCHEMA bench; CREATE TABLE bench.events(id bigint PRIMARY KEY, value bigint NOT NULL, payload text NOT NULL); CREATE PUBLICATION vsbench_pub FOR TABLE bench.events;" >/dev/null
   local seed_s; seed_s=$(seed_postgres)
   log "postgres seed done in ${seed_s}s"
+  # Seeding 50M rows plus the CHECKPOINT can bounce postgres; it then
+  # rejects connections while recovering. Wait for it to accept again
+  # before handing over to the engine, or the run dies on 57P03.
+  wait_for "PostgreSQL (post-seed)" docker exec vsbench-postgres \
+    psql -U ventstream -d bench -Atc 'SELECT 1'
   read -r _ _ _ _ _ chunk _ <<<"$(profile_values "$PROFILE")"
   engine_pg() {
     local sink_envs=(); while IFS= read -r line; do sink_envs+=("$line"); done < <(sink_env_args vsbench-postgres)
-    start_engine postgres "$PROFILE" "${sink_envs[@]}" \
+    start_engine postgres "$PROFILE" ${sink_envs[@]+"${sink_envs[@]}"} \
       -e VS_PG_HOST=vsbench-postgres -e VS_PG_PORT=5432 \
       -e VS_PG_USER=ventstream -e VS_PG_PASSWORD=ventstream -e VS_PG_DATABASE=bench \
       -e VS_PG_PUBLICATION=vsbench_pub -e VS_PG_SLOT=vsbench_slot \
@@ -324,7 +329,7 @@ boot_mysql() {
   read -r _ _ _ _ _ chunk concurrency <<<"$(profile_values "$PROFILE")"
   engine_my() {
     local sink_envs=(); while IFS= read -r line; do sink_envs+=("$line"); done < <(sink_env_args vsbench-mysql)
-    start_engine mysql "$PROFILE" "${sink_envs[@]}" \
+    start_engine mysql "$PROFILE" ${sink_envs[@]+"${sink_envs[@]}"} \
       -e VS_MYSQL_HOST=vsbench-mysql -e VS_MYSQL_PORT=3306 \
       -e VS_MYSQL_USER=ventstream -e VS_MYSQL_PASSWORD=ventstream -e VS_MYSQL_DATABASE=bench \
       -e VS_MYSQL_TABLES=events -e VS_MYSQL_SERVER_ID=4000000001 \
@@ -368,7 +373,7 @@ boot_mongodb() {
   read -r _ _ _ _ _ chunk _ <<<"$(profile_values "$PROFILE")"
   engine_mg() {
     local sink_envs=(); while IFS= read -r line; do sink_envs+=("$line"); done < <(sink_env_args vsbench-mongodb)
-    start_engine mongodb "$PROFILE" "${sink_envs[@]}" \
+    start_engine mongodb "$PROFILE" ${sink_envs[@]+"${sink_envs[@]}"} \
       -e 'VS_MONGO_URI=mongodb://vsbench-mongo:27017/?replicaSet=rs0' \
       -e VS_MONGO_DATABASE=bench -e VS_MONGO_COLLECTIONS=events \
       -e VS_MONGO_BOOTSTRAP_MODE=snapshot -e "VS_MONGO_BOOTSTRAP_CHUNK_SIZE=$chunk" \
@@ -397,7 +402,7 @@ boot_kafka() {
   log "kafka seed done in ${seed_s}s"
   engine_kf() {
     local sink_envs=(); while IFS= read -r line; do sink_envs+=("$line"); done < <(sink_env_args vsbench-kafka)
-    start_engine kafka "$PROFILE" "${sink_envs[@]}" \
+    start_engine kafka "$PROFILE" ${sink_envs[@]+"${sink_envs[@]}"} \
       -e VS_KAFKA_BROKERS=vsbench-redpanda:9092 -e VS_KAFKA_TOPICS=events \
       -e VS_KAFKA_GROUP_ID=vsbench-bootstrap -e VS_KAFKA_NAMESPACE=bench \
       -e VS_KAFKA_UNWRAP=raw -e VS_KAFKA_RAW_KEY_FIELD=id \
@@ -443,7 +448,7 @@ boot_neo4j() {
   read -r _ _ _ _ _ chunk concurrency <<<"$(profile_values "$PROFILE")"
   engine_n4() {
     local sink_envs=(); while IFS= read -r line; do sink_envs+=("$line"); done < <(sink_env_args vsbench-neo4j)
-    start_engine neo4j "$PROFILE" "${sink_envs[@]}" \
+    start_engine neo4j "$PROFILE" ${sink_envs[@]+"${sink_envs[@]}"} \
       -e VS_NEO4J_URI=bolt://vsbench-neo4j:7687 -e VS_NEO4J_USER=neo4j \
       -e VS_NEO4J_PASSWORD=ventstream -e VS_NEO4J_DATABASE=neo4j \
       -e VS_NEO4J_BOOTSTRAP_MODE=snapshot -e VS_NEO4J_POLL_INTERVAL_MS=10 \

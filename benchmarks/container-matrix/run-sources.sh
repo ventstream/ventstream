@@ -128,6 +128,10 @@ start_engine() {
   read -r bus batch batch_bytes flush parallel source_chunk source_concurrency <<<"$(profile_values "$profile")"
   cleanup_engine
   docker volume create vsbench-engine-state >/dev/null
+  local engine_mount=()
+  if [[ -n "${VS_BENCH_ENGINE_MOUNT:-}" ]]; then
+    engine_mount=(-v "$VS_BENCH_ENGINE_MOUNT")
+  fi
   docker run -d --name "$ENGINE" --network "$NETWORK" \
     --cpus "$ENGINE_CPUS" --memory "$ENGINE_MEMORY" \
     -p 127.0.0.1::4043 \
@@ -147,7 +151,7 @@ start_engine() {
     -e "_RJEM_MALLOC_CONF=$ALLOCATOR_CONF" \
     -e "VS_MEMORY_CONTROLLER_ENABLED=$MEMORY_CONTROLLER_ENABLED" \
     -e RUST_LOG=warn \
-    "$@" "$IMAGE" >/dev/null
+    ${engine_mount[@]+"${engine_mount[@]}"} "$@" "$IMAGE" >/dev/null
 }
 
 wait_delivered() {
