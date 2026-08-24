@@ -33,7 +33,8 @@ use reqwest::{header, StatusCode};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use super::config::{AuthMode, OpenSearchConfig};
+use super::config::OpenSearchConfig;
+use super::scroll;
 
 /// Errors surfaced from a reconciliation pass. Mirrors the
 /// granularity of the OpenSearch sink's error type but stays
@@ -175,8 +176,12 @@ pub async fn reconcile_orphans(
 
     loop {
         let batch = match &scroll_id {
-            Some(sid) => scroll_continue(&client, config, sid).await?,
-            None => scroll_open(&client, config, index, doc_id_prefix).await?,
+            Some(sid) => scroll::scroll_continue(&client, config, sid)
+                .await
+                .map_err(reconcile_error)?,
+            None => scroll::scroll_open(&client, config, index)
+                .await
+                .map_err(reconcile_error)?,
         };
         if batch.ids.is_empty() && batch.scroll_id.is_none() {
             break;
@@ -201,7 +206,7 @@ pub async fn reconcile_orphans(
 
     // Best-effort scroll cleanup before we decide/delete.
     if let Some(sid) = scroll_id {
-        if let Err(err) = clear_scroll(&client, config, &sid).await {
+        if let Err(err) = scroll::clear_scroll(&client, config, &sid).await {
             debug!(error = %err, "clear_scroll failed (non-fatal)");
         }
     }
@@ -345,7 +350,7 @@ impl OsReverseLookup {
             self.config.endpoint.trim_end_matches('/'),
             index,
         );
-        let req = apply_auth(self.client.post(&url), &self.config.auth)
+        let req = scroll::apply_auth(self.client.post(&url), &self.config.auth)
             .header(header::CONTENT_TYPE, "application/json")
             .body(body.to_string());
         let res = req
@@ -421,212 +426,56 @@ fn reverse_lookup_tuples_query(
 
 #[derive(Debug, Deserialize)]
 struct SearchResponseBody {
-    hits: ScrollHits,
-}
-
-/// Scroll keep-alive duration. OS holds the scroll context for at
-/// least this long after each `_search/scroll` call. Long enough to
-/// survive a slow diff pass on a big batch.
-const SCROLL_KEEP_ALIVE: &str = "2m";
-
-/// Per-batch scroll size. Trade-off: bigger batches = fewer HTTP
-/// round-trips, but more memory + per-batch latency.
-const SCROLL_BATCH_SIZE: usize = 1_000;
-
-#[derive(Debug, Default)]
-struct ScrollBatch {
-    scroll_id: Option<String>,
-    ids: Vec<String>,
-}
-
-async fn scroll_open(
-    client: &reqwest::Client,
-    config: &OpenSearchConfig,
-    index: &str,
-    _doc_id_prefix: &str,
-) -> Result<ScrollBatch, ReconcileError> {
-    let url = format!(
-        "{}/{}/_search?scroll={}",
-        config.endpoint.trim_end_matches('/'),
-        index,
-        SCROLL_KEEP_ALIVE,
-    );
-    // OpenSearch rejects `prefix` queries against `_id` (it's not a
-    // keyword or text field), so we can't filter server-side by ID
-    // prefix. Scan the whole index instead and let the caller filter
-    // each batch in-process via `extract_pk_from_doc_id`. For the
-    // common single-primary-table-per-index case the prefix filter
-    // would have matched everything anyway, so the only cost is in
-    // mixed-source indexes where unrelated docs flow through the
-    // diff loop — measured by `docs_skipped_prefix` in the summary
-    // log.
-    let body = serde_json::json!({
-        "size": SCROLL_BATCH_SIZE,
-        "_source": false,
-        "query": { "match_all": {} },
-        // Stable sort across pages — _doc is the cheapest sort and is
-        // what the docs recommend for scroll.
-        "sort": ["_doc"],
-    });
-    let req = apply_auth(client.post(&url), &config.auth)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body.to_string());
-    let res = req
-        .send()
-        .await
-        .map_err(|err| ReconcileError::Transport(err.to_string()))?;
-    parse_scroll_response(res).await
-}
-
-async fn scroll_continue(
-    client: &reqwest::Client,
-    config: &OpenSearchConfig,
-    scroll_id: &str,
-) -> Result<ScrollBatch, ReconcileError> {
-    let url = format!("{}/_search/scroll", config.endpoint.trim_end_matches('/'),);
-    let body = serde_json::json!({
-        "scroll": SCROLL_KEEP_ALIVE,
-        "scroll_id": scroll_id,
-    });
-    let req = apply_auth(client.post(&url), &config.auth)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body.to_string());
-    let res = req
-        .send()
-        .await
-        .map_err(|err| ReconcileError::Transport(err.to_string()))?;
-    parse_scroll_response(res).await
-}
-
-async fn parse_scroll_response(response: reqwest::Response) -> Result<ScrollBatch, ReconcileError> {
-    let status = response.status();
-    if !status.is_success() {
-        return Err(bad_status(status, response).await);
-    }
-    let body: ScrollResponseBody = response
-        .json()
-        .await
-        .map_err(|err| ReconcileError::Decode(err.to_string()))?;
-    Ok(ScrollBatch {
-        scroll_id: Some(body.scroll_id),
-        ids: body.hits.hits.into_iter().map(|h| h.id).collect(),
-    })
+    hits: SearchHits,
 }
 
 #[derive(Debug, Deserialize)]
-struct ScrollResponseBody {
-    #[serde(rename = "_scroll_id")]
-    scroll_id: String,
-    hits: ScrollHits,
+struct SearchHits {
+    hits: Vec<SearchHit>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ScrollHits {
-    hits: Vec<ScrollHit>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ScrollHit {
+struct SearchHit {
     #[serde(rename = "_id")]
     id: String,
 }
 
-async fn clear_scroll(
-    client: &reqwest::Client,
-    config: &OpenSearchConfig,
-    scroll_id: &str,
-) -> Result<(), ReconcileError> {
-    let url = format!("{}/_search/scroll", config.endpoint.trim_end_matches('/'),);
-    let body = serde_json::json!({ "scroll_id": [scroll_id] });
-    let req = apply_auth(client.delete(&url), &config.auth)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body.to_string());
-    let res = req
-        .send()
-        .await
-        .map_err(|err| ReconcileError::Transport(err.to_string()))?;
-    if !res.status().is_success() {
-        return Err(bad_status(res.status(), res).await);
-    }
-    Ok(())
-}
-
+/// Reconcile's own delete policy over the shared primitive.
+///
+/// This is a best-effort sweep: a per-item failure is surfaced at WARN so
+/// operators see real problems (an auth change mid-pass, say) but does not
+/// fail the whole pass. A truncate takes the opposite view — completeness
+/// is its contract — which is exactly why the policy lives with each
+/// caller and not inside `scroll::bulk_delete`.
 async fn bulk_delete(
     client: &reqwest::Client,
     config: &OpenSearchConfig,
     index: &str,
     ids: &[String],
 ) -> Result<(), ReconcileError> {
-    let url = format!("{}/_bulk", config.endpoint.trim_end_matches('/'));
-    // NDJSON body: one delete metadata line per ID. Each ID is JSON-
-    // escaped via serde_json::to_string so embedded quotes, brackets,
-    // and backslashes from the deterministic ID format don't break
-    // the parser.
-    let mut body = String::with_capacity(ids.len() * 80);
-    for id in ids {
-        let id_json =
-            serde_json::to_string(id).map_err(|err| ReconcileError::Decode(err.to_string()))?;
-        body.push_str(&format!(
-            "{{\"delete\":{{\"_index\":{index_json},\"_id\":{id_json}}}}}\n",
-            index_json = serde_json::to_string(index)
-                .map_err(|err| ReconcileError::Decode(err.to_string()))?,
-        ));
-    }
-    let req = apply_auth(client.post(&url), &config.auth)
-        .header(header::CONTENT_TYPE, "application/x-ndjson")
-        .body(body);
-    let res = req
-        .send()
+    let failed = scroll::bulk_delete(client, config, index, ids)
         .await
-        .map_err(|err| ReconcileError::Transport(err.to_string()))?;
-    let status = res.status();
-    if !status.is_success() {
-        return Err(bad_status(status, res).await);
-    }
-    // Per-item failures: we don't fail the whole reconciliation pass
-    // for an individual `not_found` (the doc was already gone, which
-    // is the goal anyway). We DO surface per-item errors at WARN so
-    // operators see real failures (auth changes mid-pass, etc.).
-    let body: BulkResponseBody = res
-        .json()
-        .await
-        .map_err(|err| ReconcileError::Decode(err.to_string()))?;
-    if body.errors {
-        for item in &body.items {
-            let Some(del) = &item.delete else { continue };
-            if del.status >= 400 && del.status != 404 {
-                warn!(
-                    id = %del.id,
-                    status = del.status,
-                    error = ?del.error,
-                    "bulk delete item failed during reconciliation"
-                );
-            }
-        }
+        .map_err(reconcile_error)?;
+    for failure in failed {
+        warn!(
+            id = %failure.id,
+            status = failure.status,
+            reason = failure.reason.as_deref().unwrap_or("unknown"),
+            "reconcile: bulk delete rejected a document"
+        );
     }
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
-struct BulkResponseBody {
-    #[serde(default)]
-    errors: bool,
-    #[serde(default)]
-    items: Vec<BulkResponseItem>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BulkResponseItem {
-    delete: Option<BulkDeleteResult>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BulkDeleteResult {
-    #[serde(rename = "_id")]
-    id: String,
-    status: u16,
-    #[serde(default)]
-    error: serde_json::Value,
+/// Map a shared-primitive failure onto this module's error type.
+fn reconcile_error(err: scroll::ScrollError) -> ReconcileError {
+    match err {
+        scroll::ScrollError::Transport(msg) => ReconcileError::Transport(msg),
+        scroll::ScrollError::Decode(msg) => ReconcileError::Decode(msg),
+        scroll::ScrollError::BadStatus { status, body } => {
+            ReconcileError::BadStatus { status, body }
+        }
+    }
 }
 
 fn build_client(config: &OpenSearchConfig) -> Result<reqwest::Client, ReconcileError> {
@@ -642,14 +491,6 @@ fn build_client(config: &OpenSearchConfig) -> Result<reqwest::Client, ReconcileE
         config.ca_file.as_deref(),
     )
     .map_err(ReconcileError::Client)
-}
-
-fn apply_auth(rb: reqwest::RequestBuilder, auth: &AuthMode) -> reqwest::RequestBuilder {
-    match auth {
-        AuthMode::None => rb,
-        AuthMode::Basic { username, password } => rb.basic_auth(username, Some(password)),
-        AuthMode::ApiKey(key) => rb.header(header::AUTHORIZATION, format!("ApiKey {key}")),
-    }
 }
 
 async fn bad_status(status: StatusCode, response: reqwest::Response) -> ReconcileError {

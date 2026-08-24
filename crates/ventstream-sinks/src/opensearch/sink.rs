@@ -39,6 +39,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::index_template;
+use super::scroll;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
@@ -169,18 +170,51 @@ impl OpenSearchSink {
         })
     }
 
+    /// Map a scroll/delete failure onto the retry classification the
+    /// dispatcher expects.
+    ///
+    /// A mid-scroll 404 is retryable, not permanent. Its dominant cause is
+    /// `search_context_missing_exception` — the keep-alive expiring during
+    /// a whole-index scan on a large or contended cluster — which a plain
+    /// retry fixes. Classifying it permanent would trade a silent partial
+    /// clear for a halt that needs a human. Retrying is safe either way: a
+    /// genuinely deleted index 404s on the first request and returns
+    /// `Ok(())`, and a partially cleared index re-scans harmlessly because
+    /// deletes are idempotent.
+    fn clear_error(err: scroll::ScrollError) -> OpenSearchSinkError {
+        match err {
+            scroll::ScrollError::BadStatus { status, body } => {
+                if (500..600).contains(&status) || status == 429 || status == 404 {
+                    OpenSearchSinkError::Server {
+                        status,
+                        message: body,
+                        retry_after: None,
+                    }
+                } else {
+                    OpenSearchSinkError::Client {
+                        status,
+                        message: body,
+                    }
+                }
+            }
+            other => OpenSearchSinkError::Transport(other.to_string()),
+        }
+    }
+
     /// Apply one target-clear (TRUNCATE) event.
     ///
-    /// Scoped by document-id prefix rather than `match_all`: doc ids are
-    /// `{schema}.{table}:{pk}`, so the prefix removes exactly the
-    /// truncated relation's documents. A `match_all` would wipe every
-    /// other relation sharing the index — the same hazard the Redis sink
-    /// refuses outright under shared routing.
+    /// Clears can't ride the bulk API — there is no "empty the target" bulk
+    /// action — and before this they fell through into the index branch and
+    /// were written as `{}` documents while every pre-truncate document
+    /// survived.
     ///
-    /// Clears can't ride the bulk API (there is no "empty the target"
-    /// bulk action), and before this they fell through into the index
-    /// branch and were written as `{}` documents under generated ids
-    /// while every pre-truncate document survived.
+    /// The scope cannot be expressed as a query: doc ids are
+    /// `{schema}.{table}:{pk}`, but `_id` is a metadata field and
+    /// OpenSearch rejects prefix queries on it. So this scans the index
+    /// with `match_all` and filters to the relation's prefix here, deleting
+    /// only what matches. A server-side `match_all` delete would wipe every
+    /// other relation sharing the index — the hazard the Redis sink refuses
+    /// outright under shared routing.
     async fn apply_target_clear(
         &self,
         event: &ventstream_core::Event,
@@ -199,41 +233,99 @@ impl OpenSearchSink {
             )));
         };
         let prefix = format!("{namespace}.{relation}:");
-        let url = format!(
-            "{}/{}/_delete_by_query?refresh=true&conflicts=proceed",
-            self.config.endpoint.trim_end_matches('/'),
-            index
+
+        // A scroll reads the search view, which lags indexing. Without this
+        // the scan can miss rows written moments before the TRUNCATE and
+        // report a clear that left documents behind.
+        match scroll::refresh(&self.client, &self.config, &index).await {
+            // The index was never created: nothing to clear.
+            Err(scroll::ScrollError::BadStatus { status: 404, .. }) => return Ok(()),
+            Err(err) => return Err(Self::clear_error(err)),
+            Ok(()) => {}
+        }
+
+        let mut scroll_id: Option<String> = None;
+        // Explicit rather than inferred from `scroll_id.is_none()`: that
+        // would couple this loop to `scroll_id` being a required field in
+        // the scroll response. If it ever became optional, the initial
+        // search would be re-issued forever and a mid-clear 404 would be
+        // misread as "index never created".
+        let mut first_request = true;
+        let mut deleted: usize = 0;
+        let mut failures: Vec<scroll::FailedDelete> = Vec::new();
+        let outcome = loop {
+            let page = match scroll_id.as_deref() {
+                Some(id) if !first_request => {
+                    scroll::scroll_continue(&self.client, &self.config, id).await
+                }
+                _ => scroll::scroll_open(&self.client, &self.config, &index).await,
+            };
+            let batch = match page {
+                Ok(batch) => batch,
+                // Only the first request may read 404 as "never created".
+                // Later it means the context expired or the index vanished
+                // mid-clear, and reporting success would advance the source
+                // cursor over a partial delete.
+                Err(scroll::ScrollError::BadStatus { status: 404, .. }) if first_request => {
+                    return Ok(());
+                }
+                Err(err) => break Err(err),
+            };
+            first_request = false;
+            scroll_id = batch.scroll_id;
+            if batch.ids.is_empty() {
+                break Ok(());
+            }
+            let doomed: Vec<String> = batch
+                .ids
+                .into_iter()
+                .filter(|id| id.starts_with(&prefix))
+                .collect();
+            if !doomed.is_empty() {
+                match scroll::bulk_delete(&self.client, &self.config, &index, &doomed).await {
+                    Ok(failed) => {
+                        deleted += doomed.len() - failed.len();
+                        failures.extend(failed);
+                    }
+                    Err(err) => break Err(err),
+                }
+            }
+        };
+
+        // Release the scroll context on every path, including failure.
+        if let Some(id) = scroll_id.as_deref() {
+            if let Err(err) = scroll::clear_scroll(&self.client, &self.config, id).await {
+                debug!(index = %index, error = %err, "failed to release scroll context after clear");
+            }
+        }
+        outcome.map_err(Self::clear_error)?;
+
+        // A truncate's contract is completeness, so unlike the reconcile
+        // sweep a per-item failure is not something to log and move past.
+        // Fail closed: the source cursor must not advance over documents
+        // the target still holds.
+        if let Some(worst) = failures.first() {
+            return Err(OpenSearchSinkError::Server {
+                status: worst.status,
+                message: format!(
+                    "TRUNCATE clear of `{index}` left {} document(s) undeleted; first: {} ({}){}",
+                    failures.len(),
+                    worst.id,
+                    worst.status,
+                    worst
+                        .reason
+                        .as_deref()
+                        .map_or_else(String::new, |reason| format!(": {reason}"))
+                ),
+                retry_after: None,
+            });
+        }
+        info!(
+            index = %index,
+            prefix = %prefix,
+            deleted,
+            "cleared opensearch documents for source TRUNCATE"
         );
-        let response = self
-            .client
-            .post(&url)
-            .json(&serde_json::json!({"query": {"prefix": {"_id": prefix}}}))
-            .send()
-            .await
-            .map_err(|err| OpenSearchSinkError::Transport(err.to_string()))?;
-        let status = response.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            // Nothing to clear: the index was never created.
-            return Ok(());
-        }
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(
-                if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    OpenSearchSinkError::Server {
-                        status: status.as_u16(),
-                        message: body,
-                        retry_after: None,
-                    }
-                } else {
-                    OpenSearchSinkError::Client {
-                        status: status.as_u16(),
-                        message: body,
-                    }
-                },
-            );
-        }
-        info!(index = %index, prefix = %prefix, "cleared opensearch documents for source TRUNCATE");
         Ok(())
     }
 
@@ -2017,5 +2109,245 @@ mod tests {
             }
             other => panic!("expected Blocked, got {other:?}"),
         }
+    }
+    fn clear_event(namespace: &str, relation: &str) -> Event {
+        let source = SourceUri::new("test://x").expect("uri");
+        let subject =
+            Subject::new(format!("postgres.{namespace}.{relation}.truncate")).expect("subject");
+        let headers = Headers::empty()
+            .with_header("ventstream.target.clear".to_owned(), "true".to_owned())
+            .with_header("ventstream.cdc.namespace".to_owned(), namespace.to_owned())
+            .with_header("ventstream.cdc.relation".to_owned(), relation.to_owned());
+        Event::builder(source, subject)
+            .payload(Payload::from_vec(b"{}".to_vec()))
+            .content_type(ContentType::Json)
+            .headers(headers)
+            .build()
+    }
+
+    /// Guards the review finding on #171: the clear path issues its own
+    /// requests, and every one of them must carry the configured
+    /// credentials. Missing auth is invisible to the container suite because
+    /// that cluster runs with the security plugin disabled — on any secured
+    /// cluster the clear would 401, classify as permanent, and halt the
+    /// pipeline, which is the exact symptom the clear was written to fix.
+    #[tokio::test]
+    async fn every_request_in_the_clear_path_carries_auth() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/static-index/_refresh"))
+            .and(header("authorization", "Basic dXNlcjpwYXNz"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Scroll open: one page of ids, two of which belong to the relation.
+        Mock::given(method("POST"))
+            .and(path("/static-index/_search"))
+            .and(header("authorization", "Basic dXNlcjpwYXNz"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "_scroll_id": "cursor-1",
+                "hits": {"hits": [
+                    {"_id": "app.orders:[\"1\"]"},
+                    {"_id": "app.customers:[\"9\"]"}
+                ]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Bulk delete of the filtered ids.
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .and(header("authorization", "Basic dXNlcjpwYXNz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"took": 1, "errors": false, "items": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Scroll continue: empty page ends the loop.
+        Mock::given(method("POST"))
+            .and(path("/_search/scroll"))
+            .and(header("authorization", "Basic dXNlcjpwYXNz"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "_scroll_id": "cursor-1",
+                "hits": {"hits": []}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Scroll context release.
+        Mock::given(method("DELETE"))
+            .and(path("/_search/scroll"))
+            .and(header("authorization", "Basic dXNlcjpwYXNz"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut cfg = OpenSearchConfig::new("auth-test", server.uri(), "static-index");
+        cfg.auth = super::super::config::AuthMode::Basic {
+            username: "user".to_owned(),
+            password: "pass".to_owned(),
+        };
+        cfg.request_timeout = Duration::from_secs(2);
+        let sink = OpenSearchSink::new(cfg).expect("sink builds");
+
+        sink.apply_target_clear(&clear_event("app", "orders"))
+            .await
+            .expect("clear succeeds against an authenticated cluster");
+        // Every mock asserts its own `authorization` header, so a request
+        // built without auth would not match and the expectations fail.
+    }
+
+    /// A 404 is a no-op only on the FIRST request, where it means the index
+    /// was never created. Once the scroll is open a 404 means the context
+    /// expired or the index vanished mid-clear; treating that as success
+    /// would advance the source cursor over a partially cleared index.
+    #[tokio::test]
+    async fn a_404_mid_scroll_is_an_error_not_a_silent_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/static-index/_refresh"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/static-index/_search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "_scroll_id": "cursor-1",
+                "hits": {"hits": [{"_id": "app.orders:[\"1\"]"}]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"took": 1, "errors": false, "items": []})),
+            )
+            .mount(&server)
+            .await;
+        // The scroll continuation 404s: context gone.
+        Mock::given(method("POST"))
+            .and(path("/_search/scroll"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/_search/scroll"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let mut cfg = OpenSearchConfig::new("mid-scroll", server.uri(), "static-index");
+        cfg.request_timeout = Duration::from_secs(2);
+        let sink = OpenSearchSink::new(cfg).expect("sink builds");
+
+        let err = sink
+            .apply_target_clear(&clear_event("app", "orders"))
+            .await
+            .expect_err("a mid-scroll 404 must not report success");
+        // Retryable, not permanent: the dominant cause is the scroll
+        // keep-alive expiring mid-scan, which a retry fixes. Classifying it
+        // permanent would halt the pipeline for a human.
+        assert!(
+            matches!(err, OpenSearchSinkError::Server { status: 404, .. }),
+            "a mid-scroll 404 must be retryable, got {err:?}"
+        );
+    }
+
+    /// A truncate's contract is completeness, so a document the server
+    /// refuses to delete must fail the clear rather than be logged and
+    /// passed over. The reconcile sweep deliberately does the opposite,
+    /// which is why the policy sits with each caller and not inside the
+    /// shared primitive.
+    #[tokio::test]
+    async fn a_rejected_document_fails_the_clear() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/static-index/_refresh"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/static-index/_search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "_scroll_id": "cursor-1",
+                "hits": {"hits": [{"_id": "app.orders:[\"1\"]"}]}
+            })))
+            .mount(&server)
+            .await;
+        // Rejected with a real error rather than a not_found, which would
+        // mean the document was already gone and is not a failure.
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 1,
+                "errors": true,
+                "items": [{"delete": {
+                    "_id": "app.orders:[\"1\"]",
+                    "status": 403,
+                    "error": {"reason": "no permissions for [indices:data/write/bulk]"}
+                }}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/_search/scroll"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "_scroll_id": "cursor-1",
+                "hits": {"hits": []}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/_search/scroll"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let mut cfg = OpenSearchConfig::new("item-failure", server.uri(), "static-index");
+        cfg.request_timeout = Duration::from_secs(2);
+        let sink = OpenSearchSink::new(cfg).expect("sink builds");
+
+        let err = sink
+            .apply_target_clear(&clear_event("app", "orders"))
+            .await
+            .expect_err("a rejected document must fail the clear");
+        let message = err.to_string();
+        assert!(
+            message.contains("undeleted") && message.contains("no permissions"),
+            "error should name the undeleted document and the reason, got: {message}"
+        );
+    }
+
+    /// A never-created index is a no-op, not an error. It 404s at the very
+    /// first request — the refresh — so the clear returns before scrolling.
+    #[tokio::test]
+    async fn a_404_on_the_first_request_is_a_no_op() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/static-index/_refresh"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Nothing else should be reached.
+        Mock::given(method("POST"))
+            .and(path("/static-index/_search"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cfg = OpenSearchConfig::new("missing-index", server.uri(), "static-index");
+        cfg.request_timeout = Duration::from_secs(2);
+        let sink = OpenSearchSink::new(cfg).expect("sink builds");
+
+        sink.apply_target_clear(&clear_event("app", "orders"))
+            .await
+            .expect("clearing a never-created index is a no-op");
     }
 }
