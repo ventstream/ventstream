@@ -376,9 +376,10 @@ infra/                      Helm charts, Docker images, k8s manifests
   concurrency model
 - Correctness is verified live, not assumed: bootstrap parity, delete
   topologies, crash-resume, and memory limits are exercised against real
-  databases in the pre-release matrix. Hosted CI runs the unit and contract
-  suites; the database-backed suites run locally and before each release
-  (see [pre-production checklist](docs/pre-production-checklist.md))
+  databases in the pre-release matrix (`scripts/test-sources.sh`). Hosted CI
+  runs the unit and contract suites; the database-backed suites run locally
+  and before each release (see
+  [pre-production checklist](docs/pre-production-checklist.md))
 
 ## Development
 

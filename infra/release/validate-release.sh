@@ -76,6 +76,27 @@ if grep -R -n -E 'ghcr.io/REPLACE_ME|ventstream-engine:latest|repository:.*:late
   exit 1
 fi
 
+# The publisher only ever creates :$version and :sha-<commit>. Docs that tell
+# people to pull :latest send them at a tag that has never existed, and demo
+# manifests pinned to an old release quietly ship a stale engine. Both had
+# drifted before this check existed, so assert on every surface a user copies
+# from, not just the packaging under infra/.
+user_facing='README.md docs docs-site demo infra/k8s infra/helm'
+if grep -R -n -E 'ghcr\.io/ventstream/ventstream(-managed-engine)?:latest' \
+  $user_facing; then
+  echo "docs or demo manifests reference :latest, which the publisher never creates" >&2
+  exit 1
+fi
+
+stale_pins=$(grep -R -h -o -E 'ghcr\.io/ventstream/ventstream(-managed-engine)?:[0-9]+\.[0-9]+\.[0-9]+' \
+  $user_facing | grep -v ":${version}$" | sort -u || true)
+if [ -n "$stale_pins" ]; then
+  echo "docs or demo manifests pin an engine image that is not the release version ($version):" >&2
+  printf '  %s\n' $stale_pins >&2
+  echo "update them, or use a <version> placeholder if the reference is illustrative" >&2
+  exit 1
+fi
+
 if grep -Eq '^[[:space:]]+COSIGN_(CERTIFICATE_IDENTITY|OIDC_ISSUER):' \
   .github/workflows/release.yml; then
   echo "release verification values must not use reserved COSIGN_* environment names" >&2
