@@ -36,7 +36,30 @@ pub struct SurrealDbSink {
     /// so 401 invalidation can identity-check the exact expired token.
     token: tokio::sync::RwLock<Option<Arc<str>>>,
     delivery_health: SinkHealth,
+    /// Batches seen so far, and which edge specs have ever matched one.
+    ///
+    /// A spec whose `from_table` names nothing this pipeline routes
+    /// produces no edges while the pipeline reports healthy, so a typo is
+    /// indistinguishable from a working config without querying the
+    /// target. Startup validation catches what it can, but the routed set
+    /// is only a lower bound there — this is the backstop that sees what
+    /// actually arrived.
+    edge_match_state: std::sync::Mutex<EdgeMatchState>,
 }
+
+/// Tracks which edge specs have matched a routed relation.
+#[derive(Default)]
+struct EdgeMatchState {
+    batches: u64,
+    /// Indexes into `config.graph_edges` that have matched at least once.
+    matched: std::collections::HashSet<usize>,
+    /// Set once the warning has been emitted, so it is said once.
+    warned: bool,
+}
+
+/// Batches to observe before concluding a spec matches nothing. Large
+/// enough that a quiet table early in a run does not trip it.
+const EDGE_MATCH_GRACE_BATCHES: u64 = 200;
 
 impl SurrealDbSink {
     /// Build the sink and HTTP client without touching the network.
@@ -164,6 +187,7 @@ impl SurrealDbSink {
             signin_url,
             token: tokio::sync::RwLock::new(None),
             delivery_health,
+            edge_match_state: std::sync::Mutex::new(EdgeMatchState::default()),
         })
     }
 
@@ -288,6 +312,105 @@ impl SurrealDbSink {
                 "surrealdb vector index ensured"
             );
         }
+        Ok(())
+    }
+
+    /// Inspect the relations arriving in this batch against the edge specs.
+    ///
+    /// Two checks, both keyed on the relation that actually arrived — the
+    /// only place the routed set is reliably known. Startup validation sees
+    /// a source's *declared* tables, which for a flat pipeline is empty,
+    /// and flat is the one mode graph edges are documented for.
+    ///
+    /// 1. A document arriving for a relation that an edge spec has claimed
+    ///    as its edge table is fatal. Writing it would interleave RELATE
+    ///    rows with documents in one table, overwriting documents whose ids
+    ///    match and leaving the rest as edges posing as documents —
+    ///    silently, and only recoverable by a full re-bootstrap. Blocking
+    ///    the batch keeps the events pending for the operator instead.
+    ///
+    /// 2. A spec whose `from_table` never matches anything warns once.
+    ///    Matching on the arriving relation rather than on emitted edges is
+    ///    deliberate: a spec whose FKs are all NULL legitimately produces no
+    ///    edges, and reporting that as a misconfiguration would train
+    ///    operators to ignore the warning.
+    fn inspect_edge_relations(
+        &self,
+        events: &[ventstream_core::Event],
+    ) -> Result<(), SurrealSinkError> {
+        if self.config.graph_edges.is_empty() {
+            return Ok(());
+        }
+        // The collision check runs on every batch regardless of the warning
+        // state: it guards against destruction, so it must never be skipped.
+        for event in events {
+            let Ok(table) = super::statements::resolve_table(&self.config, event) else {
+                continue;
+            };
+            for spec in &self.config.graph_edges {
+                if table == format!("{}{}", self.config.table_prefix, spec.name) {
+                    return Err(SurrealSinkError::QueryBlocked(format!(
+                        "graph edge `{}` names the same table as the arriving relation `{table}`. \
+                         Writing this batch would put RELATE rows into that relation's document \
+                         table, overwriting documents whose ids match and leaving the rest as \
+                         edges posing as documents. Rename the edge and re-bootstrap",
+                        spec.name
+                    )));
+                }
+            }
+        }
+        let Ok(mut state) = self.edge_match_state.lock() else {
+            // A poisoned lock means another thread panicked; the warning is
+            // diagnostic, so losing it beats propagating.
+            return Ok(());
+        };
+        if state.warned {
+            return Ok(());
+        }
+        state.batches = state.batches.saturating_add(1);
+        for event in events {
+            let Ok(table) = super::statements::resolve_table(&self.config, event) else {
+                continue;
+            };
+            for (index, spec) in self.config.graph_edges.iter().enumerate() {
+                if table == format!("{}{}", self.config.table_prefix, spec.from_table) {
+                    state.matched.insert(index);
+                }
+            }
+        }
+        if state.batches < EDGE_MATCH_GRACE_BATCHES
+            || state.matched.len() == self.config.graph_edges.len()
+        {
+            return Ok(());
+        }
+        for (index, spec) in self.config.graph_edges.iter().enumerate() {
+            if state.matched.contains(&index) {
+                continue;
+            }
+            let hint = if spec.from_table.contains('.') {
+                let bare = spec
+                    .from_table
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&spec.from_table);
+                format!(
+                    " `{}` is schema-qualified, but the relation header carries the bare \
+                     table name — try `{bare}`",
+                    spec.from_table
+                )
+            } else {
+                String::new()
+            };
+            warn!(
+                edge = %spec.name,
+                from_table = %spec.from_table,
+                batches = state.batches,
+                "graph edge has produced nothing: from_table matched no routed relation.{}",
+                hint
+            );
+        }
+        // Said once: a config mistake, not a running condition.
+        state.warned = true;
         Ok(())
     }
 
@@ -781,6 +904,13 @@ impl Sink for SurrealDbSink {
         if events.is_empty() {
             return Ok(());
         }
+        if let Err(err) = self.inspect_edge_relations(events) {
+            // A name collision is a config fault, not a delivery fault:
+            // mark blocked so it surfaces to the operator and the events
+            // stay pending rather than being written destructively.
+            self.mark_blocked(&err);
+            return Err(SinkError::Blocked(err.to_string()));
+        }
         let translated = translate_batch(&self.config, events);
 
         if let Err(err) = self.execute_runs(&translated.runs).await {
@@ -1192,6 +1322,64 @@ mod tests {
             Ok(_) => panic!("unsafe table_prefix must be rejected"),
         };
         assert!(err.to_string().contains("table_prefix"), "{err}");
+    }
+
+    fn edge_collision_config() -> SurrealDbConfig {
+        let mut config = SurrealDbConfig::new("s", "http://x", "vs", "app", "u", "p");
+        config.table_routing = super::super::config::SurrealTableRouting::ByOutputRelation;
+        // `members` is a real replicated table AND the edge name. It is not
+        // any spec's endpoint, so the construction-time check cannot see it.
+        config.graph_edges = vec![super::super::config::SurrealEdgeSpec {
+            name: "members".into(),
+            from_table: "articles".into(),
+            fk_columns: vec!["author_id".into()],
+            to_table: "people".into(),
+            reversed: false,
+        }];
+        config
+    }
+
+    fn relation_event(relation: &str) -> ventstream_core::Event {
+        let source = ventstream_core::SourceUri::new("test://x").expect("uri");
+        let subject = ventstream_core::Subject::new(format!("postgres.public.{relation}.insert"))
+            .expect("subject");
+        let headers = ventstream_core::Headers::empty()
+            .with_header("ventstream.cdc.relation".to_owned(), relation.to_owned())
+            .with_header(
+                "ventstream.doc.id".to_owned(),
+                format!("{relation}:[\"1\"]"),
+            );
+        ventstream_core::Event::builder(source, subject)
+            .payload(ventstream_core::Payload::from_vec(b"{\"id\":1}".to_vec()))
+            .content_type(ventstream_core::ContentType::Json)
+            .headers(headers)
+            .build()
+    }
+
+    /// The P1: a document arriving for a relation an edge spec claimed as
+    /// its table must block, not be written. This is the case startup
+    /// validation structurally cannot catch — a flat pipeline declares no
+    /// tables, and flat is the only mode graph edges are documented for.
+    #[test]
+    fn a_document_for_a_relation_claimed_as_an_edge_table_is_blocked() {
+        let sink = SurrealDbSink::new(edge_collision_config()).expect("sink builds");
+        let err = sink
+            .inspect_edge_relations(&[relation_event("members")])
+            .expect_err("a collision must block the batch");
+        let message = err.to_string();
+        assert!(
+            message.contains("graph edge `members`") && message.contains("posing as documents"),
+            "error should name the edge and the consequence, got: {message}"
+        );
+    }
+
+    /// The neighbouring relations must flow untouched — a check that
+    /// blocked everything would be worse than the bug.
+    #[test]
+    fn documents_for_other_relations_are_unaffected() {
+        let sink = SurrealDbSink::new(edge_collision_config()).expect("sink builds");
+        sink.inspect_edge_relations(&[relation_event("articles"), relation_event("people")])
+            .expect("unrelated relations must pass");
     }
 
     #[tokio::test]

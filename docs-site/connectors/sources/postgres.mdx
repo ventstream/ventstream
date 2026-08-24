@@ -14,9 +14,10 @@ carries its customer (1:1) and its line items (1:many).
 VentStream writes to a **target**:
 [OpenSearch / Elasticsearch](/connectors/sinks/opensearch) (one connector —
 they share the `_bulk` API),
-[Meilisearch](/connectors/sinks/meilisearch), or
-[Redis](/connectors/sinks/redis). The examples here use OpenSearch; set the
-endpoint with `VS_OS_ENDPOINT`.
+[Meilisearch](/connectors/sinks/meilisearch),
+[Redis](/connectors/sinks/redis), or
+[SurrealDB](/connectors/sinks/surrealdb). The examples here use OpenSearch;
+set the endpoint with `VS_OS_ENDPOINT`.
 </Note>
 
 ## Flat sync — no spec required

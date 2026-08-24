@@ -37,6 +37,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod admin;
 mod dispatcher;
 mod dlq;
+mod edge_validation;
 mod engine;
 mod fleet_config;
 mod health;
@@ -3894,6 +3895,35 @@ fn load_expected_tenant(
     Ok(tenant)
 }
 
+/// Bare relation names this pipeline is known to route documents for, as
+/// they appear in `ventstream.cdc.relation`.
+///
+/// **This is a lower bound, not the full set.** Postgres tails everything
+/// in the publication, and the publication's contents are only knowable
+/// once connected; what we have at startup is the configured bootstrap
+/// list. So a name here is definitely routed — no false positives — but a
+/// routed relation may be absent, and a collision against one of those is
+/// not caught at startup. That is why the runtime "matched nothing"
+/// warning exists: it covers what this cannot.
+///
+/// Empty for sources that declare no table list (Neo4j, Mongo, Kafka), so
+/// callers must treat empty as "unknown", never as "nothing routed".
+fn routed_relations(source: &CdcSourceConfig) -> Vec<String> {
+    match source {
+        // SnapshotTable carries {namespace, name}; the relation header
+        // carries `name` alone, so compare on the bare name.
+        CdcSourceConfig::Postgres(config) => config
+            .bootstrap
+            .as_ref()
+            .map(|bootstrap| bootstrap.tables.iter().map(|t| t.name.clone()).collect())
+            .unwrap_or_default(),
+        CdcSourceConfig::Mysql(config) => config.tables.clone(),
+        CdcSourceConfig::Neo4j(_) | CdcSourceConfig::Mongo(_) | CdcSourceConfig::Kafka(_) => {
+            Vec::new()
+        }
+    }
+}
+
 fn load_cdc_bundle(
     fleet_config: Option<&FleetAppliedConfig>,
     engine_config: Option<&EngineFileConfig>,
@@ -3903,7 +3933,7 @@ fn load_cdc_bundle(
     let backend = engine_config
         .and_then(|config| config.source.as_ref())
         .map(|source| source.kind);
-    match backend {
+    let bundle = match backend {
         Some(SourceKind::Postgres) => load_cdc_bundle_postgres(fleet_config, engine_config),
         Some(SourceKind::Neo4j) => load_cdc_bundle_neo4j(fleet_config, engine_config),
         Some(SourceKind::Mongo | SourceKind::Mongodb) => load_cdc_bundle_mongodb(engine_config),
@@ -3924,7 +3954,28 @@ fn load_cdc_bundle(
                 "unknown VS_CDC_SOURCE '{other}' (expected 'postgres', 'neo4j', 'mongodb', 'mysql', or 'kafka')"
             )),
         },
+    }?;
+
+    // Cross-cutting invariant: an edge table name must not collide with a
+    // relation this pipeline routes documents for. Neither half can answer
+    // that alone — the sink never learns what the source publishes, and the
+    // source has no view of edge specs — so it is checked here, where both
+    // are in scope, alongside validate_related_ids_unique and
+    // validate_projection_target_indexes.
+    if let SinkRuntimeConfig::SurrealDb(surreal) = &bundle.runtime.sink {
+        let relations = routed_relations(&bundle.source);
+        if !relations.is_empty() {
+            edge_validation::validate_edge_names_against_relations(
+                &surreal.graph_edges,
+                &relations,
+            )?;
+            for warning in edge_validation::unmatched_edge_sources(&surreal.graph_edges, &relations)
+            {
+                warn!("{warning}");
+            }
+        }
     }
+    Ok(bundle)
 }
 
 fn load_sink_config(engine_config: Option<&EngineFileConfig>) -> Result<SinkRuntimeConfig> {
