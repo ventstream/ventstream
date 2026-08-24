@@ -34,7 +34,19 @@ pub fn is_credential_db_error(error: &tokio_postgres::Error) -> bool {
 /// downstream string classifiers and operators see the real cause.
 pub fn describe_db_error(error: &tokio_postgres::Error) -> String {
     match error.as_db_error() {
-        Some(db) => format!("db error (SQLSTATE {}): {}", db.code().code(), db.message()),
+        Some(db) => {
+            // The HINT usually carries the actionable half — for an invalid
+            // slot name it names the allowed characters — so dropping it
+            // leaves the operator with a complaint and no remedy.
+            let hint = db
+                .hint()
+                .map_or_else(String::new, |hint| format!(" (hint: {hint})"));
+            format!(
+                "db error (SQLSTATE {}): {}{hint}",
+                db.code().code(),
+                db.message()
+            )
+        }
         None => error.to_string(),
     }
 }
