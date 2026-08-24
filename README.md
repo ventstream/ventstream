@@ -371,12 +371,17 @@ infra/                      Helm charts, Docker images, k8s manifests
 ## Engineering bar
 
 - `unsafe_code = "forbid"` across the workspace
-- Clippy `pedantic` + `nursery`, with `unwrap` / `panic` / `todo` denied
+- Clippy denies `unwrap` / `expect` / `panic` / `todo` / `unimplemented` /
+  `indexing_slicing` / `mem_forget`, plus a selected set of pedantic lints
+  (the full `pedantic` and `nursery` groups are not enabled)
 - Every spawned task is owned and cancellable; message passing is the primary
   concurrency model
 - Correctness is verified live, not assumed: bootstrap parity, delete
   topologies, crash-resume, and memory limits are exercised against real
-  databases in CI and release gates
+  databases in the pre-release matrix (`scripts/test-sources.sh`). Hosted CI
+  runs the unit and contract suites; the database-backed suites run locally
+  and before each release (see
+  [pre-production checklist](docs/pre-production-checklist.md))
 
 ## Development
 

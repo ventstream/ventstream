@@ -233,10 +233,10 @@ run_contracts() {
     VS_TEST_REDIS_MTLS_CLIENT_CERT_FILE="$TEMP_DIR/client.crt" \
     VS_TEST_REDIS_MTLS_CLIENT_KEY_FILE="$TEMP_DIR/client.key" \
     cargo test -p ventstream-sinks --test redis_sink_integration -- \
-      --test-threads=1 --nocapture
+      --include-ignored --test-threads=1 --nocapture
   VS_TEST_REDIS_SINK_URL="redis://127.0.0.1:$STANDALONE_PORT/" \
     cargo test -p ventstream-sinks --test redis_metrics_integration -- \
-      --test-threads=1 --nocapture
+      --include-ignored --test-threads=1 --nocapture
 }
 
 run_topologies() {
