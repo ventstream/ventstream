@@ -556,9 +556,9 @@ mod tests {
         let mut config = SurrealDbConfig::new("s", "http://x", "vs", "app", "u", "p");
         config.graph_edges = vec![super::super::config::SurrealEdgeSpec {
             name: "wrote".into(),
-            from_table: "public.articles".into(),
+            from_table: "articles".into(),
             fk_columns: vec!["author_id".into()],
-            to_table: "public.people".into(),
+            to_table: "people".into(),
             reversed: true,
         }];
         config
@@ -582,9 +582,9 @@ mod tests {
     fn fk_insert_emits_document_then_edge_apply_in_from_lane() {
         let config = edge_config();
         let events = [event(
-            "public.articles",
+            "articles",
             "insert",
-            r#"public.articles:["9"]"#,
+            r#"articles:["9"]"#,
             r#"{"id": 9, "title": "CDC", "author_id": 7}"#,
         )];
         let out = translate_batch(&config, &events);
@@ -600,10 +600,10 @@ mod tests {
             panic!("expected EdgeApply, got {:?}", out.runs[1].kind);
         };
         // reversed: person -> wrote -> article
-        assert_eq!(a_table, "public.people");
-        assert_eq!(b_table, "public.articles");
+        assert_eq!(a_table, "people");
+        assert_eq!(b_table, "articles");
         assert_eq!(out.runs[1].table, "wrote");
-        assert_eq!(out.runs[1].lane_key(), "public.articles");
+        assert_eq!(out.runs[1].lane_key(), "articles");
         assert_eq!(
             items[0],
             serde_json::json!({"eid": ["9"], "a": ["7"], "b": ["9"]})
@@ -614,9 +614,9 @@ mod tests {
     fn null_fk_emits_edge_delete_not_apply() {
         let config = edge_config();
         let events = [event(
-            "public.articles",
+            "articles",
             "update",
-            r#"public.articles:["9"]"#,
+            r#"articles:["9"]"#,
             r#"{"new": {"id": 9, "title": "CDC", "author_id": null}, "old": null}"#,
         )];
         let out = translate_batch(&config, &events);
@@ -637,11 +637,8 @@ mod tests {
             .payload(Payload::from_vec(Vec::new()))
             .headers(
                 Headers::empty()
-                    .with_header(
-                        "ventstream.doc.id".into(),
-                        r#"public.articles:["9"]"#.into(),
-                    )
-                    .with_header("ventstream.cdc.relation".into(), "public.articles".into()),
+                    .with_header("ventstream.doc.id".into(), r#"articles:["9"]"#.into())
+                    .with_header("ventstream.cdc.relation".into(), "articles".into()),
             )
             .build()];
         let out = translate_batch(&config, &events);
@@ -651,7 +648,7 @@ mod tests {
             panic!("expected edge Delete");
         };
         assert_eq!(out.runs[1].table, "wrote");
-        assert_eq!(out.runs[1].lane_key(), "public.articles");
+        assert_eq!(out.runs[1].lane_key(), "articles");
         assert_eq!(eids[0], serde_json::json!(["9"]));
     }
 
@@ -663,15 +660,15 @@ mod tests {
         let config = edge_config();
         let events = [
             event(
-                "public.articles",
+                "articles",
                 "insert",
-                r#"public.articles:["1"]"#,
+                r#"articles:["1"]"#,
                 r#"{"id": 1, "author_id": 7}"#,
             ),
             event(
-                "public.articles",
+                "articles",
                 "insert",
-                r#"public.articles:["2"]"#,
+                r#"articles:["2"]"#,
                 r#"{"id": 2, "author_id": 8}"#,
             ),
         ];
@@ -695,8 +692,7 @@ mod tests {
         let events = [Event::builder(source, subject)
             .payload(Payload::from_vec(Vec::new()))
             .headers(
-                Headers::empty()
-                    .with_header("ventstream.cdc.relation".into(), "public.articles".into()),
+                Headers::empty().with_header("ventstream.cdc.relation".into(), "articles".into()),
             )
             .build()];
         let out = translate_batch(&config, &events);
@@ -713,15 +709,15 @@ mod tests {
         config.graph_edges[0].reversed = false;
         let events = [
             event(
-                "public.articles",
+                "articles",
                 "insert",
-                r#"public.articles:["1"]"#,
+                r#"articles:["1"]"#,
                 r#"{"id": 1, "org_id": 5, "team_id": "blue"}"#,
             ),
             event(
-                "public.people",
+                "people",
                 "insert",
-                r#"public.people:["7"]"#,
+                r#"people:["7"]"#,
                 r#"{"id": 7, "name": "Ada"}"#,
             ),
         ];
@@ -736,8 +732,8 @@ mod tests {
         else {
             panic!("expected edge run last");
         };
-        assert_eq!(a_table, "public.articles");
-        assert_eq!(b_table, "public.people");
+        assert_eq!(a_table, "articles");
+        assert_eq!(b_table, "people");
         assert_eq!(
             items[0],
             serde_json::json!({"eid": ["1"], "a": ["1"], "b": ["5", "blue"]})

@@ -36,7 +36,30 @@ pub struct SurrealDbSink {
     /// so 401 invalidation can identity-check the exact expired token.
     token: tokio::sync::RwLock<Option<Arc<str>>>,
     delivery_health: SinkHealth,
+    /// Batches seen so far, and which edge specs have ever matched one.
+    ///
+    /// A spec whose `from_table` names nothing this pipeline routes
+    /// produces no edges while the pipeline reports healthy, so a typo is
+    /// indistinguishable from a working config without querying the
+    /// target. Startup validation catches what it can, but the routed set
+    /// is only a lower bound there — this is the backstop that sees what
+    /// actually arrived.
+    edge_match_state: std::sync::Mutex<EdgeMatchState>,
 }
+
+/// Tracks which edge specs have matched a routed relation.
+#[derive(Default)]
+struct EdgeMatchState {
+    batches: u64,
+    /// Indexes into `config.graph_edges` that have matched at least once.
+    matched: std::collections::HashSet<usize>,
+    /// Set once the warning has been emitted, so it is said once.
+    warned: bool,
+}
+
+/// Batches to observe before concluding a spec matches nothing. Large
+/// enough that a quiet table early in a run does not trip it.
+const EDGE_MATCH_GRACE_BATCHES: u64 = 200;
 
 impl SurrealDbSink {
     /// Build the sink and HTTP client without touching the network.
@@ -164,6 +187,7 @@ impl SurrealDbSink {
             signin_url,
             token: tokio::sync::RwLock::new(None),
             delivery_health,
+            edge_match_state: std::sync::Mutex::new(EdgeMatchState::default()),
         })
     }
 
@@ -289,6 +313,71 @@ impl SurrealDbSink {
             );
         }
         Ok(())
+    }
+
+    /// Record which edge specs saw their `from_table` in this batch, and
+    /// warn once about any that never have.
+    ///
+    /// Matching on the arriving relation rather than on emitted edges is
+    /// deliberate: a spec whose FKs are all NULL legitimately produces no
+    /// edges, and reporting that as a misconfiguration would train
+    /// operators to ignore the warning.
+    fn note_edge_matches(&self, events: &[ventstream_core::Event]) {
+        if self.config.graph_edges.is_empty() {
+            return;
+        }
+        let Ok(mut state) = self.edge_match_state.lock() else {
+            // A poisoned lock means another thread panicked; this is
+            // diagnostic, so losing it beats propagating.
+            return;
+        };
+        if state.warned {
+            return;
+        }
+        state.batches = state.batches.saturating_add(1);
+        for event in events {
+            let Ok(table) = super::statements::resolve_table(&self.config, event) else {
+                continue;
+            };
+            for (index, spec) in self.config.graph_edges.iter().enumerate() {
+                if table == format!("{}{}", self.config.table_prefix, spec.from_table) {
+                    state.matched.insert(index);
+                }
+            }
+        }
+        if state.batches < EDGE_MATCH_GRACE_BATCHES
+            || state.matched.len() == self.config.graph_edges.len()
+        {
+            return;
+        }
+        for (index, spec) in self.config.graph_edges.iter().enumerate() {
+            if state.matched.contains(&index) {
+                continue;
+            }
+            let hint = if spec.from_table.contains('.') {
+                let bare = spec
+                    .from_table
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&spec.from_table);
+                format!(
+                    " `{}` is schema-qualified, but the relation header carries the bare \
+                     table name — try `{bare}`",
+                    spec.from_table
+                )
+            } else {
+                String::new()
+            };
+            warn!(
+                edge = %spec.name,
+                from_table = %spec.from_table,
+                batches = state.batches,
+                "graph edge has produced nothing: from_table matched no routed relation.{}",
+                hint
+            );
+        }
+        // Said once: a config mistake, not a running condition.
+        state.warned = true;
     }
 
     /// Execute one RPC `query` call and return per-statement results.
@@ -781,6 +870,7 @@ impl Sink for SurrealDbSink {
         if events.is_empty() {
             return Ok(());
         }
+        self.note_edge_matches(events);
         let translated = translate_batch(&self.config, events);
 
         if let Err(err) = self.execute_runs(&translated.runs).await {

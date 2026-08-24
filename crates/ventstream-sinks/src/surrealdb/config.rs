@@ -176,12 +176,17 @@ pub struct SurrealEdgeSpec {
     /// Edge table name (pre-prefix), e.g. `wrote`. Embedded in RELATE
     /// statements as an identifier, so it must pass the safe charset.
     pub name: String,
-    /// Source relation owning the FK, as routed (the
-    /// `ventstream.cdc.relation` header value), e.g. `public.articles`.
+    /// Source relation owning the FK, as routed: the
+    /// `ventstream.cdc.relation` header value, e.g. `articles`.
+    ///
+    /// This is the BARE relation name. Postgres reports the schema
+    /// separately in `ventstream.cdc.namespace` and never includes it
+    /// here, so a schema-qualified value like `public.articles` matches
+    /// nothing and the spec silently produces no edges.
     pub from_table: String,
     /// FK column(s) on `from_table`, in the referenced key's order.
     pub fk_columns: Vec<String>,
-    /// Referenced relation, e.g. `public.people`.
+    /// Referenced relation, bare like `from_table`, e.g. `people`.
     pub to_table: String,
     /// Edge direction. Default (false) points FK-owner -> referenced
     /// (`article->authored_by->person`); reversed points

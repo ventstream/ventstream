@@ -139,6 +139,15 @@ RELATE edges you can traverse.
         reversed: true         # person->wrote->article
 ```
 
+<Note>
+`from_table` and `to_table` are **bare relation names** — `articles`, not
+`public.articles`. Postgres reports the schema separately, so a
+schema-qualified value matches nothing and the spec silently produces no
+edges. An edge `name` must also not collide with a table you replicate:
+the engine rejects that at startup, because edge rows written into a
+document table would overwrite documents that share an id.
+</Note>
+
 ```surql
 -- everything this person wrote
 SELECT ->wrote->articles.title FROM people:['7'];
