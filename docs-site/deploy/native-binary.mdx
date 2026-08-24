@@ -90,7 +90,7 @@ use the same binary and are covered by the
 Release archives are also available as ordinary HTTPS downloads:
 
 ```bash
-VERSION=0.1.24
+VERSION=0.1.43
 ARTIFACT="ventstream-$VERSION-linux-amd64.tar.gz"
 BASE="https://github.com/ventstream/ventstream/releases/download/v$VERSION"
 curl --proto '=https' --tlsv1.2 -fLO "$BASE/$ARTIFACT"
@@ -109,7 +109,7 @@ provenance verification before execution can download and verify it instead of
 piping it directly to the shell:
 
 ```bash
-gh release download v0.1.24 \
+gh release download v0.1.43 \
   --repo ventstream/ventstream \
   --pattern ventstream-installer.sh
 gh attestation verify ventstream-installer.sh \

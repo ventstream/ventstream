@@ -94,12 +94,25 @@ stale_pins=$(grep -R -h -o -E 'ghcr\.io/ventstream/ventstream(-managed-engine)?:
 # the check above cannot see them: VENTSTREAM_VERSION=0.1.28 sailed through
 # it while the Docker line four lines below was caught. The macOS and Windows
 # install tabs are the first thing a reader copies.
-stale_env=$(grep -R -h -o -E 'VENTSTREAM_VERSION[= ]+"?[0-9]+\.[0-9]+\.[0-9]+' $user_facing \
-  | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | grep -v "^${version}$" | sort -u || true)
-if [ -n "$stale_env" ]; then
-  echo "docs pin VENTSTREAM_VERSION at a version that is not the release ($version):" >&2
-  printf '  %s\n' $stale_env >&2
-  echo "these are install commands readers copy; update them" >&2
+# Every shape a version pin takes in a command a reader copies. The image
+# check above only sees `repo:tag`, so `--set image.tag=0.1.24` and
+# `--version 0.1.24` were structurally invisible to it — and by the time
+# anyone noticed, GHCR had aged 0.1.24 out entirely, so that Helm command
+# produced an ImagePullBackOff rather than an old-but-working engine.
+#
+# Scoped to this release's own series (${version%.*}.x). The fleet CLI is
+# versioned separately (0.2.x) and its current version is not knowable from
+# this repo, so asserting on it here would either fail every release or
+# encode a number that goes stale on the fleet's schedule instead of ours.
+# It needs its own check in the fleet repo.
+series="${version%.*}."
+stale_cmd=$(grep -R -h -o -E \
+  "(image\.tag=|--version |VERSION=|VENTSTREAM_VERSION[= ]+\"?|download v)${series}[0-9]+" \
+  $user_facing | grep -oE "${series}[0-9]+" | grep -v "^${version}$" | sort -u || true)
+if [ -n "$stale_cmd" ]; then
+  echo "docs pin a version that is not the release ($version) in a copyable command:" >&2
+  printf '  %s\n' $stale_cmd >&2
+  echo "readers copy these verbatim; an aged-out tag is an ImagePullBackOff, not an old engine" >&2
   exit 1
 fi
 
