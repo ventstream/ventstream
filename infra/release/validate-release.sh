@@ -90,6 +90,19 @@ fi
 
 stale_pins=$(grep -R -h -o -E 'ghcr\.io/ventstream/ventstream(-managed-engine)?:[0-9]+\.[0-9]+\.[0-9]+' \
   $user_facing | grep -v ":${version}$" | sort -u || true)
+# Bare version pins in install snippets. These are not image references, so
+# the check above cannot see them: VENTSTREAM_VERSION=0.1.28 sailed through
+# it while the Docker line four lines below was caught. The macOS and Windows
+# install tabs are the first thing a reader copies.
+stale_env=$(grep -R -h -o -E 'VENTSTREAM_VERSION[= ]+"?[0-9]+\.[0-9]+\.[0-9]+' $user_facing \
+  | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | grep -v "^${version}$" | sort -u || true)
+if [ -n "$stale_env" ]; then
+  echo "docs pin VENTSTREAM_VERSION at a version that is not the release ($version):" >&2
+  printf '  %s\n' $stale_env >&2
+  echo "these are install commands readers copy; update them" >&2
+  exit 1
+fi
+
 if [ -n "$stale_pins" ]; then
   echo "docs or demo manifests pin an engine image that is not the release version ($version):" >&2
   printf '  %s\n' $stale_pins >&2
