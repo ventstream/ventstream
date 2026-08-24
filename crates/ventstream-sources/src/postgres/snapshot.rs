@@ -273,7 +273,13 @@ async fn create_slot(client: &Client, slot_name: &str) -> Result<(), PostgresCdc
             slot_name.replace('\'', "''")
         ))
         .await
-        .map_err(|err| PostgresCdcError::Connection(format!("creating slot {slot_name}: {err}")))?;
+        .map_err(|err| {
+            // tokio-postgres collapses server errors to a bare "db error" in
+            // Display, discarding the SQLSTATE, the message and the HINT —
+            // which on this path is the entire answer.
+            let detail = crate::postgres::connection::describe_db_error(&err);
+            PostgresCdcError::Connection(format!("creating slot {slot_name}: {detail}"))
+        })?;
     info!(slot = %slot_name, "replication slot created");
     Ok(())
 }

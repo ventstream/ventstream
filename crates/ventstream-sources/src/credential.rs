@@ -81,6 +81,22 @@ pub fn is_credential_error_text(text: &str) -> bool {
 /// a supervisor loop must treat it as terminal, never retry it.
 pub fn is_crash_fast_text(text: &str) -> bool {
     text.contains("exiting so the supervisor can restart with fresh credentials")
+        || is_unrecoverable_config_text(text)
+}
+
+/// True for server refusals that describe a configuration value the server
+/// will never accept, so no retry can clear them.
+///
+/// Only SQLSTATE 42602 (invalid_name) is listed, and only because it was
+/// reproduced: Postgres 16 raises it for a replication slot name outside
+/// the allowed charset. Reserved-prefix and over-length names were tried
+/// and do NOT raise it — `pg_`-prefixed and over-long slot names are both
+/// accepted — so nothing else is claimed here.
+///
+/// Keep this list to codes someone has actually produced. Over-terminalising
+/// is the worse failure: it halts a pipeline that would have recovered.
+pub fn is_unrecoverable_config_text(text: &str) -> bool {
+    text.contains("SQLSTATE 42602")
 }
 
 /// Terminal text for sources with no in-process reconnect loop, where a
@@ -181,6 +197,52 @@ mod tests {
         assert!(is_crash_fast_text(&immediate));
         assert!(!is_crash_fast_text(
             "mysql connection failed: Server error: `ERROR 28000 (1045)`"
+        ));
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod unrecoverable_config_tests {
+    use super::*;
+
+    /// The reported case: a slot name with a capital letter. Postgres
+    /// refuses it identically on every attempt, so the supervisor must
+    /// stop rather than back off forever.
+    #[test]
+    fn an_invalid_slot_name_is_terminal() {
+        let text = "postgres connection failed: creating slot vs_slotS: db error \
+                    (SQLSTATE 42602): replication slot name \"vs_slotS\" contains \
+                    invalid character (hint: Replication slot names may only contain \
+                    lower case letters, numbers, and the underscore character.)";
+        assert!(is_unrecoverable_config_text(text));
+        assert!(
+            is_crash_fast_text(text),
+            "the supervisor loop must see this as terminal"
+        );
+    }
+
+    /// A transient connection failure must stay retryable — this is the
+    /// direction that matters, since misclassifying it would halt a
+    /// pipeline that would have recovered on its own.
+    #[test]
+    fn a_transient_failure_is_not_terminal() {
+        let text = "postgres connection failed: connection refused";
+        assert!(!is_unrecoverable_config_text(text));
+        assert!(!is_crash_fast_text(text));
+    }
+
+    #[test]
+    fn an_unrelated_sqlstate_is_not_terminal() {
+        // 57P03 (cannot_connect_now) is the recovering-server case: retry
+        // is exactly right there.
+        assert!(!is_unrecoverable_config_text(
+            "db error (SQLSTATE 57P03): the database system is starting up"
         ));
     }
 }
