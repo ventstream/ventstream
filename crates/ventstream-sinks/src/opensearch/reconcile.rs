@@ -434,12 +434,12 @@ const SCROLL_KEEP_ALIVE: &str = "2m";
 const SCROLL_BATCH_SIZE: usize = 1_000;
 
 #[derive(Debug, Default)]
-struct ScrollBatch {
-    scroll_id: Option<String>,
-    ids: Vec<String>,
+pub(crate) struct ScrollBatch {
+    pub(crate) scroll_id: Option<String>,
+    pub(crate) ids: Vec<String>,
 }
 
-async fn scroll_open(
+pub(crate) async fn scroll_open(
     client: &reqwest::Client,
     config: &OpenSearchConfig,
     index: &str,
@@ -478,7 +478,7 @@ async fn scroll_open(
     parse_scroll_response(res).await
 }
 
-async fn scroll_continue(
+pub(crate) async fn scroll_continue(
     client: &reqwest::Client,
     config: &OpenSearchConfig,
     scroll_id: &str,
@@ -531,7 +531,7 @@ struct ScrollHit {
     id: String,
 }
 
-async fn clear_scroll(
+pub(crate) async fn clear_scroll(
     client: &reqwest::Client,
     config: &OpenSearchConfig,
     scroll_id: &str,
@@ -551,7 +551,7 @@ async fn clear_scroll(
     Ok(())
 }
 
-async fn bulk_delete(
+pub(crate) async fn bulk_delete(
     client: &reqwest::Client,
     config: &OpenSearchConfig,
     index: &str,

@@ -39,6 +39,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::index_template;
+use super::reconcile;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
@@ -177,27 +178,28 @@ impl OpenSearchSink {
     /// other relation sharing the index — the same hazard the Redis sink
     /// refuses outright under shared routing.
     ///
-    /// Map a failed clear response onto the retry classification the
-    /// dispatcher expects: server errors and throttling are transient,
-    /// everything else is permanent.
-    fn clear_error(status: reqwest::StatusCode, body: String) -> OpenSearchSinkError {
-        if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            OpenSearchSinkError::Server {
-                status: status.as_u16(),
-                message: body,
-                retry_after: None,
+    /// Map a reconcile failure onto the retry classification the dispatcher
+    /// expects: server errors and throttling are transient, other statuses
+    /// are permanent, and transport/decode failures retry as transport.
+    fn clear_error(err: reconcile::ReconcileError) -> OpenSearchSinkError {
+        match err {
+            reconcile::ReconcileError::BadStatus { status, body } => {
+                if (500..600).contains(&status) || status == 429 {
+                    OpenSearchSinkError::Server {
+                        status,
+                        message: body,
+                        retry_after: None,
+                    }
+                } else {
+                    OpenSearchSinkError::Client {
+                        status,
+                        message: body,
+                    }
+                }
             }
-        } else {
-            OpenSearchSinkError::Client {
-                status: status.as_u16(),
-                message: body,
-            }
+            other => OpenSearchSinkError::Transport(other.to_string()),
         }
     }
-
-    /// Ids fetched per scroll page while clearing a truncated relation.
-    /// Ids only (`_source: false`), so a page is cheap.
-    const SCROLL_PAGE_SIZE: usize = 1000;
 
     /// Clears can't ride the bulk API (there is no "empty the target"
     /// bulk action), and before this they fell through into the index
@@ -222,107 +224,62 @@ impl OpenSearchSink {
         };
         let prefix = format!("{namespace}.{relation}:");
         // `_id` is a metadata field and OpenSearch refuses prefix queries on
-        // it ("Can only use prefix queries on keyword and text fields"), so
-        // the scope cannot be expressed as a query. Scroll the index for ids
-        // instead, filter to the truncated relation here, and bulk-delete
-        // what matches. This costs a pass over the index per truncate, but
-        // it is the only approach that also clears documents indexed by
-        // earlier versions, which carry no relation marker field.
-        let base = self.config.endpoint.trim_end_matches('/');
+        // it, so the scope cannot be expressed as a query. Scan the index and
+        // filter here instead. reconcile.rs already solved this exact problem
+        // for orphan cleanup, so reuse its primitives rather than hand-rolling
+        // a second scroll loop: they apply auth, classify status, and own the
+        // scroll context lifetime.
         let mut scroll_id: Option<String> = None;
         let mut deleted: usize = 0;
-        loop {
-            let page = if let Some(id) = scroll_id.as_deref() {
-                self.client
-                    .post(format!("{base}/_search/scroll"))
-                    .json(&serde_json::json!({"scroll": "1m", "scroll_id": id}))
-                    .send()
-                    .await
-            } else {
-                self.client
-                    .post(format!("{base}/{index}/_search?scroll=1m"))
-                    .json(&serde_json::json!({
-                        "size": Self::SCROLL_PAGE_SIZE,
-                        "_source": false,
-                        "query": {"match_all": {}}
-                    }))
-                    .send()
-                    .await
+        let outcome = loop {
+            let batch = match scroll_id.as_deref() {
+                None => {
+                    match reconcile::scroll_open(&self.client, &self.config, &index, &prefix).await
+                    {
+                        // The index was never created: nothing to clear. This
+                        // is only a no-op on the FIRST request. A 404 once the
+                        // scroll is open means the context expired or the
+                        // index vanished mid-clear, and reporting success then
+                        // would advance the source cursor over a partial
+                        // delete.
+                        Err(reconcile::ReconcileError::BadStatus { status: 404, .. }) => {
+                            return Ok(());
+                        }
+                        other => other,
+                    }
+                }
+                Some(id) => reconcile::scroll_continue(&self.client, &self.config, id).await,
+            };
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(err) => break Err(err),
+            };
+            scroll_id = batch.scroll_id.clone();
+            if batch.ids.is_empty() {
+                break Ok(());
             }
-            .map_err(|err| OpenSearchSinkError::Transport(err.to_string()))?;
+            let doomed: Vec<String> = batch
+                .ids
+                .into_iter()
+                .filter(|id| id.starts_with(&prefix))
+                .collect();
+            if !doomed.is_empty() {
+                if let Err(err) =
+                    reconcile::bulk_delete(&self.client, &self.config, &index, &doomed).await
+                {
+                    break Err(err);
+                }
+                deleted += doomed.len();
+            }
+        };
 
-            let status = page.status();
-            if status == reqwest::StatusCode::NOT_FOUND {
-                // The index was never created; nothing to clear.
-                return Ok(());
-            }
-            if !status.is_success() {
-                return Err(Self::clear_error(
-                    status,
-                    page.text().await.unwrap_or_default(),
-                ));
-            }
-            let body: serde_json::Value = page
-                .json()
-                .await
-                .map_err(|err| OpenSearchSinkError::Transport(err.to_string()))?;
-            scroll_id = body
-                .get("_scroll_id")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned);
-            let hits = body
-                .get("hits")
-                .and_then(|h| h.get("hits"))
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if hits.is_empty() {
-                break;
-            }
-            let mut body_lines = String::new();
-            for hit in &hits {
-                let Some(id) = hit.get("_id").and_then(serde_json::Value::as_str) else {
-                    continue;
-                };
-                if !id.starts_with(&prefix) {
-                    continue;
-                }
-                body_lines.push_str(
-                    &serde_json::json!({
-                        "delete": {"_index": &index, "_id": id}
-                    })
-                    .to_string(),
-                );
-                body_lines.push('\n');
-                deleted += 1;
-            }
-            if !body_lines.is_empty() {
-                let response = self
-                    .client
-                    .post(format!("{base}/_bulk?refresh=true"))
-                    .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
-                    .body(body_lines)
-                    .send()
-                    .await
-                    .map_err(|err| OpenSearchSinkError::Transport(err.to_string()))?;
-                let status = response.status();
-                if !status.is_success() {
-                    return Err(Self::clear_error(
-                        status,
-                        response.text().await.unwrap_or_default(),
-                    ));
-                }
+        // Release the scroll context on every path, including failure.
+        if let Some(id) = scroll_id.as_deref() {
+            if let Err(err) = reconcile::clear_scroll(&self.client, &self.config, id).await {
+                debug!(index = %index, error = %err, "failed to release scroll context after clear");
             }
         }
-        if let Some(id) = scroll_id {
-            // Best effort: a leaked scroll context expires on its own.
-            let _ = self
-                .client
-                .delete(format!("{base}/_search/scroll"))
-                .json(&serde_json::json!({"scroll_id": [id]}))
-                .send()
-                .await;
-        }
+        outcome.map_err(Self::clear_error)?;
         info!(
             index = %index,
             prefix = %prefix,
@@ -2112,5 +2069,158 @@ mod tests {
             }
             other => panic!("expected Blocked, got {other:?}"),
         }
+    }
+    fn clear_event(namespace: &str, relation: &str) -> Event {
+        let source = SourceUri::new("test://x").expect("uri");
+        let subject =
+            Subject::new(format!("postgres.{namespace}.{relation}.truncate")).expect("subject");
+        let headers = Headers::empty()
+            .with_header("ventstream.target.clear".to_owned(), "true".to_owned())
+            .with_header("ventstream.cdc.namespace".to_owned(), namespace.to_owned())
+            .with_header("ventstream.cdc.relation".to_owned(), relation.to_owned());
+        Event::builder(source, subject)
+            .payload(Payload::from_vec(b"{}".to_vec()))
+            .content_type(ContentType::Json)
+            .headers(headers)
+            .build()
+    }
+
+    /// Guards the review finding on #171: the clear path issues its own
+    /// requests, and every one of them must carry the configured
+    /// credentials. Missing auth is invisible to the container suite because
+    /// that cluster runs with the security plugin disabled — on any secured
+    /// cluster the clear would 401, classify as permanent, and halt the
+    /// pipeline, which is the exact symptom the clear was written to fix.
+    #[tokio::test]
+    async fn every_request_in_the_clear_path_carries_auth() {
+        let server = MockServer::start().await;
+        // Scroll open: one page of ids, two of which belong to the relation.
+        Mock::given(method("POST"))
+            .and(path("/static-index/_search"))
+            .and(header("authorization", "Basic dXNlcjpwYXNz"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "_scroll_id": "cursor-1",
+                "hits": {"hits": [
+                    {"_id": "app.orders:[\"1\"]"},
+                    {"_id": "app.customers:[\"9\"]"}
+                ]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Bulk delete of the filtered ids.
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .and(header("authorization", "Basic dXNlcjpwYXNz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"took": 1, "errors": false, "items": []})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Scroll continue: empty page ends the loop.
+        Mock::given(method("POST"))
+            .and(path("/_search/scroll"))
+            .and(header("authorization", "Basic dXNlcjpwYXNz"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "_scroll_id": "cursor-1",
+                "hits": {"hits": []}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Scroll context release.
+        Mock::given(method("DELETE"))
+            .and(path("/_search/scroll"))
+            .and(header("authorization", "Basic dXNlcjpwYXNz"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut cfg = OpenSearchConfig::new("auth-test", server.uri(), "static-index");
+        cfg.auth = super::super::config::AuthMode::Basic {
+            username: "user".to_owned(),
+            password: "pass".to_owned(),
+        };
+        cfg.request_timeout = Duration::from_secs(2);
+        let sink = OpenSearchSink::new(cfg).expect("sink builds");
+
+        sink.apply_target_clear(&clear_event("app", "orders"))
+            .await
+            .expect("clear succeeds against an authenticated cluster");
+        // Every mock asserts its own `authorization` header, so a request
+        // built without auth would not match and the expectations fail.
+    }
+
+    /// A 404 is a no-op only on the FIRST request, where it means the index
+    /// was never created. Once the scroll is open a 404 means the context
+    /// expired or the index vanished mid-clear; treating that as success
+    /// would advance the source cursor over a partially cleared index.
+    #[tokio::test]
+    async fn a_404_mid_scroll_is_an_error_not_a_silent_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/static-index/_search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "_scroll_id": "cursor-1",
+                "hits": {"hits": [{"_id": "app.orders:[\"1\"]"}]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"took": 1, "errors": false, "items": []})),
+            )
+            .mount(&server)
+            .await;
+        // The scroll continuation 404s: context gone.
+        Mock::given(method("POST"))
+            .and(path("/_search/scroll"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/_search/scroll"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let mut cfg = OpenSearchConfig::new("mid-scroll", server.uri(), "static-index");
+        cfg.request_timeout = Duration::from_secs(2);
+        let sink = OpenSearchSink::new(cfg).expect("sink builds");
+
+        let err = sink
+            .apply_target_clear(&clear_event("app", "orders"))
+            .await
+            .expect_err("a mid-scroll 404 must not report success");
+        assert!(
+            matches!(err, OpenSearchSinkError::Client { status: 404, .. }),
+            "expected a 404 client error, got {err:?}"
+        );
+    }
+
+    /// The first-request 404 still means "index never created", so the clear
+    /// is a no-op rather than an error.
+    #[tokio::test]
+    async fn a_404_on_the_first_request_is_a_no_op() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/static-index/_search"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut cfg = OpenSearchConfig::new("missing-index", server.uri(), "static-index");
+        cfg.request_timeout = Duration::from_secs(2);
+        let sink = OpenSearchSink::new(cfg).expect("sink builds");
+
+        sink.apply_target_clear(&clear_event("app", "orders"))
+            .await
+            .expect("clearing a never-created index is a no-op");
     }
 }
