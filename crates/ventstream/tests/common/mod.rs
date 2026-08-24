@@ -48,6 +48,103 @@ pub struct PgRedisStack {
 static POSTGRES_TEST_OS: tokio::sync::OnceCell<(ContainerAsync<GenericImage>, u16)> =
     tokio::sync::OnceCell::const_new();
 
+/// Label marking every container this harness starts, so leftovers can be
+/// found later.
+const IT_LABEL: &str = "ventstream.it";
+/// Label carrying the pid of the test binary that started the container.
+/// A leaked container's pid belongs to a process that no longer exists,
+/// which is what makes the sweep safe to run while other suites are live.
+const IT_PID_LABEL: &str = "ventstream.it.pid";
+
+/// Labels applied to every container started by the harness.
+///
+/// This also triggers the leaked-container sweep. That is deliberate rather
+/// than tidy: every container start calls this, so the sweep cannot be
+/// forgotten at a new call site, and it runs exactly once per binary before
+/// anything is created. Adding it to each starter instead would be eight
+/// places to miss one.
+fn it_labels() -> std::collections::HashMap<String, String> {
+    sweep_leaked_containers();
+    let mut labels = std::collections::HashMap::new();
+    labels.insert(IT_LABEL.to_owned(), "1".to_owned());
+    labels.insert(IT_PID_LABEL.to_owned(), std::process::id().to_string());
+    labels
+}
+
+/// Remove containers this harness leaked in earlier runs.
+///
+/// testcontainers 0.27 has no reaper: cleanup happens in `ContainerAsync`'s
+/// `Drop`, which never runs when a test binary is killed — a panic that
+/// aborts, a timeout, an interrupt, a wedged daemon. The containers then
+/// accumulate, each holding its memory reservation, until an unrelated run
+/// fails in a way that looks nothing like the cause.
+///
+/// Sweeping *before* the run rather than after is deliberate: the failure
+/// mode is precisely the case where cleanup code does not run.
+///
+/// Only containers whose recorded pid is no longer alive are removed, so a
+/// suite running in parallel — cargo runs test binaries concurrently — never
+/// has its containers taken out from under it.
+fn sweep_leaked_containers() {
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(|| {
+        let listed = Command::new("docker")
+            .args(["ps", "-aq", "--filter", &format!("label={IT_LABEL}=1")])
+            .output();
+        let Ok(listed) = listed else {
+            // No docker, or it is unreachable: the suites will fail on their
+            // own with a clearer message than anything said here.
+            return;
+        };
+        let ids: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let mut removed = 0usize;
+        for id in ids {
+            let owner = Command::new("docker")
+                .args([
+                    "inspect",
+                    "-f",
+                    &format!("{{{{index .Config.Labels \"{IT_PID_LABEL}\"}}}}"),
+                    &id,
+                ])
+                .output();
+            let Ok(owner) = owner else { continue };
+            let pid = String::from_utf8_lossy(&owner.stdout).trim().to_owned();
+            if pid.is_empty() || pid_is_alive(&pid) {
+                continue;
+            }
+            if Command::new("docker")
+                .args(["rm", "-f", &id])
+                .output()
+                .is_ok()
+            {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            eprintln!("swept {removed} leaked container(s) from earlier runs");
+        }
+    });
+}
+
+/// True when a pid still refers to a running process. `kill -0` signals
+/// nothing; it only reports whether the process can be signalled.
+fn pid_is_alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// Start Postgres (logical replication enabled) + OpenSearch (security
 /// off) and wait until both accept connections.
 pub async fn start_pg_os() -> PgOsStack {
@@ -87,6 +184,7 @@ pub async fn start_redis() -> (ContainerAsync<GenericImage>, u16) {
             "--appendfsync",
             "everysec",
         ])
+        .with_labels(it_labels())
         .start()
         .await
         .expect("start Redis container");
@@ -116,6 +214,7 @@ async fn start_postgres() -> (ContainerAsync<GenericImage>, u16) {
             "-c",
             "max_replication_slots=10",
         ])
+        .with_labels(it_labels())
         .start()
         .await
         .expect("start postgres container");
@@ -139,6 +238,7 @@ async fn start_os() -> (ContainerAsync<GenericImage>, u16) {
         .with_env_var("OPENSEARCH_INITIAL_ADMIN_PASSWORD", "Vent$tr3am!Pass")
         .with_env_var("bootstrap.memory_lock", "false")
         .with_env_var("OPENSEARCH_JAVA_OPTS", "-Xms512m -Xmx512m")
+        .with_labels(it_labels())
         .start();
     let os = tokio::time::timeout(Duration::from_secs(120), start)
         .await
@@ -575,6 +675,7 @@ pub async fn start_neo4j_os() -> Neo4jOsStack {
         .with_env_var("NEO4J_dbms_security_procedures_unrestricted", "db.cdc.*")
         .with_env_var("NEO4J_server_memory_heap_max__size", "512m")
         .with_env_var("NEO4J_server_memory_pagecache_size", "256m")
+        .with_labels(it_labels())
         .start()
         .await
         .expect("start neo4j container");
@@ -787,6 +888,7 @@ pub async fn start_mongodb_os() -> MongoOsStack {
         .with_exposed_port(27017.tcp())
         .with_wait_for(WaitFor::message_on_stdout("Waiting for connections"))
         .with_cmd(["mongod", "--replSet", "rs0", "--bind_ip_all"])
+        .with_labels(it_labels())
         .start()
         .await
         .expect("start mongodb container");
@@ -950,6 +1052,7 @@ pub async fn start_mysql_with_row_image(row_image: &str) -> MySqlStack {
             format!("--binlog-row-image={row_image}"),
         ])
         .with_mapped_port(mysql_port, 3306.tcp())
+        .with_labels(it_labels())
         .start()
         .await
         .expect("start mysql container");
@@ -1146,6 +1249,7 @@ pub async fn start_kafka_os() -> KafkaOsStack {
             format!("--advertise-kafka-addr={advertised}"),
         ])
         .with_mapped_port(kafka_port, 9092.tcp())
+        .with_labels(it_labels())
         .start()
         .await
         .expect("start redpanda container");
@@ -1288,6 +1392,7 @@ pub async fn start_pg_surreal() -> PgSurrealStack {
     let surreal = GenericImage::new("surrealdb/surrealdb", "latest")
         .with_exposed_port(8000.tcp())
         .with_cmd(["start", "--user", "root", "--pass", "root", "memory"])
+        .with_labels(it_labels())
         .start()
         .await
         .expect("start surrealdb container");
