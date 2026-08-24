@@ -177,6 +177,28 @@ impl OpenSearchSink {
     /// other relation sharing the index — the same hazard the Redis sink
     /// refuses outright under shared routing.
     ///
+    /// Map a failed clear response onto the retry classification the
+    /// dispatcher expects: server errors and throttling are transient,
+    /// everything else is permanent.
+    fn clear_error(status: reqwest::StatusCode, body: String) -> OpenSearchSinkError {
+        if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            OpenSearchSinkError::Server {
+                status: status.as_u16(),
+                message: body,
+                retry_after: None,
+            }
+        } else {
+            OpenSearchSinkError::Client {
+                status: status.as_u16(),
+                message: body,
+            }
+        }
+    }
+
+    /// Ids fetched per scroll page while clearing a truncated relation.
+    /// Ids only (`_source: false`), so a page is cheap.
+    const SCROLL_PAGE_SIZE: usize = 1000;
+
     /// Clears can't ride the bulk API (there is no "empty the target"
     /// bulk action), and before this they fell through into the index
     /// branch and were written as `{}` documents under generated ids
@@ -199,41 +221,114 @@ impl OpenSearchSink {
             )));
         };
         let prefix = format!("{namespace}.{relation}:");
-        let url = format!(
-            "{}/{}/_delete_by_query?refresh=true&conflicts=proceed",
-            self.config.endpoint.trim_end_matches('/'),
-            index
-        );
-        let response = self
-            .client
-            .post(&url)
-            .json(&serde_json::json!({"query": {"prefix": {"_id": prefix}}}))
-            .send()
-            .await
+        // `_id` is a metadata field and OpenSearch refuses prefix queries on
+        // it ("Can only use prefix queries on keyword and text fields"), so
+        // the scope cannot be expressed as a query. Scroll the index for ids
+        // instead, filter to the truncated relation here, and bulk-delete
+        // what matches. This costs a pass over the index per truncate, but
+        // it is the only approach that also clears documents indexed by
+        // earlier versions, which carry no relation marker field.
+        let base = self.config.endpoint.trim_end_matches('/');
+        let mut scroll_id: Option<String> = None;
+        let mut deleted: usize = 0;
+        loop {
+            let page = if let Some(id) = scroll_id.as_deref() {
+                self.client
+                    .post(format!("{base}/_search/scroll"))
+                    .json(&serde_json::json!({"scroll": "1m", "scroll_id": id}))
+                    .send()
+                    .await
+            } else {
+                self.client
+                    .post(format!("{base}/{index}/_search?scroll=1m"))
+                    .json(&serde_json::json!({
+                        "size": Self::SCROLL_PAGE_SIZE,
+                        "_source": false,
+                        "query": {"match_all": {}}
+                    }))
+                    .send()
+                    .await
+            }
             .map_err(|err| OpenSearchSinkError::Transport(err.to_string()))?;
-        let status = response.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            // Nothing to clear: the index was never created.
-            return Ok(());
+
+            let status = page.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                // The index was never created; nothing to clear.
+                return Ok(());
+            }
+            if !status.is_success() {
+                return Err(Self::clear_error(
+                    status,
+                    page.text().await.unwrap_or_default(),
+                ));
+            }
+            let body: serde_json::Value = page
+                .json()
+                .await
+                .map_err(|err| OpenSearchSinkError::Transport(err.to_string()))?;
+            scroll_id = body
+                .get("_scroll_id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+            let hits = body
+                .get("hits")
+                .and_then(|h| h.get("hits"))
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if hits.is_empty() {
+                break;
+            }
+            let mut body_lines = String::new();
+            for hit in &hits {
+                let Some(id) = hit.get("_id").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                if !id.starts_with(&prefix) {
+                    continue;
+                }
+                body_lines.push_str(
+                    &serde_json::json!({
+                        "delete": {"_index": &index, "_id": id}
+                    })
+                    .to_string(),
+                );
+                body_lines.push('\n');
+                deleted += 1;
+            }
+            if !body_lines.is_empty() {
+                let response = self
+                    .client
+                    .post(format!("{base}/_bulk?refresh=true"))
+                    .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+                    .body(body_lines)
+                    .send()
+                    .await
+                    .map_err(|err| OpenSearchSinkError::Transport(err.to_string()))?;
+                let status = response.status();
+                if !status.is_success() {
+                    return Err(Self::clear_error(
+                        status,
+                        response.text().await.unwrap_or_default(),
+                    ));
+                }
+            }
         }
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(
-                if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    OpenSearchSinkError::Server {
-                        status: status.as_u16(),
-                        message: body,
-                        retry_after: None,
-                    }
-                } else {
-                    OpenSearchSinkError::Client {
-                        status: status.as_u16(),
-                        message: body,
-                    }
-                },
-            );
+        if let Some(id) = scroll_id {
+            // Best effort: a leaked scroll context expires on its own.
+            let _ = self
+                .client
+                .delete(format!("{base}/_search/scroll"))
+                .json(&serde_json::json!({"scroll_id": [id]}))
+                .send()
+                .await;
         }
-        info!(index = %index, prefix = %prefix, "cleared opensearch documents for source TRUNCATE");
+        info!(
+            index = %index,
+            prefix = %prefix,
+            deleted,
+            "cleared opensearch documents for source TRUNCATE"
+        );
         Ok(())
     }
 
