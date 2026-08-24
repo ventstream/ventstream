@@ -371,7 +371,9 @@ infra/                      Helm charts, Docker images, k8s manifests
 ## Engineering bar
 
 - `unsafe_code = "forbid"` across the workspace
-- Clippy `pedantic` + `nursery`, with `unwrap` / `panic` / `todo` denied
+- Clippy denies `unwrap` / `expect` / `panic` / `todo` / `unimplemented` /
+  `indexing_slicing` / `mem_forget`, plus a selected set of pedantic lints
+  (the full `pedantic` and `nursery` groups are not enabled)
 - Every spawned task is owned and cancellable; message passing is the primary
   concurrency model
 - Correctness is verified live, not assumed: bootstrap parity, delete
