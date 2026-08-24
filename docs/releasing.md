@@ -122,7 +122,7 @@ Download and verify a native archive and its GitHub attestations before running
 it. Use the archive matching the operator's platform:
 
 ```bash
-VERSION=0.1.12
+VERSION=0.1.43
 PLATFORM=linux-amd64
 ARCHIVE="ventstream-$VERSION-$PLATFORM.tar.gz"
 
@@ -151,7 +151,7 @@ Install the chart by its immutable version and pin the image by digest:
 ```bash
 helm upgrade --install realtime \
   oci://ghcr.io/ventstream/charts/ventstream-gateway \
-  --version 0.1.12 \
+  --version 0.1.43 \
   --set image.digest=sha256:<digest>
 ```
 

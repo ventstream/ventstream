@@ -224,7 +224,7 @@ The published `ventstream-gateway` chart runs the horizontally scalable
 ```bash
 helm upgrade --install realtime \
   oci://ghcr.io/ventstream/charts/ventstream-gateway \
-  --version 0.1.24 \
+  --version 0.1.43 \
   --namespace ventstream --create-namespace \
   --set-string 'roles=ws\,graphql' \
   --set replicas=3 \
