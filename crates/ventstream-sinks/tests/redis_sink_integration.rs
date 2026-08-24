@@ -18,39 +18,50 @@ use ventstream_sinks::{
     RedisViewMissingBehavior, RedisViewSource, RedisViewValue, RetryConfig,
 };
 
-fn redis_url() -> Option<String> {
-    std::env::var("VS_TEST_REDIS_SINK_URL").ok()
+fn env_required(key: &str) -> String {
+    match std::env::var(key) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => panic!(
+            "{key} must be set to run this test. These tests are #[ignore]d by \
+             default; run them with --ignored once the Redis fixtures are up."
+        ),
+    }
 }
 
-fn authenticated_redis() -> Option<(String, String)> {
-    let url = std::env::var("VS_TEST_REDIS_AUTH_URL").ok()?;
-    let password = std::env::var("VS_TEST_REDIS_AUTH_PASSWORD").ok()?;
-    Some((url, password))
+fn redis_url() -> String {
+    env_required("VS_TEST_REDIS_SINK_URL")
 }
 
-fn redis_json_url() -> Option<String> {
-    std::env::var("VS_TEST_REDISJSON_URL").ok()
+fn authenticated_redis() -> (String, String) {
+    (
+        env_required("VS_TEST_REDIS_AUTH_URL"),
+        env_required("VS_TEST_REDIS_AUTH_PASSWORD"),
+    )
 }
 
-fn pressure_redis_url() -> Option<String> {
-    std::env::var("VS_TEST_REDIS_PRESSURE_URL").ok()
+fn redis_json_url() -> String {
+    env_required("VS_TEST_REDISJSON_URL")
 }
 
-fn replicated_redis_url() -> Option<String> {
-    std::env::var("VS_TEST_REDIS_REPLICATED_URL").ok()
+fn pressure_redis_url() -> String {
+    env_required("VS_TEST_REDIS_PRESSURE_URL")
 }
 
-fn aof_redis_url() -> Option<String> {
-    std::env::var("VS_TEST_REDIS_AOF_URL").ok()
+fn replicated_redis_url() -> String {
+    env_required("VS_TEST_REDIS_REPLICATED_URL")
 }
 
-fn redis_failover() -> Option<(String, String, String, String)> {
-    Some((
-        std::env::var("VS_TEST_REDIS_FAILOVER_URL").ok()?,
-        std::env::var("VS_TEST_REDIS_FAILOVER_PRIMARY_CONTAINER").ok()?,
-        std::env::var("VS_TEST_REDIS_FAILOVER_REPLICA_CONTAINER").ok()?,
-        std::env::var("VS_TEST_REDIS_FAILOVER_REPLICA_URL").ok()?,
-    ))
+fn aof_redis_url() -> String {
+    env_required("VS_TEST_REDIS_AOF_URL")
+}
+
+fn redis_failover() -> (String, String, String, String) {
+    (
+        env_required("VS_TEST_REDIS_FAILOVER_URL"),
+        env_required("VS_TEST_REDIS_FAILOVER_PRIMARY_CONTAINER"),
+        env_required("VS_TEST_REDIS_FAILOVER_REPLICA_CONTAINER"),
+        env_required("VS_TEST_REDIS_FAILOVER_REPLICA_URL"),
+    )
 }
 
 struct FailoverTopologyGuard {
@@ -141,13 +152,13 @@ fn restore_failover_topology(primary: &str, replica: &str) -> bool {
     })
 }
 
-fn redis_mtls() -> Option<(String, PathBuf, PathBuf, PathBuf)> {
-    Some((
-        std::env::var("VS_TEST_REDIS_MTLS_URL").ok()?,
-        PathBuf::from(std::env::var("VS_TEST_REDIS_MTLS_CA_FILE").ok()?),
-        PathBuf::from(std::env::var("VS_TEST_REDIS_MTLS_CLIENT_CERT_FILE").ok()?),
-        PathBuf::from(std::env::var("VS_TEST_REDIS_MTLS_CLIENT_KEY_FILE").ok()?),
-    ))
+fn redis_mtls() -> (String, PathBuf, PathBuf, PathBuf) {
+    (
+        env_required("VS_TEST_REDIS_MTLS_URL"),
+        PathBuf::from(env_required("VS_TEST_REDIS_MTLS_CA_FILE")),
+        PathBuf::from(env_required("VS_TEST_REDIS_MTLS_CLIENT_CERT_FILE")),
+        PathBuf::from(env_required("VS_TEST_REDIS_MTLS_CLIENT_KEY_FILE")),
+    )
 }
 
 fn process_rss_kib() -> u64 {
@@ -302,11 +313,10 @@ async fn matching_keys(
     }
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn lookup_views_fan_out_move_filter_and_delete_without_tombstone_payload() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:views:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -386,11 +396,10 @@ async fn lookup_views_fan_out_move_filter_and_delete_without_tombstone_payload()
     );
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn lookup_views_reject_stale_moves_and_keep_versioned_tombstones() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:view-source-order:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -475,11 +484,10 @@ async fn lookup_views_reject_stale_moves_and_keep_versioned_tombstones() {
     }
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn lookup_view_transformation_failure_preserves_every_previous_materialization() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:view-fail-closed:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -552,11 +560,10 @@ async fn lookup_view_transformation_failure_preserves_every_previous_materializa
     );
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn lookup_view_manifests_survive_sink_restart() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:view-restart:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -593,11 +600,10 @@ async fn lookup_view_manifests_survive_sink_restart() {
     assert_eq!(connection.exists::<_, bool>(&key).await, Ok(false));
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn lookup_view_schema_changes_require_rebootstrap_and_clear_removed_targets() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:view-schema:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -666,11 +672,10 @@ async fn lookup_view_schema_changes_require_rebootstrap_and_clear_removed_target
     );
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn lookup_view_schema_is_order_independent_and_tracks_contract_changes() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:view-schema-order:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -713,11 +718,10 @@ async fn lookup_view_schema_is_order_independent_and_tracks_contract_changes() {
         .expect("remove view schema metadata");
 }
 
+#[ignore = "needs VS_TEST_REDISJSON_URL; run with --ignored"]
 #[tokio::test]
 async fn lookup_view_schema_tracks_document_format_changes() {
-    let Some(url) = redis_json_url() else {
-        return;
-    };
+    let url = redis_json_url();
     let prefix = format!(
         "ventstream:test:view-schema-format:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -748,11 +752,10 @@ async fn lookup_view_schema_tracks_document_format_changes() {
         .expect("remove view schema metadata");
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn lookup_view_rebootstrap_rejects_malformed_schema_metadata_before_clearing_data() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:view-schema-invalid:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -807,11 +810,10 @@ async fn lookup_view_rebootstrap_rejects_malformed_schema_metadata_before_cleari
     }
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn lookup_view_collision_blocks_before_any_event_is_materialized() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:view-collision:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -861,11 +863,10 @@ async fn lookup_view_collision_blocks_before_any_event_is_materialized() {
     );
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn lookup_view_blocks_an_existing_key_without_ownership_metadata() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:view-missing-owner:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -914,11 +915,10 @@ async fn lookup_view_blocks_an_existing_key_without_ownership_metadata() {
     );
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn lookup_view_batch_can_handoff_a_key_released_by_an_earlier_event() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:view-handoff:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -970,11 +970,10 @@ async fn lookup_view_batch_can_handoff_a_key_released_by_an_earlier_event() {
     );
 }
 
+#[ignore = "needs VS_TEST_REDISJSON_URL; run with --ignored"]
 #[tokio::test]
 async fn redis_json_lookup_view_batch_can_handoff_a_key_in_event_order() {
-    let Some(url) = redis_json_url() else {
-        return;
-    };
+    let url = redis_json_url();
     let prefix = format!(
         "ventstream:test:view-json-handoff:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -1037,11 +1036,10 @@ async fn redis_json_lookup_view_batch_can_handoff_a_key_in_event_order() {
     }
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn lookup_view_batch_rejects_a_handoff_before_the_current_owner_releases_the_key() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:view-handoff-order:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -1097,11 +1095,10 @@ async fn lookup_view_batch_rejects_a_handoff_before_the_current_owner_releases_t
     );
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn lookup_view_batch_releases_an_intermediate_key_after_multiple_source_transitions() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:view-multiple-transitions:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -1160,11 +1157,10 @@ async fn lookup_view_batch_releases_an_intermediate_key_after_multiple_source_tr
     );
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn lookup_view_cache_expires_data_owner_and_manifest_together() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:view-cache:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -1212,11 +1208,10 @@ async fn lookup_view_cache_expires_data_owner_and_manifest_together() {
     );
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn lookup_view_truncate_clears_all_matching_view_state() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:view-truncate:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -1265,11 +1260,10 @@ async fn lookup_view_truncate_clears_all_matching_view_state() {
     );
 }
 
+#[ignore = "needs VS_TEST_REDISJSON_URL; run with --ignored"]
 #[tokio::test]
 async fn redis_json_lookup_views_publish_selected_documents_atomically() {
-    let Some(url) = redis_json_url() else {
-        return;
-    };
+    let url = redis_json_url();
     let prefix = format!(
         "ventstream:test:view-json:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -1305,11 +1299,10 @@ async fn redis_json_lookup_views_publish_selected_documents_atomically() {
     );
 }
 
+#[ignore = "needs VS_TEST_REDIS_AUTH_URL; run with --ignored"]
 #[tokio::test]
 async fn lookup_views_reject_incomplete_acl_permissions_at_startup() {
-    let Some((url, admin_password)) = authenticated_redis() else {
-        return;
-    };
+    let (url, admin_password) = authenticated_redis();
     let suffix = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let prefix = format!("ventstream:test:view-acl:{suffix}");
     let username = format!("ventstream_view_incomplete_{suffix}");
@@ -1362,11 +1355,10 @@ async fn lookup_views_reject_incomplete_acl_permissions_at_startup() {
     );
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn string_sink_upserts_expires_and_deletes() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -1456,11 +1448,10 @@ async fn string_sink_upserts_expires_and_deletes() {
     assert!(!exists);
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn direct_materialization_rejects_stale_replays_and_preserves_delete_versions() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:source-order:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -1539,11 +1530,10 @@ async fn direct_materialization_rejects_stale_replays_and_preserves_delete_versi
     );
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn script_cache_flush_reloads_on_the_active_primary() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:script-reload:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -1590,11 +1580,10 @@ async fn script_cache_flush_reloads_on_the_active_primary() {
     );
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn online_diagnostic_checks_live_capabilities_without_claiming_a_writer() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:diagnostic:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -1631,11 +1620,10 @@ async fn online_diagnostic_checks_live_capabilities_without_claiming_a_writer() 
     assert!(keys.is_empty(), "diagnostic left Redis keys behind");
 }
 
+#[ignore = "needs VS_TEST_REDIS_AUTH_URL; run with --ignored"]
 #[tokio::test]
 async fn online_diagnostic_rejects_incomplete_acl_permissions() {
-    let Some((url, admin_password)) = authenticated_redis() else {
-        return;
-    };
+    let (url, admin_password) = authenticated_redis();
     let suffix = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let username = format!("ventstream_diagnostic_denied_{suffix}");
     let prefix = format!("ventstream:test:diagnostic-acl:{suffix}");
@@ -1684,11 +1672,10 @@ async fn online_diagnostic_rejects_incomplete_acl_permissions() {
     );
 }
 
+#[ignore = "needs VS_TEST_REDIS_REPLICATED_URL; run with --ignored"]
 #[tokio::test]
 async fn online_diagnostic_verifies_replica_acknowledgement() {
-    let Some(url) = replicated_redis_url() else {
-        return;
-    };
+    let url = replicated_redis_url();
     let report = RedisSink::diagnose(
         RedisConfig::new(
             "redis-diagnostic-replica-test",
@@ -1708,11 +1695,10 @@ async fn online_diagnostic_verifies_replica_acknowledgement() {
     assert!(report.observed_replica_acks.is_some_and(|acks| acks >= 1));
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn online_diagnostic_does_not_initialize_view_schema() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:diagnostic-view:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -1743,11 +1729,10 @@ async fn online_diagnostic_does_not_initialize_view_schema() {
     );
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn drift_inspection_is_bounded_and_detects_direct_staging_leaks() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:drift-direct:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -1808,11 +1793,10 @@ async fn drift_inspection_is_bounded_and_detects_direct_staging_leaks() {
     assert!(report.targets[0].requires_rebootstrap);
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn drift_inspection_detects_broken_view_ownership_without_mutating_data() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:drift-view:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -1874,11 +1858,10 @@ async fn drift_inspection_detects_broken_view_ownership_without_mutating_data() 
     );
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn pooled_writes_serialize_each_target_and_open_an_independent_lane() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:pooled-order:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -1987,11 +1970,10 @@ async fn pooled_writes_serialize_each_target_and_open_an_independent_lane() {
     assert_eq!(stored, br#"{"id":"pooled","version":2}"#.to_vec());
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn truncate_is_bounded_target_scoped_and_ordered() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:truncate:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -2057,11 +2039,10 @@ async fn truncate_is_bounded_target_scoped_and_ordered() {
     assert!(customer_exists, "truncate crossed the target boundary");
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn exclusive_reset_is_deduplicated_and_target_scoped() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:reset:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -2122,11 +2103,10 @@ async fn shared_reset_is_refused_before_connecting() {
     ));
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn invalid_reset_target_cannot_partially_clear_valid_targets() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:reset-validation:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -2165,11 +2145,10 @@ async fn invalid_reset_target_cannot_partially_clear_valid_targets() {
     );
 }
 
+#[ignore = "needs VS_TEST_REDISJSON_URL; run with --ignored"]
 #[tokio::test]
 async fn invalid_json_is_an_exact_item_rejection() {
-    let Some(url) = redis_json_url() else {
-        return;
-    };
+    let url = redis_json_url();
     let mut config = RedisConfig::new(
         "redis-json-test",
         url,
@@ -2200,11 +2179,10 @@ async fn invalid_json_is_an_exact_item_rejection() {
     ));
 }
 
+#[ignore = "needs VS_TEST_REDISJSON_URL; run with --ignored"]
 #[tokio::test]
 async fn redis_json_sink_upserts_and_deletes() {
-    let Some(url) = redis_json_url() else {
-        return;
-    };
+    let url = redis_json_url();
     let prefix = format!(
         "ventstream:test:json:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -2255,11 +2233,10 @@ async fn redis_json_sink_upserts_and_deletes() {
     assert!(!exists);
 }
 
+#[ignore = "needs VS_TEST_REDISJSON_URL; run with --ignored"]
 #[tokio::test]
 async fn redis_json_wrong_type_rejects_only_the_conflicting_event() {
-    let Some(url) = redis_json_url() else {
-        return;
-    };
+    let url = redis_json_url();
     let prefix = format!(
         "ventstream:test:json-wrong-type:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -2336,11 +2313,10 @@ async fn redis_json_wrong_type_rejects_only_the_conflicting_event() {
     );
 }
 
+#[ignore = "needs VS_TEST_REDISJSON_URL; run with --ignored"]
 #[tokio::test]
 async fn redis_json_cache_refreshes_expiration_with_the_value() {
-    let Some(url) = redis_json_url() else {
-        return;
-    };
+    let url = redis_json_url();
     let prefix = format!(
         "ventstream:test:json-cache:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -2403,11 +2379,10 @@ async fn redis_json_cache_refreshes_expiration_with_the_value() {
     assert!(!exists);
 }
 
+#[ignore = "needs VS_TEST_REDISJSON_URL; run with --ignored"]
 #[tokio::test]
 async fn redis_json_cache_keeps_the_visible_value_unchanged_when_expiry_is_denied() {
-    let Some(url) = redis_json_url() else {
-        return;
-    };
+    let url = redis_json_url();
     let suffix = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let prefix = format!("ventstream:test:json-cache-acl:{suffix}");
     let username = format!("ventstream_json_cache_no_expiry_{suffix}");
@@ -2508,11 +2483,10 @@ async fn redis_json_cache_keeps_the_visible_value_unchanged_when_expiry_is_denie
     );
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn redis_json_mode_blocks_when_the_module_is_unavailable() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let result = RedisSink::connect(
         RedisConfig::new(
             "redis-json-module-test",
@@ -2529,11 +2503,10 @@ async fn redis_json_mode_blocks_when_the_module_is_unavailable() {
     assert!(matches!(error, ventstream_core::SinkError::Blocked(_)));
 }
 
+#[ignore = "needs VS_TEST_REDIS_AUTH_URL; run with --ignored"]
 #[tokio::test]
 async fn password_auth_is_not_required_in_the_endpoint_url() {
-    let Some((url, password)) = authenticated_redis() else {
-        return;
-    };
+    let (url, password) = authenticated_redis();
     let sink = RedisSink::connect(
         RedisConfig::new(
             "redis-auth-test",
@@ -2554,11 +2527,10 @@ async fn password_auth_is_not_required_in_the_endpoint_url() {
     .expect("authenticated write");
 }
 
+#[ignore = "needs VS_TEST_REDIS_AUTH_URL; run with --ignored"]
 #[tokio::test]
 async fn mounted_password_rotation_reconnects_without_restarting_the_sink() {
-    let Some((url, admin_password)) = authenticated_redis() else {
-        return;
-    };
+    let (url, admin_password) = authenticated_redis();
     let suffix = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let username = format!("ventstream_rotate_{suffix}");
     let first_password = "ventstream-rotation-first";
@@ -2645,11 +2617,10 @@ async fn mounted_password_rotation_reconnects_without_restarting_the_sink() {
     let _ = std::fs::remove_dir_all(directory);
 }
 
+#[ignore = "needs VS_TEST_REDIS_AUTH_URL; run with --ignored"]
 #[tokio::test]
 async fn incorrect_password_blocks_without_retrying_forever() {
-    let Some((url, _)) = authenticated_redis() else {
-        return;
-    };
+    let (url, _) = authenticated_redis();
     let mut config = RedisConfig::new(
         "redis-invalid-auth-test",
         &url,
@@ -2669,11 +2640,10 @@ async fn incorrect_password_blocks_without_retrying_forever() {
     ));
 }
 
+#[ignore = "needs VS_TEST_REDIS_AUTH_URL; run with --ignored"]
 #[tokio::test]
 async fn acl_write_denial_blocks_delivery_without_retrying() {
-    let Some((url, admin_password)) = authenticated_redis() else {
-        return;
-    };
+    let (url, admin_password) = authenticated_redis();
     let username = format!(
         "ventstream_no_write_{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -2735,11 +2705,10 @@ async fn acl_write_denial_blocks_delivery_without_retrying() {
     ));
 }
 
+#[ignore = "needs VS_TEST_REDIS_AUTH_URL; run with --ignored"]
 #[tokio::test]
 async fn acl_without_keyspace_cleanup_permissions_blocks_truncate() {
-    let Some((url, admin_password)) = authenticated_redis() else {
-        return;
-    };
+    let (url, admin_password) = authenticated_redis();
     let suffix = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let username = format!("ventstream_no_clear_{suffix}");
     let prefix = format!("ventstream:test:acl-clear:{suffix}");
@@ -2806,11 +2775,10 @@ async fn acl_without_keyspace_cleanup_permissions_blocks_truncate() {
     ));
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn active_writer_lease_blocks_duplicates_and_expires_after_owner_stops() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:writer-lease:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -2878,11 +2846,10 @@ async fn active_writer_lease_blocks_duplicates_and_expires_after_owner_stops() {
     );
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn newer_writer_fences_stale_mutations_per_target() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:fencing:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -3003,11 +2970,10 @@ async fn newer_writer_fences_stale_mutations_per_target() {
     assert_eq!(customer, r#"{"id":"independent","writer":"first"}"#);
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn newer_writer_fences_stale_lookup_view_manifests_and_values_atomically() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:view-fencing:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -3089,11 +3055,10 @@ async fn newer_writer_fences_stale_lookup_view_manifests_and_values_atomically()
     );
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn stale_multi_target_batch_is_rejected_before_any_target_is_mutated() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:fencing:atomic:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -3193,11 +3158,10 @@ async fn stale_multi_target_batch_is_rejected_before_any_target_is_mutated() {
     assert_eq!(customer, r#"{"id":"customer-1","writer":"first"}"#);
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn missing_writer_fence_recovers_only_while_the_writer_lineage_is_current() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:fence-loss:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -3284,11 +3248,10 @@ async fn missing_writer_fence_recovers_only_while_the_writer_lineage_is_current(
     assert_eq!(unchanged, r#"{"id":"fence-loss","revision":3}"#);
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn a_lost_target_fence_does_not_expire_unrelated_idle_targets() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:fence-independence:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -3348,11 +3311,10 @@ async fn a_lost_target_fence_does_not_expire_unrelated_idle_targets() {
     ));
 }
 
+#[ignore = "needs VS_TEST_REDIS_MTLS_*; run with --ignored"]
 #[tokio::test]
 async fn custom_ca_and_mutual_tls_are_supported() {
-    let Some((url, ca_file, client_cert_file, client_key_file)) = redis_mtls() else {
-        return;
-    };
+    let (url, ca_file, client_cert_file, client_key_file) = redis_mtls();
     let sink = RedisSink::connect(
         RedisConfig::new(
             "redis-mtls-test",
@@ -3377,11 +3339,10 @@ async fn custom_ca_and_mutual_tls_are_supported() {
     .expect("mutual TLS write");
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn unmet_replica_acknowledgement_fails_closed() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let mut config = RedisConfig::new(
         "redis-ack-test",
         url,
@@ -3408,11 +3369,10 @@ async fn unmet_replica_acknowledgement_fails_closed() {
     assert!(matches!(error, ventstream_core::SinkError::Connection(_)));
 }
 
+#[ignore = "needs VS_TEST_REDIS_REPLICATED_URL; run with --ignored"]
 #[tokio::test]
 async fn replicated_acknowledgement_advances_after_replica_confirmation() {
-    let Some(url) = replicated_redis_url() else {
-        return;
-    };
+    let url = replicated_redis_url();
     let mut connection = redis::Client::open(url.as_str())
         .expect("client")
         .get_connection_manager()
@@ -3457,11 +3417,10 @@ async fn replicated_acknowledgement_advances_after_replica_confirmation() {
     .expect("replica-acknowledged write");
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn aof_acknowledgement_requires_enabled_persistence() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let sink = RedisSink::connect(
         RedisConfig::new(
             "redis-aof-disabled-test",
@@ -3491,11 +3450,10 @@ async fn aof_acknowledgement_requires_enabled_persistence() {
     ));
 }
 
+#[ignore = "needs VS_TEST_REDIS_AOF_URL; run with --ignored"]
 #[tokio::test]
 async fn aof_acknowledgement_confirms_local_and_replica_fsync() {
-    let Some(url) = aof_redis_url() else {
-        return;
-    };
+    let url = aof_redis_url();
     let mut connection = redis::Client::open(url.as_str())
         .expect("client")
         .get_connection_manager()
@@ -3546,11 +3504,10 @@ async fn aof_acknowledgement_confirms_local_and_replica_fsync() {
     .expect("AOF-acknowledged write");
 }
 
+#[ignore = "needs VS_TEST_REDIS_FAILOVER_*; run with --ignored"]
 #[tokio::test]
 async fn managed_endpoint_recovers_across_primary_failover() {
-    let Some((url, primary, replica, replica_url)) = redis_failover() else {
-        return;
-    };
+    let (url, primary, replica, replica_url) = redis_failover();
     let _topology = FailoverTopologyGuard::acquire(primary.clone(), replica.clone());
     let health = SinkHealth::new();
     let mut config = RedisConfig::new(
@@ -3628,14 +3585,11 @@ async fn managed_endpoint_recovers_across_primary_failover() {
     assert_eq!(value, br#"{"id":"failover","status":"promoted"}"#.to_vec());
 }
 
+#[ignore = "needs VS_TEST_REDIS_RESTART_CONTAINER; run with --ignored"]
 #[tokio::test]
 async fn write_recovers_after_redis_restarts() {
-    let Some(url) = redis_url() else {
-        return;
-    };
-    let Ok(container) = std::env::var("VS_TEST_REDIS_RESTART_CONTAINER") else {
-        return;
-    };
+    let url = redis_url();
+    let container = env_required("VS_TEST_REDIS_RESTART_CONTAINER");
     let _container_guard = RestartContainerGuard::new(container.clone());
     let mut config = RedisConfig::new(
         "redis-restart-test",
@@ -3682,14 +3636,11 @@ async fn write_recovers_after_redis_restarts() {
         .expect("write after recovery");
 }
 
+#[ignore = "needs VS_TEST_REDIS_RESTART_CONTAINER; run with --ignored"]
 #[tokio::test]
 async fn truncate_backpressures_and_recovers_after_a_transient_outage() {
-    let Some(url) = redis_url() else {
-        return;
-    };
-    let Ok(container) = std::env::var("VS_TEST_REDIS_RESTART_CONTAINER") else {
-        return;
-    };
+    let url = redis_url();
+    let container = env_required("VS_TEST_REDIS_RESTART_CONTAINER");
     let _container_guard = RestartContainerGuard::new(container.clone());
     let suffix = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let prefix = format!("ventstream:test:truncate-recovery:{suffix}");
@@ -3768,14 +3719,11 @@ async fn truncate_backpressures_and_recovers_after_a_transient_outage() {
     assert!(keys.is_empty(), "truncate left stale keys after recovery");
 }
 
+#[ignore = "needs VS_TEST_REDIS_RESTART_CONTAINER; run with --ignored"]
 #[tokio::test]
 async fn connect_recovers_when_redis_starts_late() {
-    let Some(url) = redis_url() else {
-        return;
-    };
-    let Ok(container) = std::env::var("VS_TEST_REDIS_RESTART_CONTAINER") else {
-        return;
-    };
+    let url = redis_url();
+    let container = env_required("VS_TEST_REDIS_RESTART_CONTAINER");
     let _container_guard = RestartContainerGuard::new(container.clone());
     let output = Command::new("docker")
         .args(["stop", "-t", "0", &container])
@@ -3812,11 +3760,10 @@ async fn connect_recovers_when_redis_starts_late() {
         .expect("connect after recovery");
 }
 
+#[ignore = "needs VS_TEST_REDIS_PRESSURE_URL; run with --ignored"]
 #[tokio::test]
 async fn memory_pressure_backpressures_until_capacity_recovers() {
-    let Some(url) = pressure_redis_url() else {
-        return;
-    };
+    let url = pressure_redis_url();
     let mut admin = redis::Client::open(url.as_str())
         .expect("client")
         .get_connection_manager()
@@ -3923,11 +3870,10 @@ async fn memory_pressure_backpressures_until_capacity_recovers() {
     assert_eq!(health.snapshot(), SinkHealthSnapshot::Healthy);
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn split_pipelines_preserve_same_key_order() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let prefix = format!(
         "ventstream:test:split-order:{}",
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -3969,11 +3915,10 @@ async fn split_pipelines_preserve_same_key_order() {
     assert_eq!(stored, br#"{"id":"ordered","version":2}"#.to_vec());
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn ordered_pipeline_throughput_probe() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let Ok(event_count) = std::env::var("VS_TEST_REDIS_BENCH_EVENTS") else {
         return;
     };
@@ -4051,11 +3996,10 @@ async fn ordered_pipeline_throughput_probe() {
         .expect("remove benchmark writer fence");
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn bounded_keyspace_sustained_throughput_probe() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let Ok(duration_secs) = std::env::var("VS_TEST_REDIS_SOAK_SECS") else {
         return;
     };
@@ -4152,11 +4096,10 @@ async fn bounded_keyspace_sustained_throughput_probe() {
         .expect("remove soak writer fence");
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test]
 async fn lookup_views_sustained_throughput_probe() {
-    let Some(url) = redis_url() else {
-        return;
-    };
+    let url = redis_url();
     let Ok(duration_secs) = std::env::var("VS_TEST_REDIS_VIEW_SOAK_SECS") else {
         return;
     };

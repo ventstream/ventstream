@@ -11,11 +11,11 @@ fn sample_line<'a>(rendered: &'a str, name: &str) -> Option<&'a str> {
         .find(|line| line.starts_with(name) && line.as_bytes().get(name.len()) == Some(&b' '))
 }
 
+#[ignore = "needs VS_TEST_REDIS_SINK_URL; run with --ignored"]
 #[tokio::test(flavor = "current_thread")]
 async fn live_sink_metrics_survive_recorder_installation_after_sink_startup() {
-    let Ok(url) = std::env::var("VS_TEST_REDIS_SINK_URL") else {
-        return;
-    };
+    let url = std::env::var("VS_TEST_REDIS_SINK_URL")
+        .expect("VS_TEST_REDIS_SINK_URL must be set; this test is #[ignore]d by default");
     let prefix = format!(
         "ventstream:test:metrics:{}",
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
