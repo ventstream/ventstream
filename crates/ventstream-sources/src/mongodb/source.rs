@@ -62,6 +62,9 @@ pub struct MongoCdcSource {
     /// sink write can then never skip events on restart. When `None`,
     /// legacy behavior: flush the newest token on the timer.
     sink_progress: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Set once the first change event without a `clusterTime` has been
+    /// logged, so a server that never sends one does not warn per event.
+    warned_unversioned: std::sync::atomic::AtomicBool,
 }
 
 impl MongoCdcSource {
@@ -70,6 +73,7 @@ impl MongoCdcSource {
         Self {
             config,
             sink_progress: None,
+            warned_unversioned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -262,6 +266,25 @@ impl MongoCdcSource {
                 MongoCdcError::Operation(format!("listing collections: {e}"))
             }
         })?;
+        // Version floor for every snapshot row: the cluster's operation
+        // time at scan start. Every document the scan reads reflects at
+        // least this point, and any write that commits during the scan
+        // carries a later clusterTime on its change event — so the sink's
+        // version check lets the live write win over the snapshot row
+        // whichever lands first, and rejects a change-stream event from
+        // *before* the scan (already reflected in the row) that arrives
+        // after it. Same shape as the Postgres snapshot's scan-start LSN.
+        let version_floor = scan_start_version(db).await;
+        match version_floor {
+            Some(floor) => {
+                info!(source = %self.config.id, version_floor = floor, "bootstrap: snapshot rows versioned at scan start")
+            }
+            None => warn!(
+                source = %self.config.id,
+                "bootstrap: server returned no operationTime; snapshot rows are unversioned \
+                 and a live write racing the scan may be overtaken by a stale snapshot row"
+            ),
+        }
         for name in names {
             // Skip internal collections and anything out of scope.
             if name.starts_with("system.") || !self.config.collection_allowed(&name) {
@@ -284,12 +307,15 @@ impl MongoCdcSource {
                     warn!(collection = %name, "bootstrap doc missing _id; skipping");
                     continue;
                 };
-                let event = event_mapper::snapshot_insert(
-                    &self.config,
-                    &name,
-                    &id,
-                    document_to_json(&document),
-                )?;
+                let event = event_mapper::with_source_version(
+                    event_mapper::snapshot_insert(
+                        &self.config,
+                        &name,
+                        &id,
+                        document_to_json(&document),
+                    )?,
+                    version_floor,
+                );
                 if !self.publish(ctx, event).await? {
                     return Ok(false);
                 }
@@ -473,13 +499,37 @@ impl MongoCdcSource {
         // The ack sequence rides the same header the dispatcher's
         // watermark reads for Kafka — sink progress becomes "highest
         // contiguous ack_seq durably written", which is what gates
-        // resume-token persistence.
+        // resume-token persistence. It is a *session* counter, though:
+        // it restarts every run, so it cannot order documents across
+        // restarts and the sinks do not read it as a version.
         let bus_event = ventstream_core::Event {
             headers: bus_event
                 .headers
                 .with_header("ventstream.cdc.ack_seq".to_owned(), ack_seq.to_string()),
             ..bus_event
         };
+        // The document version is the change's clusterTime — the oplog's
+        // own ordering key, durable across restarts and the replica set.
+        // With it, the dispatcher can run bulks in parallel: a stale update
+        // that lands after a newer one, or a re-insert that overtakes a
+        // delete, is rejected by the sink's version check instead of
+        // clobbering the newer state. Without it (no clusterTime on the
+        // event — not expected on any supported server) the write is
+        // unversioned and last-arrival wins; say so once.
+        let source_version = event.cluster_time.map(event_mapper::cluster_time_version);
+        if source_version.is_none()
+            && !self
+                .warned_unversioned
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            warn!(
+                source = %self.config.id,
+                collection = %collection,
+                "change event carries no clusterTime; documents will be written unversioned \
+                 and parallel sink bulks may apply concurrent updates to one document out of order"
+            );
+        }
+        let bus_event = event_mapper::with_source_version(bus_event, source_version);
         Ok(Some(self.publish(ctx, bus_event).await?))
     }
 
@@ -621,6 +671,24 @@ fn flush_token(
         cursor_file.write(&tok)?;
     }
     Ok(())
+}
+
+/// The cluster's `operationTime` now, packed as a document version, for
+/// stamping snapshot rows. Any command reply from a replica-set member
+/// carries it; `ping` is the cheapest. `None` when the server omits it
+/// (a standalone, which change streams already refuse) or the call fails —
+/// the bootstrap then proceeds unversioned rather than not at all.
+async fn scan_start_version(db: &Database) -> Option<u64> {
+    match db.run_command(doc! { "ping": 1 }).await {
+        Ok(reply) => reply
+            .get_timestamp("operationTime")
+            .ok()
+            .map(event_mapper::cluster_time_version),
+        Err(err) => {
+            warn!(error = %err, "bootstrap: reading operationTime failed; snapshot rows unversioned");
+            None
+        }
+    }
 }
 
 /// Serialize a resume token to the persisted string form.

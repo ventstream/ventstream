@@ -55,6 +55,20 @@ mongodb+srv://user:pass@cluster.example.net/?retryWrites=true
 - **Deletes** become tombstones — the deterministic doc id targets the exact
   document to remove.
 
+## Ordering across parallel writes
+
+Every change event carries the change's `clusterTime` — the oplog's own
+ordering key — as `ventstream.cdc.source_version` (packed as
+`time << 31 | increment`, which fits a signed 64-bit sink version through
+the year 2106). Sinks that version documents (OpenSearch with
+`external_gte`, Redis versioned keys) reject a write older than the one they
+hold, so the dispatcher can run bulks in parallel (`max_parallel_bulks > 1`)
+without two updates to one document landing in the wrong order, and a delete
+can never be undone by a stale re-insert that arrives after it. Bootstrap
+documents carry the cluster's `operationTime` at scan start as a floor: a live
+write that commits during the scan outranks the snapshot row whichever lands
+first.
+
 ## The `_id` mapping
 
 The sink document id is the canonical, namespaced form
