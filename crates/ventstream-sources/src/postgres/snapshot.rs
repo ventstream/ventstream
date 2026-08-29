@@ -273,14 +273,11 @@ async fn create_slot(client: &Client, slot_name: &str) -> Result<(), PostgresCdc
             slot_name.replace('\'', "''")
         ))
         .await
-        .map_err(|err| {
-            // Shared with the SQL-denormalize path so both render the
-            // SQLSTATE, message and HINT that tokio-postgres's Display
-            // discards — see `describe_slot_creation_error`.
-            PostgresCdcError::Connection(crate::postgres::connection::describe_slot_creation_error(
-                slot_name, &err,
-            ))
-        })?;
+        // Shared with the SQL-denormalize path so both render the SQLSTATE,
+        // message and HINT that tokio-postgres's Display discards, and both
+        // classify a refusal the server will repeat forever as
+        // `Unrecoverable` — see `describe_slot_creation_error`.
+        .map_err(|err| crate::postgres::connection::describe_slot_creation_error(slot_name, &err))?;
     info!(slot = %slot_name, "replication slot created");
     Ok(())
 }
