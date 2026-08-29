@@ -140,11 +140,11 @@ change touches a shared lookup node.
 
 ### One bad row does not stop the stream
 
-An event the join engine can never process — a payload that isn't a JSON
-object, a subject that isn't CDC-shaped, a row missing what the spec
-requires — is written to the dead-letter file (`VS_DLQ_PATH`) with the
-reason prefixed `join engine:`, logged as `metric=join.poison`, and
-skipped; the cursor advances past it so a restart never replays it. Only
+An event the join engine can never process — a payload or row that isn't a
+JSON object, a subject that isn't CDC-shaped, a row with no usable key — is
+written to the dead-letter file (`VS_DLQ_PATH`) with the reason prefixed
+`join engine:`, fsynced, logged as `metric=join.poison`, and skipped; the
+cursor advances past it so a restart never replays it. Only
 failures that are a property of the event itself are handled this way. A
 failure of the *environment* — the related-row fetcher cannot reach the
 source, state cannot be persisted — stays fatal and is retried by the

@@ -603,6 +603,22 @@ impl JoinEngine {
                     table: table.to_owned(),
                     detail: format!("event subject '{}' missing op row", event.subject),
                 })?;
+                // Refuse a non-object row *here*, before the reverse index
+                // and primary state are written below. `compose_primary`
+                // would reject it anyway, but by then the garbage row would
+                // be in state (and persisted), and every later recompose of
+                // this key would fail permanently on it. A permanent
+                // failure must be raised before any mutation so quarantining
+                // the event leaves nothing behind.
+                if !row.is_object() {
+                    return Err(JoinError::InvalidPayload {
+                        table: table.to_owned(),
+                        detail: format!(
+                            "event subject '{}' row is not a JSON object",
+                            event.subject
+                        ),
+                    });
+                }
                 // pgoutput omits unchanged TOAST columns from an UPDATE's
                 // `new` row (the mapper drops their keys — see
                 // event_mapper::column_to_json). The engine replaces the
@@ -3885,6 +3901,56 @@ target:
         assert!(
             poison.records.lock().is_empty(),
             "a row that would compose once the source is back must never be dead-lettered"
+        );
+    }
+
+    /// A permanent failure must be raised before any state mutation, or
+    /// quarantining the event leaves garbage behind. The reachable case: an
+    /// UPDATE whose `new` is not an object but which carries a usable doc-id
+    /// header, so the PK resolves and — before this guard — the reverse
+    /// index and primary state were written before `compose_primary`
+    /// rejected the row. Afterwards nothing may reference that key.
+    #[tokio::test]
+    async fn non_object_primary_row_fails_before_state_is_written() {
+        let engine = Arc::new(JoinEngine::new(
+            vec![join_orders_with_customer()],
+            Arc::new(NoopFetcher),
+        ));
+        let (sender, mut receiver) = bus::channel(8);
+        let shutdown = ShutdownToken::new();
+
+        let mut poison = make_event("public.orders", "update", json!({"new": 5}));
+        poison.headers = poison.headers.with_header(
+            "ventstream.doc.id".to_owned(),
+            r#"public.orders:["1"]"#.to_owned(),
+        );
+        let err = engine
+            .handle(&poison, &sender, &shutdown)
+            .await
+            .expect_err("a non-object row cannot be joined");
+        assert!(
+            matches!(&err, JoinError::InvalidPayload { detail, .. } if detail.contains("not a JSON object")),
+            "got: {err}"
+        );
+        assert!(err.is_permanent());
+        assert!(
+            drain(&mut receiver).await.is_empty(),
+            "nothing may be emitted"
+        );
+
+        // If the garbage row had reached state, this customer change would
+        // find the primary through the reverse index and re-emit it.
+        engine
+            .handle(
+                &make_event("public.customers", "insert", json!({"id": 5, "name": "x"})),
+                &sender,
+                &shutdown,
+            )
+            .await
+            .expect("a well-formed related row is fine");
+        assert!(
+            drain(&mut receiver).await.is_empty(),
+            "no primary may have been stored for the rejected row"
         );
     }
 

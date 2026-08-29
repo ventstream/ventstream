@@ -204,10 +204,31 @@ impl DlqPoisonSink {
 #[async_trait::async_trait]
 impl PoisonSink for DlqPoisonSink {
     async fn quarantine(&self, event: &Event, reason: &str) -> bool {
-        // Only a durable record counts: `record_best_effort` returns false
-        // when the write failed, and the engine then treats the event as
-        // fatal rather than skipping it into silent loss.
-        record_best_effort(&self.dlq, event, &format!("join engine: {reason}")).await
+        // Only a durable record counts, and `record` alone is not durable:
+        // it reaches the page cache, not the disk. The join boundary will
+        // advance the source watermark past this event's LSN on the strength
+        // of this `true`, and the dispatcher's own `sync` (C3) only runs for
+        // rejections it wrote itself — a join-poisoned row never reaches it.
+        // So fsync here, at the site that owns the decision. Poison rows are
+        // rare; one fsync each is cheap. On any failure the engine treats
+        // the event as fatal rather than skipping it into silent loss.
+        if !record_best_effort(&self.dlq, event, &format!("join engine: {reason}")).await {
+            return false;
+        }
+        match self.dlq.sync().await {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(
+                    metric = "dlq.sync_failed",
+                    dlq_path = %self.dlq.path().display(),
+                    event_id = %event.id,
+                    error = %err,
+                    "DLQ fsync failed after quarantining a join poison row; treating as fatal"
+                );
+                ventstream_telemetry::bump_dlq_write_failures(1);
+                false
+            }
+        }
     }
 }
 
@@ -261,6 +282,38 @@ mod tests {
         dlq.shutdown().await.expect("shutdown");
         assert!(path.exists());
         let _ = tokio::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).await;
+    }
+
+    /// The join engine's sink writes the same record shape as sink
+    /// rejections, prefixes the reason so the two are distinguishable, and
+    /// reports success only after the record is on disk.
+    #[tokio::test]
+    async fn poison_sink_records_with_join_prefix_and_syncs() {
+        let path = temp_path("poison");
+        let dlq = DlqWriter::open(path.clone()).await.expect("open");
+        let sink = DlqPoisonSink::new(dlq.clone());
+        let event = make_event("postgres.public.orders.insert", "{invalid-json");
+
+        assert!(
+            sink.quarantine(&event, "event from 'public.orders' does not deserialize")
+                .await,
+            "a recorded and synced quarantine reports true"
+        );
+
+        // Read back without shutting the writer down: the record must already
+        // be on disk, since the watermark will advance on the strength of
+        // that `true`.
+        let contents = tokio::fs::read_to_string(&path).await.expect("read");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 1, "{contents}");
+        let record: serde_json::Value = serde_json::from_str(lines[0]).expect("json line");
+        assert_eq!(
+            record["reason"],
+            "join engine: event from 'public.orders' does not deserialize"
+        );
+        assert_eq!(record["event"]["subject"], "postgres.public.orders.insert");
+        dlq.shutdown().await.expect("shutdown");
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]
