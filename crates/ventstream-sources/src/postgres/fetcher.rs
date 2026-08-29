@@ -791,6 +791,26 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Detail as `describe_db_error` renders a refused SELECT (reproduced
+    /// in `tests/it_fetcher_error.rs`). Pins, without a live server, that
+    /// the described text reaches the `Query` variant intact and that a
+    /// table permission error is never crash-fast — the retryable case
+    /// #177 deliberately kept out of the global matcher.
+    #[test]
+    fn query_failed_keeps_the_described_refusal_and_stays_retryable() {
+        let described = "db error (SQLSTATE 42501): permission denied for table orders";
+        let err = query_failed("direct.orders", described.to_owned());
+        let FetchError::Query { table, message } = &err else {
+            panic!("expected the Query variant, got: {err}");
+        };
+        assert_eq!(table, "direct.orders");
+        assert_eq!(message, described);
+        assert!(
+            !crate::credential::is_crash_fast_text(&err.to_string()),
+            "a table permission error must stay retryable: {err}"
+        );
+    }
+
     #[test]
     fn quote_ident_doubles_embedded_quotes() {
         assert_eq!(quote_ident("plain"), r#""plain""#);
