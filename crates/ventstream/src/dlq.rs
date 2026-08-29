@@ -26,6 +26,7 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 use tracing::warn;
 use ventstream_core::Event;
+use ventstream_joins::PoisonSink;
 
 /// Failure modes for [`DlqWriter`].
 #[derive(Debug, Error)]
@@ -179,6 +180,34 @@ pub async fn record_best_effort(dlq: &DlqWriter, event: &Event, reason: &str) ->
             ventstream_telemetry::bump_dlq_write_failures(1);
             false
         }
+    }
+}
+
+/// The join engine's poison sink, backed by the pipeline's DLQ.
+///
+/// An event the join engine can never process is recorded here with the
+/// join error as its reason, on the same file and in the same record shape
+/// as sink-rejected events, so one `dlq.jsonl` holds every quarantined row
+/// and one replay tool covers both.
+#[derive(Debug, Clone)]
+pub struct DlqPoisonSink {
+    dlq: DlqWriter,
+}
+
+impl DlqPoisonSink {
+    /// Wrap the pipeline's DLQ writer.
+    pub fn new(dlq: DlqWriter) -> Self {
+        Self { dlq }
+    }
+}
+
+#[async_trait::async_trait]
+impl PoisonSink for DlqPoisonSink {
+    async fn quarantine(&self, event: &Event, reason: &str) -> bool {
+        // Only a durable record counts: `record_best_effort` returns false
+        // when the write failed, and the engine then treats the event as
+        // fatal rather than skipping it into silent loss.
+        record_best_effort(&self.dlq, event, &format!("join engine: {reason}")).await
     }
 }
 

@@ -15,10 +15,10 @@ use ventstream_core::{
     EventBus, EventReceiver, EventSender, MemoryAdmission, MemoryBudget, ShutdownToken, Sink,
     Source,
 };
-use ventstream_joins::{JoinDurability, JoinEngine};
+use ventstream_joins::{JoinDurability, JoinEngine, PoisonSink};
 
 use crate::dispatcher::{Dispatcher, DispatcherConfig};
-use crate::dlq::{DlqError, DlqWriter};
+use crate::dlq::{DlqError, DlqPoisonSink, DlqWriter};
 use crate::memory_controller::{MemoryControllerConfig, MemoryRuntime};
 
 /// Engine-level configuration knobs.
@@ -169,6 +169,9 @@ impl Engine {
     /// Drive the pipeline until shutdown or a fatal error.
     pub async fn run(mut self, shutdown: ShutdownToken) -> Result<(), EngineError> {
         let dlq = DlqWriter::open(self.config.dlq_path.clone()).await?;
+        // The join engine quarantines rows it can never process on the same
+        // DLQ the dispatcher uses for sink rejections (#131).
+        let poison: Arc<dyn PoisonSink> = Arc::new(DlqPoisonSink::new(dlq.clone()));
         info!(
             source = %self.source.id(),
             sink = %self.sink.id(),
@@ -238,6 +241,7 @@ impl Engine {
                     source_receiver,
                     join_engine,
                     durability,
+                    poison,
                     dispatcher,
                     self.config.bus_capacity,
                     memory_budget,
@@ -283,6 +287,7 @@ async fn run_with_joins(
     source_receiver: EventReceiver,
     join_engine: Arc<JoinEngine>,
     durability: JoinDurability,
+    poison: Arc<dyn PoisonSink>,
     dispatcher: Dispatcher,
     bus_capacity: usize,
     memory_budget: Option<Arc<MemoryBudget>>,
@@ -308,6 +313,7 @@ async fn run_with_joins(
                 join_sender,
                 join_shutdown,
                 Some(durability),
+                Some(poison),
             )
             .await
     });
@@ -561,14 +567,17 @@ mod tests {
         let _ = tokio::fs::remove_file(&dlq_path).await;
     }
 
+    /// #131 end to end: a row the join engine can never process is written
+    /// to the pipeline's DLQ with the join error as its reason, and the
+    /// pipeline keeps running instead of failing the iteration.
     #[tokio::test]
-    async fn join_processing_failure_is_returned_by_engine() {
+    async fn join_poison_row_is_dead_lettered_and_pipeline_continues() {
         let received = Arc::new(Mutex::new(Vec::new()));
         let total = Arc::new(AtomicUsize::new(0));
         let sink = Arc::new(CountingSink {
             id: "sink".into(),
             received,
-            total,
+            total: Arc::clone(&total),
         });
         let config = EngineConfig {
             bus_capacity: 8,
@@ -578,12 +587,13 @@ mod tests {
                 flush_interval: Duration::from_millis(10),
                 max_parallel_bulks: 1,
             },
-            dlq_path: temp_dlq("join_failure"),
+            dlq_path: temp_dlq("join_poison"),
             memory: MemoryControllerConfig {
                 enabled: false,
                 ..MemoryControllerConfig::default()
             },
         };
+        let dlq_path = config.dlq_path.clone();
         let join: ventstream_joins::JoinDefinition = serde_yaml::from_str(
             r#"
 name: orders
@@ -598,14 +608,48 @@ primary:
             Arc::new(ventstream_joins::fetcher::NoopFetcher),
         ));
         let shutdown = ShutdownToken::new();
+        // The source parks until shutdown; before #131 the join failure
+        // cancelled it. Now nothing does, so end the run ourselves.
+        let shutdown_clone = shutdown.clone();
+        let trigger = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            shutdown_clone.cancel();
+        });
         let result = Engine::new(Box::new(InvalidJoinSource), sink as Arc<dyn Sink>, config)
             .with_joins(join_engine)
             .run(shutdown)
             .await;
+        let _ = trigger.await;
 
         assert!(
-            matches!(result, Err(EngineError::Join(_))),
-            "join failures must surface as pipeline errors: {result:?}"
+            result.is_ok(),
+            "a poison row must not fail the pipeline: {result:?}"
         );
+        assert_eq!(
+            total.load(Ordering::SeqCst),
+            0,
+            "the poison row must not reach the sink"
+        );
+        let dlq = tokio::fs::read_to_string(&dlq_path)
+            .await
+            .expect("DLQ file written");
+        let lines: Vec<&str> = dlq.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly the poison row is dead-lettered: {dlq}"
+        );
+        let record: serde_json::Value = serde_json::from_str(lines[0]).expect("DLQ record is JSON");
+        let reason = record["reason"].as_str().expect("reason");
+        assert!(
+            reason.starts_with("join engine: ")
+                && reason.contains("does not deserialize as a JSON object"),
+            "the reason must name the join failure: {reason}"
+        );
+        assert_eq!(
+            record["event"]["subject"], "postgres.public.orders.insert",
+            "the full event is kept for replay: {record}"
+        );
+        let _ = tokio::fs::remove_file(&dlq_path).await;
     }
 }

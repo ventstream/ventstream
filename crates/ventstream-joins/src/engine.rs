@@ -39,6 +39,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::{Map, Value};
 use tracing::{debug, info, warn};
@@ -92,6 +93,25 @@ impl JoinDurability {
             source_progress,
         }
     }
+}
+
+/// Where the join engine sets aside an event it can never process.
+///
+/// The runtime supplies one (backed by its dead-letter queue) so that a
+/// single malformed row is quarantined and skipped instead of halting the
+/// iteration with a checkpoint that never advances past it — which replays
+/// the same row on every restart. Only failures the engine classifies as
+/// [permanent](JoinError::is_permanent) reach the sink; everything else
+/// stays fatal.
+#[async_trait]
+pub trait PoisonSink: Send + Sync {
+    /// Record `event` with the join error as `reason`.
+    ///
+    /// Return `true` only when the record is durably written. On `false` the
+    /// engine treats the failure as fatal rather than skipping the event:
+    /// dropping a row nobody can find later is silent loss, and a halted
+    /// pipeline is the lesser harm.
+    async fn quarantine(&self, event: &Event, reason: &str) -> bool;
 }
 
 /// Owns the state and processes events.
@@ -158,7 +178,7 @@ impl JoinEngine {
     ) {
         let run_shutdown = shutdown.clone();
         if let Err(err) = self
-            .run_with_durability(input, output, run_shutdown, None)
+            .run_with_durability(input, output, run_shutdown, None, None)
             .await
         {
             warn!(error = %err, "join engine stopped after a processing failure");
@@ -168,12 +188,19 @@ impl JoinEngine {
 
     /// Drain `input`, optionally coordinate durable CDC progress, and return
     /// any processing or persistence failure to the runtime.
+    ///
+    /// With a `poison` sink, an event whose failure is
+    /// [permanent](JoinError::is_permanent) is quarantined there and skipped,
+    /// and the source watermark advances past it at the next boundary like
+    /// any handled event. Without one — or if the sink cannot record it —
+    /// every failure is fatal, exactly as before.
     pub async fn run_with_durability(
         self: Arc<Self>,
         mut input: EventReceiver,
         output: EventSender,
         shutdown: ShutdownToken,
         durability: Option<JoinDurability>,
+        poison: Option<Arc<dyn PoisonSink>>,
     ) -> Result<(), JoinError> {
         info!(join_count = self.joins.len(), "join engine starting");
         // Idle-flush tick: commit any pending persistence batch even
@@ -246,14 +273,38 @@ impl JoinEngine {
                                 }
                             }
                             Err(err) => {
+                                // A permanent failure is a property of the
+                                // event: replaying it can only fail the same
+                                // way, and because the checkpoint never
+                                // advances past it, "fail and restart" is an
+                                // unrecoverable crash loop on one bad row.
+                                // Set it aside and move on. Only a recorded
+                                // quarantine counts — if the sink cannot
+                                // persist the event, skipping it would be
+                                // silent loss, so that stays fatal.
+                                let quarantined = match poison.as_ref() {
+                                    Some(sink) if err.is_permanent() => {
+                                        sink.quarantine(&event, &err.to_string()).await
+                                    }
+                                    _ => false,
+                                };
+                                if !quarantined {
+                                    warn!(
+                                        event_id = %event.id,
+                                        subject = %event.subject,
+                                        error = %err,
+                                        "join engine failed to process event; cancelling runtime"
+                                    );
+                                    shutdown.cancel();
+                                    return Err(err);
+                                }
                                 warn!(
+                                    metric = "join.poison",
                                     event_id = %event.id,
                                     subject = %event.subject,
                                     error = %err,
-                                    "join engine failed to process event; cancelling runtime"
+                                    "event can never be joined; quarantined and skipped"
                                 );
-                                shutdown.cancel();
-                                return Err(err);
                             }
                         }
                         pending_work = true;
@@ -3462,6 +3513,7 @@ target:
             output_sender,
             shutdown.clone(),
             None,
+            None,
         ));
 
         let event = make_event("public.audit_log", "insert", json!({"id": 1, "msg": "hi"}));
@@ -3499,6 +3551,7 @@ target:
             output_sender,
             shutdown.clone(),
             Some(durability),
+            None,
         ));
 
         let mut event = make_event(
@@ -3577,6 +3630,7 @@ target:
             output_sender,
             shutdown.clone(),
             None,
+            None,
         ));
         let result = tokio::time::timeout(std::time::Duration::from_secs(1), run_task)
             .await
@@ -3589,6 +3643,248 @@ target:
             output_receiver.recv().await,
             None,
             "the ack barrier after failed work must not reach the dispatcher"
+        );
+    }
+
+    /// Test poison sink: remembers every quarantined event and its reason,
+    /// and can be told to fail so the fatal fallback can be pinned.
+    #[derive(Default)]
+    struct RecordingPoisonSink {
+        records: parking_lot::Mutex<Vec<(String, String)>>,
+        reject: bool,
+    }
+
+    #[async_trait]
+    impl PoisonSink for RecordingPoisonSink {
+        async fn quarantine(&self, event: &Event, reason: &str) -> bool {
+            if self.reject {
+                return false;
+            }
+            self.records
+                .lock()
+                .push((event.subject.to_string(), reason.to_owned()));
+            true
+        }
+    }
+
+    fn invalid_orders_event(lsn: &str) -> Event {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("ventstream.cdc.namespace".to_owned(), "public".to_owned());
+        headers.insert("ventstream.cdc.relation".to_owned(), "orders".to_owned());
+        headers.insert(LSN_HEADER.to_owned(), lsn.to_owned());
+        Event::builder(
+            SourceUri::new("postgres://pub/public.orders").unwrap(),
+            Subject::new("postgres.public.orders.insert").unwrap(),
+        )
+        .payload(Payload::from_vec(b"{invalid-json".to_vec()))
+        .content_type(ContentType::Json)
+        .headers(Headers::from_map(headers))
+        .build()
+    }
+
+    /// #131: one malformed row must not take the pipeline down. With a
+    /// poison sink the event is quarantined with its reason, the runtime
+    /// keeps going, the next good event composes, and the source watermark
+    /// advances *past the poison row* at the boundary — so a restart never
+    /// replays it.
+    #[tokio::test]
+    async fn runtime_quarantines_a_poison_row_and_advances_past_it() {
+        let engine = Arc::new(JoinEngine::new(
+            vec![join_orders_with_customer()],
+            Arc::new(NoopFetcher),
+        ));
+        let poison = Arc::new(RecordingPoisonSink::default());
+        let (input_sender, input_receiver) = bus::channel(8);
+        let (output_sender, mut output_receiver) = bus::channel(8);
+        let shutdown = ShutdownToken::new();
+        let sink_progress = Arc::new(AtomicU64::new(0));
+        let source_progress = Arc::new(AtomicU64::new(0));
+        let durability =
+            JoinDurability::new(Arc::clone(&sink_progress), Arc::clone(&source_progress));
+        let run_task = tokio::spawn(Arc::clone(&engine).run_with_durability(
+            input_receiver,
+            output_sender,
+            shutdown.clone(),
+            Some(durability),
+            Some(Arc::clone(&poison) as Arc<dyn PoisonSink>),
+        ));
+
+        input_sender
+            .send(invalid_orders_event("7"), &shutdown)
+            .await
+            .unwrap();
+        let mut good = make_event(
+            "public.orders",
+            "insert",
+            json!({"id": 1, "customer_id": 5}),
+        );
+        good.headers = good
+            .headers
+            .with_header(LSN_HEADER.to_owned(), "9".to_owned());
+        input_sender.send(good, &shutdown).await.unwrap();
+        drop(input_sender);
+
+        // The good row's composed document and then the boundary barrier.
+        let mut composed = 0;
+        let mut boundary = None;
+        for _ in 0..2 {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(1), output_receiver.recv())
+                    .await
+                    .expect("join output should arrive")
+                    .expect("join output bus should remain open");
+            if event.headers.get(JOIN_BARRIER_HEADER) == Some("true") {
+                boundary = event
+                    .headers
+                    .get(JOIN_SEQUENCE_HEADER)
+                    .and_then(|value| value.parse::<u64>().ok());
+            } else {
+                composed += 1;
+                let doc: Value = serde_json::from_slice(event.payload.as_slice()).unwrap();
+                assert_eq!(doc["id"], 1, "the good row must compose: {doc}");
+            }
+        }
+        assert_eq!(composed, 1);
+        assert!(
+            !shutdown.is_cancelled(),
+            "a poison row must not cancel the runtime"
+        );
+
+        sink_progress.store(boundary.expect("join boundary sequence"), Ordering::Release);
+        run_task
+            .await
+            .expect("join runtime task should not panic")
+            .expect("a quarantined row is not a runtime failure");
+
+        let records = poison.records.lock();
+        assert_eq!(records.len(), 1, "exactly the poison row is quarantined");
+        assert_eq!(records[0].0, "postgres.public.orders.insert");
+        assert!(
+            records[0]
+                .1
+                .contains("does not deserialize as a JSON object"),
+            "the reason must say why: {}",
+            records[0].1
+        );
+        assert_eq!(
+            source_progress.load(Ordering::Acquire),
+            9,
+            "the watermark must move past the poison row, not stop before it"
+        );
+    }
+
+    /// A quarantine that could not be recorded is silent loss, not
+    /// progress: the engine must fall back to the fatal path.
+    #[tokio::test]
+    async fn runtime_stays_fatal_when_the_poison_sink_cannot_record() {
+        let engine = Arc::new(JoinEngine::new(
+            vec![join_orders_with_customer()],
+            Arc::new(NoopFetcher),
+        ));
+        let poison = Arc::new(RecordingPoisonSink {
+            reject: true,
+            ..RecordingPoisonSink::default()
+        });
+        let (input_sender, input_receiver) = bus::channel(8);
+        let (output_sender, _output_receiver) = bus::channel(8);
+        let shutdown = ShutdownToken::new();
+        let run_task = tokio::spawn(Arc::clone(&engine).run_with_durability(
+            input_receiver,
+            output_sender,
+            shutdown.clone(),
+            None,
+            Some(Arc::clone(&poison) as Arc<dyn PoisonSink>),
+        ));
+
+        input_sender
+            .send(invalid_orders_event("7"), &shutdown)
+            .await
+            .unwrap();
+        drop(input_sender);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), run_task)
+            .await
+            .expect("join runtime should stop")
+            .expect("join runtime task should not panic");
+        assert!(
+            matches!(result, Err(JoinError::InvalidPayload { .. })),
+            "an unrecorded poison row must surface as the original failure: {result:?}"
+        );
+        assert!(shutdown.is_cancelled());
+        assert!(poison.records.lock().is_empty());
+    }
+
+    /// Fetcher that cannot reach the source at all.
+    struct UnreachableFetcher;
+
+    #[async_trait]
+    impl RelatedFetcher for UnreachableFetcher {
+        async fn fetch_one(
+            &self,
+            _table: &str,
+            _pk: &[String],
+            _v: &PkValue,
+            _select: &[String],
+        ) -> Result<Option<Value>, FetchError> {
+            Err(FetchError::Unreachable("connection refused".into()))
+        }
+        async fn fetch_many(
+            &self,
+            _table: &str,
+            _fk: &[String],
+            _v: &PkValue,
+            _select: &[String],
+        ) -> Result<Vec<Value>, FetchError> {
+            Err(FetchError::Unreachable("connection refused".into()))
+        }
+    }
+
+    /// The direction that matters more: a transient failure — the source
+    /// is down, not the row — must never be dead-lettered, or the row that
+    /// would have composed once the source returns goes missing for good.
+    #[tokio::test]
+    async fn runtime_does_not_quarantine_a_transient_fetcher_failure() {
+        let mut def = join_orders_with_customer();
+        def.backfill.mode = BackfillMode::SyncOnMiss;
+        let engine = Arc::new(JoinEngine::new(vec![def], Arc::new(UnreachableFetcher)));
+        let poison = Arc::new(RecordingPoisonSink::default());
+        let (input_sender, input_receiver) = bus::channel(8);
+        let (output_sender, _output_receiver) = bus::channel(8);
+        let shutdown = ShutdownToken::new();
+        let run_task = tokio::spawn(Arc::clone(&engine).run_with_durability(
+            input_receiver,
+            output_sender,
+            shutdown.clone(),
+            None,
+            Some(Arc::clone(&poison) as Arc<dyn PoisonSink>),
+        ));
+
+        // A well-formed row whose customer must be fetched — and can't be.
+        input_sender
+            .send(
+                make_event(
+                    "public.orders",
+                    "insert",
+                    json!({"id": 1, "customer_id": 5}),
+                ),
+                &shutdown,
+            )
+            .await
+            .unwrap();
+        drop(input_sender);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), run_task)
+            .await
+            .expect("join runtime should stop")
+            .expect("join runtime task should not panic");
+        assert!(
+            matches!(result, Err(JoinError::Fetcher { .. })),
+            "a fetcher outage must stay fatal so the supervisor retries it: {result:?}"
+        );
+        assert!(shutdown.is_cancelled());
+        assert!(
+            poison.records.lock().is_empty(),
+            "a row that would compose once the source is back must never be dead-lettered"
         );
     }
 
