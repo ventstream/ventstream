@@ -7513,6 +7513,33 @@ joins:
         assert_eq!(error.to_string(), message);
     }
 
+    /// A role without REPLICATION (SQLSTATE 42501 at slot creation) is a
+    /// fixed grant. It is classified terminal at the slot site — not by a
+    /// global 42501 match — and the supervisor must stop on it rather than
+    /// back off indefinitely (#177).
+    #[tokio::test(start_paused = true)]
+    async fn sql_denormalize_role_without_replication_is_terminal_not_retried() {
+        let classified = ventstream_sources::postgres::connection::classify_slot_refusal(
+            Some("42501"),
+            "db error (SQLSTATE 42501): permission denied to use replication slots (detail: \
+             Only roles with the REPLICATION attribute may use replication slots.)",
+        );
+        let message =
+            ventstream_sources::postgres::connection::slot_creation_message("vs_slot", &classified);
+        let backend = ScriptedBackend {
+            outcomes: vec![Err(message.clone()), Ok(EngineIterationOutcome::Shutdown)].into(),
+            iterations: 0,
+        };
+        let error = run_cdc_loop(backend, ShutdownToken::new())
+            .await
+            .expect_err("a missing REPLICATION grant must be terminal, not retried");
+        assert_eq!(error.to_string(), message);
+        assert!(
+            error.to_string().contains("ALTER ROLE <role> REPLICATION"),
+            "the terminal error must carry the remedy: {error}"
+        );
+    }
+
     /// The direction that matters more: a slot-creation failure whose
     /// SQLSTATE is transient (57P03, server still starting) must keep
     /// retrying through the same rendering, since misclassifying it would

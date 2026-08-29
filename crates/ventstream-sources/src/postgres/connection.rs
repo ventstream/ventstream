@@ -35,14 +35,19 @@ pub fn is_credential_db_error(error: &tokio_postgres::Error) -> bool {
 pub fn describe_db_error(error: &tokio_postgres::Error) -> String {
     match error.as_db_error() {
         Some(db) => {
-            // The HINT usually carries the actionable half — for an invalid
-            // slot name it names the allowed characters — so dropping it
-            // leaves the operator with a complaint and no remedy.
+            // The DETAIL and HINT usually carry the actionable half — for
+            // an invalid slot name the HINT names the allowed characters,
+            // for a missing REPLICATION attribute the DETAIL names the
+            // attribute — so dropping them leaves the operator with a
+            // complaint and no remedy.
+            let detail = db
+                .detail()
+                .map_or_else(String::new, |detail| format!(" (detail: {detail})"));
             let hint = db
                 .hint()
                 .map_or_else(String::new, |hint| format!(" (hint: {hint})"));
             format!(
-                "db error (SQLSTATE {}): {}{hint}",
+                "db error (SQLSTATE {}): {}{detail}{hint}",
                 db.code().code(),
                 db.message()
             )
@@ -60,18 +65,45 @@ pub fn slot_creation_message(slot_name: &str, detail: &str) -> String {
     format!("creating slot {slot_name}: {detail}")
 }
 
+/// Classify a slot-creation refusal from its typed SQLSTATE, appending the
+/// terminal marker and the remedy when no retry can clear it.
+///
+/// Only 42501 (insufficient_privilege) is classified here. At
+/// `pg_create_logical_replication_slot` it can mean one thing — the
+/// connecting role lacks the REPLICATION attribute, a fixed grant — so it
+/// is terminal *at this site* without 42501 joining the global text matcher,
+/// where the same code on a table read may be a grant that lands moments
+/// later. 42602 (invalid slot name) is already matched globally by its
+/// code and passes through unchanged.
+///
+/// Pure so the classification can be pinned without a live server.
+pub fn classify_slot_refusal(sqlstate: Option<&str>, described: &str) -> String {
+    match sqlstate {
+        Some("42501") => format!(
+            "{described}; {} — the connecting role needs the REPLICATION attribute \
+             (ALTER ROLE <role> REPLICATION), then restart",
+            crate::credential::SITE_CLASSIFIED_TERMINAL
+        ),
+        _ => described.to_owned(),
+    }
+}
+
 /// Message for a failed `pg_create_logical_replication_slot`, carrying the
-/// SQLSTATE, message and HINT that tokio-postgres's `Display` discards.
+/// SQLSTATE, message, DETAIL and HINT that tokio-postgres's `Display`
+/// discards, classified by [`classify_slot_refusal`].
 ///
 /// Both slot-creating paths — the snapshot bootstrap and the SQL-denormalize
 /// `ensure_replication_slot` — render through this one function. The text
 /// is not only for operators: the supervisor's terminal classifier
 /// (`credential::is_crash_fast_text`) reads it, and a path that formats the
 /// raw error instead is invisible to that classifier, so a refusal the
-/// server will repeat forever (an invalid slot name, SQLSTATE 42602) would
-/// be retried forever.
+/// server will repeat forever (an invalid slot name, SQLSTATE 42602; a role
+/// without REPLICATION, 42501) would be retried forever.
 pub fn describe_slot_creation_error(slot_name: &str, error: &tokio_postgres::Error) -> String {
-    slot_creation_message(slot_name, &describe_db_error(error))
+    slot_creation_message(
+        slot_name,
+        &classify_slot_refusal(sqlstate(error), &describe_db_error(error)),
+    )
 }
 
 /// Open and drive a PostgreSQL client using the source's transport policy.
@@ -234,6 +266,55 @@ mod tests {
         assert!(
             crate::credential::is_crash_fast_text(&message),
             "the supervisor must see an invalid slot name as terminal: {message}"
+        );
+    }
+
+    /// Detail as `describe_db_error` renders Postgres 16's refusal for a
+    /// role without REPLICATION (reproduced in `tests/it_slot_error.rs`).
+    const NO_REPLICATION_DETAIL: &str =
+        "db error (SQLSTATE 42501): permission denied to use replication slots (detail: \
+         Only roles with the REPLICATION attribute may use replication slots.)";
+
+    /// A role without REPLICATION is a fixed grant: classified terminal at
+    /// this site, with the remedy in the text.
+    #[test]
+    fn a_role_without_replication_is_classified_terminal_at_the_slot_site() {
+        let classified = classify_slot_refusal(Some("42501"), NO_REPLICATION_DETAIL);
+        assert!(
+            classified.starts_with(NO_REPLICATION_DETAIL),
+            "got: {classified}"
+        );
+        assert!(
+            classified.contains("ALTER ROLE <role> REPLICATION"),
+            "remedy missing: {classified}"
+        );
+        let message = slot_creation_message("vs_slot", &classified);
+        assert!(
+            crate::credential::is_crash_fast_text(&message),
+            "the supervisor must see a missing REPLICATION grant as terminal: {message}"
+        );
+        // The unclassified description alone is not: 42501 is site-local,
+        // never a global match.
+        assert!(!crate::credential::is_crash_fast_text(
+            NO_REPLICATION_DETAIL
+        ));
+    }
+
+    /// Every other code passes through untouched — the classification here
+    /// claims exactly one meaning for exactly one code.
+    #[test]
+    fn classify_slot_refusal_passes_other_codes_through() {
+        let invalid_name = "db error (SQLSTATE 42602): replication slot name \"vs_slotS\" \
+                            contains invalid character";
+        assert_eq!(
+            classify_slot_refusal(Some("42602"), invalid_name),
+            invalid_name
+        );
+        let starting = "db error (SQLSTATE 57P03): the database system is starting up";
+        assert_eq!(classify_slot_refusal(Some("57P03"), starting), starting);
+        assert_eq!(
+            classify_slot_refusal(None, "connection reset"),
+            "connection reset"
         );
     }
 
