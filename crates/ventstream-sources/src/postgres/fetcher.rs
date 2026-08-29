@@ -36,7 +36,28 @@ use tracing::{debug, info, warn};
 use ventstream_joins::{FetchError, PkValue, RelatedFetcher};
 
 use super::config::PostgresCdcConfig;
-use super::connection::connect_client;
+use super::connection::{connect_client, describe_db_error};
+
+/// A fetcher SELECT the server refused. Rendered through
+/// [`describe_db_error`] so the SQLSTATE, message, DETAIL and HINT survive —
+/// tokio-postgres's `Display` collapses all of them to a bare "db error",
+/// which for a permission or missing-relation refusal is the whole answer.
+fn query_failed(table: &str, message: String) -> FetchError {
+    FetchError::Query {
+        table: table.to_owned(),
+        message,
+    }
+}
+
+/// A row the fetcher could not decode. These are client-side errors with no
+/// SQLSTATE, but rendering them through the same helper keeps every
+/// tokio-postgres error in this module on one path.
+fn decode_failed(table: &str, context: &str, err: &tokio_postgres::Error) -> FetchError {
+    FetchError::Decode {
+        table: table.to_owned(),
+        message: format!("{context}: {}", describe_db_error(err)),
+    }
+}
 
 /// Postgres-backed [`RelatedFetcher`].
 ///
@@ -375,22 +396,23 @@ impl PostgresFetcher {
             Ok(rows) => rows,
             Err(err) => {
                 self.invalidate(client_index, &client).await;
-                return Err(FetchError::Query {
-                    table: table.to_owned(),
-                    message: format!("resolving indexed column types: {err}"),
-                });
+                return Err(query_failed(
+                    table,
+                    format!(
+                        "resolving indexed column types: {}",
+                        describe_db_error(&err)
+                    ),
+                ));
             }
         };
 
         let mut table_types = HashMap::with_capacity(rows.len());
         for row in rows {
-            let name: String = row.try_get(0).map_err(|err| FetchError::Decode {
-                table: table.to_owned(),
-                message: format!("decoding column name: {err}"),
-            })?;
-            let sql_type: String = row.try_get(1).map_err(|err| FetchError::Decode {
-                table: table.to_owned(),
-                message: format!("decoding column type for '{name}': {err}"),
+            let name: String = row
+                .try_get(0)
+                .map_err(|err| decode_failed(table, "decoding column name", &err))?;
+            let sql_type: String = row.try_get(1).map_err(|err| {
+                decode_failed(table, &format!("decoding column type for '{name}'"), &err)
             })?;
             table_types.insert(name, sql_type);
         }
@@ -431,10 +453,7 @@ impl PostgresFetcher {
             Ok(None) => Ok(None),
             Err(err) => {
                 self.invalidate(client_index, &client).await;
-                Err(FetchError::Query {
-                    table: table.to_owned(),
-                    message: err.to_string(),
-                })
+                Err(query_failed(table, describe_db_error(&err)))
             }
         }
     }
@@ -463,23 +482,18 @@ impl PostgresFetcher {
             Ok(rows) => rows,
             Err(err) => {
                 self.invalidate(client_index, &client).await;
-                return Err(FetchError::Query {
-                    table: table.to_owned(),
-                    message: err.to_string(),
-                });
+                return Err(query_failed(table, describe_db_error(&err)));
             }
         };
 
         let mut grouped: Vec<Vec<Value>> = vec![Vec::new(); active_keys.len()];
         for row in rows {
-            let ordinal: i32 = row.try_get(0).map_err(|err| FetchError::Decode {
-                table: table.to_owned(),
-                message: format!("decoding batch key ordinal: {err}"),
-            })?;
-            let value: Option<Value> = row.try_get(1).map_err(|err| FetchError::Decode {
-                table: table.to_owned(),
-                message: format!("decoding batch row: {err}"),
-            })?;
+            let ordinal: i32 = row
+                .try_get(0)
+                .map_err(|err| decode_failed(table, "decoding batch key ordinal", &err))?;
+            let value: Option<Value> = row
+                .try_get(1)
+                .map_err(|err| decode_failed(table, "decoding batch row", &err))?;
             let Some(bucket) = usize::try_from(ordinal)
                 .ok()
                 .and_then(|index| grouped.get_mut(index))
@@ -528,10 +542,7 @@ impl PostgresFetcher {
             }
             Err(err) => {
                 self.invalidate(client_index, &client).await;
-                Err(FetchError::Query {
-                    table: table.to_owned(),
-                    message: err.to_string(),
-                })
+                Err(query_failed(table, describe_db_error(&err)))
             }
         }
     }
@@ -735,10 +746,9 @@ fn row_first_column_as_value(
     if row.is_empty() {
         return Ok(None);
     }
-    let value: Option<Value> = row.try_get(0).map_err(|err| FetchError::Decode {
-        table: table.to_owned(),
-        message: err.to_string(),
-    })?;
+    let value: Option<Value> = row
+        .try_get(0)
+        .map_err(|err| decode_failed(table, "decoding first column", &err))?;
     Ok(value.map(stringify_top_level_values))
 }
 
