@@ -48,7 +48,7 @@ pub use config::{
     BackfillMode, Cardinality, JoinDefinition, JoinOn, OnMissing, PkSpec, PrimaryRef,
     RelatedDefinition, StateBackend,
 };
-pub use engine::{JoinDurability, JoinEngine};
+pub use engine::{JoinDurability, JoinEngine, PoisonSink};
 pub use error::JoinError;
 pub use fetcher::{FetchError, RelatedFetcher};
 pub use key::PkValue;
