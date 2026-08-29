@@ -300,9 +300,12 @@ mod tests {
             "a recorded and synced quarantine reports true"
         );
 
-        // Read back without shutting the writer down: the record must already
-        // be on disk, since the watermark will advance on the strength of
-        // that `true`.
+        // Read back without shutting the writer down. This proves the bytes
+        // left the BufWriter (a flush) — page-cache data reads back fine — so
+        // it pins the record shape and the prefix, NOT the fsync. Nothing
+        // short of fault injection can observe `sync` from here; the comment
+        // on `quarantine` is what protects the durability contract. Reverting
+        // `sync()` to nothing would keep this test green.
         let contents = tokio::fs::read_to_string(&path).await.expect("read");
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(lines.len(), 1, "{contents}");
