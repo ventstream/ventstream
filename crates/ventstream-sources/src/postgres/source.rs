@@ -1354,17 +1354,9 @@ impl Source for PostgresCdcSource {
     }
 
     async fn run(&self, ctx: SourceContext) -> Result<(), SourceError> {
-        self.run_replication(ctx).await.map_err(|err| match err {
-            PostgresCdcError::Connection(msg) => SourceError::Connection(msg),
-            PostgresCdcError::Setup { statement, message } => {
-                SourceError::Connection(format!("setup failed: {statement}: {message}"))
-            }
-            PostgresCdcError::Decode(decode_err) => SourceError::Decode(decode_err.to_string()),
-            PostgresCdcError::UnknownRelation(oid) => {
-                SourceError::Decode(format!("unknown relation oid {oid}"))
-            }
-            PostgresCdcError::Internal(msg) => SourceError::Internal(msg),
-        })
+        // The mapping lives on the error type so the SQL-denormalize path,
+        // which never goes through `Source::run`, converts identically.
+        self.run_replication(ctx).await.map_err(SourceError::from)
     }
 }
 

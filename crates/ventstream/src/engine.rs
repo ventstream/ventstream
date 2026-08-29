@@ -13,7 +13,7 @@ use tokio::task::JoinError;
 use tracing::{error, info};
 use ventstream_core::{
     EventBus, EventReceiver, EventSender, MemoryAdmission, MemoryBudget, ShutdownToken, Sink,
-    Source,
+    Source, SourceError,
 };
 use ventstream_joins::{JoinDurability, JoinEngine, PoisonSink};
 
@@ -54,12 +54,18 @@ pub enum EngineError {
     Dlq(#[from] DlqError),
 
     /// Source task returned an error.
+    ///
+    /// Carries the typed [`SourceError`] rather than its text so the
+    /// supervisor can find [`SourceError::Unrecoverable`] by walking the
+    /// error chain — a refusal the upstream will repeat forever must be
+    /// terminal by type, not by matching a rendered message.
     #[error("source '{id}' failed: {error}")]
     Source {
         /// Source identifier.
         id: String,
-        /// Underlying error message.
-        error: String,
+        /// Underlying error.
+        #[source]
+        error: SourceError,
     },
 
     /// Dispatcher task returned an error.
@@ -337,15 +343,15 @@ async fn run_with_joins(
 
 fn finalize(
     source_id: String,
-    source_result: Result<(), ventstream_core::SourceError>,
+    source_result: Result<(), SourceError>,
     dispatcher_result: Result<(), crate::dispatcher::DispatcherError>,
 ) -> Result<(), EngineError> {
     match source_result {
         Ok(()) => {}
-        Err(err) => {
+        Err(error) => {
             return Err(EngineError::Source {
                 id: source_id,
-                error: err.to_string(),
+                error,
             })
         }
     }

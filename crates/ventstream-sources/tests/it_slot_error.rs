@@ -1,5 +1,6 @@
 //! Confirms the slot-creation error path surfaces what Postgres actually
-//! said: SQLSTATE, message, DETAIL and HINT, and a terminal classification.
+//! said — SQLSTATE, message, DETAIL and HINT — and classifies a refusal the
+//! server will repeat forever as `Unrecoverable` by type.
 //!
 //! Needs a Postgres with logical replication enabled, plus a role without
 //! the REPLICATION attribute for the 42501 case. Start one with:
@@ -21,6 +22,9 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
+
+use ventstream_core::SourceError;
+use ventstream_sources::error::PostgresCdcError;
 
 #[tokio::test]
 #[ignore = "local: requires the vstest-pg container"]
@@ -48,16 +52,18 @@ async fn invalid_slot_name_surfaces_sqlstate_message_and_hint() {
         described.contains("lower case letters"),
         "hint missing: {described}"
     );
-    assert!(
-        ventstream_sources::credential::is_crash_fast_text(&described),
-        "must classify terminal: {described}"
+    assert_eq!(
+        ventstream_sources::postgres::sqlstate(&err),
+        Some("42602"),
+        "the typed code the classification keys on: {err}"
     );
 }
 
-/// The helper both slot-creating paths render through (snapshot bootstrap
-/// and the SQL-denormalize `ensure_replication_slot`). With a real server
-/// error it must produce the text the unit tests assume: slot name, SQLSTATE,
-/// message and HINT, and a terminal classification.
+/// The helper both slot-creating paths go through (snapshot bootstrap and
+/// the SQL-denormalize `ensure_replication_slot`). With a real server error
+/// it must produce what the unit tests assume: the `Unrecoverable` variant,
+/// carrying slot name, SQLSTATE, message and HINT — and that variant must
+/// survive the conversion to the runtime's error type.
 #[tokio::test]
 #[ignore = "local: requires the vstest-pg container"]
 async fn slot_creation_helper_renders_real_refusal_as_terminal() {
@@ -74,7 +80,10 @@ async fn slot_creation_helper_renders_real_refusal_as_terminal() {
         .batch_execute("SELECT pg_create_logical_replication_slot('vs_slotS', 'pgoutput')")
         .await
         .expect_err("invalid slot name must fail");
-    let message = ventstream_sources::postgres::describe_slot_creation_error("vs_slotS", &err);
+    let classified = ventstream_sources::postgres::describe_slot_creation_error("vs_slotS", &err);
+    let PostgresCdcError::Unrecoverable(message) = &classified else {
+        panic!("an invalid slot name must be Unrecoverable, got: {classified}");
+    };
     assert!(
         message.starts_with("creating slot vs_slotS: db error (SQLSTATE 42602): "),
         "got: {message}"
@@ -84,22 +93,21 @@ async fn slot_creation_helper_renders_real_refusal_as_terminal() {
         "hint missing: {message}"
     );
     assert!(
-        ventstream_sources::credential::is_crash_fast_text(&message),
-        "must classify terminal: {message}"
+        matches!(SourceError::from(classified), SourceError::Unrecoverable(_)),
+        "the type must survive the hop to the runtime's error"
     );
     // The raw Display is what the SQL-denormalize path used to emit; pin
     // that it really does hide the code, so the helper is not redundant.
     assert!(
-        !ventstream_sources::credential::is_crash_fast_text(&err.to_string()),
+        !err.to_string().contains("42602"),
         "raw Display unexpectedly carries the SQLSTATE now: {err}"
     );
 }
 
 /// #177: a role without REPLICATION is refused with 42501 and a DETAIL
-/// naming the attribute. The helper classifies it terminal at the slot
-/// site and carries the remedy; the plain description — the same code as
-/// it would surface anywhere else — stays unclassified, because 42501 is
-/// deliberately not matched globally.
+/// naming the attribute. The helper classifies it `Unrecoverable` at the
+/// slot site and carries the remedy. The same code anywhere else is never
+/// classified — nothing matches 42501 globally, by text or by type.
 #[tokio::test]
 #[ignore = "local: requires the vstest-pg container and the vs_norepl role"]
 async fn role_without_replication_is_terminal_at_the_slot_site_only() {
@@ -131,13 +139,12 @@ async fn role_without_replication_is_terminal_at_the_slot_site_only() {
         described.contains("REPLICATION attribute"),
         "DETAIL missing: {described}"
     );
-    assert!(
-        !ventstream_sources::credential::is_crash_fast_text(&described),
-        "42501 must not be terminal globally: {described}"
-    );
 
-    let message =
+    let classified =
         ventstream_sources::postgres::describe_slot_creation_error("vs_norepl_slot", &err);
+    let PostgresCdcError::Unrecoverable(message) = &classified else {
+        panic!("a missing REPLICATION grant must be Unrecoverable, got: {classified}");
+    };
     assert!(
         message.starts_with("creating slot vs_norepl_slot: db error (SQLSTATE 42501): "),
         "got: {message}"
@@ -147,7 +154,7 @@ async fn role_without_replication_is_terminal_at_the_slot_site_only() {
         "remedy missing: {message}"
     );
     assert!(
-        ventstream_sources::credential::is_crash_fast_text(&message),
-        "must classify terminal at the slot site: {message}"
+        matches!(SourceError::from(classified), SourceError::Unrecoverable(_)),
+        "the type must survive the hop to the runtime's error"
     );
 }

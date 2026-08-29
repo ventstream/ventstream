@@ -1,6 +1,7 @@
 //! Error types for the source adapters.
 
 use thiserror::Error;
+use ventstream_core::SourceError;
 
 /// Errors emitted by the Neo4j CDC source.
 #[derive(Debug, Error)]
@@ -61,6 +62,32 @@ pub enum PostgresCdcError {
     /// Other unexpected error.
     #[error("postgres cdc internal error: {0}")]
     Internal(String),
+
+    /// The server refused a configuration value it will never accept, so no
+    /// retry can clear it. Raised only where the refusal's meaning is
+    /// unambiguous at the call site — see
+    /// [`classify_slot_refusal`](crate::postgres::connection::classify_slot_refusal).
+    /// Maps to [`SourceError::Unrecoverable`], which the supervisor treats as
+    /// terminal by type, not by matching the rendered text.
+    #[error("postgres configuration refused: {0}")]
+    Unrecoverable(String),
+}
+
+impl From<PostgresCdcError> for SourceError {
+    fn from(err: PostgresCdcError) -> Self {
+        match err {
+            PostgresCdcError::Connection(msg) => SourceError::Connection(msg),
+            PostgresCdcError::Setup { statement, message } => {
+                SourceError::Connection(format!("setup failed: {statement}: {message}"))
+            }
+            PostgresCdcError::Decode(decode_err) => SourceError::Decode(decode_err.to_string()),
+            PostgresCdcError::UnknownRelation(oid) => {
+                SourceError::Decode(format!("unknown relation oid {oid}"))
+            }
+            PostgresCdcError::Internal(msg) => SourceError::Internal(msg),
+            PostgresCdcError::Unrecoverable(msg) => SourceError::Unrecoverable(msg),
+        }
+    }
 }
 
 /// Errors emitted by the MongoDB CDC source.

@@ -79,42 +79,15 @@ pub fn is_credential_error_text(text: &str) -> bool {
 
 /// True when a source already emitted its own crash-fast terminal text;
 /// a supervisor loop must treat it as terminal, never retry it.
+///
+/// This is the text hook for sources that genuinely only have text — the
+/// credential sentence their reconnect loops emit. Server refusals that are
+/// classified from a typed code do not pass through here: they travel as
+/// [`SourceError::Unrecoverable`](ventstream_core::SourceError::Unrecoverable)
+/// and the supervisor inspects the error chain for that variant, so no
+/// SQLSTATE is matched as a substring anywhere.
 pub fn is_crash_fast_text(text: &str) -> bool {
     text.contains("exiting so the supervisor can restart with fresh credentials")
-        || is_unrecoverable_config_text(text)
-}
-
-/// Marker a call site appends when it has classified a server refusal from
-/// its *typed* SQLSTATE and knows no retry can clear it — see
-/// `postgres::connection::classify_slot_refusal`.
-///
-/// This exists so the decision can be made where the code's meaning is
-/// unambiguous. 42501 (insufficient_privilege) at slot creation can only
-/// mean the role lacks REPLICATION, a fixed grant; the same code on a table
-/// read may be a grant applied moments later, where retrying is right. A
-/// global code list cannot tell those apart, and over-terminalising is the
-/// worse failure — it halts a pipeline that would have recovered.
-pub const SITE_CLASSIFIED_TERMINAL: &str = "terminal: no retry can clear this";
-
-/// True for server refusals that describe a configuration value the server
-/// will never accept, so no retry can clear them.
-///
-/// Two forms are recognised:
-///
-/// - SQLSTATE 42602 (invalid_name), and only because it was reproduced:
-///   Postgres 16 raises it for a replication slot name outside the allowed
-///   charset. Reserved-prefix and over-length names were tried and do NOT
-///   raise it — `pg_`-prefixed and over-long slot names are both accepted —
-///   so nothing else is claimed here.
-/// - [`SITE_CLASSIFIED_TERMINAL`], appended by a call site that classified
-///   the refusal from its typed code. No other SQLSTATE is matched globally
-///   on purpose.
-///
-/// Keep the global list to codes someone has actually produced. Over-
-/// terminalising is the worse failure: it halts a pipeline that would have
-/// recovered.
-pub fn is_unrecoverable_config_text(text: &str) -> bool {
-    text.contains("SQLSTATE 42602") || text.contains(SITE_CLASSIFIED_TERMINAL)
 }
 
 /// Terminal text for sources with no in-process reconnect loop, where a
@@ -220,68 +193,25 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-mod unrecoverable_config_tests {
+mod text_hook_tests {
     use super::*;
 
-    /// The reported case: a slot name with a capital letter. Postgres
-    /// refuses it identically on every attempt, so the supervisor must
-    /// stop rather than back off forever.
+    /// No SQLSTATE is matched as text any more: a rendered server refusal,
+    /// terminal or not, is invisible to the text hook. Terminal ones reach
+    /// the supervisor by type instead — see
+    /// `postgres::connection::classify_slot_refusal`.
     #[test]
-    fn an_invalid_slot_name_is_terminal() {
-        let text = "postgres connection failed: creating slot vs_slotS: db error \
-                    (SQLSTATE 42602): replication slot name \"vs_slotS\" contains \
-                    invalid character (hint: Replication slot names may only contain \
-                    lower case letters, numbers, and the underscore character.)";
-        assert!(is_unrecoverable_config_text(text));
-        assert!(
-            is_crash_fast_text(text),
-            "the supervisor loop must see this as terminal"
-        );
-    }
-
-    /// A transient connection failure must stay retryable — this is the
-    /// direction that matters, since misclassifying it would halt a
-    /// pipeline that would have recovered on its own.
-    #[test]
-    fn a_transient_failure_is_not_terminal() {
-        let text = "postgres connection failed: connection refused";
-        assert!(!is_unrecoverable_config_text(text));
-        assert!(!is_crash_fast_text(text));
-    }
-
-    #[test]
-    fn an_unrelated_sqlstate_is_not_terminal() {
-        // 57P03 (cannot_connect_now) is the recovering-server case: retry
-        // is exactly right there.
-        assert!(!is_unrecoverable_config_text(
-            "db error (SQLSTATE 57P03): the database system is starting up"
-        ));
-    }
-
-    /// A refusal a call site classified from its typed code is terminal
-    /// wherever it surfaces, without that code joining the global list.
-    #[test]
-    fn a_site_classified_refusal_is_terminal() {
-        let text = format!(
-            "postgres connection failed: creating slot vs_slot: db error (SQLSTATE 42501): \
-             permission denied to use replication slots; {SITE_CLASSIFIED_TERMINAL}"
-        );
-        assert!(is_unrecoverable_config_text(&text));
-        assert!(is_crash_fast_text(&text));
-    }
-
-    /// 42501 is deliberately NOT matched globally: on a table read it can
-    /// be a grant that lands moments later, and retrying is right.
-    #[test]
-    fn an_unclassified_permission_error_stays_retryable() {
-        let text = "db error (SQLSTATE 42501): permission denied for table orders";
-        assert!(!is_unrecoverable_config_text(text));
-        assert!(!is_crash_fast_text(text));
+    fn rendered_sqlstates_do_not_trip_the_text_hook() {
+        for text in [
+            "creating slot vs_slotS: db error (SQLSTATE 42602): replication slot name \
+             \"vs_slotS\" contains invalid character",
+            "creating slot vs_slot: db error (SQLSTATE 42501): permission denied to use \
+             replication slots",
+            "db error (SQLSTATE 42501): permission denied for table orders",
+            "db error (SQLSTATE 57P03): the database system is starting up",
+            "postgres connection failed: connection refused",
+        ] {
+            assert!(!is_crash_fast_text(text), "matched as text: {text}");
+        }
     }
 }

@@ -65,44 +65,54 @@ pub fn slot_creation_message(slot_name: &str, detail: &str) -> String {
     format!("creating slot {slot_name}: {detail}")
 }
 
-/// Classify a slot-creation refusal from its typed SQLSTATE, appending the
-/// terminal marker and the remedy when no retry can clear it.
+/// Classify a slot-creation refusal from its *typed* SQLSTATE.
 ///
-/// Only 42501 (insufficient_privilege) is classified here. At
-/// `pg_create_logical_replication_slot` it can mean one thing — the
-/// connecting role lacks the REPLICATION attribute, a fixed grant — so it
-/// is terminal *at this site* without 42501 joining the global text matcher,
-/// where the same code on a table read may be a grant that lands moments
-/// later. 42602 (invalid slot name) is already matched globally by its
-/// code and passes through unchanged.
+/// This is the one seat for the decision. Two codes are terminal here, and
+/// only here, because at `pg_create_logical_replication_slot` each can mean
+/// exactly one thing:
+///
+/// - **42602** (invalid_name): the slot name is outside the allowed charset.
+///   Reproduced on Postgres 16; reserved-prefix and over-long names were
+///   tried and do NOT raise it. The server's HINT names the allowed
+///   characters.
+/// - **42501** (insufficient_privilege): the connecting role lacks the
+///   REPLICATION attribute — a fixed grant. The same code on a table read
+///   may be a grant that lands moments later, where retrying is right, which
+///   is why this is classified at the site rather than by a global code list.
+///
+/// Everything else stays a retryable [`PostgresCdcError::Connection`]. The
+/// result is a type, not a marker in the text: it maps to
+/// [`SourceError::Unrecoverable`](ventstream_core::SourceError::Unrecoverable)
+/// and the supervisor walks the error chain for that variant, so reformatting
+/// the message cannot silently turn a terminal refusal back into an infinite
+/// retry.
 ///
 /// Pure so the classification can be pinned without a live server.
-pub fn classify_slot_refusal(sqlstate: Option<&str>, described: &str) -> String {
+pub fn classify_slot_refusal(sqlstate: Option<&str>, message: String) -> PostgresCdcError {
     match sqlstate {
-        Some("42501") => format!(
-            "{described}; {} — the connecting role needs the REPLICATION attribute \
-             (ALTER ROLE <role> REPLICATION), then restart",
-            crate::credential::SITE_CLASSIFIED_TERMINAL
-        ),
-        _ => described.to_owned(),
+        Some("42602") => PostgresCdcError::Unrecoverable(message),
+        Some("42501") => PostgresCdcError::Unrecoverable(format!(
+            "{message} — the connecting role needs the REPLICATION attribute \
+             (ALTER ROLE <role> REPLICATION), then restart"
+        )),
+        _ => PostgresCdcError::Connection(message),
     }
 }
 
-/// Message for a failed `pg_create_logical_replication_slot`, carrying the
-/// SQLSTATE, message, DETAIL and HINT that tokio-postgres's `Display`
-/// discards, classified by [`classify_slot_refusal`].
+/// Error for a failed `pg_create_logical_replication_slot`: the SQLSTATE,
+/// message, DETAIL and HINT that tokio-postgres's `Display` discards,
+/// classified by [`classify_slot_refusal`].
 ///
 /// Both slot-creating paths — the snapshot bootstrap and the SQL-denormalize
-/// `ensure_replication_slot` — render through this one function. The text
-/// is not only for operators: the supervisor's terminal classifier
-/// (`credential::is_crash_fast_text`) reads it, and a path that formats the
-/// raw error instead is invisible to that classifier, so a refusal the
-/// server will repeat forever (an invalid slot name, SQLSTATE 42602; a role
-/// without REPLICATION, 42501) would be retried forever.
-pub fn describe_slot_creation_error(slot_name: &str, error: &tokio_postgres::Error) -> String {
-    slot_creation_message(
-        slot_name,
-        &classify_slot_refusal(sqlstate(error), &describe_db_error(error)),
+/// `ensure_replication_slot` — go through this one function, so a refusal
+/// the server will repeat forever is terminal on both, by type.
+pub fn describe_slot_creation_error(
+    slot_name: &str,
+    error: &tokio_postgres::Error,
+) -> PostgresCdcError {
+    classify_slot_refusal(
+        sqlstate(error),
+        slot_creation_message(slot_name, &describe_db_error(error)),
     )
 }
 
@@ -231,7 +241,7 @@ fn strict_tls_connector(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::tls::{DatabaseTlsConfig, DatabaseTlsMode};
@@ -253,21 +263,15 @@ mod tests {
         );
     }
 
-    /// The described detail must pass through untouched: the SQLSTATE is
-    /// what the supervisor's terminal classifier keys on, and the HINT is
-    /// what the operator acts on.
-    #[test]
-    fn slot_creation_message_keeps_sqlstate_and_hint_and_names_the_slot() {
-        let detail = "db error (SQLSTATE 42602): replication slot name \"vs_slotS\" contains \
-                      invalid character (hint: Replication slot names may only contain lower \
-                      case letters, numbers, and the underscore character.)";
-        let message = slot_creation_message("vs_slotS", detail);
-        assert_eq!(message, format!("creating slot vs_slotS: {detail}"));
-        assert!(
-            crate::credential::is_crash_fast_text(&message),
-            "the supervisor must see an invalid slot name as terminal: {message}"
-        );
-    }
+    use ventstream_core::SourceError;
+
+    /// Detail as `describe_db_error` renders Postgres 16's refusal of a slot
+    /// name outside the allowed charset (reproduced in
+    /// `tests/it_slot_error.rs`).
+    const INVALID_NAME_DETAIL: &str =
+        "db error (SQLSTATE 42602): replication slot name \"vs_slotS\" contains invalid \
+         character (hint: Replication slot names may only contain lower case letters, \
+         numbers, and the underscore character.)";
 
     /// Detail as `describe_db_error` renders Postgres 16's refusal for a
     /// role without REPLICATION (reproduced in `tests/it_slot_error.rs`).
@@ -275,60 +279,67 @@ mod tests {
         "db error (SQLSTATE 42501): permission denied to use replication slots (detail: \
          Only roles with the REPLICATION attribute may use replication slots.)";
 
-    /// A role without REPLICATION is a fixed grant: classified terminal at
-    /// this site, with the remedy in the text.
+    /// The rendered detail passes through untouched — the HINT is what the
+    /// operator acts on — and the slot is named.
     #[test]
-    fn a_role_without_replication_is_classified_terminal_at_the_slot_site() {
-        let classified = classify_slot_refusal(Some("42501"), NO_REPLICATION_DETAIL);
-        assert!(
-            classified.starts_with(NO_REPLICATION_DETAIL),
-            "got: {classified}"
+    fn slot_creation_message_keeps_the_detail_and_names_the_slot() {
+        assert_eq!(
+            slot_creation_message("vs_slotS", INVALID_NAME_DETAIL),
+            format!("creating slot vs_slotS: {INVALID_NAME_DETAIL}")
         );
-        assert!(
-            classified.contains("ALTER ROLE <role> REPLICATION"),
-            "remedy missing: {classified}"
-        );
-        let message = slot_creation_message("vs_slot", &classified);
-        assert!(
-            crate::credential::is_crash_fast_text(&message),
-            "the supervisor must see a missing REPLICATION grant as terminal: {message}"
-        );
-        // The unclassified description alone is not: 42501 is site-local,
-        // never a global match.
-        assert!(!crate::credential::is_crash_fast_text(
-            NO_REPLICATION_DETAIL
-        ));
     }
 
-    /// Every other code passes through untouched — the classification here
-    /// claims exactly one meaning for exactly one code.
+    /// An invalid slot name is terminal by *type*: the server refuses it
+    /// identically on every attempt, so the supervisor must stop rather than
+    /// back off forever. The classification survives the hop to the runtime's
+    /// error type, which is what the supervisor inspects.
     #[test]
-    fn classify_slot_refusal_passes_other_codes_through() {
-        let invalid_name = "db error (SQLSTATE 42602): replication slot name \"vs_slotS\" \
-                            contains invalid character";
-        assert_eq!(
-            classify_slot_refusal(Some("42602"), invalid_name),
-            invalid_name
+    fn an_invalid_slot_name_is_unrecoverable_by_type() {
+        let message = slot_creation_message("vs_slotS", INVALID_NAME_DETAIL);
+        let err = classify_slot_refusal(Some("42602"), message.clone());
+        let PostgresCdcError::Unrecoverable(text) = &err else {
+            panic!("expected Unrecoverable, got: {err}");
+        };
+        assert_eq!(text, &message, "the message is carried through intact");
+        assert!(
+            matches!(SourceError::from(err), SourceError::Unrecoverable(_)),
+            "the type must survive the conversion the supervisor sees"
         );
+    }
+
+    /// A role without REPLICATION is a fixed grant: terminal at this site,
+    /// with the remedy appended.
+    #[test]
+    fn a_role_without_replication_is_unrecoverable_at_the_slot_site() {
+        let message = slot_creation_message("vs_slot", NO_REPLICATION_DETAIL);
+        let err = classify_slot_refusal(Some("42501"), message.clone());
+        let PostgresCdcError::Unrecoverable(text) = &err else {
+            panic!("expected Unrecoverable, got: {err}");
+        };
+        assert!(text.starts_with(&message), "got: {text}");
+        assert!(
+            text.contains("ALTER ROLE <role> REPLICATION"),
+            "remedy missing: {text}"
+        );
+    }
+
+    /// The direction that matters more: every other code stays a retryable
+    /// connection failure with its message untouched. Misclassifying a
+    /// recovering server would halt a pipeline that would have healed.
+    #[test]
+    fn other_codes_stay_retryable_connection_failures() {
         let starting = "db error (SQLSTATE 57P03): the database system is starting up";
-        assert_eq!(classify_slot_refusal(Some("57P03"), starting), starting);
-        assert_eq!(
-            classify_slot_refusal(None, "connection reset"),
-            "connection reset"
-        );
-    }
-
-    /// The opposite direction matters more: a transient refusal rendered
-    /// through the same function must stay retryable.
-    #[test]
-    fn slot_creation_message_leaves_transient_failures_retryable() {
-        let message = slot_creation_message(
-            "vs_slot",
-            "db error (SQLSTATE 57P03): the database system is starting up",
-        );
+        let err = classify_slot_refusal(Some("57P03"), starting.to_owned());
         assert!(
-            !crate::credential::is_crash_fast_text(&message),
-            "a recovering server must not be classified terminal: {message}"
+            matches!(&err, PostgresCdcError::Connection(text) if text == starting),
+            "got: {err}"
+        );
+        assert!(matches!(SourceError::from(err), SourceError::Connection(_)));
+
+        let reset = classify_slot_refusal(None, "connection reset".to_owned());
+        assert!(
+            matches!(&reset, PostgresCdcError::Connection(text) if text == "connection reset"),
+            "got: {reset}"
         );
     }
 }

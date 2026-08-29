@@ -77,7 +77,7 @@ use ventstream_config::{
     SurrealVectorDistanceConfig as FileSurrealVectorDistance, TlsConfig as FileTlsConfig,
     TlsMode as FileTlsMode, TlsTrustProvider as FileTlsTrustProvider, ValueRef,
 };
-use ventstream_core::{MemoryAdmission, ReadinessSignal, ShutdownToken};
+use ventstream_core::{MemoryAdmission, ReadinessSignal, ShutdownToken, SourceError};
 use ventstream_graphql::GraphQlConfig;
 use ventstream_joins::{JoinDefinition, JoinEngine, JoinState, PersistentBackend};
 use ventstream_sinks::opensearch::{AuthMode, OpenSearchConfig, OpenSearchSink, OsReverseLookup};
@@ -1113,15 +1113,18 @@ async fn run_cdc_loop<B: CdcBackend>(mut backend: B, shutdown: ShutdownToken) ->
             // Graceful pause: the watcher cancelled the child token.
             Err(_) if pause_requested.load(std::sync::atomic::Ordering::Acquire) => continue,
             // The engine cancelled its own child token on an internal
-            // failure. Crash-fast texts and an exhausted credential
-            // budget are terminal; everything else retries with backoff.
+            // failure. A typed unrecoverable refusal, a crash-fast text and
+            // an exhausted credential budget are terminal; everything else
+            // retries with backoff.
             Err(err) if inner_shutdown.is_cancelled() => {
                 if iteration_started.elapsed() >= ITERATION_HEALTHY_THRESHOLD {
                     credential_budget.record_success();
                     iteration_backoff = ITERATION_INITIAL_BACKOFF;
                 }
                 let text = format!("{err:#}");
-                if ventstream_sources::credential::is_crash_fast_text(&text) {
+                if is_unrecoverable_source_error(&err)
+                    || ventstream_sources::credential::is_crash_fast_text(&text)
+                {
                     last_iteration_error = Some(err);
                     continue;
                 }
@@ -1154,6 +1157,26 @@ async fn run_cdc_loop<B: CdcBackend>(mut backend: B, shutdown: ShutdownToken) ->
 
     ventstream_telemetry::set_phase(ventstream_telemetry::LifecyclePhase::Stopped);
     Ok(())
+}
+
+/// True when the iteration failed on a refusal the upstream will repeat on
+/// every attempt, classified by *type* at the site that knows what the
+/// server's code means (see
+/// `ventstream_sources::postgres::connection::classify_slot_refusal`).
+///
+/// The variant is found by walking the error chain, so it is seen whether
+/// the source raised it inside `Engine::run` (wrapped in
+/// `EngineError::Source`, then in the iteration's context) or a runtime
+/// path such as the SQL-denormalize slot setup raised it directly. Text is
+/// never inspected for this: reformatting a message cannot silently turn a
+/// terminal refusal back into an infinite retry.
+fn is_unrecoverable_source_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<SourceError>(),
+            Some(SourceError::Unrecoverable(_))
+        )
+    })
 }
 
 /// Postgres source plugged into [`run_cdc_loop`].
@@ -2173,13 +2196,11 @@ async fn ensure_replication_slot(pg: &PostgresCdcConfig, slot: &str) -> Result<(
         info!(slot, "replication slot already exists (sql-denormalize)");
         return Ok(());
     }
-    // Rendered through the same helper as the snapshot-bootstrap path so
-    // the SQLSTATE, message and HINT survive. tokio-postgres's Display
-    // collapses them to "db error", which hides the cause from the operator
-    // and — worse — from the supervisor's terminal classifier: a refusal the
-    // server will repeat forever (an invalid slot name, SQLSTATE 42602)
-    // would then be retried forever if this path ever cancelled the
-    // iteration token before failing.
+    // Classified through the same helper as the snapshot-bootstrap path, so
+    // a refusal the server will repeat forever (an invalid slot name, a role
+    // without REPLICATION) is `SourceError::Unrecoverable` here too. The
+    // supervisor finds that variant in the error chain and stops instead of
+    // backing off forever — by type, not by reading the message.
     client
         .batch_execute(&format!(
             "SELECT pg_create_logical_replication_slot('{}', 'pgoutput')",
@@ -2187,8 +2208,8 @@ async fn ensure_replication_slot(pg: &PostgresCdcConfig, slot: &str) -> Result<(
         ))
         .await
         .map_err(|err| {
-            anyhow!(ventstream_sources::postgres::describe_slot_creation_error(
-                slot, &err
+            anyhow!(SourceError::from(
+                ventstream_sources::postgres::describe_slot_creation_error(slot, &err)
             ))
         })?;
     info!(slot, "replication slot created (sql-denormalize)");
@@ -7399,8 +7420,21 @@ joins:
     /// child token (the engine's internal-failure signature) and yields
     /// the scripted outcome.
     struct ScriptedBackend {
-        outcomes: std::collections::VecDeque<std::result::Result<EngineIterationOutcome, String>>,
+        outcomes:
+            std::collections::VecDeque<std::result::Result<EngineIterationOutcome, anyhow::Error>>,
         iterations: u32,
+    }
+
+    /// Script a run of text-only failures, the shape sources without typed
+    /// classification produce.
+    fn scripted_text_errors(
+        messages: &[&str],
+    ) -> std::collections::VecDeque<std::result::Result<EngineIterationOutcome, anyhow::Error>>
+    {
+        messages
+            .iter()
+            .map(|message| Err(anyhow!((*message).to_owned())))
+            .collect()
     }
 
     #[async_trait::async_trait]
@@ -7425,9 +7459,9 @@ joins:
             self.iterations += 1;
             match self.outcomes.pop_front().expect("scripted outcome") {
                 Ok(outcome) => Ok(outcome),
-                Err(message) => {
+                Err(error) => {
                     inner.cancel();
-                    Err(anyhow!(message))
+                    Err(error)
                 }
             }
         }
@@ -7439,7 +7473,7 @@ joins:
     #[tokio::test(start_paused = true)]
     async fn credential_iteration_failures_exhaust_the_budget_and_exit() {
         let backend = ScriptedBackend {
-            outcomes: (0..5).map(|_| Err(REPRO_1045.to_owned())).collect(),
+            outcomes: scripted_text_errors(&[REPRO_1045; 5]),
             iterations: 0,
         };
         let error = run_cdc_loop(backend, ShutdownToken::new())
@@ -7453,12 +7487,14 @@ joins:
     #[tokio::test(start_paused = true)]
     async fn transient_iteration_failures_retry_with_backoff_until_shutdown() {
         let backend = ScriptedBackend {
-            outcomes: vec![
-                Err("mysql connection failed: Connection refused (os error 61)".to_owned()),
-                Err("mysql connection failed: connection timed out".to_owned()),
-                Ok(EngineIterationOutcome::Shutdown),
-            ]
-            .into(),
+            outcomes: {
+                let mut outcomes = scripted_text_errors(&[
+                    "mysql connection failed: Connection refused (os error 61)",
+                    "mysql connection failed: connection timed out",
+                ]);
+                outcomes.push_back(Ok(EngineIterationOutcome::Shutdown));
+                outcomes
+            },
             iterations: 0,
         };
         // Transient errors must keep retrying (bounded backoff, no budget)
@@ -7471,7 +7507,7 @@ joins:
         let message =
             ventstream_sources::credential::exhausted_message(&"ERROR 28000 (1045): Access denied");
         let backend = ScriptedBackend {
-            outcomes: vec![Err(message.clone())].into(),
+            outcomes: scripted_text_errors(&[message.as_str()]),
             iterations: 0,
         };
         let error = run_cdc_loop(backend, ShutdownToken::new())
@@ -7488,76 +7524,146 @@ joins:
          character (hint: Replication slot names may only contain lower case letters, \
          numbers, and the underscore character.)";
 
-    /// The SQL-denormalize slot path (`ensure_replication_slot`) renders its
-    /// failure through `describe_slot_creation_error`. This pins the
-    /// property that makes that matter: when an iteration fails with that
-    /// text after cancelling its token, the supervisor stops instead of
-    /// backing off forever against a refusal the server will repeat on
-    /// every attempt. Before the fix the path formatted the raw error — no
-    /// SQLSTATE — and the classifier could not see it.
+    /// The error exactly as the SQL-denormalize slot path
+    /// (`ensure_replication_slot`) raises it: the typed classification,
+    /// converted to the runtime's error type and wrapped in anyhow with no
+    /// further context.
+    fn sql_denormalize_slot_error(sqlstate: &str, slot: &str, detail: &str) -> anyhow::Error {
+        anyhow!(SourceError::from(
+            ventstream_sources::postgres::connection::classify_slot_refusal(
+                Some(sqlstate),
+                ventstream_sources::postgres::connection::slot_creation_message(slot, detail),
+            )
+        ))
+    }
+
+    /// The error exactly as the snapshot-bootstrap path surfaces it: the
+    /// source's typed error inside `EngineError::Source`, inside the
+    /// iteration's context — two hops the classification must survive.
+    fn engine_wrapped_slot_error(sqlstate: &str, slot: &str, detail: &str) -> anyhow::Error {
+        let source: SourceError = ventstream_sources::postgres::connection::classify_slot_refusal(
+            Some(sqlstate),
+            ventstream_sources::postgres::connection::slot_creation_message(slot, detail),
+        )
+        .into();
+        anyhow!(engine::EngineError::Source {
+            id: "pg".to_owned(),
+            error: source,
+        })
+        .context("cdc engine run")
+    }
+
+    /// An invalid slot name is a refusal the server repeats on every attempt.
+    /// The supervisor must stop on it — and must find it by *type* through
+    /// both wrappings, since no text is matched for it any more.
     #[tokio::test(start_paused = true)]
-    async fn sql_denormalize_invalid_slot_name_is_terminal_not_retried() {
-        let message = ventstream_sources::postgres::connection::slot_creation_message(
-            "vs_slotS",
-            INVALID_SLOT_NAME_DETAIL,
-        );
-        let backend = ScriptedBackend {
-            // A clean shutdown is scripted second on purpose: the loop can
-            // only reach it by retrying, which would turn this Err into Ok.
-            outcomes: vec![Err(message.clone()), Ok(EngineIterationOutcome::Shutdown)].into(),
-            iterations: 0,
-        };
-        let error = run_cdc_loop(backend, ShutdownToken::new())
-            .await
-            .expect_err("an invalid slot name must be terminal, not retried");
-        assert_eq!(error.to_string(), message);
+    async fn invalid_slot_name_is_terminal_by_type_through_both_error_shapes() {
+        for (shape, error) in [
+            (
+                "sql-denormalize",
+                sql_denormalize_slot_error("42602", "vs_slotS", INVALID_SLOT_NAME_DETAIL),
+            ),
+            (
+                "engine-wrapped",
+                engine_wrapped_slot_error("42602", "vs_slotS", INVALID_SLOT_NAME_DETAIL),
+            ),
+        ] {
+            assert!(
+                is_unrecoverable_source_error(&error),
+                "{shape}: the variant must be found in the chain: {error:#}"
+            );
+            let backend = ScriptedBackend {
+                // A clean shutdown is scripted second on purpose: the loop
+                // can only reach it by retrying, which would turn this Err
+                // into Ok.
+                outcomes: vec![Err(error), Ok(EngineIterationOutcome::Shutdown)].into(),
+                iterations: 0,
+            };
+            let error = run_cdc_loop(backend, ShutdownToken::new())
+                .await
+                .unwrap_err();
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("SQLSTATE 42602") && rendered.contains("lower case letters"),
+                "{shape}: the operator must still see the code and the HINT: {rendered}"
+            );
+        }
     }
 
     /// A role without REPLICATION (SQLSTATE 42501 at slot creation) is a
-    /// fixed grant. It is classified terminal at the slot site — not by a
-    /// global 42501 match — and the supervisor must stop on it rather than
-    /// back off indefinitely (#177).
+    /// fixed grant, classified terminal at the slot site with the remedy
+    /// attached (#177). The supervisor stops on the type, not the words.
     #[tokio::test(start_paused = true)]
-    async fn sql_denormalize_role_without_replication_is_terminal_not_retried() {
-        let classified = ventstream_sources::postgres::connection::classify_slot_refusal(
-            Some("42501"),
+    async fn role_without_replication_is_terminal_by_type() {
+        let error = sql_denormalize_slot_error(
+            "42501",
+            "vs_slot",
             "db error (SQLSTATE 42501): permission denied to use replication slots (detail: \
              Only roles with the REPLICATION attribute may use replication slots.)",
         );
-        let message =
-            ventstream_sources::postgres::connection::slot_creation_message("vs_slot", &classified);
         let backend = ScriptedBackend {
-            outcomes: vec![Err(message.clone()), Ok(EngineIterationOutcome::Shutdown)].into(),
+            outcomes: vec![Err(error), Ok(EngineIterationOutcome::Shutdown)].into(),
             iterations: 0,
         };
         let error = run_cdc_loop(backend, ShutdownToken::new())
             .await
             .expect_err("a missing REPLICATION grant must be terminal, not retried");
-        assert_eq!(error.to_string(), message);
         assert!(
-            error.to_string().contains("ALTER ROLE <role> REPLICATION"),
-            "the terminal error must carry the remedy: {error}"
+            format!("{error:#}").contains("ALTER ROLE <role> REPLICATION"),
+            "the terminal error must carry the remedy: {error:#}"
         );
     }
 
     /// The direction that matters more: a slot-creation failure whose
-    /// SQLSTATE is transient (57P03, server still starting) must keep
-    /// retrying through the same rendering, since misclassifying it would
-    /// halt a pipeline that would have recovered on its own.
+    /// SQLSTATE is transient (57P03, server still starting) is a plain
+    /// connection failure and must keep retrying, since misclassifying it
+    /// would halt a pipeline that would have recovered on its own.
     #[tokio::test(start_paused = true)]
-    async fn sql_denormalize_transient_slot_failure_retries() {
-        let message = ventstream_sources::postgres::connection::slot_creation_message(
-            "vs_slot",
-            "db error (SQLSTATE 57P03): the database system is starting up",
-        );
+    async fn transient_slot_failure_retries_through_both_error_shapes() {
+        const STARTING: &str = "db error (SQLSTATE 57P03): the database system is starting up";
+        for (shape, error) in [
+            (
+                "sql-denormalize",
+                sql_denormalize_slot_error("57P03", "vs_slot", STARTING),
+            ),
+            (
+                "engine-wrapped",
+                engine_wrapped_slot_error("57P03", "vs_slot", STARTING),
+            ),
+        ] {
+            assert!(!is_unrecoverable_source_error(&error), "{shape}");
+            let backend = ScriptedBackend {
+                // Reaching the scripted shutdown is the proof of a retry.
+                outcomes: vec![Err(error), Ok(EngineIterationOutcome::Shutdown)].into(),
+                iterations: 0,
+            };
+            assert!(
+                run_cdc_loop(backend, ShutdownToken::new()).await.is_ok(),
+                "{shape}: a transient slot failure must be retried to the scripted shutdown"
+            );
+        }
+    }
+
+    /// The text that used to be matched is now inert: a message that merely
+    /// *mentions* a terminal SQLSTATE — an operator-controlled slot name
+    /// containing it, a log line quoted into an unrelated error — is a plain
+    /// retryable failure. Only the type is terminal.
+    #[tokio::test(start_paused = true)]
+    async fn mentioning_a_terminal_sqlstate_in_text_is_not_terminal() {
         let backend = ScriptedBackend {
-            // Reaching the scripted shutdown is the proof of a retry.
-            outcomes: vec![Err(message), Ok(EngineIterationOutcome::Shutdown)].into(),
+            outcomes: {
+                let mut outcomes = scripted_text_errors(&[
+                    "checking replication slot vs_slot: db error (SQLSTATE 57P03): the \
+                     database system is starting up (previous attempt reported SQLSTATE 42602)",
+                ]);
+                outcomes.push_back(Ok(EngineIterationOutcome::Shutdown));
+                outcomes
+            },
             iterations: 0,
         };
         assert!(
             run_cdc_loop(backend, ShutdownToken::new()).await.is_ok(),
-            "a transient slot failure must be retried to the scripted shutdown"
+            "text alone must never classify terminal"
         );
     }
 }

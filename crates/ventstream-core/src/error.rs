@@ -80,6 +80,19 @@ pub enum SourceError {
     /// A non-recoverable internal error.
     #[error("source internal error: {0}")]
     Internal(String),
+
+    /// The upstream refused a configuration value it will never accept —
+    /// an invalid replication slot name, a role without the attribute the
+    /// operation needs. No retry can clear it: the supervisor must stop and
+    /// surface the message rather than back off indefinitely.
+    ///
+    /// Sources raise this only where the meaning of the refusal is
+    /// unambiguous at the call site (see
+    /// `ventstream_sources::postgres::connection::classify_slot_refusal`);
+    /// the same server code elsewhere may be transient and stays
+    /// [`Connection`](Self::Connection).
+    #[error("source configuration refused: {0}")]
+    Unrecoverable(String),
 }
 
 /// One event's failure within a batch of [`SinkError::Rejected`].
