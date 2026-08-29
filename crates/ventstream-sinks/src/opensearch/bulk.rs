@@ -45,9 +45,9 @@ const TX_ID_HEADER: &str = "ventstream.cdc.tx_id";
 /// Durable ordering value for a source whose checkpoint is neither a
 /// PostgreSQL LSN nor a Neo4j transaction id. Kafka stamps partition offset +
 /// 1 so versions remain positive and survive engine restarts; MongoDB stamps
-/// the change's `clusterTime` packed as `time << 32 | increment` (the
-/// oplog's ordering key), and its snapshot rows the scan-start
-/// `operationTime` as a floor.
+/// the change's `clusterTime` packed as `time << 31 | increment` (the
+/// oplog's ordering key, kept within a Java `long` for this sink), and its
+/// snapshot rows the scan-start `operationTime` as a floor.
 const SOURCE_VERSION_HEADER: &str = "ventstream.cdc.source_version";
 
 /// The source watermark to stamp as the OpenSearch external doc version,

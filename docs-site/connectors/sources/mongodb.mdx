@@ -59,7 +59,8 @@ mongodb+srv://user:pass@cluster.example.net/?retryWrites=true
 
 Every change event carries the change's `clusterTime` — the oplog's own
 ordering key — as `ventstream.cdc.source_version` (packed as
-`time << 32 | increment`). Sinks that version documents (OpenSearch with
+`time << 31 | increment`, which fits a signed 64-bit sink version through
+the year 2106). Sinks that version documents (OpenSearch with
 `external_gte`, Redis versioned keys) reject a write older than the one they
 hold, so the dispatcher can run bulks in parallel (`max_parallel_bulks > 1`)
 without two updates to one document landing in the wrong order, and a delete

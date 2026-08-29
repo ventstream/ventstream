@@ -44,14 +44,24 @@ pub const SOURCE_VERSION_HEADER: &str = "ventstream.cdc.source_version";
 /// Pack a change event's `clusterTime` into the `u64` the sinks compare.
 ///
 /// A BSON timestamp is the oplog's own ordering key: seconds since the
-/// epoch in the high half, an increment that orders operations within the
-/// same second in the low half. Packing `time` above `increment` preserves
-/// that order exactly, across restarts and across the replica set, and the
-/// result is positive for any real clock (`time >= 1`), which
-/// `external_gte` requires. Two operations on one document never share a
-/// timestamp, so the comparison is strict.
+/// epoch, then an increment that orders operations within the same second.
+/// Packing `time` above `increment` preserves that order exactly, across
+/// restarts and across the replica set, and the result is positive for any
+/// real clock (`time >= 1`), which `external_gte` requires. Two operations
+/// on one document never share a timestamp, so the comparison is strict.
+///
+/// The layout is `time << 31 | (increment & 0x7FFF_FFFF)`, not `<< 32`: the
+/// value must fit a signed 64-bit integer, because OpenSearch's external
+/// version is a Java `long`. With 32 bits of increment the top bit is set
+/// from 2038-01-19 onward and every write is rejected; with 31 the maximum
+/// (`time = u32::MAX`, year 2106) is exactly `i64::MAX`. Thirty-one bits of
+/// increment is 2.1 billion operations per second, which nothing approaches.
+///
+/// This is a persisted contract: versions already stored in a sink are only
+/// comparable with versions packed the same way, so changing the layout
+/// forces a re-bootstrap of every deployment.
 pub fn cluster_time_version(cluster_time: Timestamp) -> u64 {
-    (u64::from(cluster_time.time) << 32) | u64::from(cluster_time.increment)
+    (u64::from(cluster_time.time) << 31) | u64::from(cluster_time.increment & 0x7FFF_FFFF)
 }
 
 /// Stamp an event with its source version, when one is known.
@@ -352,15 +362,36 @@ mod tests {
     }
 
     /// Positive for any real clock, and the packing is the documented
-    /// `time << 32 | increment` so an operator can decode a stored version.
+    /// `time << 31 | increment` so an operator can decode a stored version.
     #[test]
     fn cluster_time_version_is_positive_and_decodable() {
-        assert_eq!(cluster_time_version(ts(1, 0)), 1 << 32);
+        assert_eq!(cluster_time_version(ts(1, 0)), 1 << 31);
         assert_eq!(cluster_time_version(ts(0, 7)), 7);
         let version = cluster_time_version(ts(1_700_000_000, 42));
-        assert_eq!(version >> 32, 1_700_000_000);
-        assert_eq!(version & 0xFFFF_FFFF, 42);
+        assert_eq!(version >> 31, 1_700_000_000);
+        assert_eq!(version & 0x7FFF_FFFF, 42);
         assert!(version > 0);
+    }
+
+    /// The sink stores the version as a Java `long`. The packing must never
+    /// set the top bit — not at the 2038 second boundary, and not at the
+    /// largest timestamp a BSON `Timestamp` can hold.
+    #[test]
+    fn cluster_time_version_fits_a_signed_64_bit_sink_version() {
+        let long_max = u64::try_from(i64::MAX).expect("i64::MAX is non-negative");
+        let year_2038 = 2_147_483_648; // 2038-01-19T03:14:08Z, the first second past i32
+        assert!(cluster_time_version(ts(year_2038, 0)) <= long_max);
+        assert!(cluster_time_version(ts(year_2038, u32::MAX)) <= long_max);
+        assert_eq!(
+            cluster_time_version(ts(u32::MAX, u32::MAX)),
+            long_max,
+            "the largest possible timestamp packs to exactly i64::MAX"
+        );
+        // Ordering survives the boundary too.
+        assert!(
+            cluster_time_version(ts(year_2038 - 1, u32::MAX))
+                < cluster_time_version(ts(year_2038, 0))
+        );
     }
 
     /// The header the sinks read is stamped with the decimal version — and
