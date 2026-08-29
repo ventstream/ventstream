@@ -34,7 +34,8 @@ pub mod source;
 
 pub use config::{PostgresCdcConfig, SnapshotBootstrap, SnapshotTable};
 pub use connection::{
-    connect_client, describe_db_error, is_credential_db_error, is_credential_sqlstate, sqlstate,
+    connect_client, describe_db_error, describe_slot_creation_error, is_credential_db_error,
+    is_credential_sqlstate, sqlstate,
 };
 pub use fetcher::PostgresFetcher;
 pub use schema::type_change_epoch;

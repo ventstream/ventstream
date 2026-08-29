@@ -51,6 +51,29 @@ pub fn describe_db_error(error: &tokio_postgres::Error) -> String {
     }
 }
 
+/// Message for a failed `pg_create_logical_replication_slot`, rendered from
+/// an already-described server error. Split from
+/// [`describe_slot_creation_error`] so the shape can be pinned by a unit
+/// test without a live server (a `tokio_postgres::Error` cannot be built
+/// by hand).
+pub fn slot_creation_message(slot_name: &str, detail: &str) -> String {
+    format!("creating slot {slot_name}: {detail}")
+}
+
+/// Message for a failed `pg_create_logical_replication_slot`, carrying the
+/// SQLSTATE, message and HINT that tokio-postgres's `Display` discards.
+///
+/// Both slot-creating paths — the snapshot bootstrap and the SQL-denormalize
+/// `ensure_replication_slot` — render through this one function. The text
+/// is not only for operators: the supervisor's terminal classifier
+/// (`credential::is_crash_fast_text`) reads it, and a path that formats the
+/// raw error instead is invisible to that classifier, so a refusal the
+/// server will repeat forever (an invalid slot name, SQLSTATE 42602) would
+/// be retried forever.
+pub fn describe_slot_creation_error(slot_name: &str, error: &tokio_postgres::Error) -> String {
+    slot_creation_message(slot_name, &describe_db_error(error))
+}
+
 /// Open and drive a PostgreSQL client using the source's transport policy.
 pub async fn connect_client(
     source: &PostgresCdcConfig,
@@ -195,6 +218,36 @@ mod tests {
                 .as_ref()
                 .is_err_and(|err| err.to_string().contains("open TLS CA bundle")),
             "missing CA must fail with a file-open error"
+        );
+    }
+
+    /// The described detail must pass through untouched: the SQLSTATE is
+    /// what the supervisor's terminal classifier keys on, and the HINT is
+    /// what the operator acts on.
+    #[test]
+    fn slot_creation_message_keeps_sqlstate_and_hint_and_names_the_slot() {
+        let detail = "db error (SQLSTATE 42602): replication slot name \"vs_slotS\" contains \
+                      invalid character (hint: Replication slot names may only contain lower \
+                      case letters, numbers, and the underscore character.)";
+        let message = slot_creation_message("vs_slotS", detail);
+        assert_eq!(message, format!("creating slot vs_slotS: {detail}"));
+        assert!(
+            crate::credential::is_crash_fast_text(&message),
+            "the supervisor must see an invalid slot name as terminal: {message}"
+        );
+    }
+
+    /// The opposite direction matters more: a transient refusal rendered
+    /// through the same function must stay retryable.
+    #[test]
+    fn slot_creation_message_leaves_transient_failures_retryable() {
+        let message = slot_creation_message(
+            "vs_slot",
+            "db error (SQLSTATE 57P03): the database system is starting up",
+        );
+        assert!(
+            !crate::credential::is_crash_fast_text(&message),
+            "a recovering server must not be classified terminal: {message}"
         );
     }
 }

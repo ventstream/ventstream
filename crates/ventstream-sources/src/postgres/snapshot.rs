@@ -274,11 +274,12 @@ async fn create_slot(client: &Client, slot_name: &str) -> Result<(), PostgresCdc
         ))
         .await
         .map_err(|err| {
-            // tokio-postgres collapses server errors to a bare "db error" in
-            // Display, discarding the SQLSTATE, the message and the HINT —
-            // which on this path is the entire answer.
-            let detail = crate::postgres::connection::describe_db_error(&err);
-            PostgresCdcError::Connection(format!("creating slot {slot_name}: {detail}"))
+            // Shared with the SQL-denormalize path so both render the
+            // SQLSTATE, message and HINT that tokio-postgres's Display
+            // discards — see `describe_slot_creation_error`.
+            PostgresCdcError::Connection(crate::postgres::connection::describe_slot_creation_error(
+                slot_name, &err,
+            ))
         })?;
     info!(slot = %slot_name, "replication slot created");
     Ok(())
@@ -291,7 +292,10 @@ async fn slot_exists(client: &Client, slot_name: &str) -> Result<bool, PostgresC
             &[&slot_name],
         )
         .await
-        .map_err(|err| PostgresCdcError::Connection(format!("checking slot: {err}")))?;
+        .map_err(|err| {
+            let detail = crate::postgres::connection::describe_db_error(&err);
+            PostgresCdcError::Connection(format!("checking slot {slot_name}: {detail}"))
+        })?;
     Ok(row.get(0))
 }
 

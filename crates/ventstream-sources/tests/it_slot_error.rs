@@ -49,3 +49,44 @@ async fn invalid_slot_name_surfaces_sqlstate_message_and_hint() {
         "must classify terminal: {described}"
     );
 }
+
+/// The helper both slot-creating paths render through (snapshot bootstrap
+/// and the SQL-denormalize `ensure_replication_slot`). With a real server
+/// error it must produce the text the unit tests assume: slot name, SQLSTATE,
+/// message and HINT, and a terminal classification.
+#[tokio::test]
+#[ignore = "local: requires the vstest-pg container"]
+async fn slot_creation_helper_renders_real_refusal_as_terminal() {
+    let url = std::env::var("VS_TEST_PG_URL").unwrap_or_else(|_| {
+        "host=127.0.0.1 port=55999 user=ventstream password=x dbname=bench".to_owned()
+    });
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("connect — see this file's header for how to start Postgres");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let err = client
+        .batch_execute("SELECT pg_create_logical_replication_slot('vs_slotS', 'pgoutput')")
+        .await
+        .expect_err("invalid slot name must fail");
+    let message = ventstream_sources::postgres::describe_slot_creation_error("vs_slotS", &err);
+    assert!(
+        message.starts_with("creating slot vs_slotS: db error (SQLSTATE 42602): "),
+        "got: {message}"
+    );
+    assert!(
+        message.contains("lower case letters"),
+        "hint missing: {message}"
+    );
+    assert!(
+        ventstream_sources::credential::is_crash_fast_text(&message),
+        "must classify terminal: {message}"
+    );
+    // The raw Display is what the SQL-denormalize path used to emit; pin
+    // that it really does hide the code, so the helper is not redundant.
+    assert!(
+        !ventstream_sources::credential::is_crash_fast_text(&err.to_string()),
+        "raw Display unexpectedly carries the SQLSTATE now: {err}"
+    );
+}
