@@ -32,3 +32,4 @@ examples/*.bak
 
 # Internal code-review notes (not for the repo)
 issues.MD
+__pycache__/
