@@ -2164,19 +2164,33 @@ async fn ensure_replication_slot(pg: &PostgresCdcConfig, slot: &str) -> Result<(
             &[&slot],
         )
         .await
-        .context("checking replication slot")?
+        .map_err(|err| {
+            let detail = ventstream_sources::postgres::describe_db_error(&err);
+            anyhow!("checking replication slot {slot}: {detail}")
+        })?
         .get(0);
     if exists {
         info!(slot, "replication slot already exists (sql-denormalize)");
         return Ok(());
     }
+    // Rendered through the same helper as the snapshot-bootstrap path so
+    // the SQLSTATE, message and HINT survive. tokio-postgres's Display
+    // collapses them to "db error", which hides the cause from the operator
+    // and — worse — from the supervisor's terminal classifier: a refusal the
+    // server will repeat forever (an invalid slot name, SQLSTATE 42602)
+    // would then be retried forever if this path ever cancelled the
+    // iteration token before failing.
     client
         .batch_execute(&format!(
             "SELECT pg_create_logical_replication_slot('{}', 'pgoutput')",
             slot.replace('\'', "''")
         ))
         .await
-        .context("creating replication slot")?;
+        .map_err(|err| {
+            anyhow!(ventstream_sources::postgres::describe_slot_creation_error(
+                slot, &err
+            ))
+        })?;
     info!(slot, "replication slot created (sql-denormalize)");
     Ok(())
 }
@@ -7464,5 +7478,86 @@ joins:
             .await
             .expect_err("terminal");
         assert_eq!(error.to_string(), message);
+    }
+
+    /// Detail exactly as `describe_db_error` renders Postgres 16's refusal
+    /// of a slot name outside the allowed charset (reproduced in
+    /// `ventstream-sources/tests/it_slot_error.rs`).
+    const INVALID_SLOT_NAME_DETAIL: &str =
+        "db error (SQLSTATE 42602): replication slot name \"vs_slotS\" contains invalid \
+         character (hint: Replication slot names may only contain lower case letters, \
+         numbers, and the underscore character.)";
+
+    /// The SQL-denormalize slot path (`ensure_replication_slot`) renders its
+    /// failure through `describe_slot_creation_error`. This pins the
+    /// property that makes that matter: when an iteration fails with that
+    /// text after cancelling its token, the supervisor stops instead of
+    /// backing off forever against a refusal the server will repeat on
+    /// every attempt. Before the fix the path formatted the raw error — no
+    /// SQLSTATE — and the classifier could not see it.
+    #[tokio::test(start_paused = true)]
+    async fn sql_denormalize_invalid_slot_name_is_terminal_not_retried() {
+        let message = ventstream_sources::postgres::connection::slot_creation_message(
+            "vs_slotS",
+            INVALID_SLOT_NAME_DETAIL,
+        );
+        let backend = ScriptedBackend {
+            // A clean shutdown is scripted second on purpose: the loop can
+            // only reach it by retrying, which would turn this Err into Ok.
+            outcomes: vec![Err(message.clone()), Ok(EngineIterationOutcome::Shutdown)].into(),
+            iterations: 0,
+        };
+        let error = run_cdc_loop(backend, ShutdownToken::new())
+            .await
+            .expect_err("an invalid slot name must be terminal, not retried");
+        assert_eq!(error.to_string(), message);
+    }
+
+    /// A role without REPLICATION (SQLSTATE 42501 at slot creation) is a
+    /// fixed grant. It is classified terminal at the slot site — not by a
+    /// global 42501 match — and the supervisor must stop on it rather than
+    /// back off indefinitely (#177).
+    #[tokio::test(start_paused = true)]
+    async fn sql_denormalize_role_without_replication_is_terminal_not_retried() {
+        let classified = ventstream_sources::postgres::connection::classify_slot_refusal(
+            Some("42501"),
+            "db error (SQLSTATE 42501): permission denied to use replication slots (detail: \
+             Only roles with the REPLICATION attribute may use replication slots.)",
+        );
+        let message =
+            ventstream_sources::postgres::connection::slot_creation_message("vs_slot", &classified);
+        let backend = ScriptedBackend {
+            outcomes: vec![Err(message.clone()), Ok(EngineIterationOutcome::Shutdown)].into(),
+            iterations: 0,
+        };
+        let error = run_cdc_loop(backend, ShutdownToken::new())
+            .await
+            .expect_err("a missing REPLICATION grant must be terminal, not retried");
+        assert_eq!(error.to_string(), message);
+        assert!(
+            error.to_string().contains("ALTER ROLE <role> REPLICATION"),
+            "the terminal error must carry the remedy: {error}"
+        );
+    }
+
+    /// The direction that matters more: a slot-creation failure whose
+    /// SQLSTATE is transient (57P03, server still starting) must keep
+    /// retrying through the same rendering, since misclassifying it would
+    /// halt a pipeline that would have recovered on its own.
+    #[tokio::test(start_paused = true)]
+    async fn sql_denormalize_transient_slot_failure_retries() {
+        let message = ventstream_sources::postgres::connection::slot_creation_message(
+            "vs_slot",
+            "db error (SQLSTATE 57P03): the database system is starting up",
+        );
+        let backend = ScriptedBackend {
+            // Reaching the scripted shutdown is the proof of a retry.
+            outcomes: vec![Err(message), Ok(EngineIterationOutcome::Shutdown)].into(),
+            iterations: 0,
+        };
+        assert!(
+            run_cdc_loop(backend, ShutdownToken::new()).await.is_ok(),
+            "a transient slot failure must be retried to the scripted shutdown"
+        );
     }
 }

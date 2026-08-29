@@ -84,19 +84,37 @@ pub fn is_crash_fast_text(text: &str) -> bool {
         || is_unrecoverable_config_text(text)
 }
 
+/// Marker a call site appends when it has classified a server refusal from
+/// its *typed* SQLSTATE and knows no retry can clear it — see
+/// `postgres::connection::classify_slot_refusal`.
+///
+/// This exists so the decision can be made where the code's meaning is
+/// unambiguous. 42501 (insufficient_privilege) at slot creation can only
+/// mean the role lacks REPLICATION, a fixed grant; the same code on a table
+/// read may be a grant applied moments later, where retrying is right. A
+/// global code list cannot tell those apart, and over-terminalising is the
+/// worse failure — it halts a pipeline that would have recovered.
+pub const SITE_CLASSIFIED_TERMINAL: &str = "terminal: no retry can clear this";
+
 /// True for server refusals that describe a configuration value the server
 /// will never accept, so no retry can clear them.
 ///
-/// Only SQLSTATE 42602 (invalid_name) is listed, and only because it was
-/// reproduced: Postgres 16 raises it for a replication slot name outside
-/// the allowed charset. Reserved-prefix and over-length names were tried
-/// and do NOT raise it — `pg_`-prefixed and over-long slot names are both
-/// accepted — so nothing else is claimed here.
+/// Two forms are recognised:
 ///
-/// Keep this list to codes someone has actually produced. Over-terminalising
-/// is the worse failure: it halts a pipeline that would have recovered.
+/// - SQLSTATE 42602 (invalid_name), and only because it was reproduced:
+///   Postgres 16 raises it for a replication slot name outside the allowed
+///   charset. Reserved-prefix and over-length names were tried and do NOT
+///   raise it — `pg_`-prefixed and over-long slot names are both accepted —
+///   so nothing else is claimed here.
+/// - [`SITE_CLASSIFIED_TERMINAL`], appended by a call site that classified
+///   the refusal from its typed code. No other SQLSTATE is matched globally
+///   on purpose.
+///
+/// Keep the global list to codes someone has actually produced. Over-
+/// terminalising is the worse failure: it halts a pipeline that would have
+/// recovered.
 pub fn is_unrecoverable_config_text(text: &str) -> bool {
-    text.contains("SQLSTATE 42602")
+    text.contains("SQLSTATE 42602") || text.contains(SITE_CLASSIFIED_TERMINAL)
 }
 
 /// Terminal text for sources with no in-process reconnect loop, where a
@@ -244,5 +262,26 @@ mod unrecoverable_config_tests {
         assert!(!is_unrecoverable_config_text(
             "db error (SQLSTATE 57P03): the database system is starting up"
         ));
+    }
+
+    /// A refusal a call site classified from its typed code is terminal
+    /// wherever it surfaces, without that code joining the global list.
+    #[test]
+    fn a_site_classified_refusal_is_terminal() {
+        let text = format!(
+            "postgres connection failed: creating slot vs_slot: db error (SQLSTATE 42501): \
+             permission denied to use replication slots; {SITE_CLASSIFIED_TERMINAL}"
+        );
+        assert!(is_unrecoverable_config_text(&text));
+        assert!(is_crash_fast_text(&text));
+    }
+
+    /// 42501 is deliberately NOT matched globally: on a table read it can
+    /// be a grant that lands moments later, and retrying is right.
+    #[test]
+    fn an_unclassified_permission_error_stays_retryable() {
+        let text = "db error (SQLSTATE 42501): permission denied for table orders";
+        assert!(!is_unrecoverable_config_text(text));
+        assert!(!is_crash_fast_text(text));
     }
 }
