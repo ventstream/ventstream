@@ -55,6 +55,20 @@ pub struct OpenSearchConfig {
     /// Process-local availability state shared with the health server.
     #[doc(hidden)]
     pub delivery_health: Option<SinkHealth>,
+
+    /// How long the destination must remember a deleted document's version
+    /// (`index.gc_deletes`). Default 24 hours; `Duration::ZERO` disables
+    /// management entirely.
+    ///
+    /// The sink's defence against a stale write arriving *after* a delete is
+    /// OpenSearch's versioned tombstone — and OpenSearch forgets it after
+    /// `index.gc_deletes`, which defaults to **60 seconds**. The retry policy
+    /// above is unbounded by default with a 30-second backoff ceiling, so our
+    /// own retries can outlive the stock tombstone and resurrect a deleted
+    /// document. The sink therefore raises the setting on every index it
+    /// writes to; clusters that deny settings updates must set it themselves
+    /// (see the sink docs), and the sink warns when it cannot.
+    pub tombstone_retention: Duration,
 }
 
 impl OpenSearchConfig {
@@ -76,7 +90,16 @@ impl OpenSearchConfig {
             ca_file: None,
             reconcile_allow_full_purge: false,
             delivery_health: None,
+            tombstone_retention: Duration::from_secs(24 * 60 * 60),
         }
+    }
+
+    /// Override how long deleted-document versions must be retained
+    /// (`index.gc_deletes`). Zero disables management.
+    #[must_use]
+    pub const fn with_tombstone_retention(mut self, retention: Duration) -> Self {
+        self.tombstone_retention = retention;
+        self
     }
 
     /// Set the authentication mode.

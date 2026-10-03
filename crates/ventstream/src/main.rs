@@ -4865,7 +4865,12 @@ fn load_opensearch_config(engine_config: Option<&EngineFileConfig>) -> Result<Op
             opensearch.reconcile_allow_full_purge,
             "VS_OS_RECONCILE_ALLOW_FULL_PURGE",
             false,
-        ));
+        ))
+        .with_tombstone_retention(config_duration_ms_or_env(
+            opensearch.tombstone_retention_ms,
+            "VS_OS_TOMBSTONE_RETENTION_MS",
+            Duration::from_secs(24 * 60 * 60),
+        )?);
     let tls = database_tls_or_env(
         opensearch.tls.as_ref(),
         "VS_OS_TLS_MODE",
@@ -4919,7 +4924,11 @@ fn load_opensearch_config_from_env() -> Result<OpenSearchConfig> {
     };
     let mut os = OpenSearchConfig::new("opensearch", os_endpoint, index_template)
         .with_auth(os_auth)
-        .with_reconcile_allow_full_purge(bool_env("VS_OS_RECONCILE_ALLOW_FULL_PURGE", false));
+        .with_reconcile_allow_full_purge(bool_env("VS_OS_RECONCILE_ALLOW_FULL_PURGE", false))
+        .with_tombstone_retention(opt_duration_ms(
+            "VS_OS_TOMBSTONE_RETENTION_MS",
+            Duration::from_secs(24 * 60 * 60),
+        )?);
     let tls = database_tls_or_env(None, "VS_OS_TLS_MODE", "VS_OS_TLS_CA_FILE", None)?;
     let insecure_tls = bool_env("VS_INSECURE_TLS", false);
     if tls.is_some() && insecure_tls {

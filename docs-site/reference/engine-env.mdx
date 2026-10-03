@@ -36,6 +36,7 @@ Validation fails when a required reference is missing.
 | `VS_OS_API_KEY` | API-key credential. Takes precedence over basic auth when both are present. |
 | `VS_INDEX_TEMPLATE` | Required legacy routing template when canonical `index_routing` is not configured. |
 | `VS_OS_RECONCILE_ALLOW_FULL_PURGE` | Allow reconciliation to remove every document when the source key set is empty. Default `false`; leave disabled unless an empty source is known to be authoritative. |
+| `VS_OS_TOMBSTONE_RETENTION_MS` | `index.gc_deletes` the sink enforces on indices it writes, so delete tombstones outlive the retry horizon. Default 24 hours; `0` disables management (then set it on the cluster yourself). |
 | `VS_OS_TLS_MODE` | `verify_full` requires HTTPS and validates the certificate chain and hostname. `disabled` requires an `http://` endpoint. |
 | `VS_OS_TLS_CA_FILE` | Optional PEM CA bundle for a privately issued OpenSearch certificate. |
 | `VS_INSECURE_TLS` | Disable sink certificate verification. Default `false`; use only for isolated local testing. |
