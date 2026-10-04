@@ -2899,6 +2899,15 @@ async fn build_and_run_mysql_sql_denormalize_engine(
         .await
         .context("building MySQL SQL denormalizer")?
         .with_recompose_limits(recompose_chunk, recompose_concurrency);
+    // Same gate as the Postgres denormalizer: every sink that can express
+    // "empty this target" gets the clear event on a primary TRUNCATE;
+    // otherwise pre-truncate documents would linger forever (#154).
+    if matches!(
+        runtime.sink.kind(),
+        "redis" | "meilisearch" | "surrealdb" | "opensearch" | "elasticsearch"
+    ) {
+        denorm = denorm.with_target_clears();
+    }
     if requires_full_row_image {
         denorm
             .require_full_binlog_row_image()
@@ -2927,7 +2936,10 @@ async fn build_and_run_mysql_sql_denormalize_engine(
     let sink_progress = Arc::new(AtomicU64::new(0));
     let source = MySqlCdcSource::new(config)
         .with_sink_progress(Arc::clone(&sink_progress))
-        .with_transition_images(true);
+        .with_transition_images(true)
+        // Surface binlog TRUNCATEs as events so the denormalizer can
+        // clear and rebuild; plain pipelines keep warn-and-count (#154).
+        .with_truncate_events(true);
     let sink = build_sink(runtime.sink.clone(), &inner_shutdown).await?;
     let dispatcher_config = mysql_dispatcher_config(runtime.engine_config.dispatcher.clone());
 

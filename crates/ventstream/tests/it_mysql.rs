@@ -1532,3 +1532,127 @@ async fn mysql_server_epoch_guard_adopts_then_detects_change() {
 
     pool.disconnect().await.expect("pool disconnect");
 }
+
+/// #154: a MySQL TRUNCATE must not leave stale documents in the sink.
+/// A truncated related table recomposes every primary (embedded arrays
+/// empty out); a truncated primary clears the projection target and
+/// rebuilds from the post-truncate table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "local integration: requires Docker"]
+async fn mysql_sql_mode_truncate_clears_and_rebuilds_redis() {
+    const PREFIX: &str = "ventstream:it:mysql:truncate";
+
+    let stack = common::start_mysql().await;
+    let (_redis, redis_port) = common::start_redis().await;
+    let mut mysql = common::mysql_root_conn(stack.mysql_port)
+        .await
+        .expect("mysql root connection");
+    mysql
+        .query_drop(format!(
+            "CREATE USER IF NOT EXISTS '{}'@'%' IDENTIFIED BY '{}'; \
+             GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{}'@'%'; \
+             CREATE TABLE IF NOT EXISTS {}.orders (
+               id VARCHAR(64) PRIMARY KEY,
+               status VARCHAR(64) NOT NULL
+             ); \
+             CREATE TABLE IF NOT EXISTS {}.order_items (
+               id VARCHAR(64) PRIMARY KEY,
+               order_id VARCHAR(64) NOT NULL,
+               product VARCHAR(64) NOT NULL
+             ); \
+             DELETE FROM {}.order_items; \
+             DELETE FROM {}.orders; \
+             INSERT INTO {}.orders (id, status) VALUES
+               ('tr-order-1', 'created'),
+               ('tr-order-2', 'created'); \
+             INSERT INTO {}.order_items (id, order_id, product) VALUES
+               ('tr-item-1', 'tr-order-1', 'book')",
+            common::MYSQL_USER,
+            common::MYSQL_PASSWORD,
+            common::MYSQL_USER,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+        ))
+        .await
+        .expect("seed truncate tables");
+
+    let state_dir = common::state_dir("mysql-redis-truncate", stack.mysql_port);
+    let spec_path = common::write_spec(&state_dir, REDIS_JOINED_ORDERS_SPEC);
+    // Target-wide clears require exclusive keyspace ownership — the sink
+    // refuses to pattern-delete keys it may not own (fails closed).
+    let mut engine = common::spawn_mysql_redis_engine_with_options(&common::MySqlRedisEngine {
+        mysql_port: stack.mysql_port,
+        redis_port,
+        spec_path: &spec_path,
+        state_dir: &state_dir,
+        key_prefix: PREFIX,
+        tables: "orders,order_items",
+        keyspace_ownership: "exclusive",
+    });
+    let pattern = format!("{PREFIX}:{{orders}}:*");
+
+    common::wait_until(
+        Duration::from_secs(60),
+        "MySQL Redis truncate-test snapshot",
+        || {
+            let pattern = pattern.clone();
+            async move {
+                redis_document(redis_port, &pattern, "tr-order-1")
+                    .await
+                    .is_some_and(|document| item_ids(&document) == vec!["tr-item-1".to_owned()])
+            }
+        },
+    )
+    .await;
+
+    // Related truncate: every primary recomposes; the embedded array
+    // empties without the parent rows changing.
+    mysql
+        .query_drop(format!("TRUNCATE TABLE {}.order_items", common::MYSQL_DB))
+        .await
+        .expect("truncate related table");
+    common::wait_until(
+        Duration::from_secs(60),
+        "related truncate empties embedded items",
+        || {
+            let pattern = pattern.clone();
+            async move {
+                redis_document(redis_port, &pattern, "tr-order-1")
+                    .await
+                    .is_some_and(|document| item_ids(&document).is_empty())
+            }
+        },
+    )
+    .await;
+
+    // Primary truncate: the projection target clears — pre-truncate
+    // documents must not linger — and rebuilds from the new table state.
+    mysql
+        .query_drop(format!(
+            "TRUNCATE TABLE {db}.orders; \
+             INSERT INTO {db}.orders (id, status) VALUES ('tr-order-9', 'fresh')",
+            db = common::MYSQL_DB,
+        ))
+        .await
+        .expect("truncate primary table and reseed");
+    common::wait_until(
+        Duration::from_secs(60),
+        "primary truncate clears and rebuilds the projection",
+        || {
+            let pattern = pattern.clone();
+            async move {
+                let fresh = redis_document(redis_port, &pattern, "tr-order-9").await;
+                let stale_one = redis_document(redis_port, &pattern, "tr-order-1").await;
+                let stale_two = redis_document(redis_port, &pattern, "tr-order-2").await;
+                fresh.is_some() && stale_one.is_none() && stale_two.is_none()
+            }
+        },
+    )
+    .await;
+
+    engine.kill();
+}
