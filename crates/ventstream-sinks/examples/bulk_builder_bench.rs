@@ -123,7 +123,7 @@ fn main() {
         let body = match mode.as_str() {
             "legacy" => legacy_bulk_body(&events, &template),
             "request" => {
-                bulk::build_bulk_request(&events, &template, now, None)
+                bulk::build_bulk_request(&events, &template, now, None, None)
                     .unwrap_or_else(|error| {
                         eprintln!("request build failed: {error}");
                         std::process::exit(2);
@@ -131,7 +131,7 @@ fn main() {
                     .body
             }
             "body" => {
-                bulk::build_bulk_body(&events, &template, now, None)
+                bulk::build_bulk_body(&events, &template, now, None, None)
                     .unwrap_or_else(|error| {
                         eprintln!("body build failed: {error}");
                         std::process::exit(2);

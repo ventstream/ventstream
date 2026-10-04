@@ -534,6 +534,7 @@ impl OpenSearchSink {
         events: &[ventstream_core::Event],
         range: std::ops::Range<usize>,
         permanent: &mut Vec<ventstream_core::FailedItem>,
+        delete_targets: Option<&bulk::DeleteTargets>,
         written_indices: &mut HashSet<String>,
     ) -> Result<(), OpenSearchSinkError> {
         let mut ranges = VecDeque::new();
@@ -544,7 +545,10 @@ impl OpenSearchSink {
                     "bulk split produced an invalid event range".into(),
                 ));
             };
-            match self.send_slice_with_retry(attempt, written_indices).await {
+            match self
+                .send_slice_with_retry(attempt, delete_targets, written_indices)
+                .await
+            {
                 Ok(()) => {}
                 Err(OpenSearchSinkError::RequestTooLarge { .. }) if range.len() > 1 => {
                     let midpoint = range.start + range.len() / 2;
@@ -597,6 +601,11 @@ impl OpenSearchSink {
         if events.is_empty() {
             return Ok(());
         }
+        // Under a time-rolled template, resolve which index each deleted id
+        // actually lives in before any body is built (#124). Resolved once
+        // per batch; retries and size-splits reuse the same map.
+        let delete_targets = self.resolve_delete_indices(events).await?;
+        let delete_targets = delete_targets.as_ref();
         let mut permanent: Vec<ventstream_core::FailedItem> = Vec::new();
 
         // A clear must be applied exactly where it sits in the stream:
@@ -613,6 +622,7 @@ impl OpenSearchSink {
                     events,
                     segment_start..index,
                     &mut permanent,
+                    delete_targets,
                     written_indices,
                 )
                 .await?;
@@ -625,6 +635,7 @@ impl OpenSearchSink {
                 events,
                 segment_start..events.len(),
                 &mut permanent,
+                delete_targets,
                 written_indices,
             )
             .await?;
@@ -649,6 +660,7 @@ impl OpenSearchSink {
     async fn send_slice_with_retry(
         &self,
         events: &[ventstream_core::Event],
+        delete_targets: Option<&bulk::DeleteTargets>,
         written_indices: &mut HashSet<String>,
     ) -> Result<(), OpenSearchSinkError> {
         if events.is_empty() {
@@ -679,7 +691,8 @@ impl OpenSearchSink {
                 events
             };
             if encoded.is_none() {
-                let prepared = self.encode_attempt(attempt, rendered_at, written_indices)?;
+                let prepared =
+                    self.encode_attempt(attempt, rendered_at, delete_targets, written_indices)?;
                 // Nothing to send: every event in this slice was handled
                 // outside the bulk API (a target clear). Posting a
                 // zero-byte NDJSON body is a hard 400, which would fail
@@ -879,12 +892,14 @@ impl OpenSearchSink {
         &self,
         events: &[ventstream_core::Event],
         rendered_at: chrono::DateTime<Utc>,
+        delete_targets: Option<&bulk::DeleteTargets>,
         written_indices: &mut HashSet<String>,
     ) -> Result<(Bytes, Vec<usize>), OpenSearchSinkError> {
         let (body, item_event_offsets) = bulk::build_bulk_body(
             events,
             &self.config.index_template,
             rendered_at,
+            delete_targets,
             Some(written_indices),
         )?;
         if body.len() > self.config.bulk.max_bytes {
@@ -894,6 +909,129 @@ impl OpenSearchSink {
             });
         }
         Ok((Bytes::from(body), item_event_offsets))
+    }
+
+    /// Resolve which concrete indices hold each document this batch deletes
+    /// (#124). `None` when the template has no time placeholders — then the
+    /// rendered index is always the right one and no lookup is spent.
+    ///
+    /// With a time-rolled template (`events-%Y-%m-%d`), rendering at delete
+    /// time addresses *today's* index while the document lives in the index
+    /// of the period it was written — OpenSearch answers "missing", the
+    /// sink's 404-is-already-applied rule swallows it, and the document
+    /// survives forever. One `ids` query per rendered wildcard pattern maps
+    /// each id to every index holding it (several, if cross-period updates
+    /// left copies); unresolved ids fall back to the rendered index, which
+    /// covers the written-moments-ago-not-yet-refreshed case.
+    ///
+    /// A resolution failure fails the batch (the caller's error path), not
+    /// silently falls back: a fallback under a cluster blip would quietly
+    /// reintroduce the bug this exists to fix.
+    async fn resolve_delete_indices(
+        &self,
+        events: &[ventstream_core::Event],
+    ) -> Result<Option<bulk::DeleteTargets>, OpenSearchSinkError> {
+        if !index_template::has_time_placeholders(&self.config.index_template) {
+            return Ok(None);
+        }
+        // pattern → ids deleted under that pattern (usually one pattern).
+        let mut by_pattern: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for event in events {
+            if is_target_clear(event) {
+                continue;
+            }
+            let mut ids: Vec<&str> = Vec::new();
+            if bulk::is_delete_event(event) {
+                if let Some(id) = event.headers.get("ventstream.doc.id") {
+                    ids.push(id);
+                }
+            } else if let Some(old_id) = event.headers.get("ventstream.doc.old_id") {
+                ids.push(old_id);
+            }
+            if ids.is_empty() {
+                continue;
+            }
+            let pattern =
+                index_template::render_time_wildcards(&self.config.index_template, event)?;
+            let entry = by_pattern.entry(pattern).or_default();
+            for id in ids {
+                if !entry.iter().any(|existing| existing == id) {
+                    entry.push(id.to_owned());
+                }
+            }
+        }
+        if by_pattern.is_empty() {
+            return Ok(None);
+        }
+        let mut targets = bulk::DeleteTargets::new();
+        for (pattern, ids) in by_pattern {
+            // Each id can live in several period indices (cross-period
+            // updates leave one copy per index), so size generously; if the
+            // cap is ever hit, over-truncation only means some copies fall
+            // back to the rendered index — same as before this fix.
+            let size = ids.len().saturating_mul(8).min(10_000);
+            let url = format!(
+                "{}/{}/_search?ignore_unavailable=true&allow_no_indices=true",
+                self.endpoint_base, pattern
+            );
+            let body = serde_json::json!({
+                "size": size,
+                "_source": false,
+                "query": { "ids": { "values": ids } }
+            });
+            let response = apply_auth(self.client.post(&url), &self.config.auth)
+                .timeout(self.config.request_timeout)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|err| {
+                    OpenSearchSinkError::Transport(format!(
+                        "resolving delete indices for '{pattern}': {err}"
+                    ))
+                })?;
+            let status = response.status();
+            if !status.is_success() {
+                let message = read_truncated_body(response, 512).await;
+                let error = format!("resolving delete indices for '{pattern}': {message}");
+                return Err(if status.is_server_error() || status.as_u16() == 429 {
+                    OpenSearchSinkError::Server {
+                        status: status.as_u16(),
+                        message: error,
+                        retry_after: None,
+                    }
+                } else {
+                    OpenSearchSinkError::Client {
+                        status: status.as_u16(),
+                        message: error,
+                    }
+                });
+            }
+            let parsed: serde_json::Value = response.json().await.map_err(|err| {
+                OpenSearchSinkError::MalformedResponse(format!(
+                    "resolving delete indices for '{pattern}': {err}"
+                ))
+            })?;
+            let hits = parsed
+                .pointer("/hits/hits")
+                .and_then(serde_json::Value::as_array);
+            for hit in hits.into_iter().flatten() {
+                let (Some(index), Some(id)) = (
+                    hit.get("_index").and_then(serde_json::Value::as_str),
+                    hit.get("_id").and_then(serde_json::Value::as_str),
+                ) else {
+                    continue;
+                };
+                let indices = targets.entry(id.to_owned()).or_default();
+                if !indices.iter().any(|existing| existing == index) {
+                    indices.push(index.to_owned());
+                }
+            }
+        }
+        for indices in targets.values_mut() {
+            indices.sort_unstable();
+        }
+        Ok(Some(targets))
     }
 
     /// Single prepared attempt — POST immutable NDJSON, parse response, and
@@ -1479,7 +1617,7 @@ mod tests {
         template: &str,
         now: chrono::DateTime<Utc>,
     ) -> Result<Vec<u8>, OpenSearchSinkError> {
-        bulk::build_bulk_body(events, template, now, None).map(|(body, _)| body)
+        bulk::build_bulk_body(events, template, now, None, None).map(|(body, _)| body)
     }
 
     fn make_event(subject: &str, payload: &str) -> Event {
@@ -2382,6 +2520,16 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        // The time-rolled test template now resolves delete indices first
+        // (#124); an id that was never written resolves to nothing.
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path_regex(r"/.*/_search$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hits": { "hits": [] }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let source = SourceUri::new("test://x").expect("uri");
         let subject = Subject::new("postgres.app.orders.delete").expect("subject");
@@ -2804,5 +2952,150 @@ mod tests {
         sink.apply_target_clear(&clear_event("app", "orders"))
             .await
             .expect("clearing a never-created index is a no-op");
+    }
+
+    fn delete_event(doc_id: &str) -> Event {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("ventstream.doc.id".to_owned(), doc_id.to_owned());
+        let source = SourceUri::new("test://x").expect("uri");
+        let subject = Subject::new("postgres.app.orders.delete").expect("subject");
+        Event::builder(source, subject)
+            .payload(Payload::from_vec(b"{}".to_vec()))
+            .content_type(ContentType::Json)
+            .headers(Headers::from_map(headers))
+            .build()
+    }
+
+    /// #124 end to end at the HTTP seam: with a time-rolled template, a
+    /// delete first resolves which index holds the id, and the bulk action
+    /// targets THAT index — not the one rendered at delete time. The
+    /// retention PUT (#151) follows the resolved index too.
+    #[tokio::test]
+    async fn time_rolled_delete_targets_the_index_holding_the_document() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/events-*-*-*/_search"))
+            .and(wiremock::matchers::body_string_contains("app.orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hits": { "hits": [
+                    { "_index": "events-2026-08-20", "_id": "app.orders:[\"1\"]" }
+                ]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bulk_ok = serde_json::json!({
+            "took": 1, "errors": false,
+            "items": [{ "delete": { "_id": "app.orders:[\"1\"]", "status": 200 } }]
+        });
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .and(wiremock::matchers::body_string_contains(
+                "events-2026-08-20",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(bulk_ok))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/events-2026-08-20/_settings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "acknowledged": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sink = tombstone_sink(
+            &server.uri(),
+            "events-%Y-%m-%d",
+            Duration::from_secs(24 * 60 * 60),
+        );
+        let batch = SinkBatch::new(vec![delete_event("app.orders:[\"1\"]")]);
+        sink.write(batch).await.expect("write");
+    }
+
+    /// An id the lookup does not find keeps the rendered (current) index —
+    /// the fresh-write and never-existed cases keep the old semantics.
+    #[tokio::test]
+    async fn unresolved_time_rolled_delete_falls_back_to_the_rendered_index() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/events-*-*-*/_search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "hits": { "hits": [] }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let today = Utc::now().format("events-%Y-%m-%d").to_string();
+        let bulk_ok = serde_json::json!({
+            "took": 1, "errors": false,
+            "items": [{ "delete": { "_id": "app.orders:[\"2\"]", "status": 404 } }]
+        });
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .and(wiremock::matchers::body_string_contains(today.clone()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(bulk_ok))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sink = tombstone_sink(&server.uri(), "events-%Y-%m-%d", Duration::ZERO);
+        let batch = SinkBatch::new(vec![delete_event("app.orders:[\"2\"]")]);
+        sink.write(batch).await.expect("write");
+    }
+
+    /// A literal template never drifts, so no lookup is spent on it.
+    #[tokio::test]
+    async fn literal_template_skips_delete_resolution() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path_regex(r"/.*/_search$"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let bulk_ok = serde_json::json!({
+            "took": 1, "errors": false,
+            "items": [{ "delete": { "_id": "app.orders:[\"3\"]", "status": 200 } }]
+        });
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(bulk_ok))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sink = tombstone_sink(&server.uri(), "orders", Duration::ZERO);
+        let batch = SinkBatch::new(vec![delete_event("app.orders:[\"3\"]")]);
+        sink.write(batch).await.expect("write");
+    }
+
+    /// Resolution failing must fail the batch (fail closed): silently
+    /// falling back under a cluster blip would quietly reintroduce the
+    /// wrong-index delete this exists to fix.
+    #[tokio::test]
+    async fn delete_resolution_failure_fails_the_batch_closed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/events-*-*-*/_search"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let sink = tombstone_sink(&server.uri(), "events-%Y-%m-%d", Duration::ZERO);
+        let batch = SinkBatch::new(vec![delete_event("app.orders:[\"4\"]")]);
+        let result = sink.write(batch).await;
+        assert!(
+            matches!(result, Err(ventstream_core::SinkError::Connection(_))),
+            "resolution failure must surface, not fall back: {result:?}"
+        );
     }
 }

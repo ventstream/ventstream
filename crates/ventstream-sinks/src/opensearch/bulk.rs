@@ -124,14 +124,23 @@ pub struct BulkRequest {
     pub item_event_offsets: Vec<usize>,
 }
 
+/// The concrete indices each delete id actually lives in, resolved by the
+/// sink before building the request (#124). Keyed by stable doc id. A
+/// missing key means the id resolved to nothing, and the delete falls back
+/// to the rendered (current) index — which is exactly right for a document
+/// written moments ago whose index segment hasn't refreshed yet, and keeps
+/// today's 404-is-already-applied semantics for ids that never existed.
+pub type DeleteTargets = std::collections::HashMap<String, Vec<String>>;
+
 /// Build a bulk request from a slice of events and a template.
 pub fn build_bulk_request(
     events: &[Event],
     template: &str,
     now: DateTime<Utc>,
+    delete_targets: Option<&DeleteTargets>,
     written_indices: Option<&mut std::collections::HashSet<String>>,
 ) -> Result<BulkRequest, OpenSearchSinkError> {
-    build_bulk_request_inner(events, template, now, written_indices, true)
+    build_bulk_request_inner(events, template, now, delete_targets, written_indices, true)
 }
 
 /// Build only the NDJSON body used by the HTTP hot path.
@@ -149,16 +158,25 @@ pub fn build_bulk_body(
     events: &[Event],
     template: &str,
     now: DateTime<Utc>,
+    delete_targets: Option<&DeleteTargets>,
     written_indices: Option<&mut std::collections::HashSet<String>>,
 ) -> Result<(Vec<u8>, Vec<usize>), OpenSearchSinkError> {
-    build_bulk_request_inner(events, template, now, written_indices, false)
-        .map(|request| (request.body, request.item_event_offsets))
+    build_bulk_request_inner(
+        events,
+        template,
+        now,
+        delete_targets,
+        written_indices,
+        false,
+    )
+    .map(|request| (request.body, request.item_event_offsets))
 }
 
 fn build_bulk_request_inner(
     events: &[Event],
     template: &str,
     now: DateTime<Utc>,
+    delete_targets: Option<&DeleteTargets>,
     mut written_indices: Option<&mut std::collections::HashSet<String>>,
     collect_indices: bool,
 ) -> Result<BulkRequest, OpenSearchSinkError> {
@@ -198,11 +216,6 @@ fn build_bulk_request_inner(
         // (e.g. the join engine / denormalize modes set `ventstream.doc.id`
         // = `{primary_table}:{primary_pk}` so re-emits overwrite the same
         // doc). All denormalize modes stamp it.
-        if let Some(written) = written_indices.as_deref_mut() {
-            if !written.contains(index.as_ref()) {
-                written.insert(index.as_ref().to_owned());
-            }
-        }
         let stable_id = event.headers.get("ventstream.doc.id");
         // Source watermark → external doc version (None for bootstrap).
         let version = external_version(event);
@@ -225,20 +238,16 @@ fn build_bulk_request_inner(
             // Bulk delete action: action line only, no payload body.
             // Versioned (external_gte) so a stale recompose-upsert can't
             // overtake this tombstone across parallel bulks (H18).
-            let action = DeleteAction {
-                delete: ActionMeta::new(index.as_ref(), doc_id, version),
-            };
-            serde_json::to_writer(&mut body, &action).map_err(|err| {
-                OpenSearchSinkError::Internal(format!("serializing bulk action: {err}"))
-            })?;
-            body.push(b'\n');
-            item_event_offsets.push(event_offset);
-        } else {
-            // A key-changing update relocated the doc: remove the previous
-            // doc first so the old id does not linger as a stale copy.
-            if let Some(old_id) = event.headers.get("ventstream.doc.old_id") {
+            //
+            // Under a time-rolled template the rendered index is *today's*,
+            // while the document lives in the index of the period it was
+            // written — so a resolved target list (one entry per index that
+            // actually holds the id, possibly several after cross-period
+            // updates) takes precedence (#124).
+            for target in delete_indices(delete_targets, doc_id, index.as_ref()) {
+                record_written(&mut written_indices, target);
                 let action = DeleteAction {
-                    delete: ActionMeta::new(index.as_ref(), old_id, version),
+                    delete: ActionMeta::new(target, doc_id, version),
                 };
                 serde_json::to_writer(&mut body, &action).map_err(|err| {
                     OpenSearchSinkError::Internal(format!("serializing bulk action: {err}"))
@@ -246,6 +255,25 @@ fn build_bulk_request_inner(
                 body.push(b'\n');
                 item_event_offsets.push(event_offset);
             }
+        } else {
+            // A key-changing update relocated the doc: remove the previous
+            // doc first so the old id does not linger as a stale copy. The
+            // old doc was written in the past, so it takes the same
+            // resolved-index treatment as a tombstone (#124).
+            if let Some(old_id) = event.headers.get("ventstream.doc.old_id") {
+                for target in delete_indices(delete_targets, old_id, index.as_ref()) {
+                    record_written(&mut written_indices, target);
+                    let action = DeleteAction {
+                        delete: ActionMeta::new(target, old_id, version),
+                    };
+                    serde_json::to_writer(&mut body, &action).map_err(|err| {
+                        OpenSearchSinkError::Internal(format!("serializing bulk action: {err}"))
+                    })?;
+                    body.push(b'\n');
+                    item_event_offsets.push(event_offset);
+                }
+            }
+            record_written(&mut written_indices, index.as_ref());
             // Upsert. Use the stable id when present; otherwise fall back to
             // the per-event id — which makes each event its own doc (no upsert
             // dedup, so re-emits duplicate). Surface the fallback so a
@@ -325,7 +353,52 @@ pub(crate) fn is_target_clear(event: &ventstream_core::Event) -> bool {
 /// event in the join engine's primary path was passed through with the
 /// same subject (carrying the row's `old` payload), so we can recognize
 /// it here and emit an OS bulk `delete` action instead of `index`.
-fn is_delete_event(event: &Event) -> bool {
+/// Record an index an action will be written to, deduplicating inline.
+fn record_written(
+    written_indices: &mut Option<&mut std::collections::HashSet<String>>,
+    index: &str,
+) {
+    if let Some(written) = written_indices.as_deref_mut() {
+        if !written.contains(index) {
+            written.insert(index.to_owned());
+        }
+    }
+}
+
+/// The indices a delete action for `doc_id` must target: the resolved list
+/// when the sink looked the id up, else the rendered index.
+fn delete_indices<'a>(
+    delete_targets: Option<&'a DeleteTargets>,
+    doc_id: &str,
+    rendered: &'a str,
+) -> impl Iterator<Item = &'a str> {
+    let resolved = delete_targets
+        .and_then(|targets| targets.get(doc_id))
+        .filter(|list| !list.is_empty());
+    match resolved {
+        Some(list) => EitherIter::Left(list.iter().map(String::as_str)),
+        None => EitherIter::Right(std::iter::once(rendered)),
+    }
+}
+
+/// Minimal two-sided iterator so [`delete_indices`] has one return type
+/// without boxing on the hot path.
+enum EitherIter<L, R> {
+    Left(L),
+    Right(R),
+}
+
+impl<T, L: Iterator<Item = T>, R: Iterator<Item = T>> Iterator for EitherIter<L, R> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> {
+        match self {
+            Self::Left(left) => left.next(),
+            Self::Right(right) => right.next(),
+        }
+    }
+}
+
+pub(crate) fn is_delete_event(event: &Event) -> bool {
     event
         .subject
         .as_str()
@@ -509,7 +582,7 @@ mod tests {
             make_event("a.b", br#"{"x":1}"#),
             make_event("a.b", br#"{"x":2}"#),
         ];
-        let req = build_bulk_request(&events, "static-index", now(), None).unwrap();
+        let req = build_bulk_request(&events, "static-index", now(), None, None).unwrap();
         let text = String::from_utf8(req.body).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 4);
@@ -528,7 +601,7 @@ mod tests {
     #[test]
     fn bulk_request_terminates_body_with_newline() {
         let events = vec![make_event("a.b", b"{}")];
-        let req = build_bulk_request(&events, "x", now(), None).unwrap();
+        let req = build_bulk_request(&events, "x", now(), None, None).unwrap();
         assert_eq!(*req.body.last().unwrap(), b'\n');
     }
 
@@ -536,7 +609,7 @@ mod tests {
     fn bulk_request_uses_event_id_as_underscore_id() {
         let event = make_event("a.b", b"{}");
         let id = event.id.to_string();
-        let req = build_bulk_request(&[event], "static", now(), None).unwrap();
+        let req = build_bulk_request(&[event], "static", now(), None, None).unwrap();
         let text = String::from_utf8(req.body).unwrap();
         assert!(text.contains(&id), "expected event id {id} in bulk body");
     }
@@ -547,7 +620,8 @@ mod tests {
             make_event("postgres.app.products.insert", b"{}"),
             make_event("postgres.app.products.update", b"{}"),
         ];
-        let req = build_bulk_request(&events, "events-${subject:1}-%Y-%m-%d", now(), None).unwrap();
+        let req =
+            build_bulk_request(&events, "events-${subject:1}-%Y-%m-%d", now(), None, None).unwrap();
         assert_eq!(
             req.indices,
             vec!["events-app-2026-05-23", "events-app-2026-05-23"]
@@ -559,7 +633,7 @@ mod tests {
         // A misbehaving source that produced a payload with an embedded
         // newline would otherwise break the NDJSON framing.
         let event = make_event("a.b", b"{\"a\":1,\n\"b\":2}");
-        let req = build_bulk_request(&[event], "static", now(), None).unwrap();
+        let req = build_bulk_request(&[event], "static", now(), None, None).unwrap();
         let text = String::from_utf8(req.body).unwrap();
         // Should be 3 lines total: action + doc + (trailing empty).
         assert_eq!(text.matches('\n').count(), 2);
@@ -639,6 +713,7 @@ mod tests {
             "orders",
             chrono::Utc.timestamp_opt(0, 0).single().expect("ts"),
             None,
+            None,
         )
         .expect("build");
         assert!(body.is_empty(), "a lone clear must not produce a bulk body");
@@ -673,7 +748,7 @@ mod tests {
         // block delivery rather than emit an unmatchable delete that 404s and
         // leaves the doc indexed forever.
         let event = make_event_with_doc_id("a.b.delete", None);
-        let err = match build_bulk_request(&[event], "idx", now(), None) {
+        let err = match build_bulk_request(&[event], "idx", now(), None, None) {
             Err(e) => e,
             Ok(_) => panic!("delete without doc.id must block, not be emitted"),
         };
@@ -687,7 +762,7 @@ mod tests {
     fn delete_with_doc_id_targets_that_id() {
         // A delete WITH the stable id targets it (not the per-event ULID).
         let event = make_event_with_doc_id("a.b.delete", Some("orders:5"));
-        let req = build_bulk_request(&[event], "idx", now(), None).expect("ok");
+        let req = build_bulk_request(&[event], "idx", now(), None, None).expect("ok");
         let text = String::from_utf8(req.body).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 1, "delete is action-line only, no payload");
@@ -710,7 +785,7 @@ mod tests {
                 ("ventstream.cdc.lsn", "24000000"),
             ],
         );
-        let req = build_bulk_request(&[event], "idx", now(), None).expect("ok");
+        let req = build_bulk_request(&[event], "idx", now(), None, None).expect("ok");
         let text = String::from_utf8(req.body).unwrap();
         let action = text.lines().next().expect("action line");
         assert!(action.starts_with(r#"{"index":{"#), "got: {action}");
@@ -733,7 +808,7 @@ mod tests {
                 ("ventstream.cdc.lsn", "24000500"),
             ],
         );
-        let req = build_bulk_request(&[event], "idx", now(), None).expect("ok");
+        let req = build_bulk_request(&[event], "idx", now(), None, None).expect("ok");
         let text = String::from_utf8(req.body).unwrap();
         let action = text.lines().next().expect("action line");
         assert!(action.starts_with(r#"{"delete":{"#), "got: {action}");
@@ -753,7 +828,7 @@ mod tests {
                 ("ventstream.cdc.tx_id", "9001"),
             ],
         );
-        let req = build_bulk_request(&[event], "idx", now(), None).expect("ok");
+        let req = build_bulk_request(&[event], "idx", now(), None, None).expect("ok");
         let text = String::from_utf8(req.body).unwrap();
         let action = text.lines().next().expect("action line");
         assert!(action.contains(r#""version":9001"#), "got: {action}");
@@ -773,7 +848,7 @@ mod tests {
                 ("ventstream.cdc.source_version", "3"),
             ],
         );
-        let req = build_bulk_request(&[event], "idx", now(), None).expect("ok");
+        let req = build_bulk_request(&[event], "idx", now(), None, None).expect("ok");
         let text = String::from_utf8(req.body).unwrap();
         let action = text.lines().next().expect("action line");
         assert!(action.contains(r#""version":3"#), "got: {action}");
@@ -790,7 +865,7 @@ mod tests {
             "postgres.shop.orders.insert",
             &[("ventstream.doc.id", "shop.orders:[\"ord-1\"]")],
         );
-        let req = build_bulk_request(&[event], "idx", now(), None).expect("ok");
+        let req = build_bulk_request(&[event], "idx", now(), None, None).expect("ok");
         let text = String::from_utf8(req.body).unwrap();
         let action = text.lines().next().expect("action line");
         assert!(!action.contains("version"), "must be unversioned: {action}");
@@ -807,7 +882,7 @@ mod tests {
                 ("ventstream.cdc.lsn", "0"),
             ],
         );
-        let req = build_bulk_request(&[event], "idx", now(), None).expect("ok");
+        let req = build_bulk_request(&[event], "idx", now(), None, None).expect("ok");
         let text = String::from_utf8(req.body).unwrap();
         let action = text.lines().next().expect("action line");
         assert!(!action.contains("version"), "must be unversioned: {action}");
@@ -865,5 +940,140 @@ mod tests {
             error: None,
         });
         assert!(!missing_indexed_document.is_delete_not_found());
+    }
+
+    fn delete_event(doc_id: &str) -> Event {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("ventstream.doc.id".to_owned(), doc_id.to_owned());
+        let source = SourceUri::new("test://x").expect("uri");
+        let subject = Subject::new("postgres.app.orders.delete").expect("subject");
+        Event::builder(source, subject)
+            .payload(Payload::from_vec(b"{}".to_vec()))
+            .content_type(ContentType::Json)
+            .headers(Headers::from_map(headers))
+            .build()
+    }
+
+    /// #124: a resolved target list routes the delete to every index that
+    /// actually holds the document, not the index rendered at delete time —
+    /// and the written-index set records the actual targets, so retention
+    /// management (#151) follows the deletes too.
+    #[test]
+    fn resolved_delete_targets_override_the_rendered_index() {
+        let event = delete_event("app.orders:[\"1\"]");
+        let mut targets = DeleteTargets::new();
+        targets.insert(
+            "app.orders:[\"1\"]".to_owned(),
+            vec![
+                "events-2026-05-20".to_owned(),
+                "events-2026-05-21".to_owned(),
+            ],
+        );
+        let mut written = std::collections::HashSet::new();
+        let req = build_bulk_request(
+            std::slice::from_ref(&event),
+            "events-%Y-%m-%d",
+            now(),
+            Some(&targets),
+            Some(&mut written),
+        )
+        .unwrap();
+        let text = String::from_utf8(req.body).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "one delete per holding index: {text}");
+        assert!(
+            lines[0].contains(r#""_index":"events-2026-05-20""#),
+            "{text}"
+        );
+        assert!(
+            lines[1].contains(r#""_index":"events-2026-05-21""#),
+            "{text}"
+        );
+        assert!(
+            !text.contains("2026-05-23"),
+            "the rendered (current) index must not be targeted: {text}"
+        );
+        assert_eq!(
+            req.item_event_offsets,
+            vec![0, 0],
+            "both actions map back to one event for per-item errors"
+        );
+        assert_eq!(
+            written,
+            ["events-2026-05-20", "events-2026-05-21"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            "the written set holds the resolved targets, not the rendered index"
+        );
+    }
+
+    /// An id the resolution did not find falls back to the rendered index:
+    /// never-written and written-but-unrefreshed documents keep today's
+    /// 404-is-already-applied semantics.
+    #[test]
+    fn unresolved_delete_falls_back_to_the_rendered_index() {
+        let event = delete_event("app.orders:[\"2\"]");
+        let targets = DeleteTargets::new();
+        let req = build_bulk_request(
+            std::slice::from_ref(&event),
+            "events-%Y-%m-%d",
+            now(),
+            Some(&targets),
+            None,
+        )
+        .unwrap();
+        let text = String::from_utf8(req.body).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains(r#""_index":"events-2026-05-23""#), "{text}");
+    }
+
+    /// The relocation delete (`doc.old_id`) removes a *past* document too,
+    /// so it takes the resolved routing while the upsert half keeps the
+    /// rendered index.
+    #[test]
+    fn relocation_old_id_delete_takes_resolved_routing() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            "ventstream.doc.id".to_owned(),
+            "app.orders:[\"new\"]".to_owned(),
+        );
+        headers.insert(
+            "ventstream.doc.old_id".to_owned(),
+            "app.orders:[\"old\"]".to_owned(),
+        );
+        let source = SourceUri::new("test://x").expect("uri");
+        let subject = Subject::new("postgres.app.orders.update").expect("subject");
+        let event = Event::builder(source, subject)
+            .payload(Payload::from_vec(br#"{"x":1}"#.to_vec()))
+            .content_type(ContentType::Json)
+            .headers(Headers::from_map(headers))
+            .build();
+        let mut targets = DeleteTargets::new();
+        targets.insert(
+            "app.orders:[\"old\"]".to_owned(),
+            vec!["events-2026-05-01".to_owned()],
+        );
+        let req = build_bulk_request(
+            std::slice::from_ref(&event),
+            "events-%Y-%m-%d",
+            now(),
+            Some(&targets),
+            None,
+        )
+        .unwrap();
+        let text = String::from_utf8(req.body).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "delete + index action + doc body: {text}");
+        assert!(
+            lines[0].starts_with(r#"{"delete":"#)
+                && lines[0].contains(r#""_index":"events-2026-05-01""#),
+            "{text}"
+        );
+        assert!(
+            lines[1].starts_with(r#"{"index":"#)
+                && lines[1].contains(r#""_index":"events-2026-05-23""#),
+            "{text}"
+        );
     }
 }
