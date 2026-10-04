@@ -19,4 +19,4 @@ mod value;
 pub use config::MySqlCdcConfig;
 pub use cursor::checkpoint_is_resumable as mysql_checkpoint_is_resumable;
 pub use fetcher::MySqlFetcher;
-pub use source::MySqlCdcSource;
+pub use source::{scan_start_version, versioning_epoch_ok, MySqlCdcSource};

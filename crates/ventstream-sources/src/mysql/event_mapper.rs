@@ -72,9 +72,7 @@ fn source_uri(config: &MySqlCdcConfig, table: &str) -> Result<SourceUri, MySqlCd
     .map_err(|e| MySqlCdcError::Internal(e.to_string()))
 }
 
-/// Header the versioning sinks read as the document's external version.
-/// Shared with the Kafka and MongoDB sources.
-pub(crate) const SOURCE_VERSION_HEADER: &str = "ventstream.cdc.source_version";
+pub(crate) use ventstream_core::SOURCE_VERSION_HEADER;
 
 /// Pack a binlog coordinate into the `u64` the sinks compare.
 ///
@@ -89,17 +87,15 @@ pub(crate) const SOURCE_VERSION_HEADER: &str = "ventstream.cdc.source_version";
 ///
 /// Positions are masked to 32 bits, matching the binlog protocol's own u32
 /// `log_pos`. A file grown past 4 GiB by one giant transaction wraps that
-/// counter at the protocol level too; rows in that tail degrade to
-/// equal-version (last-arrival) ordering until the next rotation.
+/// counter at the protocol level too; a wrapped position would pack
+/// *lower* than earlier rows in the same file and a versioning sink
+/// would reject those writes as stale — the tail loop detects the wrap
+/// and ships that file's remaining rows unversioned instead.
 pub(crate) fn binlog_version(file: &str, pos: u64) -> Option<u64> {
-    let suffix: String = file
-        .chars()
-        .rev()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
+    let digits_start = file
+        .rfind(|c: char| !c.is_ascii_digit())
+        .map_or(0, |i| i + 1);
+    let suffix = file.get(digits_start..).unwrap_or("");
     if suffix.is_empty() {
         return None;
     }

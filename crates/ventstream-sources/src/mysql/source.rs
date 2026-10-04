@@ -1,6 +1,7 @@
 //! Source impl: binlog tail (trigger) + re-`SELECT` (body) + snapshot bootstrap.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -47,6 +48,14 @@ pub struct MySqlCdcSource {
 struct RowChange {
     before: Option<Vec<Option<Value>>>,
     after: Option<Vec<Option<Value>>>,
+}
+
+/// Where a tail begins and whether its events may carry binlog-coordinate
+/// versions (false after the server-epoch guard tripped).
+#[derive(Debug, Clone)]
+struct TailStart {
+    pos: BinlogPos,
+    versioning: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +131,10 @@ impl MySqlCdcSource {
         }
         let cursor_file = CursorFile::new(&self.config.state_dir)?;
         let mut next_ack_sequence = 1u64;
+        // Server-epoch guard (#118 review): on a uuid change, every event
+        // in this process ships unversioned so recovery behaves like the
+        // pre-versioning engine — loudly — instead of freezing the sink.
+        let versioning = versioning_epoch_ok(&pool, &self.config.state_dir, &self.config.id).await;
 
         let incomplete = cursor_file.incomplete_kind()?;
         let persisted = match incomplete {
@@ -165,14 +178,28 @@ impl MySqlCdcSource {
                     };
                     cursor_file.mark_incomplete(marker)?;
                     info!(source = %self.config.id, database = %self.config.database, "bootstrap: scanning tables");
-                    if !self
-                        .bootstrap(
-                            &pool,
-                            &ctx,
-                            event_mapper::binlog_version(&pos.file, pos.pos),
-                        )
-                        .await?
-                    {
+                    // The snapshot reads CURRENT table state, so its version
+                    // floor is the master position at scan start — never the
+                    // retained cursor. With the old cursor as floor, the
+                    // replayed range (old cursor → now) would outrank
+                    // snapshot rows that already reflect it: a row deleted
+                    // and re-inserted in that window gets tombstoned by the
+                    // replay after the snapshot restored it.
+                    let version_floor = if !versioning {
+                        None
+                    } else {
+                        let scan_start = if has_retained_cursor {
+                            master_pos(&pool).await?
+                        } else {
+                            pos.clone()
+                        };
+                        let floor = event_mapper::binlog_version(&scan_start.file, scan_start.pos);
+                        if floor.is_none() {
+                            self.warn_unversioned(&scan_start.file);
+                        }
+                        floor
+                    };
+                    if !self.bootstrap(&pool, &ctx, version_floor).await? {
                         return Ok(()); // cancelled mid-scan; sentinel stays
                     }
                     if self.emit_snapshot_completion_marker
@@ -203,15 +230,24 @@ impl MySqlCdcSource {
         // snapshot: rows deleted before that snapshot would remain in the
         // sink. Fail closed until the operator performs a full sink
         // reconciliation or a controlled drain/reset.
-        self.tail_with_reconnect(&pool, &cursor_file, start, &ctx, &mut next_ack_sequence)
-            .await
+        self.tail_with_reconnect(
+            &pool,
+            &cursor_file,
+            TailStart {
+                pos: start,
+                versioning,
+            },
+            &ctx,
+            &mut next_ack_sequence,
+        )
+        .await
     }
 
     async fn tail_with_reconnect(
         &self,
         pool: &Pool,
         cursor_file: &CursorFile,
-        start: BinlogPos,
+        start: TailStart,
         ctx: &SourceContext,
         next_ack_sequence: &mut u64,
     ) -> Result<(), MySqlCdcError> {
@@ -219,7 +255,8 @@ impl MySqlCdcSource {
         const MAX_BACKOFF: Duration = Duration::from_secs(30);
         const HEALTHY_THRESHOLD: Duration = Duration::from_secs(30);
 
-        let mut resume = start;
+        let versioning = start.versioning;
+        let mut resume = start.pos;
         let mut consecutive_failures = 0u32;
         let mut backoff = INITIAL_BACKOFF;
         let mut credential_budget = CredentialFailureBudget::new();
@@ -230,7 +267,16 @@ impl MySqlCdcSource {
             }
             let connected_at = Instant::now();
             match self
-                .tail(pool, cursor_file, resume.clone(), ctx, next_ack_sequence)
+                .tail(
+                    pool,
+                    cursor_file,
+                    TailStart {
+                        pos: resume.clone(),
+                        versioning,
+                    },
+                    ctx,
+                    next_ack_sequence,
+                )
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -440,10 +486,14 @@ impl MySqlCdcSource {
         &self,
         pool: &Pool,
         cursor_file: &CursorFile,
-        start: BinlogPos,
+        start: TailStart,
         ctx: &SourceContext,
         next_ack_sequence: &mut u64,
     ) -> Result<(), MySqlCdcError> {
+        let TailStart {
+            pos: start,
+            versioning,
+        } = start;
         // Re-checked per (re)connect: a live `SET GLOBAL binlog_format`
         // flip must not silently starve the stream.
         {
@@ -470,6 +520,7 @@ impl MySqlCdcSource {
 
         let mut table_map: HashMap<u64, TableMapEvent<'static>> = HashMap::new();
         let mut pos = start;
+        let mut file_wrapped = false;
         let mut pending_gated: VecDeque<(u64, BinlogPos)> = VecDeque::new();
         let mut pending_write: Option<BinlogPos> = None;
         // Newest processed binlog position, for the lag gauge only
@@ -559,6 +610,7 @@ impl MySqlCdcSource {
                         Some(EventData::RotateEvent(r)) => {
                             pos.file = sanitize_binlog_filename(&r.name());
                             pos.pos = r.position();
+                            file_wrapped = false;
                             None
                         }
                         Some(EventData::TableMapEvent(tme)) => {
@@ -580,15 +632,40 @@ impl MySqlCdcSource {
                         _ => None,
                     };
 
+                    // >4 GiB file: the protocol's u32 log_pos wraps, so
+                    // later rows in the same file would pack LOWER than
+                    // earlier ones and a versioning sink would reject their
+                    // writes as stale (409 → swallowed). Ship the wrapped
+                    // tail unversioned instead, until the next rotation.
+                    if log_pos != 0 && log_pos < pos.pos && !file_wrapped {
+                        file_wrapped = true;
+                        warn!(
+                            source = %self.config.id,
+                            binlog_file = %pos.file,
+                            "binlog file grew past 4 GiB and its position counter wrapped; \
+                             rows ship unversioned until the next binlog rotation"
+                        );
+                    }
                     let mut emitted = false;
                     if let Some(batch) = decoded {
                         if batch.db == self.config.database && self.config.table_allowed(&batch.table) {
-                            // The event's own binlog coordinate: the row's
-                            // durable, replica-wide ordering key (#118).
-                            let source_version = event_mapper::binlog_version(
-                                &pos.file,
-                                if log_pos != 0 { log_pos } else { pos.pos },
-                            );
+                            // The event's own binlog coordinate — durable
+                            // across restarts, but **server-local**: a
+                            // failover or RESET MASTER changes the
+                            // coordinate space, which is why the server-
+                            // epoch guard above can force unversioned mode.
+                            let source_version = if !versioning || file_wrapped {
+                                None
+                            } else {
+                                let version = event_mapper::binlog_version(
+                                    &pos.file,
+                                    if log_pos != 0 { log_pos } else { pos.pos },
+                                );
+                                if version.is_none() {
+                                    self.warn_unversioned(&pos.file);
+                                }
+                                version
+                            };
                             let outcome = self
                                 .process(pool, &schema_cache, batch, ctx, source_version)
                                 .await?;
@@ -717,20 +794,8 @@ impl MySqlCdcSource {
             };
             // Versioned so a versioning sink rejects a stale write that
             // lands after a newer one — the protection every other source
-            // already has (#118). An unversionable coordinate (no numeric
-            // binlog suffix) ships unversioned and is logged once.
-            if source_version.is_none()
-                && !self
-                    .warned_unversioned
-                    .swap(true, std::sync::atomic::Ordering::Relaxed)
-            {
-                warn!(
-                    source = %self.config.id,
-                    binlog_file = %"<unparsed>",
-                    "binlog filename has no numeric suffix; documents ship unversioned \
-                     and parallel sink writes to one document may apply out of order"
-                );
-            }
+            // already has (#118). The tail loop decides whether a version
+            // exists and warns there, where the filename is in scope.
             let ev = event_mapper::with_source_version(ev, source_version);
             if !self.publish(ctx, ev).await? {
                 return Ok(ProcessOutcome {
@@ -744,6 +809,32 @@ impl MySqlCdcSource {
             completed: true,
             emitted,
         })
+    }
+
+    /// Once per process: this file's rows are shipping unversioned, with
+    /// the real filename and the actual reason (#118 review).
+    fn warn_unversioned(&self, binlog_file: &str) {
+        if self
+            .warned_unversioned
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let has_suffix = binlog_file
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_digit());
+        let reason = if has_suffix {
+            "its numeric suffix exceeds the packable 2^31 file-sequence ceiling"
+        } else {
+            "it has no numeric suffix"
+        };
+        warn!(
+            source = %self.config.id,
+            binlog_file = %binlog_file,
+            "binlog coordinate cannot be packed into a sink version ({reason}); documents \
+             ship unversioned and parallel sink writes to one document may apply out of order"
+        );
     }
 
     async fn publish(&self, ctx: &SourceContext, event: Event) -> Result<bool, MySqlCdcError> {
@@ -1024,6 +1115,77 @@ async fn record_binlog_lag(pool: &Pool, current: &BinlogPos) {
 /// Numeric suffix of a binlog file name (`mysql-bin.000042` → 42).
 fn binlog_file_seq(file: &str) -> Option<u64> {
     file.rsplit('.').next()?.parse().ok()
+}
+
+/// Whether versioned stamping is safe on this server, judged by
+/// `@@server_uuid` against the uuid persisted beside the binlog cursor.
+///
+/// Binlog file numbers are **server-local**: after a failover, RESET
+/// MASTER, or restore, the new server's coordinates can be far below the
+/// versions already written to the sink, and every subsequent write
+/// (including a full re-bootstrap) would be rejected as stale — 409s a
+/// versioning sink deliberately swallows, so the sink silently freezes.
+/// On a uuid mismatch this logs at ERROR and the caller ships events
+/// unversioned (pre-#118 last-write-wins semantics, loudly) until the
+/// operator reindexes the sink target and resets the state directory,
+/// which adopts the new server's uuid. The stored uuid is NOT updated on
+/// mismatch, so the condition stays loud across restarts.
+pub async fn versioning_epoch_ok(pool: &Pool, state_dir: &Path, source_id: &str) -> bool {
+    let current: Option<String> = match pool.get_conn().await {
+        Ok(mut conn) => match conn.query_first("SELECT @@server_uuid").await {
+            Ok(uuid) => uuid,
+            Err(err) => {
+                warn!(source = %source_id, error = %err, "could not read @@server_uuid; skipping the server-epoch check");
+                return true;
+            }
+        },
+        Err(err) => {
+            warn!(source = %source_id, error = %err, "could not connect for the server-epoch check; skipping it");
+            return true;
+        }
+    };
+    let Some(current) = current else {
+        return true;
+    };
+    let path = state_dir.join("server_uuid");
+    match std::fs::read_to_string(&path) {
+        Ok(stored) => {
+            let stored = stored.trim();
+            if stored == current {
+                true
+            } else {
+                error!(
+                    source = %source_id,
+                    stored_uuid = %stored,
+                    server_uuid = %current,
+                    "MySQL server identity changed (failover/RESET MASTER/restore?): binlog \
+                     coordinates are server-local, so versioned writes against the old sink \
+                     state would be silently rejected as stale. Shipping documents UNVERSIONED \
+                     until you reindex/reset the sink target and delete the source state \
+                     directory (a fresh bootstrap adopts the new server's identity)"
+                );
+                false
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(err) = std::fs::write(&path, &current) {
+                warn!(source = %source_id, error = %err, "could not persist @@server_uuid; the server-epoch check will not survive restarts");
+            }
+            true
+        }
+        Err(err) => {
+            warn!(source = %source_id, error = %err, "could not read the persisted server uuid; skipping the server-epoch check");
+            true
+        }
+    }
+}
+
+/// The packed version floor for a snapshot that is about to start: the
+/// master position at scan start. `None` when the coordinate cannot be
+/// packed. Shared with the SQL denormalizer's bootstrap (#118 review).
+pub async fn scan_start_version(pool: &Pool) -> Option<u64> {
+    let pos = master_pos(pool).await.ok()?;
+    event_mapper::binlog_version(&pos.file, pos.pos)
 }
 
 async fn master_pos(pool: &Pool) -> Result<BinlogPos, MySqlCdcError> {

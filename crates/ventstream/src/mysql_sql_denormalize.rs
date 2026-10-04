@@ -221,6 +221,13 @@ pub struct MySqlDenormalizer {
     recompose_key_chunk: usize,
     recompose_query_concurrency: usize,
     sink_lookup: Option<ReverseLookup>,
+    /// Packed scan-start master position stamped on every bootstrap page
+    /// (#118 review): without it an internal-versioned bootstrap doc can
+    /// land after a versioned tail recompose of the same doc and
+    /// overwrite it once parallel bulks are unclamped. `None` when the
+    /// coordinate cannot be packed or the server-epoch guard suppressed
+    /// versioning.
+    bootstrap_version_floor: Option<u64>,
 }
 
 impl MySqlDenormalizer {
@@ -231,6 +238,20 @@ impl MySqlDenormalizer {
         chunk_size: u64,
     ) -> Result<Self> {
         let pool = Pool::new(config.opts());
+        // Same server-epoch rule as the binlog source: a uuid change makes
+        // binlog-coordinate versions dangerous, so the floor (and with it
+        // every bootstrap stamp) is dropped. The bootstrap scan starts
+        // right after connect, so a connect-time floor can only be LOWER
+        // than true scan start — the safe direction: concurrent live
+        // writes still outrank the snapshot rows.
+        let bootstrap_version_floor =
+            if ventstream_sources::mysql::versioning_epoch_ok(&pool, &config.state_dir, &config.id)
+                .await
+            {
+                ventstream_sources::mysql::scan_start_version(&pool).await
+            } else {
+                None
+            };
         let database = config.database.clone();
         let mut defs = Vec::with_capacity(joins.len());
         for def in joins {
@@ -252,6 +273,7 @@ impl MySqlDenormalizer {
             recompose_key_chunk: DEFAULT_RECOMPOSE_KEY_CHUNK,
             recompose_query_concurrency: DEFAULT_RECOMPOSE_QUERY_CONCURRENCY,
             sink_lookup: None,
+            bootstrap_version_floor,
         })
     }
 
@@ -346,7 +368,7 @@ impl MySqlDenormalizer {
                         &pk_text,
                         &doc,
                         false,
-                        None,
+                        self.bootstrap_version_floor,
                     )?;
                     sender.send(event, shutdown).await.map_err(|err| {
                         anyhow::anyhow!(
@@ -1097,7 +1119,7 @@ fn primary_pk_from_doc_id(doc_id: &str, primary_table: &str) -> Option<Vec<Strin
 fn max_source_version(events: &[Event]) -> Option<u64> {
     events
         .iter()
-        .filter_map(|event| event.headers.get("ventstream.cdc.source_version"))
+        .filter_map(|event| event.headers.get(ventstream_core::SOURCE_VERSION_HEADER))
         .filter_map(|raw| raw.parse::<u64>().ok())
         .max()
 }
@@ -1141,7 +1163,7 @@ fn build_doc_event(
     // denormalizer's WAL LSN (#118). Bootstrap documents carry no version.
     if let Some(version) = source_version {
         headers.insert(
-            "ventstream.cdc.source_version".to_owned(),
+            ventstream_core::SOURCE_VERSION_HEADER.to_owned(),
             version.to_string(),
         );
     }
@@ -1279,6 +1301,7 @@ mod tests {
             recompose_key_chunk: 1,
             recompose_query_concurrency: 1,
             sink_lookup: None,
+            bootstrap_version_floor: None,
         };
         let source = SourceUri::new("mysql-cdc://test").expect("source");
         let subject = Subject::new("ventstream.internal.ack_barrier").expect("subject");
@@ -1530,7 +1553,9 @@ mod tests {
         )
         .expect("event");
         assert_eq!(
-            versioned.headers.get("ventstream.cdc.source_version"),
+            versioned
+                .headers
+                .get(ventstream_core::SOURCE_VERSION_HEADER),
             Some(((42u64 << 32) | 1_457).to_string().as_str())
         );
 
@@ -1544,7 +1569,9 @@ mod tests {
         )
         .expect("event");
         assert_eq!(
-            unversioned.headers.get("ventstream.cdc.source_version"),
+            unversioned
+                .headers
+                .get(ventstream_core::SOURCE_VERSION_HEADER),
             None
         );
     }
@@ -1555,7 +1582,7 @@ mod tests {
             let mut headers = HashMap::new();
             if let Some(version) = version {
                 headers.insert(
-                    "ventstream.cdc.source_version".to_owned(),
+                    ventstream_core::SOURCE_VERSION_HEADER.to_owned(),
                     version.to_owned(),
                 );
             }

@@ -31,7 +31,9 @@ pub mod source;
 
 pub use bus::{EventBus, EventReceiver, EventSender};
 pub use error::{BackpressureError, CoreError, FailedItem, SinkError, SourceError};
-pub use event::{ContentType, Event, EventId, Headers, Payload, SourceUri, Subject};
+pub use event::{
+    ContentType, Event, EventId, Headers, Payload, SourceUri, Subject, SOURCE_VERSION_HEADER,
+};
 pub use memory::{MemoryAdmission, MemoryBudget, MemoryPressure};
 pub use readiness::ReadinessSignal;
 pub use shutdown::ShutdownToken;
