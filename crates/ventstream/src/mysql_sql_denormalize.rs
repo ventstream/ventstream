@@ -94,6 +94,17 @@ fn esc(ident: &str) -> String {
     ident.replace('`', "``")
 }
 
+/// Escape a value for splicing into a single-quoted MySQL string
+/// literal. Doubling the quote alone is NOT enough: MySQL processes
+/// backslash escapes inside string literals by default, so a value
+/// ending in `\` would escape the closing quote and run the rest of
+/// the value as SQL (#130). Config-sourced values are already rejected
+/// at load by `ventstream_joins::validate_sql_identifiers`; this covers
+/// catalog-sourced names as defense in depth.
+fn lit(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "''")
+}
+
 fn relation_of(table: &str) -> &str {
     table.rsplit('.').next().unwrap_or(table)
 }
@@ -106,7 +117,7 @@ fn namespace_of(table: &str) -> &str {
 fn json_object_expr(alias: &str, cols: &[String]) -> String {
     let pairs = cols
         .iter()
-        .map(|c| format!("'{}', `{alias}`.`{}`", c.replace('\'', "''"), esc(c)))
+        .map(|c| format!("'{}', `{alias}`.`{}`", lit(c), esc(c)))
         .collect::<Vec<_>>()
         .join(", ");
     format!("JSON_OBJECT({pairs})")
@@ -822,7 +833,7 @@ async fn build_doc_expr(pool: &Pool, database: &str, def: &JoinDefinition) -> Re
     let primary_cols = columns_of(pool, database, relation_of(&def.primary.table)).await?;
     let mut pairs: Vec<String> = primary_cols
         .iter()
-        .map(|c| format!("'{}', `p`.`{}`", c.replace('\'', "''"), esc(c)))
+        .map(|c| format!("'{}', `p`.`{}`", lit(c), esc(c)))
         .collect();
     for (i, related) in def.related.iter().enumerate() {
         let alias = format!("r{i}");
@@ -844,7 +855,7 @@ async fn build_doc_expr(pool: &Pool, database: &str, def: &JoinDefinition) -> Re
                 "COALESCE((SELECT JSON_ARRAYAGG({proj}) FROM {table} `{alias}` WHERE {cond}), JSON_ARRAY())"
             ),
         };
-        let embed = related.embed_as.replace('\'', "''");
+        let embed = lit(&related.embed_as);
         pairs.push(format!("'{embed}', {sub}"));
     }
     Ok(format!("JSON_OBJECT({})", pairs.join(", ")))
@@ -863,6 +874,18 @@ async fn columns_of(pool: &Pool, database: &str, table: &str) -> Result<Vec<Stri
         .with_context(|| format!("enumerating columns of {database}.{table}"))?;
     if cols.is_empty() {
         anyhow::bail!("no columns found for {database}.{table} (does it exist?)");
+    }
+    // These names are spliced into generated SQL as JSON_OBJECT keys.
+    // Quote-doubling is correct in every sql_mode, so quotes are fine —
+    // but `\\` reads differently under NO_BACKSLASH_ESCAPES, and rather
+    // than guess the session mode, refuse backslash-bearing names.
+    for col in &cols {
+        if col.contains('\\') {
+            anyhow::bail!(
+                "column {col:?} of {database}.{table} contains a backslash; \
+                 such names cannot be embedded safely in generated SQL — rename the column"
+            );
+        }
     }
     Ok(cols)
 }
@@ -1434,5 +1457,28 @@ mod tests {
                 vec!["region".to_owned(), "item_id".to_owned()]
             ))
         );
+    }
+    /// #130: a value ending in a backslash must not escape the closing
+    /// quote of the literal it is spliced into.
+    #[test]
+    fn literal_escaping_covers_backslashes_and_quotes() {
+        assert_eq!(lit("plain"), "plain");
+        assert_eq!(lit("it's"), "it''s");
+        assert_eq!(lit("tail\\"), "tail\\\\");
+        assert_eq!(lit("mix'\\'"), "mix''\\\\''");
+        // Rendered inside quotes, the trailing backslash no longer eats
+        // the closing quote.
+        let rendered = format!("'{}'", lit("x\\"));
+        assert_eq!(rendered, "'x\\\\'");
+    }
+
+    #[test]
+    fn json_object_expr_escapes_hostile_column_names() {
+        // Quote case only: backslash-bearing names never get here —
+        // `columns_of` refuses them (the `\\\\` rendering would be wrong
+        // under NO_BACKSLASH_ESCAPES, so it must stay unreachable). The
+        // backtick identifier side leaves quotes alone (no meaning there).
+        let sql = json_object_expr("r0", &["b'c".to_owned()]);
+        assert_eq!(sql, "JSON_OBJECT('b''c', `r0`.`b'c`)");
     }
 }

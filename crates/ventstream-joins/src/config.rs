@@ -250,6 +250,102 @@ pub enum BackfillMode {
     None,
 }
 
+/// Validate a parsed joins spec: unique related ids and SQL-safe
+/// identifier strings. The single entry point every loader must call —
+/// keeping both rules behind one function means the next rule cannot be
+/// wired into some branches and not others.
+pub fn validate_spec(joins: &[JoinDefinition]) -> Result<(), String> {
+    validate_related_ids_unique(joins)?;
+    validate_sql_identifiers(joins)
+}
+
+/// Related ids key the shared reverse indexes, so they must be unique
+/// across the whole spec.
+///
+/// Keyed on definition INDEX, not name: `effective_name()` falls back
+/// to the primary table, so two unnamed definitions over the same
+/// table report the same name — and a name-based guard would exempt
+/// exactly the case the primary-table filter also cannot separate
+/// (both share the table). Indexing also catches the same id twice
+/// inside one definition, which a name comparison permits.
+fn validate_related_ids_unique(joins: &[JoinDefinition]) -> Result<(), String> {
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (index, def) in joins.iter().enumerate() {
+        for rel in &def.related {
+            if let Some(previous) = seen.insert(rel.id.as_str(), index) {
+                let previous_name = joins
+                    .get(previous)
+                    .map_or("<unknown>", |def| def.effective_name());
+                return Err(format!(
+                    "related id `{}` is declared more than once (join definitions #{} `{}` and \
+                     #{} `{}`). Related ids key the shared reverse indexes, so they must be \
+                     unique across the whole spec — rename one of them",
+                    rel.id,
+                    previous + 1,
+                    previous_name,
+                    index + 1,
+                    def.effective_name(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject config strings that cannot be embedded safely in generated SQL.
+///
+/// The SQL-denormalize modes splice `embed_as` and `select` into
+/// statement text as string literals and identifiers (Postgres also
+/// splices `sort_by` into ORDER BY, quoted; MySQL sorts client-side).
+/// Quote-doubling alone is not enough everywhere: MySQL processes
+/// backslash escapes inside string literals by default, so a value
+/// ending in `\` escapes the closing quote and the rest of the value
+/// executes as SQL. Joins specs can arrive through the Fleet control
+/// plane, which makes them untrusted input — so the safe character set
+/// is enforced when the spec loads, for every mode, instead of trusting
+/// each generator to escape correctly.
+///
+/// Allowed: letters and digits (any script), `_`, `-`, `$` and `.` —
+/// ordinary column and JSON-key names. `embed_as` additionally rejects
+/// `.`: it is a single-segment path by contract, and the reverse-lookup
+/// builder concatenates `{embed_as}.{pk}`, so a dotted `embed_as` is
+/// indistinguishable from nesting and can resolve the wrong parent.
+fn validate_sql_identifiers(joins: &[JoinDefinition]) -> Result<(), String> {
+    fn check(join: &str, field: &str, value: &str, allow_dot: bool) -> Result<(), String> {
+        let ok = !value.is_empty()
+            && value.chars().all(|c| {
+                c.is_alphanumeric() || matches!(c, '_' | '-' | '$') || (allow_dot && c == '.')
+            });
+        if ok {
+            return Ok(());
+        }
+        let dot_note = if allow_dot {
+            ""
+        } else {
+            " (`.` is reserved: embed_as is a single-segment path, and a dot would collide \
+             with nested-path lookups)"
+        };
+        Err(format!(
+            "join `{join}`: `{field}` value {value:?} is not a safe SQL identifier — \
+             use letters, digits, `_`, `-` or `$` only{dot_note} (it is embedded in \
+             generated SQL, and must stay non-empty)"
+        ))
+    }
+    for def in joins {
+        let name = def.effective_name();
+        for rel in &def.related {
+            check(name, "embed_as", &rel.embed_as, false)?;
+            for column in &rel.select {
+                check(name, "select", column, true)?;
+            }
+            if let Some(sort_by) = &rel.sort_by {
+                check(name, "sort_by", sort_by, true)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -369,5 +465,53 @@ related:
             &["region", "customer_id"]
         );
         assert_eq!(def.related[0].join_on.to.columns(), &["region", "id"]);
+    }
+    #[test]
+    fn sql_identifier_validation_accepts_ordinary_names() {
+        let yaml = r#"
+name: orders
+primary:
+  table: public.orders
+  pk: id
+related:
+  - id: customer
+    table: public.customers
+    pk: id
+    join_on: { from: customer_id, to: id }
+    embed_as: customer
+    select: [id, full_name, created-at, total$, legacy.col, straße]
+    sort_by: id
+"#;
+        let def: JoinDefinition = serde_yaml::from_str(yaml).expect("parse");
+        validate_spec(std::slice::from_ref(&def)).expect("safe names pass");
+    }
+
+    #[test]
+    fn sql_identifier_validation_rejects_escape_characters() {
+        let template = r#"
+name: orders
+primary:
+  table: public.orders
+  pk: id
+related:
+  - id: customer
+    table: public.customers
+    pk: id
+    join_on: { from: customer_id, to: id }
+    embed_as: EMBED
+"#;
+        // A trailing backslash escapes the closing quote of the literal
+        // it is spliced into; a quote closes it early. Both must fail
+        // at load, before any SQL is generated.
+        // `customer.v2` would render the sink field `customer.v2.id`,
+        // indistinguishable from nested customer → v2 → id in the
+        // reverse-lookup path — `.` is reserved in embed_as alone.
+        for bad in ["tail\\", "it's", "a`b", "spa ced", "", "customer.v2"] {
+            let yaml = template.replace("EMBED", &format!("{bad:?}"));
+            let def: JoinDefinition = serde_yaml::from_str(&yaml).expect("parse");
+            let err = validate_spec(std::slice::from_ref(&def))
+                .expect_err(&format!("{bad:?} must be rejected"));
+            assert!(err.contains("embed_as"), "{err}");
+        }
     }
 }
