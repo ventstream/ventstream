@@ -64,11 +64,52 @@ pub struct OpenSearchSink {
     endpoint_base: String,
     adaptive: AdaptiveConcurrency,
     delivery_health: SinkHealth,
-    /// Indices whose `index.gc_deletes` this process has already raised.
-    gc_ensured: parking_lot::Mutex<HashSet<String>>,
-    /// Indices whose settings update failed and was already warned about,
-    /// so the (retried) failure doesn't warn on every batch.
-    gc_warned: parking_lot::Mutex<HashSet<String>>,
+    /// Per-index tombstone-retention state: when it was last ensured, the
+    /// failure backoff, and whether the cluster permanently refused.
+    gc_state: parking_lot::Mutex<std::collections::HashMap<String, GcIndexState>>,
+}
+
+/// Settings-management state for one index (#151 review hardening).
+#[derive(Default)]
+struct GcIndexState {
+    /// When `index.gc_deletes` was last confirmed on this index. Entries
+    /// re-verify after [`GC_REVERIFY`], so an index dropped and recreated —
+    /// or an ISM-rolled alias backing — regains the setting without a
+    /// process restart.
+    ensured_at: Option<Instant>,
+    /// Consecutive failed attempts, driving the exponential backoff.
+    failures: u32,
+    /// Earliest next attempt. Keeps a refusing or missing index from
+    /// adding a settings round-trip to every batch on the ack path.
+    next_attempt_at: Option<Instant>,
+    /// One warning per index per failure streak.
+    warned: bool,
+    /// A 401/403 is a fixed permission decision: stop asking, warn once,
+    /// and leave the documented manual requirement to the operator.
+    gave_up: bool,
+}
+
+/// How long a confirmed `gc_deletes` setting is trusted before re-verifying.
+const GC_REVERIFY: Duration = Duration::from_secs(60 * 60);
+/// First retry delay after a failed settings attempt; doubles per failure.
+const GC_RETRY_BASE: Duration = Duration::from_millis(500);
+/// Ceiling on the settings retry backoff.
+const GC_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// Exponential backoff for settings attempts: `GC_RETRY_BASE * 2^(n-1)`,
+/// capped at [`GC_RETRY_MAX`].
+fn gc_backoff(failures: u32) -> Duration {
+    GC_RETRY_BASE
+        .saturating_mul(1u32 << failures.saturating_sub(1).min(16))
+        .min(GC_RETRY_MAX)
+}
+
+/// One settings attempt's outcome, applied to [`GcIndexState`].
+enum GcOutcome {
+    Applied,
+    NotThereYet,
+    Refused(String),
+    Failed(String),
 }
 
 struct AdaptiveConcurrency {
@@ -190,44 +231,52 @@ impl OpenSearchSink {
             endpoint_base,
             adaptive,
             delivery_health,
-            gc_ensured: parking_lot::Mutex::new(HashSet::new()),
-            gc_warned: parking_lot::Mutex::new(HashSet::new()),
+            gc_state: parking_lot::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
-    /// Raise `index.gc_deletes` on every index this batch wrote to, once
-    /// per index per process (#151).
+    /// Raise `index.gc_deletes` on every index this batch's bulk actually
+    /// wrote to (#151).
     ///
-    /// OpenSearch rejects a stale write arriving after a delete only while
-    /// it still remembers the deleted document's version, and it forgets it
-    /// after `index.gc_deletes` — 60 seconds by default, which our own
-    /// unbounded retry schedule easily exceeds. Runs after a successful
-    /// bulk so the index is guaranteed to exist (auto-created by the write),
-    /// which also means time-rolled indices are covered as each one appears.
+    /// The index set comes from the bulk encoder — the same render, same
+    /// clock — never from re-rendering, which can cross an hour or day
+    /// boundary and name an index the bulk never touched. Per index this
+    /// keeps a small state machine: a confirmed setting is trusted for
+    /// [`GC_REVERIFY`] and then re-applied (an index dropped and recreated,
+    /// or an ISM-rolled alias backing, regains it without a restart);
+    /// failures back off exponentially so a refusing cluster never pays
+    /// more than one attempt per window on the ack path; a 401/403 is a
+    /// fixed permission decision and stops the attempts permanently; a 404
+    /// means the index is not there yet (a clear-only batch creates
+    /// nothing) and retries quietly; and a 2xx only counts when the body
+    /// says `acknowledged: true`.
     ///
-    /// Best-effort by design: a cluster that denies settings updates gets
-    /// one warning per index and the requirement is documented; failing the
-    /// write would turn a hardening step into an outage.
-    async fn ensure_tombstone_retention(&self, batch: &SinkBatch) {
+    /// Best-effort by design: the write's outcome is never changed here —
+    /// failing the write would turn a hardening step into an outage.
+    async fn ensure_tombstone_retention(&self, written_indices: &HashSet<String>) {
         let retention = self.config.tombstone_retention;
-        if retention.is_zero() {
+        if retention.is_zero() || written_indices.is_empty() {
             return;
         }
-        let now = Utc::now();
+        let now = Instant::now();
         let mut targets: Vec<String> = Vec::new();
         {
-            let ensured = self.gc_ensured.lock();
-            let mut seen: HashSet<String> = HashSet::new();
-            for event in batch.events() {
-                let Ok(index) = index_template::render(&self.config.index_template, event, now)
-                else {
-                    // The bulk that just succeeded already validated every
-                    // rendered target; nothing actionable here.
+            let mut state = self.gc_state.lock();
+            for index in written_indices {
+                let entry = state.entry(index.clone()).or_default();
+                if entry.gave_up {
                     continue;
-                };
-                if !ensured.contains(&index) && seen.insert(index.clone()) {
-                    targets.push(index);
                 }
+                if entry
+                    .ensured_at
+                    .is_some_and(|at| now.duration_since(at) < GC_REVERIFY)
+                {
+                    continue;
+                }
+                if entry.next_attempt_at.is_some_and(|at| now < at) {
+                    continue;
+                }
+                targets.push(index.clone());
             }
         }
         let retention_value = format!("{}ms", retention.as_millis());
@@ -237,36 +286,80 @@ impl OpenSearchSink {
             let request = apply_auth(self.client.put(&url), &self.config.auth)
                 .timeout(self.config.request_timeout)
                 .json(&body);
-            match request.send().await {
-                Ok(response) if response.status().is_success() => {
+            let outcome = match request.send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        // A 2xx with `acknowledged: false` means the cluster
+                        // did NOT apply the setting; treating it as success
+                        // would trust a 60s tombstone forever.
+                        let acknowledged = response
+                            .json::<serde_json::Value>()
+                            .await
+                            .ok()
+                            .and_then(|body| body.get("acknowledged").and_then(|v| v.as_bool()))
+                            .unwrap_or(false);
+                        if acknowledged {
+                            GcOutcome::Applied
+                        } else {
+                            GcOutcome::Failed("2xx but acknowledged=false".to_owned())
+                        }
+                    } else if status == StatusCode::NOT_FOUND {
+                        // Not created yet (e.g. only clears have targeted
+                        // it). Quietly try again on a later batch.
+                        GcOutcome::NotThereYet
+                    } else if status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED
+                    {
+                        GcOutcome::Refused(read_truncated_body(response, 512).await)
+                    } else {
+                        let message = read_truncated_body(response, 512).await;
+                        GcOutcome::Failed(format!("HTTP {status}: {message}"))
+                    }
+                }
+                Err(err) => GcOutcome::Failed(err.to_string()),
+            };
+            let mut state = self.gc_state.lock();
+            let entry = state.entry(index.clone()).or_default();
+            match outcome {
+                GcOutcome::Applied => {
                     info!(
                         index = %index,
                         retention = %retention_value,
                         metric = "opensearch.gc_deletes_set",
                         "raised index.gc_deletes so delete tombstones outlive the retry horizon"
                     );
-                    self.gc_ensured.lock().insert(index);
+                    entry.ensured_at = Some(Instant::now());
+                    entry.failures = 0;
+                    entry.next_attempt_at = None;
+                    entry.warned = false;
                 }
-                outcome => {
-                    let detail = match outcome {
-                        Ok(response) => {
-                            let status = response.status();
-                            let body = read_truncated_body(response, 512).await;
-                            format!("HTTP {status}: {body}")
-                        }
-                        Err(err) => err.to_string(),
-                    };
-                    // Warn once per index; keep it un-ensured so the next
-                    // batch retries quietly.
-                    let first = self.gc_warned.lock().insert(index.clone());
-                    if first {
+                GcOutcome::NotThereYet => {
+                    entry.failures = entry.failures.saturating_add(1);
+                    entry.next_attempt_at = Some(Instant::now() + gc_backoff(entry.failures));
+                }
+                GcOutcome::Refused(detail) => {
+                    entry.gave_up = true;
+                    warn!(
+                        index = %index,
+                        error = %detail,
+                        retention = %retention_value,
+                        "cluster permanently refuses index settings updates; set \
+                         index.gc_deletes >= the retry horizon yourself or grant \
+                         indices:admin/settings/update (see the OpenSearch sink docs)"
+                    );
+                }
+                GcOutcome::Failed(detail) => {
+                    entry.failures = entry.failures.saturating_add(1);
+                    entry.next_attempt_at = Some(Instant::now() + gc_backoff(entry.failures));
+                    if !entry.warned {
+                        entry.warned = true;
                         warn!(
                             index = %index,
                             error = %detail,
                             retention = %retention_value,
-                            "could not raise index.gc_deletes; deletes older than the index's \
-                             gc_deletes window can be resurrected by a stale retry — set it \
-                             manually or grant settings permission (see the OpenSearch sink docs)"
+                            "could not raise index.gc_deletes; retrying with backoff — until it \
+                             applies, deletes older than the index's gc_deletes window can be \
+                             resurrected by a stale retry"
                         );
                     }
                 }
@@ -441,6 +534,7 @@ impl OpenSearchSink {
         events: &[ventstream_core::Event],
         range: std::ops::Range<usize>,
         permanent: &mut Vec<ventstream_core::FailedItem>,
+        written_indices: &mut HashSet<String>,
     ) -> Result<(), OpenSearchSinkError> {
         let mut ranges = VecDeque::new();
         ranges.push_back(range);
@@ -450,7 +544,7 @@ impl OpenSearchSink {
                     "bulk split produced an invalid event range".into(),
                 ));
             };
-            match self.send_slice_with_retry(attempt).await {
+            match self.send_slice_with_retry(attempt, written_indices).await {
                 Ok(()) => {}
                 Err(OpenSearchSinkError::RequestTooLarge { .. }) if range.len() > 1 => {
                     let midpoint = range.start + range.len() / 2;
@@ -494,7 +588,11 @@ impl OpenSearchSink {
     ///
     /// Successful chunks are never re-sent. Failures retain offsets into the
     /// original dispatcher batch so DLQ routing remains precise.
-    async fn send_with_retry(&self, batch: &SinkBatch) -> Result<(), OpenSearchSinkError> {
+    async fn send_with_retry(
+        &self,
+        batch: &SinkBatch,
+        written_indices: &mut HashSet<String>,
+    ) -> Result<(), OpenSearchSinkError> {
         let events = batch.events();
         if events.is_empty() {
             return Ok(());
@@ -511,15 +609,25 @@ impl OpenSearchSink {
                 continue;
             }
             if index > segment_start {
-                self.send_bulk_range(events, segment_start..index, &mut permanent)
-                    .await?;
+                self.send_bulk_range(
+                    events,
+                    segment_start..index,
+                    &mut permanent,
+                    written_indices,
+                )
+                .await?;
             }
             self.apply_target_clear(event).await?;
             segment_start = index + 1;
         }
         if segment_start < events.len() {
-            self.send_bulk_range(events, segment_start..events.len(), &mut permanent)
-                .await?;
+            self.send_bulk_range(
+                events,
+                segment_start..events.len(),
+                &mut permanent,
+                written_indices,
+            )
+            .await?;
         }
         if permanent.is_empty() {
             return Ok(());
@@ -541,6 +649,7 @@ impl OpenSearchSink {
     async fn send_slice_with_retry(
         &self,
         events: &[ventstream_core::Event],
+        written_indices: &mut HashSet<String>,
     ) -> Result<(), OpenSearchSinkError> {
         if events.is_empty() {
             return Ok(());
@@ -570,7 +679,7 @@ impl OpenSearchSink {
                 events
             };
             if encoded.is_none() {
-                let prepared = self.encode_attempt(attempt, rendered_at)?;
+                let prepared = self.encode_attempt(attempt, rendered_at, written_indices)?;
                 // Nothing to send: every event in this slice was handled
                 // outside the bulk API (a target clear). Posting a
                 // zero-byte NDJSON body is a hard 400, which would fail
@@ -770,9 +879,14 @@ impl OpenSearchSink {
         &self,
         events: &[ventstream_core::Event],
         rendered_at: chrono::DateTime<Utc>,
+        written_indices: &mut HashSet<String>,
     ) -> Result<(Bytes, Vec<usize>), OpenSearchSinkError> {
-        let (body, item_event_offsets) =
-            bulk::build_bulk_body(events, &self.config.index_template, rendered_at)?;
+        let (body, item_event_offsets) = bulk::build_bulk_body(
+            events,
+            &self.config.index_template,
+            rendered_at,
+            Some(written_indices),
+        )?;
         if body.len() > self.config.bulk.max_bytes {
             return Err(OpenSearchSinkError::RequestTooLarge {
                 actual_bytes: body.len(),
@@ -1183,9 +1297,18 @@ impl Sink for OpenSearchSink {
     }
 
     async fn write(&self, batch: SinkBatch) -> Result<(), SinkError> {
-        let result = self.send_with_retry(&batch).await;
-        if result.is_ok() {
-            self.ensure_tombstone_retention(&batch).await;
+        let mut written_indices: HashSet<String> = HashSet::new();
+        let result = self.send_with_retry(&batch, &mut written_indices).await;
+        // A partial failure still completed the bulk round-trip: the
+        // indices exist and their deletes flowed, so they need the
+        // retention raised exactly as much as a clean batch — a relation
+        // with one permanently rejected item per batch must not pin its
+        // index at the 60s default forever (#151 review).
+        if matches!(
+            &result,
+            Ok(()) | Err(OpenSearchSinkError::PartialFailure { .. })
+        ) {
+            self.ensure_tombstone_retention(&written_indices).await;
         }
         if let Err(error) = &result {
             if matches!(
@@ -1356,7 +1479,7 @@ mod tests {
         template: &str,
         now: chrono::DateTime<Utc>,
     ) -> Result<Vec<u8>, OpenSearchSinkError> {
-        bulk::build_bulk_body(events, template, now).map(|(body, _)| body)
+        bulk::build_bulk_body(events, template, now, None).map(|(body, _)| body)
     }
 
     fn make_event(subject: &str, payload: &str) -> Event {
@@ -1437,16 +1560,39 @@ mod tests {
         }
     }
 
-    /// A cluster that refuses the settings update must not fail the write
-    /// — that would turn hardening into an outage — and the sink must keep
-    /// retrying on later batches rather than give up.
+    /// A 401/403 is a fixed permission decision: the write stays green,
+    /// exactly one attempt is made, and the sink stops asking instead of
+    /// adding a doomed settings round-trip to every batch.
     #[tokio::test]
-    async fn settings_refusal_keeps_writes_green_and_is_retried() {
+    async fn forbidden_settings_update_gives_up_permanently() {
         let server = MockServer::start().await;
         bulk_ok_mock(2).mount(&server).await;
         Mock::given(method("PUT"))
             .and(path("/orders/_settings"))
             .respond_with(ResponseTemplate::new(403).set_body_string("no settings for you"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sink = tombstone_sink(&server.uri(), "orders", Duration::from_secs(24 * 60 * 60));
+        for _ in 0..2 {
+            let batch = SinkBatch::new(vec![make_event("postgres.app.t.insert", r#"{"x":1}"#)]);
+            sink.write(batch)
+                .await
+                .expect("a refused settings call must not fail the write");
+        }
+    }
+
+    /// A transient settings failure retries — after a backoff, not on the
+    /// very next batch, so a struggling master is not hammered from the
+    /// ack path.
+    #[tokio::test]
+    async fn transient_settings_failure_retries_after_backoff() {
+        let server = MockServer::start().await;
+        bulk_ok_mock(3).mount(&server).await;
+        Mock::given(method("PUT"))
+            .and(path("/orders/_settings"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("master busy"))
             .up_to_n_times(1)
             .expect(1)
             .mount(&server)
@@ -1461,12 +1607,83 @@ mod tests {
             .await;
 
         let sink = tombstone_sink(&server.uri(), "orders", Duration::from_secs(24 * 60 * 60));
-        for _ in 0..2 {
-            let batch = SinkBatch::new(vec![make_event("postgres.app.t.insert", r#"{"x":1}"#)]);
-            sink.write(batch)
-                .await
-                .expect("a refused settings call must not fail the write");
-        }
+        // First write: PUT fails (503), backoff starts.
+        let batch = SinkBatch::new(vec![make_event("postgres.app.t.insert", r#"{"x":1}"#)]);
+        sink.write(batch).await.expect("write");
+        // Second write lands inside the backoff window: no second PUT yet.
+        let batch = SinkBatch::new(vec![make_event("postgres.app.t.insert", r#"{"x":2}"#)]);
+        sink.write(batch).await.expect("write");
+        // Past the backoff, the next write retries and succeeds.
+        tokio::time::sleep(GC_RETRY_BASE + Duration::from_millis(150)).await;
+        let batch = SinkBatch::new(vec![make_event("postgres.app.t.insert", r#"{"x":3}"#)]);
+        sink.write(batch).await.expect("write");
+    }
+
+    /// A 2xx whose body says `acknowledged: false` did NOT apply the
+    /// setting and must be treated as a failure, not success.
+    #[tokio::test]
+    async fn unacknowledged_settings_response_is_a_failure() {
+        let server = MockServer::start().await;
+        bulk_ok_mock(2).mount(&server).await;
+        Mock::given(method("PUT"))
+            .and(path("/orders/_settings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "acknowledged": false
+            })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/orders/_settings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "acknowledged": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sink = tombstone_sink(&server.uri(), "orders", Duration::from_secs(24 * 60 * 60));
+        let batch = SinkBatch::new(vec![make_event("postgres.app.t.insert", r#"{"x":1}"#)]);
+        sink.write(batch).await.expect("write");
+        tokio::time::sleep(GC_RETRY_BASE + Duration::from_millis(150)).await;
+        let batch = SinkBatch::new(vec![make_event("postgres.app.t.insert", r#"{"x":2}"#)]);
+        sink.write(batch).await.expect("write");
+    }
+
+    /// #151 review red #1: a batch that ends in a PARTIAL failure still
+    /// completed its bulk round-trip — the index exists, its deletes
+    /// flowed — so the retention must be raised exactly as for a clean
+    /// batch. One permanently rejected item per batch must not pin the
+    /// index at the 60s default forever.
+    #[tokio::test]
+    async fn partial_failure_still_raises_retention() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "took": 1,
+            "errors": true,
+            "items": [{ "index": { "_id": "bad", "status": 400,
+                "error": { "type": "mapper_parsing_exception", "reason": "boom" } } }]
+        });
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/orders/_settings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "acknowledged": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sink = tombstone_sink(&server.uri(), "orders", Duration::from_secs(24 * 60 * 60));
+        let batch = SinkBatch::new(vec![make_event("postgres.app.t.insert", r#"{"x":1}"#)]);
+        let result = sink.write(batch).await;
+        assert!(result.is_err(), "the permanent item failure still surfaces");
     }
 
     /// Zero retention disables management entirely: not every deployment
