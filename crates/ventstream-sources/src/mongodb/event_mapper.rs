@@ -36,10 +36,7 @@ use ventstream_core::{doc_id, ContentType, Event, Headers, Payload, SourceUri, S
 use super::config::MongoCdcConfig;
 use crate::error::MongoCdcError;
 
-/// Header the versioning sinks read as the document's external version.
-/// Shared with the Kafka source; Postgres and Neo4j use their own
-/// LSN / transaction-id headers for the same purpose.
-pub const SOURCE_VERSION_HEADER: &str = "ventstream.cdc.source_version";
+pub use ventstream_core::SOURCE_VERSION_HEADER;
 
 /// Pack a change event's `clusterTime` into the `u64` the sinks compare.
 ///

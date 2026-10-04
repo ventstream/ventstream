@@ -25,7 +25,7 @@ use super::offset::OffsetTracker;
 use crate::error::KafkaCdcError;
 
 const ACK_SEQUENCE_HEADER: &str = "ventstream.cdc.ack_seq";
-const SOURCE_VERSION_HEADER: &str = "ventstream.cdc.source_version";
+use ventstream_core::SOURCE_VERSION_HEADER;
 
 /// Kafka/Redpanda CDC source.
 pub struct KafkaCdcSource {

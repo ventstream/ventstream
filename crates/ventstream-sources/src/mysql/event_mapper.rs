@@ -72,6 +72,56 @@ fn source_uri(config: &MySqlCdcConfig, table: &str) -> Result<SourceUri, MySqlCd
     .map_err(|e| MySqlCdcError::Internal(e.to_string()))
 }
 
+pub(crate) use ventstream_core::SOURCE_VERSION_HEADER;
+
+/// Pack a binlog coordinate into the `u64` the sinks compare.
+///
+/// The binlog file's numeric suffix (`binlog.000042` → 42) goes in the high
+/// half and the event's end position in the low 32 bits, so versions order
+/// exactly as the binlog does: by file, then by position within the file —
+/// durable across restarts, unlike the per-session ack sequence. The result
+/// stays within a signed 64-bit sink version for any file sequence below
+/// 2^31 (two billion rotations); beyond that — or for a filename with no
+/// numeric suffix — `None` is returned and the event ships unversioned
+/// rather than mis-ordered.
+///
+/// Positions are masked to 32 bits, matching the binlog protocol's own u32
+/// `log_pos`. A file grown past 4 GiB by one giant transaction wraps that
+/// counter at the protocol level too; a wrapped position would pack
+/// *lower* than earlier rows in the same file and a versioning sink
+/// would reject those writes as stale — the tail loop detects the wrap
+/// and ships that file's remaining rows unversioned instead.
+pub(crate) fn binlog_version(file: &str, pos: u64) -> Option<u64> {
+    let digits_start = file
+        .rfind(|c: char| !c.is_ascii_digit())
+        .map_or(0, |i| i + 1);
+    let suffix = file.get(digits_start..).unwrap_or("");
+    if suffix.is_empty() {
+        return None;
+    }
+    let sequence: u64 = suffix.parse().ok()?;
+    if sequence > (i64::MAX as u64) >> 32 {
+        return None;
+    }
+    Some((sequence << 32) | (pos & 0xFFFF_FFFF))
+}
+
+/// Stamp an event with its source version, when one is known. `None`
+/// leaves the event unversioned (last-arrival-wins at the sink); callers
+/// log that case once.
+#[must_use]
+pub(crate) fn with_source_version(event: Event, version: Option<u64>) -> Event {
+    match version {
+        Some(version) => Event {
+            headers: event
+                .headers
+                .with_header(SOURCE_VERSION_HEADER.to_owned(), version.to_string()),
+            ..event
+        },
+        None => event,
+    }
+}
+
 fn event(
     config: &MySqlCdcConfig,
     table: &str,
@@ -309,5 +359,62 @@ mod tests {
             ev.headers.get("ventstream.doc.id"),
             Some(r#"shop.line_items:["ord-1","3"]"#)
         );
+    }
+
+    /// #118: the packed binlog coordinate must order exactly as the binlog
+    /// does — by file sequence, then by position — and never exceed the
+    /// signed 64-bit sink version (the #190 lesson, applied here from the
+    /// start).
+    #[test]
+    fn binlog_version_orders_like_the_binlog_and_fits_a_signed_64() {
+        let early_file = binlog_version("binlog.000007", 4_000_000).expect("version");
+        let later_file = binlog_version("binlog.000008", 4).expect("version");
+        assert!(early_file < later_file, "file sequence dominates position");
+        assert!(
+            binlog_version("binlog.000007", 100) < binlog_version("binlog.000007", 200),
+            "position orders within a file"
+        );
+        assert_eq!(
+            binlog_version("mysql-bin.000042", 1_457),
+            Some((42u64 << 32) | 1_457),
+            "decodable packing"
+        );
+        let max_seq = (i64::MAX as u64) >> 32;
+        let ceiling = binlog_version(&format!("binlog.{max_seq}"), u64::from(u32::MAX))
+            .expect("largest representable coordinate");
+        assert!(ceiling <= i64::MAX as u64);
+        assert_eq!(
+            binlog_version(&format!("binlog.{}", max_seq + 1), 0),
+            None,
+            "a sequence past the signed-64 ceiling ships unversioned, never mis-ordered"
+        );
+    }
+
+    #[test]
+    fn binlog_version_requires_a_numeric_suffix_and_masks_the_position() {
+        assert_eq!(binlog_version("binlog", 10), None);
+        assert_eq!(binlog_version("", 10), None);
+        // Positions wrap at the protocol's own 32-bit boundary.
+        assert_eq!(
+            binlog_version("binlog.000001", (1u64 << 32) | 5),
+            Some((1u64 << 32) | 5)
+        );
+    }
+
+    #[test]
+    fn with_source_version_stamps_only_when_known() {
+        let event = change_event(
+            &cfg(),
+            "orders",
+            Op::Insert,
+            &["1".to_owned()],
+            Some(serde_json::json!({"id": 1})),
+        )
+        .expect("event");
+        assert_eq!(event.headers.get(SOURCE_VERSION_HEADER), None);
+        let stamped = with_source_version(event.clone(), Some(99));
+        assert_eq!(stamped.headers.get(SOURCE_VERSION_HEADER), Some("99"));
+        let untouched = with_source_version(event, None);
+        assert_eq!(untouched.headers.get(SOURCE_VERSION_HEADER), None);
     }
 }

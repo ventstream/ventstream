@@ -1482,3 +1482,53 @@ async fn mysql_fetch_many_batch_groups_rows_per_key() {
 
     pool.disconnect().await.expect("pool disconnect");
 }
+
+/// #118 review: binlog coordinates are server-local, so the engine pins
+/// the server identity. First contact adopts `@@server_uuid`; a changed
+/// uuid (failover / RESET MASTER / restore) must suppress versioning —
+/// loudly — instead of letting versioned writes go silently stale.
+#[tokio::test]
+#[ignore = "local integration: requires Docker"]
+async fn mysql_server_epoch_guard_adopts_then_detects_change() {
+    let stack = common::start_mysql().await;
+    let pool = mysql_async::Pool::new(
+        mysql_async::OptsBuilder::default()
+            .ip_or_hostname("127.0.0.1")
+            .tcp_port(stack.mysql_port)
+            .user(Some("root"))
+            .pass(Some(common::MYSQL_PASSWORD)),
+    );
+    let state_dir = std::path::PathBuf::from(common::state_dir("epoch-guard", stack.mysql_port));
+
+    // Fresh state dir: adopt the uuid and allow versioning.
+    assert!(ventstream_sources::mysql::versioning_epoch_ok(&pool, &state_dir, "it").await);
+    let stored = std::fs::read_to_string(state_dir.join("server_uuid")).expect("uuid persisted");
+    assert!(!stored.trim().is_empty());
+
+    // Same server again: still allowed.
+    assert!(ventstream_sources::mysql::versioning_epoch_ok(&pool, &state_dir, "it").await);
+
+    // Simulate a failover/restore: the cursor's uuid no longer matches.
+    std::fs::write(
+        state_dir.join("server_uuid"),
+        "00000000-dead-beef-0000-000000000000",
+    )
+    .expect("tamper uuid");
+    assert!(
+        !ventstream_sources::mysql::versioning_epoch_ok(&pool, &state_dir, "it").await,
+        "a changed server identity must suppress versioning"
+    );
+    // And it must stay suppressed across restarts (the stored uuid is not
+    // silently overwritten).
+    assert!(!ventstream_sources::mysql::versioning_epoch_ok(&pool, &state_dir, "it").await);
+
+    // The packed scan-start floor is available from a live server.
+    assert!(
+        ventstream_sources::mysql::scan_start_version(&pool)
+            .await
+            .is_some(),
+        "scan-start version should pack from a stock binlog filename"
+    );
+
+    pool.disconnect().await.expect("pool disconnect");
+}

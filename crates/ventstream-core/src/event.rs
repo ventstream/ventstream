@@ -338,6 +338,15 @@ impl Headers {
     }
 }
 
+/// Header carrying a source's durable ordering value for one document
+/// (`ventstream.cdc.source_version`): the Postgres LSN analogue for
+/// sources whose checkpoint isn't an LSN (MySQL binlog coordinate,
+/// MongoDB clusterTime, Kafka offset). Versioning sinks compare it as
+/// the document's external version so a stale write that arrives after
+/// a newer one is rejected instead of clobbering it. One definition
+/// here — sources stamp it, denormalizers propagate it, sinks read it.
+pub const SOURCE_VERSION_HEADER: &str = "ventstream.cdc.source_version";
+
 /// An immutable event flowing through the engine.
 ///
 /// Cloning is O(1): [`EventId`] is `Copy`, [`SourceUri`] / [`Subject`] are
