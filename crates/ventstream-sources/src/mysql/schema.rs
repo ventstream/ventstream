@@ -24,6 +24,10 @@ pub(crate) struct TableSchema {
     pub(crate) pk_ordinals: Vec<usize>,
     /// Columns whose `DATA_TYPE` is `json` (parsed as nested JSON).
     pub(crate) json_columns: HashSet<String>,
+    /// Columns whose `COLUMN_TYPE` carries `unsigned` — the fetcher must
+    /// `CAST(? AS UNSIGNED)` (not `SIGNED`) for these so a `bigint
+    /// unsigned` key above `i64::MAX` survives the round trip.
+    pub(crate) unsigned_columns: HashSet<String>,
     /// ENUM label lists by 0-based ordinal (labels are 1-indexed in
     /// binlog values). Binlog row images carry the numeric index; the
     /// SELECT paths return the label — both must render the label or
@@ -180,9 +184,13 @@ async fn load(pool: &Pool, db: &str, table: &str) -> Result<TableSchema, MySqlCd
     let mut column_types = vec![String::new(); column_count];
     let mut ordinal_of: HashMap<String, usize> = HashMap::new();
     let mut json_columns = HashSet::new();
+    let mut unsigned_columns = HashSet::new();
     let mut enum_labels: HashMap<usize, Vec<String>> = HashMap::new();
     let mut set_labels: HashMap<usize, Vec<String>> = HashMap::new();
     for (name, ord, dtype, ctype) in cols {
+        if ctype.to_ascii_lowercase().contains("unsigned") {
+            unsigned_columns.insert(name.clone());
+        }
         let ordinal = (ord as usize).saturating_sub(1);
         if let Some(slot) = column_names.get_mut(ordinal) {
             *slot = name.clone();
@@ -231,6 +239,7 @@ async fn load(pool: &Pool, db: &str, table: &str) -> Result<TableSchema, MySqlCd
         pk_names,
         pk_ordinals,
         json_columns,
+        unsigned_columns,
         enum_labels,
         set_labels,
     })
