@@ -151,6 +151,23 @@ fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+/// Render a value as a complete single-quoted SQL string literal.
+///
+/// Quote-doubling alone is complete only under
+/// `standard_conforming_strings = on` (the Postgres default); with it
+/// off, a trailing backslash escapes the closing quote — the same
+/// splice-escape MySQL had (#130). Values containing a backslash are
+/// therefore rendered as `E'...'` strings, whose escape processing is
+/// identical in BOTH modes, so this stays safe even for a caller that
+/// bypassed the config validator.
+fn lit(value: &str) -> String {
+    if value.contains('\\') {
+        format!("E'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+    } else {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+}
+
 /// Resolve column types without reading table data. `format_type` returns a
 /// SQL-ready type spelling (including quoting and modifiers), which is used by
 /// the indexed text-to-native casts in recomposition queries.
@@ -200,7 +217,7 @@ fn related_projection(alias: &str, select: &[String]) -> String {
     } else {
         let pairs = select
             .iter()
-            .map(|c| format!("'{}', {alias}.{}", c.replace('\'', "''"), quote_ident(c)))
+            .map(|c| format!("{}, {alias}.{}", lit(c), quote_ident(c)))
             .collect::<Vec<_>>()
             .join(", ");
         format!("jsonb_build_object({pairs})")
@@ -229,7 +246,7 @@ fn doc_expr(def: &JoinDefinition) -> String {
         let table = quote_qualified(&related.table);
         let cond = join_condition(&alias, related);
         let proj = related_projection(&alias, &related.select);
-        let embed = related.embed_as.replace('\'', "''");
+        let embed = lit(&related.embed_as);
         let sub = match related.cardinality {
             Cardinality::One => {
                 format!("(SELECT {proj} FROM {table} {alias} WHERE {cond} LIMIT 1)")
@@ -245,7 +262,7 @@ fn doc_expr(def: &JoinDefinition) -> String {
                 )
             }
         };
-        expr.push_str(&format!(" || jsonb_build_object('{embed}', {sub})"));
+        expr.push_str(&format!(" || jsonb_build_object({embed}, {sub})"));
     }
     expr
 }
@@ -1602,6 +1619,17 @@ fn build_target_clear_event(
     clippy::indexing_slicing
 )]
 mod tests {
+    /// #130 parity with the MySQL generator: a trailing backslash must
+    /// not escape the closing quote, in either
+    /// `standard_conforming_strings` mode — hence the E-string form.
+    #[test]
+    fn literal_escaping_is_mode_independent() {
+        assert_eq!(lit("plain"), "'plain'");
+        assert_eq!(lit("it's"), "'it''s'");
+        assert_eq!(lit("tail\\"), "E'tail\\\\'");
+        assert_eq!(lit("mix'\\"), "E'mix''\\\\'");
+    }
+
     use super::*;
 
     /// A 4-table-ish join def built via the real Deserialize path.

@@ -3544,42 +3544,18 @@ fn config_spec_path(
     config.and_then(selector).cloned()
 }
 
-/// Reject specs where two join definitions reuse a `related.id`.
-///
-/// The reverse indexes are keyed on that id alone, so duplicates share a
-/// bucket across definitions. The re-emit path filters by primary table
-/// so the shared bucket can't produce wrong-index writes — but two
-/// definitions over the SAME primary table reusing an id would still be
-/// ambiguous, and in every case the sharing is a config mistake worth
-/// naming rather than silently tolerating.
-fn validate_related_ids_unique(joins: &[JoinDefinition]) -> Result<()> {
-    // Keyed on definition INDEX, not name: `effective_name()` falls back
-    // to the primary table, so two unnamed definitions over the same
-    // table report the same name — and a name-based guard would exempt
-    // exactly the case the primary-table filter also cannot separate
-    // (both share the table). Indexing also catches the same id twice
-    // inside one definition, which a name comparison permits.
-    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for (index, def) in joins.iter().enumerate() {
-        for rel in &def.related {
-            if let Some(previous) = seen.insert(rel.id.as_str(), index) {
-                let previous_name = joins
-                    .get(previous)
-                    .map_or("<unknown>", |def| def.effective_name());
-                return Err(anyhow!(
-                    "related id `{}` is declared more than once (join definitions #{} `{}` and \
-                     #{} `{}`). Related ids key the shared reverse indexes, so they must be \
-                     unique across the whole spec — rename one of them",
-                    rel.id,
-                    previous + 1,
-                    previous_name,
-                    index + 1,
-                    def.effective_name()
-                ));
-            }
-        }
+/// Parse + validate one joins YAML text, whatever door it came in
+/// through. The single funnel means a new spec rule cannot be wired
+/// into some load branches and not others.
+fn parse_joins_yaml(text: &str, origin: &str) -> Result<Vec<JoinDefinition>> {
+    let parsed: JoinsFile =
+        serde_yaml::from_str(text).with_context(|| format!("parsing joins YAML from {origin}"))?;
+    if parsed.joins.is_empty() {
+        warn!(origin, "joins YAML had no `joins:` entries");
     }
-    Ok(())
+    ventstream_joins::validate_spec(&parsed.joins)
+        .map_err(|err| anyhow!("joins spec from {origin} rejected: {err}"))?;
+    Ok(parsed.joins)
 }
 
 fn load_joins_yaml(
@@ -3588,30 +3564,16 @@ fn load_joins_yaml(
 ) -> Result<(Vec<JoinDefinition>, Option<String>)> {
     if let Some(config) = fleet_config {
         if let Some(text) = config.text_at("/specs/joins_yaml")? {
-            let parsed: JoinsFile =
-                serde_yaml::from_str(text).context("parsing Fleet-applied joins YAML")?;
-            if parsed.joins.is_empty() {
-                warn!("Fleet-applied joins YAML had no `joins:` entries");
-            }
-            validate_related_ids_unique(&parsed.joins)?;
-            ventstream_joins::validate_sql_identifiers(&parsed.joins)
-                .map_err(|err| anyhow!("joins spec rejected: {err}"))?;
-            return Ok((parsed.joins, Some(text.to_owned())));
+            let joins = parse_joins_yaml(text, "Fleet-applied config")?;
+            return Ok((joins, Some(text.to_owned())));
         }
     }
 
     if let Some(path) = config_spec_path(engine_config, |config| config.specs.joins.as_ref()) {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading joins YAML at {}", path.display()))?;
-        let parsed: JoinsFile = serde_yaml::from_str(&text)
-            .with_context(|| format!("parsing joins YAML at {}", path.display()))?;
-        if parsed.joins.is_empty() {
-            warn!(path = %path.display(), "joins YAML had no `joins:` entries");
-        }
-        validate_related_ids_unique(&parsed.joins)?;
-        ventstream_joins::validate_sql_identifiers(&parsed.joins)
-            .map_err(|err| anyhow!("joins spec rejected: {err}"))?;
-        return Ok((parsed.joins, Some(text)));
+        let joins = parse_joins_yaml(&text, &path.display().to_string())?;
+        return Ok((joins, Some(text)));
     }
 
     match opt("VS_JOINS_YAML")? {
@@ -3619,15 +3581,8 @@ fn load_joins_yaml(
         Some(path) => {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading joins YAML at {path}"))?;
-            let parsed: JoinsFile = serde_yaml::from_str(&text)
-                .with_context(|| format!("parsing joins YAML at {path}"))?;
-            if parsed.joins.is_empty() {
-                warn!(path = %path, "joins YAML had no `joins:` entries");
-            }
-            validate_related_ids_unique(&parsed.joins)?;
-            ventstream_joins::validate_sql_identifiers(&parsed.joins)
-                .map_err(|err| anyhow!("joins spec rejected: {err}"))?;
-            Ok((parsed.joins, Some(text)))
+            let joins = parse_joins_yaml(&text, &path)?;
+            Ok((joins, Some(text)))
         }
     }
 }
@@ -4001,7 +3956,7 @@ fn load_cdc_bundle(
     // relation this pipeline routes documents for. Neither half can answer
     // that alone — the sink never learns what the source publishes, and the
     // source has no view of edge specs — so it is checked here, where both
-    // are in scope, alongside validate_related_ids_unique and
+    // are in scope, alongside ventstream_joins::validate_spec and
     // validate_projection_target_indexes.
     if let SinkRuntimeConfig::SurrealDb(surreal) = &bundle.runtime.sink {
         let relations = routed_relations(&bundle.source);
@@ -7290,9 +7245,9 @@ joins:
         cardinality: one
 "#;
         let parsed: JoinsFile = serde_yaml::from_str(spec).expect("parse spec");
-        let err = validate_related_ids_unique(&parsed.joins)
+        let err = ventstream_joins::validate_spec(&parsed.joins)
             .expect_err("duplicate related id across unnamed definitions must be rejected");
-        assert!(err.to_string().contains("customer"), "{err}");
+        assert!(err.contains("customer"), "{err}");
 
         // The same id twice inside ONE definition is equally ambiguous.
         let same_def = r#"
@@ -7316,7 +7271,7 @@ joins:
         cardinality: one
 "#;
         let parsed: JoinsFile = serde_yaml::from_str(same_def).expect("parse spec");
-        assert!(validate_related_ids_unique(&parsed.joins).is_err());
+        assert!(ventstream_joins::validate_spec(&parsed.joins).is_err());
 
         // Distinct ids are fine.
         let ok = r#"
@@ -7343,7 +7298,7 @@ joins:
         cardinality: one
 "#;
         let parsed: JoinsFile = serde_yaml::from_str(ok).expect("parse spec");
-        validate_related_ids_unique(&parsed.joins).expect("distinct ids are valid");
+        ventstream_joins::validate_spec(&parsed.joins).expect("distinct ids are valid");
     }
 
     #[test]

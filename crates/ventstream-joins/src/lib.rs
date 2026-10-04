@@ -45,7 +45,7 @@ pub mod persistence;
 pub mod state;
 
 pub use config::{
-    validate_sql_identifiers, BackfillMode, Cardinality, JoinDefinition, JoinOn, OnMissing, PkSpec,
+    validate_spec, BackfillMode, Cardinality, JoinDefinition, JoinOn, OnMissing, PkSpec,
     PrimaryRef, RelatedDefinition, StateBackend,
 };
 pub use engine::{JoinDurability, JoinEngine, PoisonSink};

@@ -876,13 +876,13 @@ async fn columns_of(pool: &Pool, database: &str, table: &str) -> Result<Vec<Stri
         anyhow::bail!("no columns found for {database}.{table} (does it exist?)");
     }
     // These names are spliced into generated SQL as JSON_OBJECT keys.
-    // `lit` escapes them for MySQL's default mode, but a server running
-    // NO_BACKSLASH_ESCAPES reads `\\` differently — rather than guess
-    // the session mode, refuse the pathological names outright.
+    // Quote-doubling is correct in every sql_mode, so quotes are fine —
+    // but `\\` reads differently under NO_BACKSLASH_ESCAPES, and rather
+    // than guess the session mode, refuse backslash-bearing names.
     for col in &cols {
-        if col.contains('\'') || col.contains('\\') {
+        if col.contains('\\') {
             anyhow::bail!(
-                "column {col:?} of {database}.{table} contains a quote or backslash; \
+                "column {col:?} of {database}.{table} contains a backslash; \
                  such names cannot be embedded safely in generated SQL — rename the column"
             );
         }
@@ -1474,9 +1474,11 @@ mod tests {
 
     #[test]
     fn json_object_expr_escapes_hostile_column_names() {
-        let sql = json_object_expr("r0", &["a\\".to_owned(), "b'c".to_owned()]);
-        // The literal side escapes quotes and backslashes; the backtick
-        // identifier side leaves them alone (they have no meaning there).
-        assert_eq!(sql, "JSON_OBJECT('a\\\\', `r0`.`a\\`, 'b''c', `r0`.`b'c`)");
+        // Quote case only: backslash-bearing names never get here —
+        // `columns_of` refuses them (the `\\\\` rendering would be wrong
+        // under NO_BACKSLASH_ESCAPES, so it must stay unreachable). The
+        // backtick identifier side leaves quotes alone (no meaning there).
+        let sql = json_object_expr("r0", &["b'c".to_owned()]);
+        assert_eq!(sql, "JSON_OBJECT('b''c', `r0`.`b'c`)");
     }
 }
