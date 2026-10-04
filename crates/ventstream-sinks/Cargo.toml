@@ -22,6 +22,7 @@ futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 metrics = "0.24"
+percent-encoding = "2"
 sha2 = "0.10"
 thiserror = { workspace = true }
 tokio = { workspace = true }

@@ -353,6 +353,16 @@ pub(crate) fn is_target_clear(event: &ventstream_core::Event) -> bool {
 /// event in the join engine's primary path was passed through with the
 /// same subject (carrying the row's `old` payload), so we can recognize
 /// it here and emit an OS bulk `delete` action instead of `index`.
+pub(crate) fn is_delete_event(event: &Event) -> bool {
+    event
+        .subject
+        .as_str()
+        .rsplit('.')
+        .next()
+        .map(|op| op == "delete")
+        .unwrap_or(false)
+}
+
 /// Record an index an action will be written to, deduplicating inline.
 fn record_written(
     written_indices: &mut Option<&mut std::collections::HashSet<String>>,
@@ -365,47 +375,26 @@ fn record_written(
     }
 }
 
-/// The indices a delete action for `doc_id` must target: the resolved list
-/// when the sink looked the id up, else the rendered index.
+/// The indices a delete action for `doc_id` must target: the resolved
+/// list **plus** the index rendered at delete time. The resolution query
+/// can only see documents already visible to search — a copy written in
+/// this same batch, or seconds ago and not yet refreshed, resolves to
+/// nothing — so the rendered index is always included as well. The
+/// extra delete at worst 404s, which the response handler already
+/// treats as an idempotent success.
 fn delete_indices<'a>(
     delete_targets: Option<&'a DeleteTargets>,
     doc_id: &str,
     rendered: &'a str,
 ) -> impl Iterator<Item = &'a str> {
-    let resolved = delete_targets
+    let resolved: &[String] = delete_targets
         .and_then(|targets| targets.get(doc_id))
-        .filter(|list| !list.is_empty());
-    match resolved {
-        Some(list) => EitherIter::Left(list.iter().map(String::as_str)),
-        None => EitherIter::Right(std::iter::once(rendered)),
-    }
-}
-
-/// Minimal two-sided iterator so [`delete_indices`] has one return type
-/// without boxing on the hot path.
-enum EitherIter<L, R> {
-    Left(L),
-    Right(R),
-}
-
-impl<T, L: Iterator<Item = T>, R: Iterator<Item = T>> Iterator for EitherIter<L, R> {
-    type Item = T;
-    fn next(&mut self) -> Option<T> {
-        match self {
-            Self::Left(left) => left.next(),
-            Self::Right(right) => right.next(),
-        }
-    }
-}
-
-pub(crate) fn is_delete_event(event: &Event) -> bool {
-    event
-        .subject
-        .as_str()
-        .rsplit('.')
-        .next()
-        .map(|op| op == "delete")
-        .unwrap_or(false)
+        .map_or(&[], Vec::as_slice);
+    let rendered_unseen = !resolved.iter().any(|index| index == rendered);
+    resolved
+        .iter()
+        .map(String::as_str)
+        .chain(rendered_unseen.then_some(rendered))
 }
 
 /// Append `payload` to `out`, replacing any embedded `\n` byte with a
@@ -466,15 +455,23 @@ impl BulkResponseAction {
 
     /// Whether a delete reached the desired state because the document was
     /// already absent. Replayed deletes must remain idempotent across source
-    /// and sink restarts. An `index_not_found_exception` is a deployment
-    /// failure, not an idempotent delete result, and must block delivery.
+    /// and sink restarts. `index_not_found_exception` qualifies too: under a
+    /// time-rolled template the sink deliberately targets the rendered
+    /// current-period index alongside the resolved ones, and that index may
+    /// simply not exist yet — an index that does not exist holds no copy of
+    /// the document, so the delete's goal state already holds. (For a
+    /// literal template a missing index means nothing was ever written
+    /// there, which is the same conclusion.)
     pub fn is_delete_not_found(&self) -> bool {
         matches!(
             self,
             Self::Delete(entry)
                 if entry.status == 404
                     && (entry.error.is_none()
-                        || entry.error_type() == Some("document_missing_exception"))
+                        || matches!(
+                            entry.error_type(),
+                            Some("document_missing_exception" | "index_not_found_exception")
+                        ))
         )
     }
 }
@@ -927,12 +924,14 @@ mod tests {
         });
         assert!(already_absent.is_delete_not_found());
 
+        // The rendered current-period index is always targeted alongside
+        // resolved ones and may not exist yet — already-applied, not a failure.
         let missing_index = BulkResponseAction::Delete(BulkResponseEntry {
             id: Some("gone".into()),
             status: 404,
             error: Some(serde_json::json!({ "type": "index_not_found_exception" })),
         });
-        assert!(!missing_index.is_delete_not_found());
+        assert!(missing_index.is_delete_not_found());
 
         let missing_indexed_document = BulkResponseAction::Index(BulkResponseEntry {
             id: Some("gone".into()),
@@ -959,7 +958,7 @@ mod tests {
     /// and the written-index set records the actual targets, so retention
     /// management (#151) follows the deletes too.
     #[test]
-    fn resolved_delete_targets_override_the_rendered_index() {
+    fn resolved_delete_targets_extend_the_rendered_index() {
         let event = delete_event("app.orders:[\"1\"]");
         let mut targets = DeleteTargets::new();
         targets.insert(
@@ -980,7 +979,11 @@ mod tests {
         .unwrap();
         let text = String::from_utf8(req.body).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2, "one delete per holding index: {text}");
+        assert_eq!(
+            lines.len(),
+            3,
+            "one delete per holding index plus the rendered index: {text}"
+        );
         assert!(
             lines[0].contains(r#""_index":"events-2026-05-20""#),
             "{text}"
@@ -990,21 +993,50 @@ mod tests {
             "{text}"
         );
         assert!(
-            !text.contains("2026-05-23"),
-            "the rendered (current) index must not be targeted: {text}"
+            lines[2].contains(r#""_index":"events-2026-05-23""#),
+            "the rendered index is always targeted too — resolution cannot \
+             see same-batch or unrefreshed writes: {text}"
         );
         assert_eq!(
             req.item_event_offsets,
-            vec![0, 0],
-            "both actions map back to one event for per-item errors"
+            vec![0, 0, 0],
+            "all actions map back to one event for per-item errors"
         );
         assert_eq!(
             written,
-            ["events-2026-05-20", "events-2026-05-21"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-            "the written set holds the resolved targets, not the rendered index"
+            [
+                "events-2026-05-20",
+                "events-2026-05-21",
+                "events-2026-05-23"
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            "the written set holds the resolved targets and the rendered index"
+        );
+    }
+
+    #[test]
+    fn resolved_delete_does_not_duplicate_the_rendered_index() {
+        let event = delete_event("app.orders:[\"1\"]");
+        let mut targets = DeleteTargets::new();
+        targets.insert(
+            "app.orders:[\"1\"]".to_owned(),
+            vec!["events-2026-05-23".to_owned()],
+        );
+        let req = build_bulk_request(
+            std::slice::from_ref(&event),
+            "events-%Y-%m-%d",
+            now(),
+            Some(&targets),
+            None,
+        )
+        .unwrap();
+        let text = String::from_utf8(req.body).unwrap();
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "resolution already covering the rendered index yields one action: {text}"
         );
     }
 
@@ -1064,15 +1096,24 @@ mod tests {
         .unwrap();
         let text = String::from_utf8(req.body).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 3, "delete + index action + doc body: {text}");
+        assert_eq!(
+            lines.len(),
+            4,
+            "resolved delete + rendered delete + index action + doc body: {text}"
+        );
         assert!(
             lines[0].starts_with(r#"{"delete":"#)
                 && lines[0].contains(r#""_index":"events-2026-05-01""#),
             "{text}"
         );
         assert!(
-            lines[1].starts_with(r#"{"index":"#)
+            lines[1].starts_with(r#"{"delete":"#)
                 && lines[1].contains(r#""_index":"events-2026-05-23""#),
+            "the old id is also deleted from the rendered index: {text}"
+        );
+        assert!(
+            lines[2].starts_with(r#"{"index":"#)
+                && lines[2].contains(r#""_index":"events-2026-05-23""#),
             "{text}"
         );
     }

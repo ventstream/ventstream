@@ -109,6 +109,133 @@ pub fn render(
     Ok(out)
 }
 
+/// One parsed template element, shared by [`render`]'s siblings so the
+/// wildcard pattern and the index matcher can never diverge from what the
+/// bulk actually writes — that divergence is exactly the mismatch that
+/// would make delete resolution miss (#196 review).
+enum Token {
+    /// Literal text, with `%%` already collapsed to `%`.
+    Literal(String),
+    /// A time placeholder: `Y`, `m`, `d`, or `H`.
+    Time(char),
+    /// A `${...}` substitution token (contents between the braces).
+    Subst(String),
+}
+
+/// Tokenize a template, with the same error shapes `render` reports.
+fn tokenize(template: &str) -> Result<Vec<Token>, OpenSearchSinkError> {
+    let mut tokens: Vec<Token> = Vec::new();
+    let mut literal = String::new();
+    let mut chars = template.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if ch == '%' {
+            match chars.next() {
+                Some((_, '%')) => literal.push('%'),
+                Some((_, spec @ ('Y' | 'm' | 'd' | 'H'))) => {
+                    if !literal.is_empty() {
+                        tokens.push(Token::Literal(std::mem::take(&mut literal)));
+                    }
+                    tokens.push(Token::Time(spec));
+                }
+                Some((_, other)) => {
+                    return Err(OpenSearchSinkError::IndexTemplate(format!(
+                        "unknown time placeholder '%{other}' at byte {idx}"
+                    )))
+                }
+                None => {
+                    return Err(OpenSearchSinkError::IndexTemplate(format!(
+                        "trailing '%' at byte {idx}"
+                    )))
+                }
+            }
+            continue;
+        }
+        if ch == '$' && chars.peek().map(|(_, c)| *c) == Some('{') {
+            chars.next();
+            let mut token = String::new();
+            let mut closed = false;
+            for (_, tc) in chars.by_ref() {
+                if tc == '}' {
+                    closed = true;
+                    break;
+                }
+                token.push(tc);
+            }
+            if !closed {
+                return Err(OpenSearchSinkError::IndexTemplate(format!(
+                    "unterminated '${{' starting at byte {idx}"
+                )));
+            }
+            if !literal.is_empty() {
+                tokens.push(Token::Literal(std::mem::take(&mut literal)));
+            }
+            tokens.push(Token::Subst(token));
+            continue;
+        }
+        literal.push(ch);
+    }
+    if !literal.is_empty() {
+        tokens.push(Token::Literal(literal));
+    }
+    Ok(tokens)
+}
+
+/// Digits a time placeholder renders to, fixed-width.
+fn time_width(spec: char) -> usize {
+    match spec {
+        'Y' => 4,
+        _ => 2,
+    }
+}
+
+/// True when `candidate` is an index name this template could have
+/// rendered **for this event**: literals and substitutions must match
+/// exactly, and each time placeholder must match a fixed-width digit run.
+///
+/// Delete resolution searches a wildcard pattern, and `*` happily crosses
+/// `-` — `events-*-*-*` also matches `events-app-2026-05-23` or an
+/// operator's `events-archive-...`. Accepting such hits would send a
+/// versioned delete into another template's index that happens to share
+/// the id, so every hit is post-filtered through this before it becomes a
+/// delete target.
+pub fn rendered_index_matches(
+    template: &str,
+    event: &Event,
+    candidate: &str,
+) -> Result<bool, OpenSearchSinkError> {
+    let tokens = tokenize(template)?;
+    let bytes = candidate.as_bytes();
+    let mut at = 0usize;
+    for token in &tokens {
+        match token {
+            Token::Literal(lit) => {
+                if !candidate[at..].starts_with(lit.as_str()) {
+                    return Ok(false);
+                }
+                at += lit.len();
+            }
+            Token::Subst(token) => {
+                let value = sanitize_index_segment(&substitute(token, event));
+                if !candidate[at..].starts_with(value.as_str()) {
+                    return Ok(false);
+                }
+                at += value.len();
+            }
+            Token::Time(spec) => {
+                let width = time_width(*spec);
+                let Some(run) = bytes.get(at..at + width) else {
+                    return Ok(false);
+                };
+                if !run.iter().all(u8::is_ascii_digit) {
+                    return Ok(false);
+                }
+                at += width;
+            }
+        }
+    }
+    Ok(at == candidate.len())
+}
+
 /// True when the template derives part of the index name from the **time
 /// of writing** (`%Y`, `%m`, `%d`, `%H`). `%%` is a literal percent and
 /// does not count.
@@ -133,60 +260,25 @@ pub fn has_time_placeholders(template: &str) -> bool {
 /// Consecutive wildcards collapse to one.
 pub fn render_time_wildcards(template: &str, event: &Event) -> Result<String, OpenSearchSinkError> {
     let mut out = String::with_capacity(template.len() + 8);
-    let mut chars = template.char_indices().peekable();
-
-    while let Some((idx, ch)) = chars.next() {
-        if ch == '%' {
-            match chars.next() {
-                Some((_, '%')) => out.push('%'),
-                Some((_, 'Y' | 'm' | 'd' | 'H')) => {
-                    if !out.ends_with('*') {
-                        out.push('*');
-                    }
-                }
-                Some((_, other)) => {
-                    return Err(OpenSearchSinkError::IndexTemplate(format!(
-                        "unknown time placeholder '%{other}' at byte {idx}"
-                    )))
-                }
-                None => {
-                    return Err(OpenSearchSinkError::IndexTemplate(format!(
-                        "trailing '%' at byte {idx}"
-                    )))
+    for token in tokenize(template)? {
+        match token {
+            Token::Literal(lit) => {
+                // A literal '*' would widen the pattern; indices can't
+                // contain '*', so sanitize it like any substitution would.
+                for ch in lit.chars() {
+                    out.push(if ch == '*' { '_' } else { ch });
                 }
             }
-            continue;
-        }
-
-        if ch == '$' && chars.peek().map(|(_, c)| *c) == Some('{') {
-            chars.next(); // consume the '{'
-            let mut token = String::new();
-            let mut closed = false;
-            for (_, tc) in chars.by_ref() {
-                if tc == '}' {
-                    closed = true;
-                    break;
+            Token::Subst(token) => {
+                out.push_str(&sanitize_index_segment(&substitute(&token, event)));
+            }
+            Token::Time(_) => {
+                if !out.ends_with('*') {
+                    out.push('*');
                 }
-                token.push(tc);
             }
-            if !closed {
-                return Err(OpenSearchSinkError::IndexTemplate(format!(
-                    "unterminated '${{' starting at byte {idx}"
-                )));
-            }
-            out.push_str(&sanitize_index_segment(&substitute(&token, event)));
-            continue;
         }
-
-        // A literal '*' in the template would widen the pattern; indices
-        // can't contain '*', so sanitize it like any substitution would.
-        if ch == '*' {
-            out.push('_');
-            continue;
-        }
-        out.push(ch);
     }
-
     if out.is_empty() {
         return Err(OpenSearchSinkError::IndexTemplate(
             "rendered index pattern is empty".into(),
@@ -439,5 +531,34 @@ mod tests {
             err.to_string().contains("unknown time placeholder"),
             "{err}"
         );
+    }
+
+    /// The matcher accepts exactly the names the template can render for
+    /// an event: time placeholders are fixed-width digit runs, everything
+    /// else is literal. `*` in the lookup pattern crosses `-`, so this is
+    /// what keeps foreign indices out of the delete targets.
+    #[test]
+    fn rendered_index_matches_only_plausible_renders() {
+        let event = make_event("postgres.app.orders.delete", HashMap::new());
+        let tpl = "events-%Y-%m-%d";
+        assert!(rendered_index_matches(tpl, &event, "events-2026-08-20").unwrap());
+        assert!(rendered_index_matches(tpl, &event, "events-1999-12-31").unwrap());
+        // Non-digits where a time component belongs — another pipeline's
+        // index that the wildcard pattern happily matched.
+        assert!(!rendered_index_matches(tpl, &event, "events-archive-2026-08").unwrap());
+        // Wrong width, missing separator, trailing garbage.
+        assert!(!rendered_index_matches(tpl, &event, "events-26-08-20").unwrap());
+        assert!(!rendered_index_matches(tpl, &event, "events-20260820").unwrap());
+        assert!(!rendered_index_matches(tpl, &event, "events-2026-08-20-extra").unwrap());
+        assert!(!rendered_index_matches(tpl, &event, "events-2026-08-2").unwrap());
+
+        // Substitutions must match what this event renders to.
+        let tpl = "e-${subject:0}-%Y";
+        assert!(rendered_index_matches(tpl, &event, "e-postgres-2026").unwrap());
+        assert!(!rendered_index_matches(tpl, &event, "e-mysql-2026").unwrap());
+
+        // A literal template matches only itself.
+        assert!(rendered_index_matches("orders", &event, "orders").unwrap());
+        assert!(!rendered_index_matches("orders", &event, "orders-2026").unwrap());
     }
 }
