@@ -2353,6 +2353,11 @@ pub struct OpenSearchSinkConfig {
     /// Allow destructive full-purge reconciliation.
     #[serde(default)]
     pub reconcile_allow_full_purge: Option<bool>,
+    /// Deleted-document version retention (`index.gc_deletes`) the sink
+    /// enforces on indices it writes, in milliseconds. 0 disables
+    /// management. Default 24 hours.
+    #[serde(default)]
+    pub tombstone_retention_ms: Option<u64>,
     /// Disable TLS certificate verification. Development only.
     #[serde(default)]
     pub insecure_tls: Option<bool>,

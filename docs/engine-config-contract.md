@@ -92,6 +92,7 @@ The engine now consumes:
 - `sink.opensearch.index_routing` with `by_output_relation`,
   `by_projection_target`, `fixed`, or `template` strategy
 - `sink.opensearch.reconcile_allow_full_purge`
+- `sink.opensearch.tombstone_retention_ms`
 - `sink.opensearch.insecure_tls`
 - `sink.meilisearch.endpoint_ref`
 - `sink.meilisearch.api_key_ref`

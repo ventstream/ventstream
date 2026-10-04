@@ -129,8 +129,9 @@ pub fn build_bulk_request(
     events: &[Event],
     template: &str,
     now: DateTime<Utc>,
+    written_indices: Option<&mut std::collections::HashSet<String>>,
 ) -> Result<BulkRequest, OpenSearchSinkError> {
-    build_bulk_request_inner(events, template, now, true)
+    build_bulk_request_inner(events, template, now, written_indices, true)
 }
 
 /// Build only the NDJSON body used by the HTTP hot path.
@@ -138,12 +139,19 @@ pub fn build_bulk_request(
 /// The public request builder retains per-event index assignments for callers
 /// that need them. The sink retry path tracks event offsets directly, so it can
 /// avoid allocating and cloning an otherwise-unused `Vec<String>`.
+/// `written_indices`, when supplied, collects every index name an action in
+/// this body targets — the exact set the bulk writes to, captured at encode
+/// time with the same `now` the actions rendered with. Callers that manage
+/// per-index settings (tombstone retention, #151) must use this set rather
+/// than re-rendering later: a fresh render can cross an hour or day
+/// boundary and name an index the bulk never touched.
 pub fn build_bulk_body(
     events: &[Event],
     template: &str,
     now: DateTime<Utc>,
+    written_indices: Option<&mut std::collections::HashSet<String>>,
 ) -> Result<(Vec<u8>, Vec<usize>), OpenSearchSinkError> {
-    build_bulk_request_inner(events, template, now, false)
+    build_bulk_request_inner(events, template, now, written_indices, false)
         .map(|request| (request.body, request.item_event_offsets))
 }
 
@@ -151,6 +159,7 @@ fn build_bulk_request_inner(
     events: &[Event],
     template: &str,
     now: DateTime<Utc>,
+    mut written_indices: Option<&mut std::collections::HashSet<String>>,
     collect_indices: bool,
 ) -> Result<BulkRequest, OpenSearchSinkError> {
     let mut body = Vec::with_capacity(events.len() * 256);
@@ -189,6 +198,11 @@ fn build_bulk_request_inner(
         // (e.g. the join engine / denormalize modes set `ventstream.doc.id`
         // = `{primary_table}:{primary_pk}` so re-emits overwrite the same
         // doc). All denormalize modes stamp it.
+        if let Some(written) = written_indices.as_deref_mut() {
+            if !written.contains(index.as_ref()) {
+                written.insert(index.as_ref().to_owned());
+            }
+        }
         let stable_id = event.headers.get("ventstream.doc.id");
         // Source watermark → external doc version (None for bootstrap).
         let version = external_version(event);
@@ -495,7 +509,7 @@ mod tests {
             make_event("a.b", br#"{"x":1}"#),
             make_event("a.b", br#"{"x":2}"#),
         ];
-        let req = build_bulk_request(&events, "static-index", now()).unwrap();
+        let req = build_bulk_request(&events, "static-index", now(), None).unwrap();
         let text = String::from_utf8(req.body).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 4);
@@ -514,7 +528,7 @@ mod tests {
     #[test]
     fn bulk_request_terminates_body_with_newline() {
         let events = vec![make_event("a.b", b"{}")];
-        let req = build_bulk_request(&events, "x", now()).unwrap();
+        let req = build_bulk_request(&events, "x", now(), None).unwrap();
         assert_eq!(*req.body.last().unwrap(), b'\n');
     }
 
@@ -522,7 +536,7 @@ mod tests {
     fn bulk_request_uses_event_id_as_underscore_id() {
         let event = make_event("a.b", b"{}");
         let id = event.id.to_string();
-        let req = build_bulk_request(&[event], "static", now()).unwrap();
+        let req = build_bulk_request(&[event], "static", now(), None).unwrap();
         let text = String::from_utf8(req.body).unwrap();
         assert!(text.contains(&id), "expected event id {id} in bulk body");
     }
@@ -533,7 +547,7 @@ mod tests {
             make_event("postgres.app.products.insert", b"{}"),
             make_event("postgres.app.products.update", b"{}"),
         ];
-        let req = build_bulk_request(&events, "events-${subject:1}-%Y-%m-%d", now()).unwrap();
+        let req = build_bulk_request(&events, "events-${subject:1}-%Y-%m-%d", now(), None).unwrap();
         assert_eq!(
             req.indices,
             vec!["events-app-2026-05-23", "events-app-2026-05-23"]
@@ -545,7 +559,7 @@ mod tests {
         // A misbehaving source that produced a payload with an embedded
         // newline would otherwise break the NDJSON framing.
         let event = make_event("a.b", b"{\"a\":1,\n\"b\":2}");
-        let req = build_bulk_request(&[event], "static", now()).unwrap();
+        let req = build_bulk_request(&[event], "static", now(), None).unwrap();
         let text = String::from_utf8(req.body).unwrap();
         // Should be 3 lines total: action + doc + (trailing empty).
         assert_eq!(text.matches('\n').count(), 2);
@@ -624,6 +638,7 @@ mod tests {
             std::slice::from_ref(&clear),
             "orders",
             chrono::Utc.timestamp_opt(0, 0).single().expect("ts"),
+            None,
         )
         .expect("build");
         assert!(body.is_empty(), "a lone clear must not produce a bulk body");
@@ -658,7 +673,7 @@ mod tests {
         // block delivery rather than emit an unmatchable delete that 404s and
         // leaves the doc indexed forever.
         let event = make_event_with_doc_id("a.b.delete", None);
-        let err = match build_bulk_request(&[event], "idx", now()) {
+        let err = match build_bulk_request(&[event], "idx", now(), None) {
             Err(e) => e,
             Ok(_) => panic!("delete without doc.id must block, not be emitted"),
         };
@@ -672,7 +687,7 @@ mod tests {
     fn delete_with_doc_id_targets_that_id() {
         // A delete WITH the stable id targets it (not the per-event ULID).
         let event = make_event_with_doc_id("a.b.delete", Some("orders:5"));
-        let req = build_bulk_request(&[event], "idx", now()).expect("ok");
+        let req = build_bulk_request(&[event], "idx", now(), None).expect("ok");
         let text = String::from_utf8(req.body).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 1, "delete is action-line only, no payload");
@@ -695,7 +710,7 @@ mod tests {
                 ("ventstream.cdc.lsn", "24000000"),
             ],
         );
-        let req = build_bulk_request(&[event], "idx", now()).expect("ok");
+        let req = build_bulk_request(&[event], "idx", now(), None).expect("ok");
         let text = String::from_utf8(req.body).unwrap();
         let action = text.lines().next().expect("action line");
         assert!(action.starts_with(r#"{"index":{"#), "got: {action}");
@@ -718,7 +733,7 @@ mod tests {
                 ("ventstream.cdc.lsn", "24000500"),
             ],
         );
-        let req = build_bulk_request(&[event], "idx", now()).expect("ok");
+        let req = build_bulk_request(&[event], "idx", now(), None).expect("ok");
         let text = String::from_utf8(req.body).unwrap();
         let action = text.lines().next().expect("action line");
         assert!(action.starts_with(r#"{"delete":{"#), "got: {action}");
@@ -738,7 +753,7 @@ mod tests {
                 ("ventstream.cdc.tx_id", "9001"),
             ],
         );
-        let req = build_bulk_request(&[event], "idx", now()).expect("ok");
+        let req = build_bulk_request(&[event], "idx", now(), None).expect("ok");
         let text = String::from_utf8(req.body).unwrap();
         let action = text.lines().next().expect("action line");
         assert!(action.contains(r#""version":9001"#), "got: {action}");
@@ -758,7 +773,7 @@ mod tests {
                 ("ventstream.cdc.source_version", "3"),
             ],
         );
-        let req = build_bulk_request(&[event], "idx", now()).expect("ok");
+        let req = build_bulk_request(&[event], "idx", now(), None).expect("ok");
         let text = String::from_utf8(req.body).unwrap();
         let action = text.lines().next().expect("action line");
         assert!(action.contains(r#""version":3"#), "got: {action}");
@@ -775,7 +790,7 @@ mod tests {
             "postgres.shop.orders.insert",
             &[("ventstream.doc.id", "shop.orders:[\"ord-1\"]")],
         );
-        let req = build_bulk_request(&[event], "idx", now()).expect("ok");
+        let req = build_bulk_request(&[event], "idx", now(), None).expect("ok");
         let text = String::from_utf8(req.body).unwrap();
         let action = text.lines().next().expect("action line");
         assert!(!action.contains("version"), "must be unversioned: {action}");
@@ -792,7 +807,7 @@ mod tests {
                 ("ventstream.cdc.lsn", "0"),
             ],
         );
-        let req = build_bulk_request(&[event], "idx", now()).expect("ok");
+        let req = build_bulk_request(&[event], "idx", now(), None).expect("ok");
         let text = String::from_utf8(req.body).unwrap();
         let action = text.lines().next().expect("action line");
         assert!(!action.contains("version"), "must be unversioned: {action}");

@@ -98,6 +98,24 @@ many times a record is re-emitted. A source delete becomes a document
 spec too — every source stamps the id natively — and an update that changes a
 row's primary key deletes the old document and indexes the new one.
 
+### Delete tombstones and `index.gc_deletes`
+
+Out-of-order protection after a delete relies on OpenSearch remembering the
+deleted document's version, and OpenSearch forgets it after
+`index.gc_deletes` — **60 seconds by default**, which VentStream's own retry
+schedule can exceed. A stale retry arriving after that window would silently
+resurrect the deleted document.
+
+The sink therefore raises `index.gc_deletes` on every index it writes to
+(once per index, after the first successful write, so time-rolled indices are
+covered as each appears). The retention is
+`VS_OS_TOMBSTONE_RETENTION_MS` / `tombstone_retention_ms`, default 24 hours;
+`0` disables management. If the cluster denies settings updates, the sink
+logs one warning per index and keeps writing — **set `index.gc_deletes` at
+least as high yourself**, or grant the sink's credential
+`indices:admin/settings/update` on its indices. Keep the retention above any
+realistic retry or replay window.
+
 ## Reliability
 
 - **Bulk upserts** are batched and flushed with bounded parallelism.
