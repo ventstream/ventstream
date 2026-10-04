@@ -97,6 +97,11 @@ A change to `orders`, `customers`, or `order_items` recomputes the
 affected order documents. A `cardinality: one` related row embeds as an
 object; `many` embeds as an array.
 
+`embed_as`, `select` entries, and `sort_by` accept ASCII letters,
+digits, `_`, `-`, `$` and `.` only — they are embedded in generated
+SQL, so the engine rejects the spec at startup if any of them contains
+other characters.
+
 ### Neo4j: denormalize specs
 
 The Neo4j spec is Cypher. You write the body that, given a primary node

@@ -3594,6 +3594,8 @@ fn load_joins_yaml(
                 warn!("Fleet-applied joins YAML had no `joins:` entries");
             }
             validate_related_ids_unique(&parsed.joins)?;
+            ventstream_joins::validate_sql_identifiers(&parsed.joins)
+                .map_err(|err| anyhow!("joins spec rejected: {err}"))?;
             return Ok((parsed.joins, Some(text.to_owned())));
         }
     }
@@ -3607,6 +3609,8 @@ fn load_joins_yaml(
             warn!(path = %path.display(), "joins YAML had no `joins:` entries");
         }
         validate_related_ids_unique(&parsed.joins)?;
+        ventstream_joins::validate_sql_identifiers(&parsed.joins)
+            .map_err(|err| anyhow!("joins spec rejected: {err}"))?;
         return Ok((parsed.joins, Some(text)));
     }
 
@@ -3621,6 +3625,8 @@ fn load_joins_yaml(
                 warn!(path = %path, "joins YAML had no `joins:` entries");
             }
             validate_related_ids_unique(&parsed.joins)?;
+            ventstream_joins::validate_sql_identifiers(&parsed.joins)
+                .map_err(|err| anyhow!("joins spec rejected: {err}"))?;
             Ok((parsed.joins, Some(text)))
         }
     }

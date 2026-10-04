@@ -250,6 +250,52 @@ pub enum BackfillMode {
     None,
 }
 
+/// Reject config strings that cannot be embedded safely in generated SQL.
+///
+/// The MySQL SQL-denormalize mode splices `embed_as` and `select` into
+/// statement text as string literals and identifiers. Quote-doubling
+/// alone is not enough there: MySQL processes backslash escapes inside
+/// string literals by default, so a value ending in `\` escapes the
+/// closing quote and the rest of the value executes as SQL. Joins specs
+/// can arrive through the Fleet control plane, which makes them
+/// untrusted input — so the safe character set is enforced when the
+/// spec loads, for every mode, instead of trusting each generator to
+/// escape correctly. `sort_by` is applied client-side today but is held
+/// to the same rule so it can never become an injection path later.
+///
+/// Allowed: ASCII letters, digits, `_`, `-`, `$` and `.` — ordinary
+/// column and JSON-key names. Anything else fails startup with the
+/// offending field named.
+pub fn validate_sql_identifiers(joins: &[JoinDefinition]) -> Result<(), String> {
+    fn check(join: &str, field: &str, value: &str) -> Result<(), String> {
+        let ok = !value.is_empty()
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '$' | '.'));
+        if ok {
+            return Ok(());
+        }
+        Err(format!(
+            "join `{join}`: `{field}` value {value:?} is not a safe SQL identifier — \
+             use ASCII letters, digits, `_`, `-`, `$` or `.` only (it is embedded in \
+             generated SQL, and must stay non-empty)"
+        ))
+    }
+    for def in joins {
+        let name = def.effective_name();
+        for rel in &def.related {
+            check(name, "embed_as", &rel.embed_as)?;
+            for column in &rel.select {
+                check(name, "select", column)?;
+            }
+            if let Some(sort_by) = &rel.sort_by {
+                check(name, "sort_by", sort_by)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -369,5 +415,50 @@ related:
             &["region", "customer_id"]
         );
         assert_eq!(def.related[0].join_on.to.columns(), &["region", "id"]);
+    }
+    #[test]
+    fn sql_identifier_validation_accepts_ordinary_names() {
+        let yaml = r#"
+name: orders
+primary:
+  table: public.orders
+  pk: id
+related:
+  - id: customer
+    table: public.customers
+    pk: id
+    join_on: { from: customer_id, to: id }
+    embed_as: customer.v2
+    select: [id, full_name, created-at, total$]
+    sort_by: id
+"#;
+        let def: JoinDefinition = serde_yaml::from_str(yaml).expect("parse");
+        validate_sql_identifiers(std::slice::from_ref(&def)).expect("safe names pass");
+    }
+
+    #[test]
+    fn sql_identifier_validation_rejects_escape_characters() {
+        let template = r#"
+name: orders
+primary:
+  table: public.orders
+  pk: id
+related:
+  - id: customer
+    table: public.customers
+    pk: id
+    join_on: { from: customer_id, to: id }
+    embed_as: EMBED
+"#;
+        // A trailing backslash escapes the closing quote of the literal
+        // it is spliced into; a quote closes it early. Both must fail
+        // at load, before any SQL is generated.
+        for bad in ["tail\\", "it's", "a`b", "spa ced", ""] {
+            let yaml = template.replace("EMBED", &format!("{bad:?}"));
+            let def: JoinDefinition = serde_yaml::from_str(&yaml).expect("parse");
+            let err = validate_sql_identifiers(std::slice::from_ref(&def))
+                .expect_err(&format!("{bad:?} must be rejected"));
+            assert!(err.contains("embed_as"), "{err}");
+        }
     }
 }
