@@ -1219,3 +1219,266 @@ async fn mysql_enum_pk_delete_matches_bootstrap_doc_id() {
     engine.kill();
     let _ = std::fs::remove_dir_all(&state_dir);
 }
+
+/// #136: the MySQL fetcher's batched related-row lookup must group rows
+/// per key exactly like one `fetch_many` per key would — one set-based
+/// query instead of N round-trips — including composite keys, duplicate
+/// and NULL inputs, keys with no rows, and JSON column parsing.
+#[tokio::test]
+#[ignore = "local integration: requires Docker"]
+async fn mysql_fetch_many_batch_groups_rows_per_key() {
+    use serde_json::json;
+    use ventstream_joins::{PkValue, RelatedFetcher};
+    use ventstream_sources::mysql::MySqlFetcher;
+
+    let stack = common::start_mysql().await;
+    let mut mysql = common::mysql_root_conn(stack.mysql_port)
+        .await
+        .expect("mysql root connection");
+    mysql
+        .query_drop(format!(
+            "CREATE TABLE {db}.batch_items ( \
+                 id INT PRIMARY KEY, \
+                 order_id VARCHAR(64) NOT NULL, \
+                 qty INT NOT NULL, \
+                 attrs JSON NULL); \
+             INSERT INTO {db}.batch_items (id, order_id, qty, attrs) VALUES \
+                 (1, 'ord-1', 2, '{{\"gift\": true}}'), \
+                 (2, 'ord-1', 5, NULL), \
+                 (3, 'ord-2', 1, NULL), \
+                 (4, 'ord-9', 9, NULL); \
+             CREATE TABLE {db}.batch_badges ( \
+                 tenant_id INT NOT NULL, \
+                 owner VARCHAR(64) NOT NULL, \
+                 label VARCHAR(64) NOT NULL, \
+                 PRIMARY KEY (tenant_id, owner, label)); \
+             INSERT INTO {db}.batch_badges (tenant_id, owner, label) VALUES \
+                 (1, 'ann', 'gold'), (1, 'ann', 'silver'), (2, 'ann', 'gold')",
+            db = common::MYSQL_DB,
+        ))
+        .await
+        .expect("seed batch tables");
+
+    let pool = mysql_async::Pool::new(
+        mysql_async::OptsBuilder::default()
+            .ip_or_hostname("127.0.0.1")
+            .tcp_port(stack.mysql_port)
+            .user(Some("root"))
+            .pass(Some(common::MYSQL_PASSWORD))
+            .db_name(Some(common::MYSQL_DB)),
+    );
+    let fetcher = MySqlFetcher::new(pool.clone(), common::MYSQL_DB);
+
+    // Duplicates collapse, NULL keys are skipped, missing keys come back
+    // with no rows, and input order is preserved.
+    let keys = [
+        PkValue::from_single(&json!("ord-1")),
+        PkValue::from_single(&json!("ord-2")),
+        PkValue::from_single(&json!("ord-1")),
+        // The engine's null-key sentinel (empty bytes), not a key with a
+        // NULL component — only the sentinel is skipped.
+        PkValue::from_bytes(Vec::new()),
+        PkValue::from_single(&json!("ord-404")),
+    ];
+    let table = format!("{}.batch_items", common::MYSQL_DB);
+    let select = ["id".to_owned(), "qty".to_owned(), "attrs".to_owned()];
+    let batched = fetcher
+        .fetch_many_batch(&table, &["order_id".to_owned()], &keys, &select)
+        .await
+        .expect("batched lookup");
+    assert_eq!(
+        batched
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            PkValue::from_single(&json!("ord-1")),
+            PkValue::from_single(&json!("ord-2")),
+            PkValue::from_single(&json!("ord-404")),
+        ],
+        "unique non-null keys, input order preserved"
+    );
+    assert_eq!(batched[0].1.len(), 2, "ord-1 holds two rows");
+    assert_eq!(batched[1].1.len(), 1, "ord-2 holds one row");
+    assert!(batched[2].1.is_empty(), "a missing key gets an empty group");
+    for (_, rows) in &batched {
+        for row in rows {
+            assert!(
+                row.get("_vs_ord").is_none(),
+                "the batch ordinal must not leak into composed rows: {row}"
+            );
+        }
+    }
+    // JSON columns parse to nested JSON through the batch path too.
+    let gift_row = batched[0]
+        .1
+        .iter()
+        .find(|row| row["id"] == json!(1))
+        .expect("row id 1");
+    assert_eq!(gift_row["attrs"], json!({ "gift": true }));
+
+    // Parity with the per-key path the default impl used. Neither path
+    // carries an ORDER BY, so compare as sorted sets — row order is the
+    // planner's business.
+    let sorted = |rows: &[serde_json::Value]| {
+        let mut sorted: Vec<String> = rows.iter().map(ToString::to_string).collect();
+        sorted.sort();
+        sorted
+    };
+    for (key, rows) in &batched {
+        let single = fetcher
+            .fetch_many(&table, &["order_id".to_owned()], key, &select)
+            .await
+            .expect("per-key lookup");
+        assert_eq!(
+            sorted(rows),
+            sorted(&single),
+            "batched rows must match fetch_many for {key:?}"
+        );
+    }
+
+    // Composite keys: all components join, `select: []` returns full rows.
+    let badges = format!("{}.batch_badges", common::MYSQL_DB);
+    let composite = fetcher
+        .fetch_many_batch(
+            &badges,
+            &["tenant_id".to_owned(), "owner".to_owned()],
+            &[
+                PkValue::from_values(&[json!(1), json!("ann")]),
+                PkValue::from_values(&[json!(2), json!("ann")]),
+            ],
+            &[],
+        )
+        .await
+        .expect("composite batched lookup");
+    assert_eq!(composite[0].1.len(), 2, "tenant 1 has two badges");
+    assert_eq!(composite[1].1.len(), 1, "tenant 2 has one badge");
+    assert!(
+        composite[0]
+            .1
+            .iter()
+            .all(|row| row["tenant_id"] == json!(1)),
+        "rows group under the right composite key: {:?}",
+        composite[0].1
+    );
+
+    // A key with a NULL component is returned with an empty group and
+    // never queried (a SQL join cannot pair rows on NULL) — matching the
+    // Postgres batch builder.
+    let with_null = fetcher
+        .fetch_many_batch(
+            &badges,
+            &["tenant_id".to_owned(), "owner".to_owned()],
+            &[
+                PkValue::from_values(&[json!(1), json!(null)]),
+                PkValue::from_values(&[json!(1), json!("ann")]),
+            ],
+            &[],
+        )
+        .await
+        .expect("batched lookup with a null component");
+    assert_eq!(with_null.len(), 2, "the null-component key keeps its slot");
+    assert!(
+        with_null[0].1.is_empty(),
+        "a null-component key gets an empty group: {:?}",
+        with_null[0].1
+    );
+    assert_eq!(with_null[1].1.len(), 2, "the real key still resolves");
+
+    // >256 keys spans two chunks: the global-ordinal arithmetic must put
+    // every row in the right group across the chunk boundary.
+    let mut wide_values = Vec::with_capacity(300);
+    for parent in 0..300 {
+        wide_values.push(format!("({parent}, {parent})"));
+    }
+    mysql
+        .query_drop(format!(
+            "CREATE TABLE {db}.batch_wide (id INT PRIMARY KEY, parent_id INT NOT NULL); \
+             INSERT INTO {db}.batch_wide (id, parent_id) VALUES {values}",
+            db = common::MYSQL_DB,
+            values = wide_values.join(", "),
+        ))
+        .await
+        .expect("seed wide table");
+    let wide_keys: Vec<PkValue> = (0..300)
+        .map(|parent| PkValue::from_single(&json!(parent)))
+        .collect();
+    let wide = fetcher
+        .fetch_many_batch(
+            &format!("{}.batch_wide", common::MYSQL_DB),
+            &["parent_id".to_owned()],
+            &wide_keys,
+            &[],
+        )
+        .await
+        .expect("two-chunk batched lookup");
+    assert_eq!(wide.len(), 300);
+    for (parent, (_, rows)) in wide.iter().enumerate() {
+        assert_eq!(rows.len(), 1, "parent {parent} has exactly one child");
+        assert_eq!(
+            rows[0]["id"],
+            json!(parent),
+            "parent {parent} got someone else's child: {:?}",
+            rows[0]
+        );
+    }
+
+    // 64-bit keys on an UNINDEXED integer column: without typed casts
+    // MySQL compares varchar-vs-bigint as double, and adjacent keys
+    // above 2^53 collide — a parent would receive another parent's
+    // children (#198 review, verified live pre-fix).
+    mysql
+        .query_drop(format!(
+            "CREATE TABLE {db}.batch_u64 ( \
+                 id INT PRIMARY KEY, \
+                 ref_id BIGINT UNSIGNED NOT NULL); \
+             INSERT INTO {db}.batch_u64 (id, ref_id) VALUES \
+                 (1, 18014398509481985), \
+                 (2, 18014398509481986), \
+                 (3, 18446744073709551615)",
+            db = common::MYSQL_DB,
+        ))
+        .await
+        .expect("seed u64 table");
+    let u64_table = format!("{}.batch_u64", common::MYSQL_DB);
+    let precise = fetcher
+        .fetch_many_batch(
+            &u64_table,
+            &["ref_id".to_owned()],
+            &[
+                PkValue::from_single(&json!("18014398509481985")),
+                PkValue::from_single(&json!("18446744073709551615")),
+            ],
+            &[],
+        )
+        .await
+        .expect("u64 batched lookup");
+    assert_eq!(
+        precise[0].1.len(),
+        1,
+        "adjacent 2^54-range keys must not collide through a double cast: {:?}",
+        precise[0].1
+    );
+    assert_eq!(precise[0].1[0]["id"], json!(1));
+    assert_eq!(
+        precise[1].1.len(),
+        1,
+        "a bigint unsigned key above i64::MAX survives the cast: {:?}",
+        precise[1].1
+    );
+    assert_eq!(precise[1].1[0]["id"], json!(3));
+    // The per-key path uses the same casts.
+    let single = fetcher
+        .fetch_many(
+            &u64_table,
+            &["ref_id".to_owned()],
+            &PkValue::from_single(&json!("18014398509481986")),
+            &[],
+        )
+        .await
+        .expect("u64 per-key lookup");
+    assert_eq!(single.len(), 1, "{single:?}");
+    assert_eq!(single[0]["id"], json!(2));
+
+    pool.disconnect().await.expect("pool disconnect");
+}

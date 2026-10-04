@@ -1249,6 +1249,7 @@ mod tests {
             pk_names: Vec::new(),
             pk_ordinals: Vec::new(),
             json_columns: HashSet::new(),
+            unsigned_columns: HashSet::new(),
             enum_labels: std::collections::HashMap::new(),
             set_labels: std::collections::HashMap::new(),
         }
