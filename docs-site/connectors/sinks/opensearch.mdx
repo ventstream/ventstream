@@ -98,6 +98,18 @@ many times a record is re-emitted. A source delete becomes a document
 spec too — every source stamps the id natively — and an update that changes a
 row's primary key deletes the old document and indexes the new one.
 
+### Deletes under time-rolled index names
+
+With a time-rolled template (`events-%Y-%m-%d`), the document lives in the
+index of the period it was **written**, while a naive delete would address
+the index rendered at delete time. The sink therefore resolves each deleted
+id across the template's wildcard pattern first and targets every index
+actually holding it — including leftover copies from cross-period updates.
+Ids that resolve to nothing (never written, or written moments ago and not
+yet refreshed) fall back to the rendered index. If the resolution query
+fails, the batch fails closed and retries rather than silently deleting
+from the wrong index. Literal templates skip the lookup entirely.
+
 ### Delete tombstones and `index.gc_deletes`
 
 Out-of-order protection after a delete relies on OpenSearch remembering the

@@ -109,6 +109,92 @@ pub fn render(
     Ok(out)
 }
 
+/// True when the template derives part of the index name from the **time
+/// of writing** (`%Y`, `%m`, `%d`, `%H`). `%%` is a literal percent and
+/// does not count.
+///
+/// Time-rolled templates make a document's index drift: an event about a
+/// row first written yesterday renders to *today's* index, so a delete
+/// addressed by rendering misses the document entirely (#124). Callers use
+/// this to decide whether deletes need their real index resolved by id.
+pub fn has_time_placeholders(template: &str) -> bool {
+    let mut chars = template.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '%' && chars.next() != Some('%') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Render the event-derived parts of the template normally but replace
+/// every time placeholder with `*`: the search pattern matching every
+/// concrete index this template can have produced for this event.
+/// Consecutive wildcards collapse to one.
+pub fn render_time_wildcards(template: &str, event: &Event) -> Result<String, OpenSearchSinkError> {
+    let mut out = String::with_capacity(template.len() + 8);
+    let mut chars = template.char_indices().peekable();
+
+    while let Some((idx, ch)) = chars.next() {
+        if ch == '%' {
+            match chars.next() {
+                Some((_, '%')) => out.push('%'),
+                Some((_, 'Y' | 'm' | 'd' | 'H')) => {
+                    if !out.ends_with('*') {
+                        out.push('*');
+                    }
+                }
+                Some((_, other)) => {
+                    return Err(OpenSearchSinkError::IndexTemplate(format!(
+                        "unknown time placeholder '%{other}' at byte {idx}"
+                    )))
+                }
+                None => {
+                    return Err(OpenSearchSinkError::IndexTemplate(format!(
+                        "trailing '%' at byte {idx}"
+                    )))
+                }
+            }
+            continue;
+        }
+
+        if ch == '$' && chars.peek().map(|(_, c)| *c) == Some('{') {
+            chars.next(); // consume the '{'
+            let mut token = String::new();
+            let mut closed = false;
+            for (_, tc) in chars.by_ref() {
+                if tc == '}' {
+                    closed = true;
+                    break;
+                }
+                token.push(tc);
+            }
+            if !closed {
+                return Err(OpenSearchSinkError::IndexTemplate(format!(
+                    "unterminated '${{' starting at byte {idx}"
+                )));
+            }
+            out.push_str(&sanitize_index_segment(&substitute(&token, event)));
+            continue;
+        }
+
+        // A literal '*' in the template would widen the pattern; indices
+        // can't contain '*', so sanitize it like any substitution would.
+        if ch == '*' {
+            out.push('_');
+            continue;
+        }
+        out.push(ch);
+    }
+
+    if out.is_empty() {
+        return Err(OpenSearchSinkError::IndexTemplate(
+            "rendered index pattern is empty".into(),
+        ));
+    }
+    Ok(out)
+}
+
 /// Resolve one `${...}` token against the event. Returns the raw value
 /// (un-sanitized); the caller applies [`sanitize_index_segment`].
 fn substitute(token: &str, event: &Event) -> String {
@@ -317,5 +403,41 @@ mod tests {
 
         let err = render("-leading-dash", &event, march_23()).unwrap_err();
         assert!(matches!(err, OpenSearchSinkError::IndexTemplate(_)));
+    }
+
+    /// `%%` is a literal percent, not a time placeholder: a template using
+    /// it stays static and must not pay the delete-resolution lookup.
+    #[test]
+    fn time_placeholders_detected_but_percent_escape_is_not() {
+        assert!(has_time_placeholders("events-%Y-%m-%d"));
+        assert!(has_time_placeholders("e-%H"));
+        assert!(!has_time_placeholders("orders"));
+        assert!(!has_time_placeholders("literal-100%%"));
+    }
+
+    /// The wildcard pattern renders event-derived parts normally, turns
+    /// each time placeholder into `*` (adjacent ones collapse), and
+    /// sanitizes a literal `*` so it cannot widen the pattern.
+    #[test]
+    fn time_wildcards_replace_time_and_keep_event_parts() {
+        let event = make_event("postgres.app.orders.delete", HashMap::new());
+        assert_eq!(
+            render_time_wildcards("events-%Y-%m-%d", &event).unwrap(),
+            "events-*-*-*"
+        );
+        assert_eq!(
+            render_time_wildcards("e-${subject:0}-%Y%m%d", &event).unwrap(),
+            "e-postgres-*"
+        );
+        assert_eq!(render_time_wildcards("plain", &event).unwrap(), "plain");
+        assert_eq!(
+            render_time_wildcards("pct-%%-%d", &event).unwrap(),
+            "pct-%-*"
+        );
+        let err = render_time_wildcards("bad-%q", &event).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown time placeholder"),
+            "{err}"
+        );
     }
 }
