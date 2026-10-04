@@ -339,7 +339,11 @@ impl RelatedFetcher for MySqlFetcher {
     /// instead, keyed by ordinal like the Postgres fetcher; chunks run
     /// concurrently. Keys with a NULL component are returned with empty
     /// groups without querying, matching the Postgres batch builder —
-    /// a SQL join never pairs rows on NULL.
+    /// a SQL join never pairs rows on NULL. Note the deliberate edge-case
+    /// divergence from [`Self::fetch_many`]: the per-key path binds a
+    /// real SQL NULL, so `<=>` there matches rows whose key column IS
+    /// NULL, while this path returns such keys empty. Do not rely on the
+    /// two paths agreeing for null-component keys.
     async fn fetch_many_batch(
         &self,
         table: &str,
