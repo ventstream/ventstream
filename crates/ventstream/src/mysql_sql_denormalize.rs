@@ -346,6 +346,7 @@ impl MySqlDenormalizer {
                         &pk_text,
                         &doc,
                         false,
+                        None,
                     )?;
                     sender.send(event, shutdown).await.map_err(|err| {
                         anyhow::anyhow!(
@@ -384,6 +385,8 @@ impl MySqlDenormalizer {
         pks: &[Vec<String>],
         sender: &EventSender,
         shutdown: &ShutdownToken,
+
+        source_version: Option<u64>,
     ) -> Result<Vec<Vec<String>>> {
         let mut emitted: Vec<Vec<String>> = Vec::new();
         if pks.is_empty() {
@@ -421,6 +424,7 @@ impl MySqlDenormalizer {
                     &pk_text,
                     &doc,
                     false,
+                    source_version,
                 )?;
                 sender.send(event, shutdown).await.map_err(|err| {
                     anyhow::anyhow!(
@@ -450,6 +454,11 @@ impl MySqlDenormalizer {
         // Parse each event: relation, op, available row image,
         // and the changed row's PK from the doc-id header.
         let parsed: Vec<ParsedEvent> = events.iter().map(parse_event).collect();
+        // Highest binlog coordinate in the batch: every recomposed document
+        // reflects source state at least this new, so it is the safe
+        // external version for everything this batch emits (#118) — the
+        // same shape as the PG denormalizer's max_lsn.
+        let source_version = max_source_version(events);
 
         for pd in &self.defs {
             let mut affected: HashSet<Vec<String>> = HashSet::new();
@@ -573,7 +582,8 @@ impl MySqlDenormalizer {
                     batch = events.len(),
                     "mysql sql-denormalize batched tail recompose"
                 );
-                self.recompose(pd, &pks, sender, shutdown).await?
+                self.recompose(pd, &pks, sender, shutdown, source_version)
+                    .await?
             };
 
             // Tombstone deleted keys MySQL no longer has (not re-created this batch).
@@ -588,6 +598,7 @@ impl MySqlDenormalizer {
                     pk,
                     &Value::Null,
                     true,
+                    source_version,
                 )?;
                 sender.send(event, shutdown).await.map_err(|err| {
                     anyhow::anyhow!("publishing MySQL tombstone for {}: {err}", pd.primary_table)
@@ -741,6 +752,7 @@ impl MySqlDenormalizer {
             &["__vs_probe__".to_owned()],
             &Value::Null,
             false,
+            None,
         )
         .ok()?;
         lookup.resolve_index_for(&probe)
@@ -1079,12 +1091,24 @@ fn primary_pk_from_doc_id(doc_id: &str, primary_table: &str) -> Option<Vec<Strin
 }
 
 /// Build a composed-doc event (subject `mysql.{ns}.{rel}.{op}`, doc-id header).
+/// Highest `ventstream.cdc.source_version` across a batch — the packed
+/// binlog coordinate the MySQL source stamps on every change event. `None`
+/// when no event carries one (bootstrap sentinels, pre-#118 replays).
+fn max_source_version(events: &[Event]) -> Option<u64> {
+    events
+        .iter()
+        .filter_map(|event| event.headers.get("ventstream.cdc.source_version"))
+        .filter_map(|raw| raw.parse::<u64>().ok())
+        .max()
+}
+
 fn build_doc_event(
     primary_table: &str,
     target_index: Option<&str>,
     pk_text: &[String],
     doc: &Value,
     delete: bool,
+    source_version: Option<u64>,
 ) -> Result<Event> {
     let ns = namespace_of(primary_table);
     let rel = relation_of(primary_table);
@@ -1111,6 +1135,15 @@ fn build_doc_event(
     }
     if delete {
         headers.insert("ventstream.cdc.op".to_owned(), "delete".to_owned());
+    }
+    // Carry the triggering binlog coordinate so a versioning sink rejects a
+    // stale write landing after a newer one — the MySQL analog of the PG
+    // denormalizer's WAL LSN (#118). Bootstrap documents carry no version.
+    if let Some(version) = source_version {
+        headers.insert(
+            "ventstream.cdc.source_version".to_owned(),
+            version.to_string(),
+        );
     }
     Ok(Event::builder(source, subject)
         .payload(payload)
@@ -1386,6 +1419,7 @@ mod tests {
                 &["5".to_owned()],
                 &json!({ "id": "5" }),
                 delete,
+                Some(77),
             )
             .expect("event");
 
@@ -1480,5 +1514,67 @@ mod tests {
         // backtick identifier side leaves quotes alone (no meaning there).
         let sql = json_object_expr("r0", &["b'c".to_owned()]);
         assert_eq!(sql, "JSON_OBJECT('b''c', `r0`.`b'c`)");
+    }
+    /// #118: the batch's binlog coordinate rides every emitted document so
+    /// a versioning sink can reject a stale write; bootstrap documents
+    /// (no version) stay unversioned.
+    #[test]
+    fn build_doc_event_carries_the_source_version_when_known() {
+        let versioned = build_doc_event(
+            "shop.orders",
+            None,
+            &["5".to_owned()],
+            &json!({ "id": "5" }),
+            false,
+            Some((42u64 << 32) | 1_457),
+        )
+        .expect("event");
+        assert_eq!(
+            versioned.headers.get("ventstream.cdc.source_version"),
+            Some(((42u64 << 32) | 1_457).to_string().as_str())
+        );
+
+        let unversioned = build_doc_event(
+            "shop.orders",
+            None,
+            &["5".to_owned()],
+            &json!({ "id": "5" }),
+            false,
+            None,
+        )
+        .expect("event");
+        assert_eq!(
+            unversioned.headers.get("ventstream.cdc.source_version"),
+            None
+        );
+    }
+
+    #[test]
+    fn max_source_version_takes_the_highest_and_ignores_unversioned() {
+        fn with_version(version: Option<&str>) -> Event {
+            let mut headers = HashMap::new();
+            if let Some(version) = version {
+                headers.insert(
+                    "ventstream.cdc.source_version".to_owned(),
+                    version.to_owned(),
+                );
+            }
+            Event::builder(
+                SourceUri::new("test://x").expect("uri"),
+                Subject::new("mysql.shop.orders.update").expect("subject"),
+            )
+            .payload(Payload::from_vec(b"{}".to_vec()))
+            .content_type(ContentType::Json)
+            .headers(Headers::from_map(headers))
+            .build()
+        }
+        let events = vec![
+            with_version(Some("180388626433")),
+            with_version(None),
+            with_version(Some("180388626500")),
+            with_version(Some("not-a-number")),
+        ];
+        assert_eq!(max_source_version(&events), Some(180_388_626_500));
+        assert_eq!(max_source_version(&[with_version(None)]), None);
     }
 }

@@ -38,6 +38,9 @@ pub struct MySqlCdcSource {
     emit_snapshot_completion_marker: bool,
     force_snapshot_from_cursor: bool,
     emit_transition_images: bool,
+    /// Set once the first unversionable binlog coordinate has been logged,
+    /// so an exotic binlog naming scheme does not warn per event.
+    warned_unversioned: std::sync::atomic::AtomicBool,
 }
 
 /// One decoded row change, retaining both images and omitted-column markers.
@@ -67,6 +70,7 @@ impl MySqlCdcSource {
             emit_snapshot_completion_marker: false,
             force_snapshot_from_cursor: false,
             emit_transition_images: false,
+            warned_unversioned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -161,7 +165,14 @@ impl MySqlCdcSource {
                     };
                     cursor_file.mark_incomplete(marker)?;
                     info!(source = %self.config.id, database = %self.config.database, "bootstrap: scanning tables");
-                    if !self.bootstrap(&pool, &ctx).await? {
+                    if !self
+                        .bootstrap(
+                            &pool,
+                            &ctx,
+                            event_mapper::binlog_version(&pos.file, pos.pos),
+                        )
+                        .await?
+                    {
                         return Ok(()); // cancelled mid-scan; sentinel stays
                     }
                     if self.emit_snapshot_completion_marker
@@ -281,7 +292,16 @@ impl MySqlCdcSource {
     }
 
     /// Keyset-paginated snapshot of every in-scope table. `false` on shutdown.
-    async fn bootstrap(&self, pool: &Pool, ctx: &SourceContext) -> Result<bool, MySqlCdcError> {
+    /// `version_floor` is the packed scan-start master position: every row
+    /// this scan reads reflects at least that point, and any later binlog
+    /// event packs higher, so a live write always outranks the snapshot row
+    /// at a versioning sink whichever lands first (#118).
+    async fn bootstrap(
+        &self,
+        pool: &Pool,
+        ctx: &SourceContext,
+        version_floor: Option<u64>,
+    ) -> Result<bool, MySqlCdcError> {
         let schema_cache = SchemaCache::new();
         let mut conn = pool.get_conn().await.map_err(op_err)?;
         let tables: Vec<String> = conn
@@ -342,7 +362,10 @@ impl MySqlCdcSource {
                         let pk_vals = pk_values_from_row(row, &schema.pk_names);
                         let pk = pk_components(&pk_vals);
                         let doc = row_to_json(row, &schema.json_columns);
-                        let ev = event_mapper::snapshot_insert(&self.config, &table, &pk, doc)?;
+                        let ev = event_mapper::with_source_version(
+                            event_mapper::snapshot_insert(&self.config, &table, &pk, doc)?,
+                            version_floor,
+                        );
                         if !self.publish(ctx, ev).await? {
                             return Ok(false);
                         }
@@ -560,8 +583,14 @@ impl MySqlCdcSource {
                     let mut emitted = false;
                     if let Some(batch) = decoded {
                         if batch.db == self.config.database && self.config.table_allowed(&batch.table) {
+                            // The event's own binlog coordinate: the row's
+                            // durable, replica-wide ordering key (#118).
+                            let source_version = event_mapper::binlog_version(
+                                &pos.file,
+                                if log_pos != 0 { log_pos } else { pos.pos },
+                            );
                             let outcome = self
-                                .process(pool, &schema_cache, batch, ctx)
+                                .process(pool, &schema_cache, batch, ctx, source_version)
                                 .await?;
                             if !outcome.completed {
                                 flush_confirmed_positions(
@@ -623,6 +652,7 @@ impl MySqlCdcSource {
         schema_cache: &SchemaCache,
         batch: RowBatch,
         ctx: &SourceContext,
+        source_version: Option<u64>,
     ) -> Result<ProcessOutcome, MySqlCdcError> {
         let RowBatch {
             db,
@@ -685,6 +715,23 @@ impl MySqlCdcSource {
                     None => continue, // row gone before re-read; a delete will follow
                 }
             };
+            // Versioned so a versioning sink rejects a stale write that
+            // lands after a newer one — the protection every other source
+            // already has (#118). An unversionable coordinate (no numeric
+            // binlog suffix) ships unversioned and is logged once.
+            if source_version.is_none()
+                && !self
+                    .warned_unversioned
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                warn!(
+                    source = %self.config.id,
+                    binlog_file = %"<unparsed>",
+                    "binlog filename has no numeric suffix; documents ship unversioned \
+                     and parallel sink writes to one document may apply out of order"
+                );
+            }
+            let ev = event_mapper::with_source_version(ev, source_version);
             if !self.publish(ctx, ev).await? {
                 return Ok(ProcessOutcome {
                     completed: false,

@@ -61,6 +61,14 @@ binlog-row-image = FULL
   MySQL sink batches are serialized so two changes to the same document cannot
   land out of order across parallel bulk requests. Batch size and recomposition
   concurrency still provide throughput without weakening document ordering.
+- **Ordering.** Every change event also carries its binlog coordinate as
+  `ventstream.cdc.source_version` (file sequence in the high bits, position
+  in the low 32, within a signed 64-bit sink version). Sinks that version
+  documents (OpenSearch `external_gte`, Redis versioned keys) reject a write
+  older than the one they hold, and denormalized documents carry the highest
+  coordinate of the batch that produced them. Bootstrap rows carry the
+  scan-start master position as a floor, so a live write racing the scan
+  always outranks the snapshot row.
   A crash before confirmation replays from the previous persisted position, so
   recovery is at-least-once and deterministic document IDs make duplicates
   idempotent. A restart resumes from the confirmed position with no
