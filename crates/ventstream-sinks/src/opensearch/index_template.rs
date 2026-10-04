@@ -42,51 +42,19 @@ pub fn render(
     now: DateTime<Utc>,
 ) -> Result<String, OpenSearchSinkError> {
     let mut out = String::with_capacity(template.len() + 16);
-    let mut chars = template.char_indices().peekable();
-
-    while let Some((idx, ch)) = chars.next() {
-        if ch == '%' {
-            match chars.next() {
-                Some((_, 'Y')) => out.push_str(&format!("{:04}", now.year())),
-                Some((_, 'm')) => out.push_str(&format!("{:02}", now.month())),
-                Some((_, 'd')) => out.push_str(&format!("{:02}", now.day())),
-                Some((_, 'H')) => out.push_str(&format!("{:02}", now.hour())),
-                Some((_, '%')) => out.push('%'),
-                Some((_, other)) => {
-                    return Err(OpenSearchSinkError::IndexTemplate(format!(
-                        "unknown time placeholder '%{other}' at byte {idx}"
-                    )))
-                }
-                None => {
-                    return Err(OpenSearchSinkError::IndexTemplate(format!(
-                        "trailing '%' at byte {idx}"
-                    )))
-                }
+    for token in tokenize(template)? {
+        match token {
+            Token::Literal(lit) => out.push_str(&lit),
+            Token::Subst(token) => {
+                out.push_str(&sanitize_index_segment(&substitute(&token, event)));
             }
-            continue;
+            Token::Time(spec) => match spec {
+                'Y' => out.push_str(&format!("{:04}", now.year())),
+                'm' => out.push_str(&format!("{:02}", now.month())),
+                'd' => out.push_str(&format!("{:02}", now.day())),
+                _ => out.push_str(&format!("{:02}", now.hour())),
+            },
         }
-
-        if ch == '$' && chars.peek().map(|(_, c)| *c) == Some('{') {
-            chars.next(); // consume the '{'
-            let mut token = String::new();
-            let mut closed = false;
-            for (_, tc) in chars.by_ref() {
-                if tc == '}' {
-                    closed = true;
-                    break;
-                }
-                token.push(tc);
-            }
-            if !closed {
-                return Err(OpenSearchSinkError::IndexTemplate(format!(
-                    "unterminated '${{' starting at byte {idx}"
-                )));
-            }
-            out.push_str(&sanitize_index_segment(&substitute(&token, event)));
-            continue;
-        }
-
-        out.push(ch);
     }
 
     // OpenSearch rejects index names that are empty, start with `_`, `-`,
@@ -186,6 +154,47 @@ fn time_width(spec: char) -> usize {
         'Y' => 4,
         _ => 2,
     }
+}
+
+/// The instant one period before `now`, where a "period" is the finest
+/// time placeholder the template uses (`%H` → an hour, `%d` → a day,
+/// `%m` → a month, `%Y` → a year). `None` for templates without time
+/// placeholders.
+///
+/// Deletes target the index rendered at delete time *and* the previous
+/// period's: a copy indexed just before a period boundary may not be
+/// refreshed into the search view when the delete's resolution query
+/// runs moments later, and the rendered index alone only covers the
+/// current period. One period back is as far as that visibility gap can
+/// reach, so this closes it without refreshing the whole pattern.
+pub fn previous_period(
+    template: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>, OpenSearchSinkError> {
+    let mut finest: Option<char> = None;
+    let rank = |spec: char| match spec {
+        'H' => 3,
+        'd' => 2,
+        'm' => 1,
+        _ => 0,
+    };
+    for token in tokenize(template)? {
+        if let Token::Time(spec) = token {
+            if finest.is_none_or(|current| rank(spec) > rank(current)) {
+                finest = Some(spec);
+            }
+        }
+    }
+    Ok(finest.map(|spec| match spec {
+        'H' => now - chrono::Duration::hours(1),
+        'd' => now - chrono::Duration::days(1),
+        'm' => now
+            .checked_sub_months(chrono::Months::new(1))
+            .unwrap_or(now),
+        _ => now
+            .checked_sub_months(chrono::Months::new(12))
+            .unwrap_or(now),
+    }))
 }
 
 /// True when `candidate` is an index name this template could have
@@ -560,5 +569,33 @@ mod tests {
         // A literal template matches only itself.
         assert!(rendered_index_matches("orders", &event, "orders").unwrap());
         assert!(!rendered_index_matches("orders", &event, "orders-2026").unwrap());
+    }
+
+    /// One period = the finest time placeholder present; literal
+    /// templates have no period at all.
+    #[test]
+    fn previous_period_steps_back_by_the_finest_placeholder() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 1, 0, 30, 0).unwrap();
+        let event = make_event("postgres.app.orders.delete", HashMap::new());
+        let prev = |tpl: &str| {
+            previous_period(tpl, now)
+                .unwrap()
+                .map(|at| render(tpl, &event, at).unwrap())
+        };
+        // Day templates step a day back — across the month boundary here.
+        assert_eq!(
+            prev("events-%Y-%m-%d").as_deref(),
+            Some("events-2026-02-28")
+        );
+        // An hour template steps an hour back, across the day boundary.
+        assert_eq!(
+            prev("events-%Y-%m-%d-%H").as_deref(),
+            Some("events-2026-02-28-23")
+        );
+        // Coarser-only templates step by their own unit.
+        assert_eq!(prev("events-%Y-%m").as_deref(), Some("events-2026-02"));
+        assert_eq!(prev("events-%Y").as_deref(), Some("events-2025"));
+        // No time placeholders → no period.
+        assert_eq!(prev("orders"), None);
     }
 }

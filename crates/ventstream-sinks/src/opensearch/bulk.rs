@@ -199,6 +199,10 @@ fn build_bulk_request_inner(
     } else {
         None
     };
+    // One period back for time-rolled templates — deletes also target the
+    // index rendered there (see `delete_indices`). `None` for literal
+    // templates, so the fast path pays nothing.
+    let prev_now = index_template::previous_period(template, now)?;
 
     for (event_offset, event) in events.iter().enumerate() {
         // Target clears are applied by the sink before the bulk request
@@ -241,10 +245,19 @@ fn build_bulk_request_inner(
             //
             // Under a time-rolled template the rendered index is *today's*,
             // while the document lives in the index of the period it was
-            // written — so a resolved target list (one entry per index that
-            // actually holds the id, possibly several after cross-period
-            // updates) takes precedence (#124).
-            for target in delete_indices(delete_targets, doc_id, index.as_ref()) {
+            // written — so the resolved target list (one entry per index
+            // that actually holds the id, possibly several after
+            // cross-period updates) is unioned with the rendered and
+            // previous-period indices (#124).
+            let prev_index = prev_now
+                .map(|at| index_template::render(template, event, at))
+                .transpose()?;
+            for target in delete_indices(
+                delete_targets,
+                doc_id,
+                index.as_ref(),
+                prev_index.as_deref(),
+            ) {
                 record_written(&mut written_indices, target);
                 let action = DeleteAction {
                     delete: ActionMeta::new(target, doc_id, version),
@@ -261,7 +274,15 @@ fn build_bulk_request_inner(
             // old doc was written in the past, so it takes the same
             // resolved-index treatment as a tombstone (#124).
             if let Some(old_id) = event.headers.get("ventstream.doc.old_id") {
-                for target in delete_indices(delete_targets, old_id, index.as_ref()) {
+                let prev_index = prev_now
+                    .map(|at| index_template::render(template, event, at))
+                    .transpose()?;
+                for target in delete_indices(
+                    delete_targets,
+                    old_id,
+                    index.as_ref(),
+                    prev_index.as_deref(),
+                ) {
                     record_written(&mut written_indices, target);
                     let action = DeleteAction {
                         delete: ActionMeta::new(target, old_id, version),
@@ -376,25 +397,34 @@ fn record_written(
 }
 
 /// The indices a delete action for `doc_id` must target: the resolved
-/// list **plus** the index rendered at delete time. The resolution query
-/// can only see documents already visible to search — a copy written in
-/// this same batch, or seconds ago and not yet refreshed, resolves to
-/// nothing — so the rendered index is always included as well. The
-/// extra delete at worst 404s, which the response handler already
-/// treats as an idempotent success.
+/// list **plus** the index rendered at delete time **plus** the one
+/// rendered a period earlier. The resolution query can only see
+/// documents already visible to search — a copy written in this same
+/// batch or seconds ago resolves to nothing — and such a fresh copy
+/// lives in the current period's index or, right at a period boundary,
+/// the previous one's. Targeting both closes the visibility gap without
+/// refreshing the whole wildcard pattern on the ack path; the extra
+/// deletes at worst 404, which the response handler already treats as
+/// an idempotent success.
 fn delete_indices<'a>(
     delete_targets: Option<&'a DeleteTargets>,
     doc_id: &str,
     rendered: &'a str,
+    rendered_prev: Option<&'a str>,
 ) -> impl Iterator<Item = &'a str> {
     let resolved: &[String] = delete_targets
         .and_then(|targets| targets.get(doc_id))
         .map_or(&[], Vec::as_slice);
-    let rendered_unseen = !resolved.iter().any(|index| index == rendered);
+    let unseen = |candidate: &&'a str| -> bool { !resolved.iter().any(|index| index == candidate) };
+    let rendered_extra = Some(rendered).filter(unseen);
+    let prev_extra = rendered_prev
+        .filter(|prev| *prev != rendered)
+        .filter(unseen);
     resolved
         .iter()
         .map(String::as_str)
-        .chain(rendered_unseen.then_some(rendered))
+        .chain(rendered_extra)
+        .chain(prev_extra)
 }
 
 /// Append `payload` to `out`, replacing any embedded `\n` byte with a
@@ -981,8 +1011,9 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines.len(),
-            3,
-            "one delete per holding index plus the rendered index: {text}"
+            4,
+            "one delete per holding index plus the rendered and \
+             previous-period indices: {text}"
         );
         assert!(
             lines[0].contains(r#""_index":"events-2026-05-20""#),
@@ -997,9 +1028,14 @@ mod tests {
             "the rendered index is always targeted too — resolution cannot \
              see same-batch or unrefreshed writes: {text}"
         );
+        assert!(
+            lines[3].contains(r#""_index":"events-2026-05-22""#),
+            "the previous period's index is targeted too — a copy written \
+             just before the boundary may not be searchable yet: {text}"
+        );
         assert_eq!(
             req.item_event_offsets,
-            vec![0, 0, 0],
+            vec![0, 0, 0, 0],
             "all actions map back to one event for per-item errors"
         );
         assert_eq!(
@@ -1007,12 +1043,13 @@ mod tests {
             [
                 "events-2026-05-20",
                 "events-2026-05-21",
+                "events-2026-05-22",
                 "events-2026-05-23"
             ]
             .into_iter()
             .map(str::to_owned)
             .collect(),
-            "the written set holds the resolved targets and the rendered index"
+            "the written set holds the resolved, rendered, and previous-period indices"
         );
     }
 
@@ -1033,10 +1070,20 @@ mod tests {
         )
         .unwrap();
         let text = String::from_utf8(req.body).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
-            text.lines().count(),
-            1,
-            "resolution already covering the rendered index yields one action: {text}"
+            lines.len(),
+            2,
+            "resolution covering the rendered index adds no duplicate; only \
+             the previous period's index is appended: {text}"
+        );
+        assert!(
+            lines[0].contains(r#""_index":"events-2026-05-23""#),
+            "{text}"
+        );
+        assert!(
+            lines[1].contains(r#""_index":"events-2026-05-22""#),
+            "{text}"
         );
     }
 
@@ -1056,8 +1103,13 @@ mod tests {
         )
         .unwrap();
         let text = String::from_utf8(req.body).unwrap();
-        assert_eq!(text.lines().count(), 1);
+        assert_eq!(
+            text.lines().count(),
+            2,
+            "rendered index plus the previous period's: {text}"
+        );
         assert!(text.contains(r#""_index":"events-2026-05-23""#), "{text}");
+        assert!(text.contains(r#""_index":"events-2026-05-22""#), "{text}");
     }
 
     /// The relocation delete (`doc.old_id`) removes a *past* document too,
@@ -1098,8 +1150,9 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines.len(),
-            4,
-            "resolved delete + rendered delete + index action + doc body: {text}"
+            5,
+            "resolved + rendered + previous-period deletes, index action, \
+             doc body: {text}"
         );
         assert!(
             lines[0].starts_with(r#"{"delete":"#)
@@ -1112,8 +1165,13 @@ mod tests {
             "the old id is also deleted from the rendered index: {text}"
         );
         assert!(
-            lines[2].starts_with(r#"{"index":"#)
-                && lines[2].contains(r#""_index":"events-2026-05-23""#),
+            lines[2].starts_with(r#"{"delete":"#)
+                && lines[2].contains(r#""_index":"events-2026-05-22""#),
+            "and from the previous period's index: {text}"
+        );
+        assert!(
+            lines[3].starts_with(r#"{"index":"#)
+                && lines[3].contains(r#""_index":"events-2026-05-23""#),
             "{text}"
         );
     }

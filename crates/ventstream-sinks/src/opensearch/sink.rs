@@ -922,8 +922,9 @@ impl OpenSearchSink {
     /// period it was **written**, not the one rendered at delete time. For
     /// every delete (and relocation old-id) this searches the template's
     /// wildcard pattern and records each index holding the id; the bulk
-    /// builder targets those **plus** the rendered index, which covers
-    /// same-batch and not-yet-refreshed copies the search cannot see.
+    /// builder targets those **plus** the rendered and previous-period
+    /// indices, which cover same-batch and not-yet-refreshed copies the
+    /// search cannot see.
     /// Returns `None` for literal templates — the rendered index is always
     /// right there.
     ///
@@ -974,23 +975,13 @@ impl OpenSearchSink {
         }
         let mut targets = bulk::DeleteTargets::new();
         for (pattern, (event, ids)) in by_pattern {
-            // The documents being deleted may have been indexed moments ago
-            // and not yet refreshed into the search view — an ids query
-            // would miss them and the delete would silently skip a live
-            // copy. Refresh the pattern first so resolution sees everything
-            // committed so far.
-            let refresh_url = format!(
-                "{}/{}/_refresh?ignore_unavailable=true&allow_no_indices=true",
-                self.endpoint_base,
-                encode_index_segment(&pattern)
-            );
-            let refresh_context = format!("refreshing '{pattern}' before delete resolution");
-            self.send_lookup_with_retry(&refresh_context, || {
-                apply_auth(self.client.post(&refresh_url), &self.config.auth)
-                    .timeout(self.config.request_timeout)
-            })
-            .await?;
-
+            // No refresh before the query, deliberately: forcing a refresh
+            // of every index the pattern matches on the ack path would
+            // defeat `refresh_interval` cluster-wide. A copy too fresh for
+            // the search view can only be in the current period's index or,
+            // at a boundary, the previous one's — and the bulk builder
+            // targets both unconditionally (`delete_indices`), so resolution
+            // only needs to find the older, long-since-refreshed copies.
             let search_url = format!(
                 "{}/{}/_search?ignore_unavailable=true&allow_no_indices=true",
                 self.endpoint_base,
@@ -1084,7 +1075,7 @@ impl OpenSearchSink {
         Ok(Some(targets))
     }
 
-    /// Send an auxiliary request (delete-index resolution, refresh) with
+    /// Send an auxiliary request (delete-index resolution) with
     /// the bulk path's retry discipline: transport errors and transiently
     /// classified responses back off and retry (honoring `Retry-After` up
     /// to the backoff ceiling); permanent failures surface immediately.
@@ -2655,7 +2646,9 @@ mod tests {
             "errors": true,
             "items": [
                 { "delete": { "_id": "orders:missing", "status": 404,
-                    "error": { "type": "document_missing_exception" } } }
+                    "error": { "type": "document_missing_exception" } } },
+                { "delete": { "_id": "orders:missing", "status": 404,
+                    "error": { "type": "index_not_found_exception" } } }
             ]
         });
         Mock::given(method("POST"))
@@ -2665,14 +2658,8 @@ mod tests {
             .mount(&server)
             .await;
         // The time-rolled test template now resolves delete indices first
-        // (#124); an id that was never written resolves to nothing. The
-        // pattern is refreshed before the lookup so fresh writes are seen.
-        Mock::given(method("POST"))
-            .and(wiremock::matchers::path_regex(r"/.*/_refresh$"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
+        // (#124); an id that was never written resolves to nothing, and
+        // the delete falls back to the rendered + previous-period indices.
         Mock::given(method("POST"))
             .and(wiremock::matchers::path_regex(r"/.*/_search$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3126,12 +3113,9 @@ mod tests {
     async fn time_rolled_delete_targets_the_index_holding_the_document() {
         let server = MockServer::start().await;
         let today = Utc::now().format("events-%Y-%m-%d").to_string();
-        Mock::given(method("POST"))
-            .and(path("/events-*-*-*/_refresh"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
+        let yesterday = (Utc::now() - chrono::Duration::days(1))
+            .format("events-%Y-%m-%d")
+            .to_string();
         Mock::given(method("POST"))
             .and(path("/events-*-*-*/_search"))
             .and(wiremock::matchers::body_string_contains("app.orders"))
@@ -3143,13 +3127,16 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        // Two delete actions: the resolved index and the rendered one. The
-        // rendered current-period index does not exist yet — that 404 is an
-        // already-applied delete, not a failure.
+        // Three delete actions: the resolved index, the rendered one, and
+        // the previous period's. The rendered and previous-period indices
+        // may not exist — those 404s are already-applied deletes, not
+        // failures.
         let bulk_ok = serde_json::json!({
             "took": 1, "errors": true,
             "items": [
                 { "delete": { "_id": "app.orders:[\"1\"]", "status": 200 } },
+                { "delete": { "_id": "app.orders:[\"1\"]", "status": 404,
+                    "error": { "type": "index_not_found_exception" } } },
                 { "delete": { "_id": "app.orders:[\"1\"]", "status": 404,
                     "error": { "type": "index_not_found_exception" } } }
             ]
@@ -3180,6 +3167,14 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/{yesterday}/_settings")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "acknowledged": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let sink = tombstone_sink(
             &server.uri(),
@@ -3196,12 +3191,6 @@ mod tests {
     #[tokio::test]
     async fn transient_resolution_failure_retries_and_succeeds() {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/events-*-*-*/_refresh"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
         Mock::given(method("POST"))
             .and(path("/events-*-*-*/_search"))
             .respond_with(ResponseTemplate::new(429).set_body_string("busy"))
@@ -3220,7 +3209,10 @@ mod tests {
         let today = Utc::now().format("events-%Y-%m-%d").to_string();
         let bulk_ok = serde_json::json!({
             "took": 1, "errors": false,
-            "items": [{ "delete": { "_id": "app.orders:[\"9\"]", "status": 404 } }]
+            "items": [
+                { "delete": { "_id": "app.orders:[\"9\"]", "status": 404 } },
+                { "delete": { "_id": "app.orders:[\"9\"]", "status": 404 } }
+            ]
         });
         Mock::given(method("POST"))
             .and(path("/_bulk"))
@@ -3241,12 +3233,6 @@ mod tests {
     #[tokio::test]
     async fn resolution_hits_outside_the_template_are_ignored() {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/events-*-*-*/_refresh"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
         Mock::given(method("POST"))
             .and(path("/events-*-*-*/_search"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3270,6 +3256,7 @@ mod tests {
             "took": 1, "errors": false,
             "items": [
                 { "delete": { "_id": "app.orders:[\"7\"]", "status": 200 } },
+                { "delete": { "_id": "app.orders:[\"7\"]", "status": 404 } },
                 { "delete": { "_id": "app.orders:[\"7\"]", "status": 404 } }
             ]
         });
@@ -3294,12 +3281,6 @@ mod tests {
     async fn unresolved_time_rolled_delete_falls_back_to_the_rendered_index() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/events-*-*-*/_refresh"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
             .and(path("/events-*-*-*/_search"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "hits": { "hits": [] }
@@ -3310,7 +3291,10 @@ mod tests {
         let today = Utc::now().format("events-%Y-%m-%d").to_string();
         let bulk_ok = serde_json::json!({
             "took": 1, "errors": false,
-            "items": [{ "delete": { "_id": "app.orders:[\"2\"]", "status": 404 } }]
+            "items": [
+                { "delete": { "_id": "app.orders:[\"2\"]", "status": 404 } },
+                { "delete": { "_id": "app.orders:[\"2\"]", "status": 404 } }
+            ]
         });
         Mock::given(method("POST"))
             .and(path("/_bulk"))
@@ -3363,12 +3347,6 @@ mod tests {
     #[tokio::test]
     async fn delete_resolution_failure_fails_the_batch_closed() {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/events-*-*-*/_refresh"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
         // Transient, so the lookup retries on the sink's schedule (3
         // attempts here) before the batch fails closed.
         Mock::given(method("POST"))
