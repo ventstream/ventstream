@@ -228,6 +228,7 @@ pub struct MySqlDenormalizer {
     /// coordinate cannot be packed or the server-epoch guard suppressed
     /// versioning.
     bootstrap_version_floor: Option<u64>,
+    emit_target_clears: bool,
 }
 
 impl MySqlDenormalizer {
@@ -274,6 +275,7 @@ impl MySqlDenormalizer {
             recompose_query_concurrency: DEFAULT_RECOMPOSE_QUERY_CONCURRENCY,
             sink_lookup: None,
             bootstrap_version_floor,
+            emit_target_clears: false,
         })
     }
 
@@ -301,6 +303,20 @@ impl MySqlDenormalizer {
         self
     }
 
+    /// Emit a scoped target-clear event before rebuilding when the
+    /// primary table is truncated. Enable only for sinks that implement
+    /// the clear (`ventstream.target.clear`) on this configuration — a
+    /// Redis sink with shared keyspace ownership refuses target-wide
+    /// clears, and a refused clear retries forever with the cursor
+    /// pinned. With the flag off a primary TRUNCATE still rebuilds the
+    /// projection, but pre-truncate documents may linger in the sink
+    /// until reconciled.
+    #[must_use]
+    pub const fn with_target_clears(mut self) -> Self {
+        self.emit_target_clears = true;
+        self
+    }
+
     /// Enable the sink reverse-lookup fallback for 1:many child deletes.
     #[must_use]
     pub fn with_reverse_lookup(mut self, lookup: ReverseLookup) -> Self {
@@ -319,74 +335,13 @@ impl MySqlDenormalizer {
     async fn bootstrap(&self, sender: &EventSender, shutdown: &ShutdownToken) -> Result<()> {
         for pd in &self.defs {
             let started = std::time::Instant::now();
-            let mut emitted: u64 = 0;
-            let mut last: Option<Vec<String>> = None;
-            let order = pd
-                .pk_cols
-                .iter()
-                .map(|c| format!("`p`.`{}`", esc(c)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            loop {
-                if shutdown.is_cancelled() {
-                    return Ok(());
-                }
-                let (where_clause, params) = match &last {
-                    None => (String::new(), Vec::new()),
-                    Some(vals) => {
-                        let lhs = pd
-                            .pk_cols
-                            .iter()
-                            .map(|c| format!("`p`.`{}`", esc(c)))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let ph = vec!["?"; vals.len()].join(", ");
-                        (format!("WHERE ({lhs}) > ({ph}) "), vals.clone())
-                    }
-                };
-                let sql = format!(
-                    "{head} {where_clause}ORDER BY {order} LIMIT {limit}",
-                    head = pd.select_head(),
-                    limit = self.chunk_size,
-                );
-                let mut conn = self.conn().await?;
-                let rows: Vec<Row> = conn
-                    .exec(&sql, mysql_params(&params))
-                    .await
-                    .with_context(|| format!("bootstrap select for {}", pd.primary_table))?;
-                drop(conn);
-                if rows.is_empty() {
-                    break;
-                }
-                let n = rows.len();
-                let mut page_last: Option<Vec<String>> = None;
-                for row in &rows {
-                    let (pk_text, doc) = decode_doc_row(pd, row)?;
-                    let event = build_doc_event(
-                        &pd.primary_table,
-                        pd.def.target_index(),
-                        &pk_text,
-                        &doc,
-                        false,
-                        self.bootstrap_version_floor,
-                    )?;
-                    sender.send(event, shutdown).await.map_err(|err| {
-                        anyhow::anyhow!(
-                            "publishing MySQL bootstrap document for {}: {err}",
-                            pd.primary_table
-                        )
-                    })?;
-                    ventstream_telemetry::bump_events_emitted(1);
-                    emitted += 1;
-                    page_last = Some(pk_text);
-                }
-                if (n as u64) < self.chunk_size {
-                    break;
-                }
-                match page_last {
-                    Some(p) => last = Some(p),
-                    None => break,
-                }
+            let emitted = self
+                .emit_all(pd, self.bootstrap_version_floor, sender, shutdown)
+                .await?;
+            if shutdown.is_cancelled() {
+                // Partial scan: the bootstrap restarts from scratch, so
+                // don't log it as complete with a partial row count.
+                return Ok(());
             }
             info!(
                 primary = %pd.primary_table,
@@ -397,6 +352,88 @@ impl MySqlDenormalizer {
             );
         }
         Ok(())
+    }
+
+    /// Emit the full composed projection for one definition (keyset-chunked
+    /// SQL join → doc events). Used by bootstrap and by the TRUNCATE
+    /// rebuild path (#154). Returns the number of rows emitted.
+    async fn emit_all(
+        &self,
+        pd: &PreparedDef,
+        version: Option<u64>,
+        sender: &EventSender,
+        shutdown: &ShutdownToken,
+    ) -> Result<u64> {
+        let mut emitted: u64 = 0;
+        let mut last: Option<Vec<String>> = None;
+        let order = pd
+            .pk_cols
+            .iter()
+            .map(|c| format!("`p`.`{}`", esc(c)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        loop {
+            if shutdown.is_cancelled() {
+                return Ok(emitted);
+            }
+            let (where_clause, params) = match &last {
+                None => (String::new(), Vec::new()),
+                Some(vals) => {
+                    let lhs = pd
+                        .pk_cols
+                        .iter()
+                        .map(|c| format!("`p`.`{}`", esc(c)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let ph = vec!["?"; vals.len()].join(", ");
+                    (format!("WHERE ({lhs}) > ({ph}) "), vals.clone())
+                }
+            };
+            let sql = format!(
+                "{head} {where_clause}ORDER BY {order} LIMIT {limit}",
+                head = pd.select_head(),
+                limit = self.chunk_size,
+            );
+            let mut conn = self.conn().await?;
+            let rows: Vec<Row> = conn
+                .exec(&sql, mysql_params(&params))
+                .await
+                .with_context(|| format!("bootstrap select for {}", pd.primary_table))?;
+            drop(conn);
+            if rows.is_empty() {
+                break;
+            }
+            let n = rows.len();
+            let mut page_last: Option<Vec<String>> = None;
+            for row in &rows {
+                let (pk_text, doc) = decode_doc_row(pd, row)?;
+                let event = build_doc_event(
+                    &pd.primary_table,
+                    pd.def.target_index(),
+                    &pk_text,
+                    &doc,
+                    false,
+                    version,
+                )?;
+                sender.send(event, shutdown).await.map_err(|err| {
+                    anyhow::anyhow!(
+                        "publishing MySQL bootstrap document for {}: {err}",
+                        pd.primary_table
+                    )
+                })?;
+                ventstream_telemetry::bump_events_emitted(1);
+                emitted += 1;
+                page_last = Some(pk_text);
+            }
+            if (n as u64) < self.chunk_size {
+                break;
+            }
+            match page_last {
+                Some(p) => last = Some(p),
+                None => break,
+            }
+        }
+        Ok(emitted)
     }
 
     /// Recompose a set of primary keys and emit docs. Returns the PK-text of
@@ -483,6 +520,78 @@ impl MySqlDenormalizer {
         let source_version = max_source_version(events);
 
         for pd in &self.defs {
+            // TRUNCATE first (#154, ported from the Postgres denormalizer):
+            // a truncated primary clears the projection target (when the
+            // sink supports it) and rebuilds from the post-truncate table;
+            // a truncated related table recomposes every primary, since
+            // every embedded object/array may have changed.
+            let primary_truncated = parsed
+                .iter()
+                .any(|ev| ev.op == "truncate" && relation_of(&pd.primary_table) == ev.relation);
+            let related_truncated = parsed.iter().any(|ev| {
+                ev.op == "truncate"
+                    && pd
+                        .def
+                        .related
+                        .iter()
+                        .any(|related| relation_of(&related.table) == ev.relation)
+            });
+            if primary_truncated {
+                if self.emit_target_clears {
+                    let clear = build_target_clear_event(
+                        &pd.primary_table,
+                        pd.def.target_index(),
+                        source_version,
+                    )?;
+                    sender
+                        .send(clear, shutdown)
+                        .await
+                        .map_err(|err| anyhow::anyhow!("emitting projection clear: {err}"))?;
+                    ventstream_telemetry::bump_events_emitted(1);
+                } else {
+                    warn!(
+                        primary = %pd.primary_table,
+                        "primary truncate rebuilding WITHOUT a target clear (this sink \
+                         configuration cannot clear the target safely); pre-truncate \
+                         documents may linger until reconciled"
+                    );
+                }
+                // Stamp the rebuild with the batch's binlog coordinate, not
+                // the connect-time bootstrap floor: the clear leaves
+                // versioned tombstones behind (gc_deletes), and a rebuild
+                // stamped below them would be rejected as stale.
+                let rows = self.emit_all(pd, source_version, sender, shutdown).await?;
+                // A cancelled rebuild emitted only part of the projection;
+                // acknowledging would persist the cursor past the TRUNCATE
+                // and the missing documents would never be replayed.
+                if shutdown.is_cancelled() {
+                    anyhow::bail!(
+                        "shutdown during truncate rebuild of {}; batch not acknowledged",
+                        pd.primary_table
+                    );
+                }
+                debug!(
+                    primary = %pd.primary_table,
+                    rows,
+                    "mysql sql-denormalize primary truncate cleared and rebuilt projection"
+                );
+                continue;
+            }
+            if related_truncated {
+                let rows = self.emit_all(pd, source_version, sender, shutdown).await?;
+                if shutdown.is_cancelled() {
+                    anyhow::bail!(
+                        "shutdown during truncate recompose of {}; batch not acknowledged",
+                        pd.primary_table
+                    );
+                }
+                debug!(
+                    primary = %pd.primary_table,
+                    rows,
+                    "mysql sql-denormalize related truncate recomposed projection"
+                );
+            }
+
             let mut affected: HashSet<Vec<String>> = HashSet::new();
             let mut deletes: HashSet<Vec<String>> = HashSet::new();
             // Child-delete reverse-lookup, keyed by the embedded PK fields →
@@ -932,6 +1041,44 @@ struct ParsedEvent {
     doc_id_pk: Option<Vec<String>>,
 }
 
+/// The scoped "empty this projection target" event a primary-table
+/// TRUNCATE turns into. Mirrors the Postgres denormalizer's clear:
+/// sinks route it by `ventstream.target.clear` + relation/target-index
+/// headers; it carries no document.
+fn build_target_clear_event(
+    primary_table: &str,
+    target_index: Option<&str>,
+    source_version: Option<u64>,
+) -> Result<Event> {
+    let ns = namespace_of(primary_table);
+    let rel = relation_of(primary_table);
+    let subject = Subject::new(format!("mysql.{ns}.{rel}.truncate"))
+        .map_err(|err| anyhow::anyhow!("invalid subject: {err}"))?;
+    let source = SourceUri::new(format!("mysql-sqljoin://{primary_table}"))
+        .map_err(|err| anyhow::anyhow!("invalid source uri: {err}"))?;
+    let mut headers = HashMap::new();
+    headers.insert("ventstream.cdc.relation".to_owned(), rel.to_owned());
+    headers.insert("ventstream.cdc.namespace".to_owned(), ns.to_owned());
+    headers.insert("ventstream.target.clear".to_owned(), "true".to_owned());
+    if let Some(version) = source_version {
+        headers.insert(
+            ventstream_core::SOURCE_VERSION_HEADER.to_owned(),
+            version.to_string(),
+        );
+    }
+    if let Some(target_index) = target_index {
+        headers.insert(
+            "ventstream.target.index".to_owned(),
+            target_index.to_owned(),
+        );
+    }
+    Ok(Event::builder(source, subject)
+        .payload(Payload::from_vec(b"{}".to_vec()))
+        .content_type(ContentType::Json)
+        .headers(Headers::from_map(headers))
+        .build())
+}
+
 fn parse_event(event: &Event) -> ParsedEvent {
     let relation = event
         .headers
@@ -1300,6 +1447,7 @@ mod tests {
             chunk_size: 1,
             recompose_key_chunk: 1,
             recompose_query_concurrency: 1,
+            emit_target_clears: false,
             sink_lookup: None,
             bootstrap_version_floor: None,
         };
@@ -1515,6 +1663,32 @@ mod tests {
             ))
         );
     }
+    /// #154: the clear event is scoped to the projection target and
+    /// routable by sinks (clear header + relation/namespace + index).
+    #[test]
+    fn target_clear_event_is_scoped() {
+        let event =
+            build_target_clear_event("shop.orders", Some("tenant-orders"), Some(4_200_000_001))
+                .expect("target clear event");
+        assert_eq!(
+            event.headers.get("ventstream.cdc.source_version"),
+            Some("4200000001")
+        );
+        assert_eq!(event.subject.as_str(), "mysql.shop.orders.truncate");
+        assert_eq!(event.headers.get("ventstream.target.clear"), Some("true"));
+        assert_eq!(event.headers.get("ventstream.cdc.relation"), Some("orders"));
+        assert_eq!(event.headers.get("ventstream.cdc.namespace"), Some("shop"));
+        assert_eq!(
+            event.headers.get("ventstream.target.index"),
+            Some("tenant-orders")
+        );
+
+        let bare =
+            build_target_clear_event("shop.orders", None, None).expect("clear without index");
+        assert_eq!(bare.headers.get("ventstream.target.index"), None);
+        assert_eq!(bare.headers.get("ventstream.cdc.source_version"), None);
+    }
+
     /// #130: a value ending in a backslash must not escape the closing
     /// quote of the literal it is spliced into.
     #[test]

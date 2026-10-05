@@ -42,6 +42,7 @@ pub struct MySqlCdcSource {
     /// Set once the first unversionable binlog coordinate has been logged,
     /// so an exotic binlog naming scheme does not warn per event.
     warned_unversioned: std::sync::atomic::AtomicBool,
+    emit_truncate_events: bool,
 }
 
 /// One decoded row change, retaining both images and omitted-column markers.
@@ -80,6 +81,7 @@ impl MySqlCdcSource {
             force_snapshot_from_cursor: false,
             emit_transition_images: false,
             warned_unversioned: std::sync::atomic::AtomicBool::new(false),
+            emit_truncate_events: false,
         }
     }
 
@@ -110,6 +112,20 @@ impl MySqlCdcSource {
     #[must_use]
     pub fn with_transition_images(mut self, enabled: bool) -> Self {
         self.emit_transition_images = enabled;
+        self
+    }
+
+    /// Publish a `.truncate` event when a TRUNCATE on an allowed table is
+    /// observed in the binlog. Off by default: a raw truncate event has no
+    /// doc id, so in a plain pipeline it would reach the sink as an
+    /// unroutable document. The SQL-denormalize engine enables it and
+    /// turns the event into a scoped target clear + rebuild (#154).
+    ///
+    /// Pair with [`Self::with_sink_progress`]: the binlog cursor waits for
+    /// the rebuild only when the sink-progress gate is wired.
+    #[must_use]
+    pub fn with_truncate_events(mut self, enabled: bool) -> Self {
+        self.emit_truncate_events = enabled;
         self
     }
 
@@ -436,6 +452,8 @@ impl MySqlCdcSource {
     /// the next rows event decodes against a fresh `INFORMATION_SCHEMA`
     /// fetch, then reports column-level drift. Warn-only: the pipeline keeps
     /// flowing; unrecognized statements are ignored.
+    /// Returns the allowed tables a TRUNCATE statement named, so the tail
+    /// loop can publish truncate events for them when enabled.
     async fn handle_query_event(
         &self,
         pool: &Pool,
@@ -443,9 +461,10 @@ impl MySqlCdcSource {
         table_map: &mut HashMap<u64, mysql_async::binlog::events::TableMapEvent<'static>>,
         default_db: &str,
         sql: &str,
-    ) {
+    ) -> Vec<String> {
+        let mut truncated: Vec<String> = Vec::new();
         let Some(statement) = parse_ddl(sql, default_db) else {
-            return;
+            return truncated;
         };
         for (db, table) in &statement.tables {
             if db != &self.config.database || !self.config.table_allowed(table) {
@@ -456,6 +475,7 @@ impl MySqlCdcSource {
                 tracing::warn!(table = %table_label, "TRUNCATE observed in binlog");
                 metrics::counter!("vs_truncate_events_total", "table" => table_label.clone())
                     .increment(1);
+                truncated.push(table.clone());
                 continue;
             }
             // Stale TABLE_MAP metadata must never pair with the new schema.
@@ -480,6 +500,7 @@ impl MySqlCdcSource {
                 },
             }
         }
+        truncated
     }
 
     async fn tail(
@@ -601,6 +622,7 @@ impl MySqlCdcSource {
                         }
                     };
                     let log_pos = u64::from(event.header().log_pos());
+                    let mut truncated_tables: Vec<String> = Vec::new();
 
                     // Decode synchronously (borrows the event), then do the
                     // async re-SELECT/publish on owned data.
@@ -619,14 +641,15 @@ impl MySqlCdcSource {
                         }
                         Some(EventData::RowsEvent(rows)) => decode_rows(&rows, &table_map)?,
                         Some(EventData::QueryEvent(query)) => {
-                            self.handle_query_event(
-                                pool,
-                                &schema_cache,
-                                &mut table_map,
-                                &query.schema(),
-                                &query.query(),
-                            )
-                            .await;
+                            truncated_tables = self
+                                .handle_query_event(
+                                    pool,
+                                    &schema_cache,
+                                    &mut table_map,
+                                    &query.schema(),
+                                    &query.query(),
+                                )
+                                .await;
                             None
                         }
                         _ => None,
@@ -680,6 +703,42 @@ impl MySqlCdcSource {
                             }
                             emitted = outcome.emitted;
                         }
+                    }
+                    if self.emit_truncate_events && !truncated_tables.is_empty() {
+                        // Stamped like row events so a denormalizer batch
+                        // holding only the truncate still knows the batch's
+                        // binlog coordinate for its rebuild stamp.
+                        let truncate_version = if !versioning || file_wrapped {
+                            None
+                        } else {
+                            event_mapper::binlog_version(
+                                &pos.file,
+                                if log_pos != 0 { log_pos } else { pos.pos },
+                            )
+                        };
+                        for table in &truncated_tables {
+                            let ev = event_mapper::with_source_version(
+                                event_mapper::truncate_event(&self.config, table)?,
+                                truncate_version,
+                            );
+                            if !self.publish(ctx, ev).await? {
+                                flush_confirmed_positions(
+                                    self.sink_progress.as_ref(),
+                                    cursor_file,
+                                    &mut pending_gated,
+                                    &mut pending_write,
+                                )?;
+                                return Ok(());
+                            }
+                        }
+                        // Rides the same ack/position machinery as row
+                        // events. The "cursor waits for the rebuild"
+                        // property additionally requires the sink-progress
+                        // gate (`with_sink_progress`); without it the
+                        // position goes straight to the pending write, like
+                        // every other event. The engine wiring always sets
+                        // both together.
+                        emitted = true;
                     }
                     if log_pos != 0 {
                         pos.pos = log_pos;

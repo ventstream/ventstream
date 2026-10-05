@@ -739,15 +739,36 @@ impl SqlDenormalizer {
                         .iter()
                         .any(|related| relation_of(&related.table) == relation)
             });
-            if primary_truncated && self.emit_target_clears {
-                let clear =
-                    build_target_clear_event(&pd.primary_table, pd.def.target_index(), batch_lsn)?;
-                sender
-                    .send(clear, shutdown)
-                    .await
-                    .map_err(|err| anyhow::anyhow!("emitting projection clear: {err}"))?;
-                ventstream_telemetry::bump_events_emitted(1);
+            if primary_truncated {
+                if self.emit_target_clears {
+                    let clear = build_target_clear_event(
+                        &pd.primary_table,
+                        pd.def.target_index(),
+                        batch_lsn,
+                    )?;
+                    sender
+                        .send(clear, shutdown)
+                        .await
+                        .map_err(|err| anyhow::anyhow!("emitting projection clear: {err}"))?;
+                    ventstream_telemetry::bump_events_emitted(1);
+                } else {
+                    warn!(
+                        primary = %pd.primary_table,
+                        "primary truncate rebuilding WITHOUT a target clear (this sink \
+                         configuration cannot clear the target safely); pre-truncate \
+                         documents may linger until reconciled"
+                    );
+                }
                 let rows = self.emit_all(pd, batch_lsn, sender, shutdown).await?;
+                // A cancelled rebuild emitted only part of the projection;
+                // acknowledging would persist the slot past the TRUNCATE
+                // and the missing documents would never be replayed.
+                if shutdown.is_cancelled() {
+                    anyhow::bail!(
+                        "shutdown during truncate rebuild of {}; batch not acknowledged",
+                        pd.primary_table
+                    );
+                }
                 debug!(
                     primary = %pd.primary_table,
                     rows,
@@ -757,6 +778,12 @@ impl SqlDenormalizer {
             }
             if related_truncated {
                 let rows = self.emit_all(pd, batch_lsn, sender, shutdown).await?;
+                if shutdown.is_cancelled() {
+                    anyhow::bail!(
+                        "shutdown during truncate recompose of {}; batch not acknowledged",
+                        pd.primary_table
+                    );
+                }
                 debug!(
                     primary = %pd.primary_table,
                     rows,

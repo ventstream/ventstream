@@ -247,6 +247,16 @@ reverse-lookup (on by default; `VS_MYSQL_SINK_REVERSE_LOOKUP=false` to disable),
 including **composite child PKs** — each PK column is matched and AND-ed, and
 any over-match is harmless since the parent is recomposed from current DB truth.
 
+`TRUNCATE TABLE` is handled like the Postgres denormalizer handles it: a
+truncated **related** table recomposes every primary (embedded objects and
+arrays empty out), and a truncated **primary** table clears the projection
+target and rebuilds it from the post-truncate table, so pre-truncate
+documents never linger in the sink. Redis target clears require
+`keyspace.ownership: exclusive`, since the sink refuses to pattern-delete
+keys it may not own; with shared ownership the engine says so at startup
+and a primary truncate **rebuilds without clearing** — the pipeline keeps
+flowing, but pre-truncate keys may linger until reconciled.
+
 ## Current limitations
 
 - **Joins are raw, not recursive.** One level of embedding per related entry

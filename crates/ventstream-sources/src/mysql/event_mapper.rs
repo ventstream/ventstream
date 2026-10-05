@@ -144,6 +144,39 @@ fn event(
     )
 }
 
+/// A TRUNCATE observed in the binlog, as an event (subject suffix
+/// `truncate`, no doc id — there is no row). Only published when the
+/// source was built `with_truncate_events`; the SQL-denormalize engine
+/// consumes it to clear and rebuild the projection (#154).
+pub(crate) fn truncate_event(config: &MySqlCdcConfig, table: &str) -> Result<Event, MySqlCdcError> {
+    let subject = Subject::new(format!(
+        "mysql.{}.{}.truncate",
+        sanitize(&config.namespace),
+        sanitize(table)
+    ))
+    .map_err(|e| MySqlCdcError::Internal(e.to_string()))?;
+    let mut h = HashMap::with_capacity(4);
+    h.insert(
+        "ventstream.cdc.namespace".to_owned(),
+        config.namespace.clone(),
+    );
+    h.insert("ventstream.cdc.relation".to_owned(), table.to_owned());
+    h.insert(
+        "ventstream.cdc.database".to_owned(),
+        config.database.clone(),
+    );
+    h.insert(
+        "ventstream.cdc.event_type".to_owned(),
+        "truncate".to_owned(),
+    );
+    Ok(Event::builder(source_uri(config, table)?, subject)
+        .payload(Payload::from_vec(b"{}".to_vec()))
+        .content_type(ContentType::Json)
+        .occurred_at(Utc::now())
+        .headers(Headers::from_map(h))
+        .build())
+}
+
 /// Live change. Upserts require the re-read row. Deletes include the available
 /// binlog before-image so downstream joins can recover foreign keys.
 #[allow(clippy::needless_pass_by_value)]
