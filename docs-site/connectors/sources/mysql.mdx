@@ -251,9 +251,11 @@ any over-match is harmless since the parent is recomposed from current DB truth.
 truncated **related** table recomposes every primary (embedded objects and
 arrays empty out), and a truncated **primary** table clears the projection
 target and rebuilds it from the post-truncate table, so pre-truncate
-documents never linger in the sink. Redis target clears additionally
-require `keyspace.ownership: exclusive`, since the sink refuses to
-pattern-delete keys it may not own.
+documents never linger in the sink. Redis target clears require
+`keyspace.ownership: exclusive`, since the sink refuses to pattern-delete
+keys it may not own; with shared ownership the engine says so at startup
+and a primary truncate **rebuilds without clearing** — the pipeline keeps
+flowing, but pre-truncate keys may linger until reconciled.
 
 ## Current limitations
 

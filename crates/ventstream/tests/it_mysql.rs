@@ -1656,3 +1656,104 @@ async fn mysql_sql_mode_truncate_clears_and_rebuilds_redis() {
 
     engine.kill();
 }
+
+/// #200 review: with the default (shared) Redis keyspace ownership a
+/// target-wide clear is refused by the sink, and a refused clear would
+/// retry forever with the cursor pinned. The engine must instead rebuild
+/// WITHOUT clearing: the pipeline keeps flowing (fresh docs appear);
+/// pre-truncate keys may linger, which is the documented trade-off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "local integration: requires Docker"]
+async fn mysql_truncate_with_shared_redis_rebuilds_without_stalling() {
+    const PREFIX: &str = "ventstream:it:mysql:truncshared";
+
+    let stack = common::start_mysql().await;
+    let (_redis, redis_port) = common::start_redis().await;
+    let mut mysql = common::mysql_root_conn(stack.mysql_port)
+        .await
+        .expect("mysql root connection");
+    mysql
+        .query_drop(format!(
+            "CREATE USER IF NOT EXISTS '{}'@'%' IDENTIFIED BY '{}'; \
+             GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{}'@'%'; \
+             CREATE TABLE IF NOT EXISTS {}.orders (
+               id VARCHAR(64) PRIMARY KEY,
+               status VARCHAR(64) NOT NULL
+             ); \
+             CREATE TABLE IF NOT EXISTS {}.order_items (
+               id VARCHAR(64) PRIMARY KEY,
+               order_id VARCHAR(64) NOT NULL,
+               product VARCHAR(64) NOT NULL
+             ); \
+             DELETE FROM {}.order_items; \
+             DELETE FROM {}.orders; \
+             INSERT INTO {}.orders (id, status) VALUES ('sh-order-1', 'created')",
+            common::MYSQL_USER,
+            common::MYSQL_PASSWORD,
+            common::MYSQL_USER,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+            common::MYSQL_DB,
+        ))
+        .await
+        .expect("seed shared-ownership tables");
+
+    let state_dir = common::state_dir("mysql-redis-truncshared", stack.mysql_port);
+    let spec_path = common::write_spec(&state_dir, REDIS_JOINED_ORDERS_SPEC);
+    let mut engine = common::spawn_mysql_redis_engine_with_options(&common::MySqlRedisEngine {
+        mysql_port: stack.mysql_port,
+        redis_port,
+        spec_path: &spec_path,
+        state_dir: &state_dir,
+        key_prefix: PREFIX,
+        tables: "orders,order_items",
+        keyspace_ownership: "shared",
+    });
+    let pattern = format!("{PREFIX}:{{orders}}:*");
+
+    common::wait_until(Duration::from_secs(60), "shared-ownership snapshot", || {
+        let pattern = pattern.clone();
+        async move {
+            redis_document(redis_port, &pattern, "sh-order-1")
+                .await
+                .is_some()
+        }
+    })
+    .await;
+
+    mysql
+        .query_drop(format!(
+            "TRUNCATE TABLE {db}.orders; \
+             INSERT INTO {db}.orders (id, status) VALUES ('sh-order-2', 'fresh')",
+            db = common::MYSQL_DB,
+        ))
+        .await
+        .expect("truncate primary and reseed");
+
+    // The pipeline must keep flowing: the rebuilt projection (and any
+    // later live change) lands. No clear happened, so the stale key is
+    // allowed to linger — the point is no stall, not cleanliness.
+    common::wait_until(
+        Duration::from_secs(60),
+        "shared-ownership truncate rebuild flows",
+        || {
+            let pattern = pattern.clone();
+            async move {
+                redis_document(redis_port, &pattern, "sh-order-2")
+                    .await
+                    .is_some()
+            }
+        },
+    )
+    .await;
+    assert!(
+        redis_document(redis_port, &pattern, "sh-order-1")
+            .await
+            .is_some(),
+        "without a clear, the pre-truncate key lingers (documented trade-off)"
+    );
+
+    engine.kill();
+}

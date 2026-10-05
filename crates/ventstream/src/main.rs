@@ -399,6 +399,31 @@ fn optional_usize_argument(argv: &[String], flag: &str, default: usize) -> Resul
     }
 }
 
+/// Whether the SQL denormalizers should emit target-clear events for
+/// this sink configuration. Every sink kind the engine builds implements
+/// the clear (`kind()` only ever returns opensearch / redis /
+/// meilisearch / surrealdb — the old five-kind match here was always
+/// true), with one configuration exception: a Redis sink whose keyspace
+/// ownership is not `exclusive` refuses target-wide clears, and a
+/// refused clear is `SinkError::Blocked` — never DLQ'd — so the pipeline
+/// would retry the same clear forever with the source cursor pinned at
+/// the TRUNCATE. For that configuration the denormalizer rebuilds
+/// WITHOUT clearing (pre-truncate keys may linger until reconciled),
+/// announced here once at startup.
+fn sink_supports_target_clears(sink: &SinkRuntimeConfig) -> bool {
+    match sink.redis() {
+        Some(redis) if redis.keyspace_ownership != RedisKeyspaceOwnership::Exclusive => {
+            warn!(
+                "sink.redis.keyspace.ownership is not 'exclusive', so a primary TRUNCATE \
+                 will rebuild the projection without clearing the target and pre-truncate \
+                 keys may linger; set ownership=exclusive to enable safe target clears"
+            );
+            false
+        }
+        _ => true,
+    }
+}
+
 async fn run_check_redis_sink(engine_config: Option<&EngineFileConfig>) -> Result<()> {
     let sink = load_sink_config(engine_config)?;
     let SinkRuntimeConfig::Redis(config) = sink else {
@@ -2241,14 +2266,10 @@ async fn build_and_run_pg_sql_denormalize_engine(
         .await
         .context("building SQL denormalizer")?
         .with_pipeline_health(runtime.pipeline_health.clone());
-    // Every sink that can express "empty this target" gets the clear
-    // event. OpenSearch was excluded, so a source TRUNCATE reached the
-    // bulk path with no doc id and was indexed as a junk document while
-    // the pre-truncate rows survived forever.
-    if matches!(
-        runtime.sink.kind(),
-        "redis" | "meilisearch" | "surrealdb" | "opensearch" | "elasticsearch"
-    ) {
+    // Every sink that can express "empty this target" safely gets the
+    // clear event; see `sink_supports_target_clears` for the one Redis
+    // configuration that cannot.
+    if sink_supports_target_clears(&runtime.sink) {
         denorm = denorm.with_target_clears();
     }
     // Search sinks can serve as a reverse index when the WAL delete
@@ -2899,13 +2920,10 @@ async fn build_and_run_mysql_sql_denormalize_engine(
         .await
         .context("building MySQL SQL denormalizer")?
         .with_recompose_limits(recompose_chunk, recompose_concurrency);
-    // Same gate as the Postgres denormalizer: every sink that can express
-    // "empty this target" gets the clear event on a primary TRUNCATE;
-    // otherwise pre-truncate documents would linger forever (#154).
-    if matches!(
-        runtime.sink.kind(),
-        "redis" | "meilisearch" | "surrealdb" | "opensearch" | "elasticsearch"
-    ) {
+    // Same gate as the Postgres denormalizer: every sink configuration
+    // that can clear a target safely gets the clear event on a primary
+    // TRUNCATE (#154); see `sink_supports_target_clears`.
+    if sink_supports_target_clears(&runtime.sink) {
         denorm = denorm.with_target_clears();
     }
     if requires_full_row_image {

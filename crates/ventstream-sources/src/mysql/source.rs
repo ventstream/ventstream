@@ -120,6 +120,9 @@ impl MySqlCdcSource {
     /// doc id, so in a plain pipeline it would reach the sink as an
     /// unroutable document. The SQL-denormalize engine enables it and
     /// turns the event into a scoped target clear + rebuild (#154).
+    ///
+    /// Pair with [`Self::with_sink_progress`]: the binlog cursor waits for
+    /// the rebuild only when the sink-progress gate is wired.
     #[must_use]
     pub fn with_truncate_events(mut self, enabled: bool) -> Self {
         self.emit_truncate_events = enabled;
@@ -729,8 +732,12 @@ impl MySqlCdcSource {
                             }
                         }
                         // Rides the same ack/position machinery as row
-                        // events, so the cursor only advances past the
-                        // TRUNCATE once the rebuild is durably sunk.
+                        // events. The "cursor waits for the rebuild"
+                        // property additionally requires the sink-progress
+                        // gate (`with_sink_progress`); without it the
+                        // position goes straight to the pending write, like
+                        // every other event. The engine wiring always sets
+                        // both together.
                         emitted = true;
                     }
                     if log_pos != 0 {
