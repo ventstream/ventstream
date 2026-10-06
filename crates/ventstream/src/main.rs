@@ -6136,6 +6136,17 @@ fn load_cdc_bundle_postgres(
                 .map(PathBuf::from),
         };
     pg.transaction_spool_dir = transaction_spool_dir;
+    let transaction_memory_limit_bytes = config_usize_or_env(
+        source_config.and_then(|config| config.transaction_memory_limit_bytes),
+        "VS_PG_TRANSACTION_MEMORY_LIMIT_BYTES",
+        ventstream_sources::postgres::DEFAULT_TRANSACTION_MEMORY_LIMIT_BYTES,
+    )?;
+    if transaction_memory_limit_bytes == 0 {
+        return Err(anyhow!(
+            "VS_PG_TRANSACTION_MEMORY_LIMIT_BYTES / source.postgres.transaction_memory_limit_bytes must be positive"
+        ));
+    }
+    pg.transaction_memory_limit_bytes = Some(transaction_memory_limit_bytes);
 
     let (joins, joins_yaml_text) = load_joins_yaml(fleet_config, engine_config)?;
     validate_projection_target_indexes(engine_config, &joins)?;

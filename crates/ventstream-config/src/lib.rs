@@ -461,6 +461,10 @@ pub struct PostgresSourceConfig {
     /// Writable directory for transaction records that exceed the in-memory buffer.
     #[serde(default)]
     pub transaction_spool_dir: Option<PathBuf>,
+    /// In-memory budget per transaction before its records spill to the
+    /// spool directory (default 8 MiB).
+    #[serde(default)]
+    pub transaction_memory_limit_bytes: Option<usize>,
     /// TLS transport policy.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
@@ -510,6 +514,11 @@ impl PostgresSourceConfig {
         {
             return Err(ConfigError::InvalidField(
                 "source.postgres.transaction_spool_dir must not be empty",
+            ));
+        }
+        if self.transaction_memory_limit_bytes == Some(0) {
+            return Err(ConfigError::InvalidField(
+                "source.postgres.transaction_memory_limit_bytes must be positive",
             ));
         }
         if let Some(tls) = &self.tls {

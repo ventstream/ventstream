@@ -63,6 +63,10 @@ pub struct PostgresCdcConfig {
 
     /// Writable directory for transactions that exceed the in-memory WAL buffer.
     pub transaction_spool_dir: Option<PathBuf>,
+
+    /// In-memory budget per transaction before its WAL records spill to the
+    /// spool directory. `None` = 8 MiB.
+    pub transaction_memory_limit_bytes: Option<usize>,
 }
 
 /// Tables to scan in a one-time snapshot bootstrap.
@@ -142,6 +146,7 @@ impl PostgresCdcConfig {
             bootstrap: None,
             tls: None,
             transaction_spool_dir: None,
+            transaction_memory_limit_bytes: None,
         }
     }
 

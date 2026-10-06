@@ -74,7 +74,7 @@ use pgwire_replication::{
 };
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -91,7 +91,13 @@ pub const LSN_HEADER: &str = "ventstream.cdc.lsn";
 /// values trade more PG-side traffic for faster slot reclamation;
 /// larger values trade slot lag for less wire chatter.
 const DEFAULT_LSN_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
-const TRANSACTION_MEMORY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+/// In-memory budget for one transaction's WAL records before they spill
+/// to the spool file. Overridable per source
+/// ([`PostgresCdcConfig::transaction_memory_limit_bytes`]).
+pub const DEFAULT_TRANSACTION_MEMORY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+/// Spool file I/O buffer. Records are ~1 KiB; without buffering each one
+/// cost three syscalls to write and three to read (#202).
+const SPOOL_IO_BUFFER_BYTES: usize = 1024 * 1024;
 static TRANSACTION_SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 use tracing::{debug, error, info, warn};
 use ventstream_core::event::Payload;
@@ -114,32 +120,43 @@ struct WalRecord {
     data: Bytes,
 }
 
+/// The spool file in its two phases: written sequentially while the
+/// transaction streams in, then read back from the start at commit. Both
+/// phases are buffered — the records are small and the file is large.
+enum SpoolIo {
+    Writing(BufWriter<File>),
+    Reading(BufReader<File>),
+    /// Momentary state while the writer is being turned into the reader.
+    Switching,
+}
+
 enum TransactionStorage {
     Memory {
         records: VecDeque<WalRecord>,
         bytes: usize,
     },
     Disk {
-        file: File,
+        io: SpoolIo,
         path: PathBuf,
         remaining: usize,
-        reading: bool,
     },
 }
 
 struct TransactionBuffer {
     storage: TransactionStorage,
     spool_dir: PathBuf,
+    memory_limit: usize,
 }
 
 impl TransactionBuffer {
-    fn new(spool_dir: PathBuf) -> Self {
+    fn new(spool_dir: PathBuf, memory_limit: usize) -> Self {
         Self {
             storage: TransactionStorage::Memory {
                 records: VecDeque::new(),
                 bytes: 0,
             },
             spool_dir,
+            memory_limit,
         }
     }
 
@@ -147,7 +164,7 @@ impl TransactionBuffer {
         let record_bytes = record.data.len().saturating_add(16);
         match &mut self.storage {
             TransactionStorage::Memory { records, bytes }
-                if bytes.saturating_add(record_bytes) <= TRANSACTION_MEMORY_LIMIT_BYTES =>
+                if bytes.saturating_add(record_bytes) <= self.memory_limit =>
             {
                 records.push_back(record);
                 *bytes = bytes.saturating_add(record_bytes);
@@ -158,35 +175,51 @@ impl TransactionBuffer {
                 Ok(())
             }
             TransactionStorage::Disk {
-                file, remaining, ..
+                io: SpoolIo::Writing(writer),
+                remaining,
+                ..
             } => {
-                write_wal_record(file, &record)?;
+                write_wal_record(writer, &record)?;
                 *remaining = remaining.saturating_add(1);
                 Ok(())
             }
+            TransactionStorage::Disk {
+                io: SpoolIo::Reading(_) | SpoolIo::Switching,
+                ..
+            } => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "transaction spool is already being replayed",
+            )),
         }
     }
 
     fn next_record(&mut self) -> io::Result<Option<WalRecord>> {
         match &mut self.storage {
             TransactionStorage::Memory { records, .. } => Ok(records.pop_front()),
-            TransactionStorage::Disk {
-                file,
-                remaining,
-                reading,
-                ..
-            } => {
-                if !*reading {
-                    file.flush()?;
+            TransactionStorage::Disk { io, remaining, .. } => {
+                if matches!(io, SpoolIo::Writing(_)) {
+                    // First read: flush, rewind, switch to the read buffer.
+                    let SpoolIo::Writing(writer) = std::mem::replace(io, SpoolIo::Switching) else {
+                        unreachable!("checked above");
+                    };
+                    let mut file = writer.into_inner().map_err(|error| error.into_error())?;
                     file.seek(SeekFrom::Start(0))?;
-                    *reading = true;
+                    *io = SpoolIo::Reading(BufReader::with_capacity(SPOOL_IO_BUFFER_BYTES, file));
                 }
                 if *remaining == 0 {
                     return Ok(None);
                 }
-                let record = read_wal_record(file)?;
-                *remaining = remaining.saturating_sub(1);
-                Ok(Some(record))
+                match io {
+                    SpoolIo::Reading(reader) => {
+                        let record = read_wal_record(reader)?;
+                        *remaining = remaining.saturating_sub(1);
+                        Ok(Some(record))
+                    }
+                    SpoolIo::Writing(_) | SpoolIo::Switching => Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "transaction spool is not readable",
+                    )),
+                }
             }
         }
     }
@@ -205,16 +238,16 @@ impl TransactionBuffer {
             }
             TransactionStorage::Disk { .. } => unreachable!("spill called for disk storage"),
         };
-        let (mut file, path) = create_spool_file(&self.spool_dir)?;
+        let (file, path) = create_spool_file(&self.spool_dir)?;
+        let mut writer = BufWriter::with_capacity(SPOOL_IO_BUFFER_BYTES, file);
         while let Some(record) = records.pop_front() {
-            write_wal_record(&mut file, &record)?;
+            write_wal_record(&mut writer, &record)?;
         }
-        write_wal_record(&mut file, next)?;
+        write_wal_record(&mut writer, next)?;
         self.storage = TransactionStorage::Disk {
-            file,
+            io: SpoolIo::Writing(writer),
             path,
             remaining: count,
-            reading: false,
         };
         metrics::counter!("vs_postgres_transaction_spills_total").increment(1);
         Ok(())
@@ -243,8 +276,8 @@ impl Drop for TransactionBuffer {
                 bytes: 0,
             },
         );
-        if let TransactionStorage::Disk { file, path, .. } = storage {
-            drop(file);
+        if let TransactionStorage::Disk { io, path, .. } = storage {
+            drop(io);
             let _ = std::fs::remove_file(path);
         }
     }
@@ -274,7 +307,7 @@ fn create_spool_file(directory: &Path) -> io::Result<(File, PathBuf)> {
     ))
 }
 
-fn write_wal_record(file: &mut File, record: &WalRecord) -> io::Result<()> {
+fn write_wal_record(file: &mut impl Write, record: &WalRecord) -> io::Result<()> {
     let length = u64::try_from(record.data.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "WAL record is too large"))?;
     file.write_all(&record.wal_start.to_le_bytes())?;
@@ -282,7 +315,7 @@ fn write_wal_record(file: &mut File, record: &WalRecord) -> io::Result<()> {
     file.write_all(&record.data)
 }
 
-fn read_wal_record(file: &mut File) -> io::Result<WalRecord> {
+fn read_wal_record(file: &mut impl Read) -> io::Result<WalRecord> {
     let mut wal_start = [0u8; 8];
     let mut length = [0u8; 8];
     file.read_exact(&mut wal_start)?;
@@ -319,6 +352,8 @@ pub struct PostgresCdcSource {
     /// replication slot for subsequent WAL replay.
     bootstrap_existing_slot: bool,
     transaction_spool_dir: PathBuf,
+    /// In-memory budget per transaction before spilling to the spool.
+    transaction_memory_limit: usize,
     /// Consecutive WAL messages skipped for uncached relations; reset
     /// by any successfully decoded payload. Bounded by
     /// [`MAX_UNKNOWN_RELATION_STREAK`].
@@ -360,6 +395,10 @@ impl PostgresCdcSource {
             .transaction_spool_dir
             .clone()
             .unwrap_or_else(|| std::env::temp_dir().join("ventstream-postgres-transactions"));
+        let transaction_memory_limit = config
+            .transaction_memory_limit_bytes
+            .unwrap_or(DEFAULT_TRANSACTION_MEMORY_LIMIT_BYTES)
+            .max(1);
         Self {
             config,
             relations: RelationCache::new(),
@@ -367,6 +406,7 @@ impl PostgresCdcSource {
             lsn_flush_interval: DEFAULT_LSN_FLUSH_INTERVAL,
             bootstrap_existing_slot: false,
             transaction_spool_dir,
+            transaction_memory_limit,
             unknown_relation_streak: AtomicU64::new(0),
             toast_refetch: tokio::sync::Mutex::new(ToastRefetchState::default()),
         }
@@ -402,6 +442,15 @@ impl PostgresCdcSource {
     #[must_use]
     pub fn with_transaction_spool_dir(mut self, directory: impl Into<PathBuf>) -> Self {
         self.transaction_spool_dir = directory.into();
+        self
+    }
+
+    /// Override the in-memory budget per transaction before its records
+    /// spill to the spool file. Larger values keep bulk loads off disk at
+    /// the cost of memory; the default is 8 MiB.
+    #[must_use]
+    pub fn with_transaction_memory_limit(mut self, bytes: usize) -> Self {
+        self.transaction_memory_limit = bytes.max(1);
         self
     }
 
@@ -847,26 +896,22 @@ impl PostgresCdcSource {
                 event = client.recv() => {
                     match event.map_err(|err| PostgresCdcError::Connection(err.to_string()))? {
                         Some(ReplicationEvent::XLogData { wal_start, wal_end, data, .. }) => {
-                            let events = self.decode_payload_or_skip_unknown(&data)?;
                             let wal_start_u64 = wal_start.as_u64();
-                            // Per-payload breadcrumb — operators chasing
-                            // "did this row get emitted?" want to see
-                            // each WAL message's event count + LSN.
-                            // Row CONTENTS are NOT logged; emitted as
-                            // structured Events instead, which the
-                            // dispatcher logs by size, not value.
-                            debug!(
-                                wal_start = %wal_start,
-                                wal_end = %wal_end,
-                                events_in_payload = events.len(),
-                                payload_bytes = data.len(),
-                                metric = "pg.replication.xlog_data",
-                                "wal payload yielded events"
-                            );
-                            if events.is_empty() {
-                                continue;
-                            }
                             if let Some(buffer) = transaction.as_mut() {
+                                // Inside a transaction the raw payload is
+                                // buffered as-is and decoded exactly once, at
+                                // replay. Decoding here too (as this path did
+                                // until #202) doubled the source task's CPU
+                                // for no information the replay doesn't
+                                // recover — relation messages and empty
+                                // payloads are handled in order there.
+                                debug!(
+                                    wal_start = %wal_start,
+                                    wal_end = %wal_end,
+                                    payload_bytes = data.len(),
+                                    metric = "pg.replication.xlog_data",
+                                    "wal payload buffered for commit replay"
+                                );
                                 buffer
                                     .push(WalRecord {
                                         wal_start: wal_start_u64,
@@ -878,6 +923,24 @@ impl PostgresCdcSource {
                                         ))
                                     })?;
                             } else {
+                                let events = self.decode_payload_or_skip_unknown(&data)?;
+                                // Per-payload breadcrumb — operators chasing
+                                // "did this row get emitted?" want to see
+                                // each WAL message's event count + LSN.
+                                // Row CONTENTS are NOT logged; emitted as
+                                // structured Events instead, which the
+                                // dispatcher logs by size, not value.
+                                debug!(
+                                    wal_start = %wal_start,
+                                    wal_end = %wal_end,
+                                    events_in_payload = events.len(),
+                                    payload_bytes = data.len(),
+                                    metric = "pg.replication.xlog_data",
+                                    "wal payload yielded events"
+                                );
+                                if events.is_empty() {
+                                    continue;
+                                }
                                 self.publish_events(events, wal_start_u64, ctx).await?;
                                 // Bound by the LSN actually stamped on the
                                 // events — a wal_end bound could never be
@@ -909,6 +972,7 @@ impl PostgresCdcSource {
                             }
                             transaction = Some(TransactionBuffer::new(
                                 self.transaction_spool_dir.clone(),
+                                self.transaction_memory_limit,
                             ));
                             debug!(
                                 xid,
@@ -1128,8 +1192,9 @@ impl PostgresCdcSource {
             } else {
                 event
             };
-            // Truncate visibility (A4): counted here, not at decode, because
-            // a buffered transaction decodes each payload twice.
+            // Truncate visibility (A4): counted at publish, not at decode,
+            // so the count tracks what was actually emitted (a payload
+            // skipped at replay for an uncached relation is never counted).
             if let Some(qualified) = event.subject.as_str().strip_suffix(".truncate") {
                 // Subject is `postgres.<schema>.<table>` — drop the kind
                 // segment so the label matches the drift counter's form.
@@ -1739,7 +1804,7 @@ mod tests {
             "ventstream-pg-tx-memory-{}",
             TRANSACTION_SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut buffer = TransactionBuffer::new(directory);
+        let mut buffer = TransactionBuffer::new(directory, DEFAULT_TRANSACTION_MEMORY_LIMIT_BYTES);
         for wal_start in [11, 12, 13] {
             buffer
                 .push(WalRecord {
@@ -1762,7 +1827,8 @@ mod tests {
             "ventstream-pg-tx-spill-{}",
             TRANSACTION_SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut buffer = TransactionBuffer::new(directory.clone());
+        let mut buffer =
+            TransactionBuffer::new(directory.clone(), DEFAULT_TRANSACTION_MEMORY_LIMIT_BYTES);
         for wal_start in 1..=5 {
             buffer
                 .push(WalRecord {
@@ -1783,6 +1849,54 @@ mod tests {
             observed.push((record.wal_start, record.data[0]));
         }
         assert_eq!(observed, vec![(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]);
+        drop(buffer);
+        assert!(!spool_path.exists());
+        let _ = std::fs::remove_dir(directory);
+    }
+
+    /// #202: a configurable budget spills early, and ten thousand small
+    /// records survive the buffered write → flush → rewind → buffered read
+    /// transition in order with their contents intact.
+    #[test]
+    fn small_memory_limit_spills_many_records_through_buffered_io() {
+        let directory = std::env::temp_dir().join(format!(
+            "ventstream-pg-tx-buffered-{}",
+            TRANSACTION_SPOOL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut buffer = TransactionBuffer::new(directory.clone(), 4 * 1024);
+        for wal_start in 1..=10_000u64 {
+            let byte = u8::try_from(wal_start % 251).expect("fits");
+            buffer
+                .push(WalRecord {
+                    wal_start,
+                    data: Bytes::from(vec![byte; 100]),
+                })
+                .expect("buffer record");
+        }
+        assert!(
+            buffer.is_spilled(),
+            "a 4 KiB budget must spill 1 MB of records"
+        );
+        let spool_path = buffer.spool_path().expect("spool path").to_path_buf();
+
+        let mut next_expected = 1u64;
+        while let Some(record) = buffer.next_record().expect("read record") {
+            assert_eq!(record.wal_start, next_expected);
+            assert_eq!(record.data.len(), 100);
+            assert!(record
+                .data
+                .iter()
+                .all(|b| *b == u8::try_from(next_expected % 251).expect("fits")));
+            next_expected += 1;
+        }
+        assert_eq!(next_expected, 10_001, "every record replayed exactly once");
+        // Pushing after replay began is a programming error, not silent loss.
+        assert!(buffer
+            .push(WalRecord {
+                wal_start: 1,
+                data: Bytes::from_static(b"x"),
+            })
+            .is_err());
         drop(buffer);
         assert!(!spool_path.exists());
         let _ = std::fs::remove_dir(directory);
