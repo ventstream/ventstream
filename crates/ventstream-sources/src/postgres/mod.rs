@@ -42,3 +42,4 @@ pub use schema::type_change_epoch;
 pub use snapshot::{resync_tables, ResyncStats};
 pub use source::is_credential_message;
 pub use source::PostgresCdcSource;
+pub use source::DEFAULT_TRANSACTION_MEMORY_LIMIT_BYTES;

@@ -2294,10 +2294,17 @@ async fn build_and_run_pg_sql_denormalize_engine(
 
     let sink_progress = Arc::new(AtomicU64::new(0));
     let transform_progress = Arc::new(AtomicU64::new(0));
+    // Batches may overlap in the sink only where the sink orders writes by
+    // source version (OpenSearch external_gte, Redis versioned keys).
+    // Meilisearch and SurrealDB apply writes last-arrival-wins, so they
+    // keep the confirm-each-batch policy; the MySQL path clamps to one
+    // bulk for the same reason.
+    let version_ordered_sink = matches!(runtime.sink.kind(), "opensearch" | "redis");
     let denormalize_durability = sql_denormalize::SqlDenormalizeDurability::new(
         Arc::clone(&transform_progress),
         Arc::clone(&sink_progress),
-    );
+    )
+    .with_version_ordered_sink(version_ordered_sink);
     let lsn_flush = config_duration_ms_or_env(
         runtime
             .engine_file_config
@@ -6136,6 +6143,17 @@ fn load_cdc_bundle_postgres(
                 .map(PathBuf::from),
         };
     pg.transaction_spool_dir = transaction_spool_dir;
+    let transaction_memory_limit_bytes = config_usize_or_env(
+        source_config.and_then(|config| config.transaction_memory_limit_bytes),
+        "VS_PG_TRANSACTION_MEMORY_LIMIT_BYTES",
+        ventstream_sources::postgres::DEFAULT_TRANSACTION_MEMORY_LIMIT_BYTES,
+    )?;
+    if transaction_memory_limit_bytes == 0 {
+        return Err(anyhow!(
+            "VS_PG_TRANSACTION_MEMORY_LIMIT_BYTES / source.postgres.transaction_memory_limit_bytes must be positive"
+        ));
+    }
+    pg.transaction_memory_limit_bytes = Some(transaction_memory_limit_bytes);
 
     let (joins, joins_yaml_text) = load_joins_yaml(fleet_config, engine_config)?;
     validate_projection_target_indexes(engine_config, &joins)?;

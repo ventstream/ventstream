@@ -209,6 +209,8 @@ source:
       chunk_size: 10000
     denormalize_mode: memory # memory | sql
     sink_reverse_lookup: true
+    transaction_memory_limit_bytes: 8388608 # per-transaction WAL budget before spilling to disk
+    transaction_spool_dir: /var/lib/ventstream/pg-spool # optional; default: system temp dir
 ```
 
 Direct values and `*_ref` are mutually exclusive. `password` is intentionally not

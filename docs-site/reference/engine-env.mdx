@@ -230,6 +230,8 @@ certificates in Kubernetes Secrets or a local secret provider.
 | `VS_LSN_FLUSH_MS` | Sink-gated source checkpoint flush cadence in milliseconds (default 200). Used by PostgreSQL and MySQL join pipelines. |
 | `VS_PG_RELATED_FETCH_POOL_SIZE` | Maximum pooled connections for in-memory related-row fetches (default 4). One connection opens at startup; the remainder open lazily under concurrent demand. Canonical config: `source.postgres.related_fetch_pool_size`. |
 | `VS_PG_SINK_REVERSE_LOOKUP` | `true` (default) lets SQL mode resolve 1:many child deletes to their parent through an OpenSearch reverse lookup. |
+| `VS_PG_TRANSACTION_MEMORY_LIMIT_BYTES` | In-memory budget per transaction before its WAL records spill to the spool directory (default 8 MiB). Raise it to keep bulk loads done in one transaction off disk; the budget is per in-flight transaction. Canonical config: `source.postgres.transaction_memory_limit_bytes`. |
+| `VS_PG_TRANSACTION_SPOOL_DIR` | Writable directory for transactions that exceed the memory budget (default: `ventstream-postgres-transactions` under the system temp directory). Canonical config: `source.postgres.transaction_spool_dir`. |
 | `VS_PERSIST_BATCH_OPS` | Maximum join-state mutations in one persistent redb transaction (default 5000). Canonical config: `runtime.joins.persist_batch_ops`. |
 | `VS_JOIN_IDLE_FLUSH_MS` | Maximum time before pending join-state mutations are flushed while idle (default 1000). Canonical config: `runtime.joins.idle_flush_ms`. |
 
