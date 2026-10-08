@@ -2294,10 +2294,17 @@ async fn build_and_run_pg_sql_denormalize_engine(
 
     let sink_progress = Arc::new(AtomicU64::new(0));
     let transform_progress = Arc::new(AtomicU64::new(0));
+    // Batches may overlap in the sink only where the sink orders writes by
+    // source version (OpenSearch external_gte, Redis versioned keys).
+    // Meilisearch and SurrealDB apply writes last-arrival-wins, so they
+    // keep the confirm-each-batch policy; the MySQL path clamps to one
+    // bulk for the same reason.
+    let version_ordered_sink = matches!(runtime.sink.kind(), "opensearch" | "redis");
     let denormalize_durability = sql_denormalize::SqlDenormalizeDurability::new(
         Arc::clone(&transform_progress),
         Arc::clone(&sink_progress),
-    );
+    )
+    .with_version_ordered_sink(version_ordered_sink);
     let lsn_flush = config_duration_ms_or_env(
         runtime
             .engine_file_config

@@ -28,20 +28,42 @@ v0.1.19 is the first slow release; it contains one substantive commit
 
 The benchmark loads its rows as ONE ~1 GB transaction. A variant commits
 every 1,000 rows (≈1 MiB each, never spilling) separates spill cost from the
-rest:
+rest. Each A/B below is one back-to-back session; the two sessions ran hours
+apart, so compare rows only within a table.
+
+Session 1 — stage A alone (decode once, buffered spool, configurable budget):
+
+| Build | One 1M-row transaction | 1,000-row transactions |
+|---|---|---|
+| main (303de13) | 14,542/s | 27,243/s |
+| + stage A | 15,515/s | 27,650/s |
+| v0.1.18 | 35,749/s | 42,849/s |
+
+Stage A is within run-to-run noise (+7% / +1.5%): the spool and the double
+decode were never the cost. The changes are kept because they are correct
+and cheap, not because they are the fix.
+
+Session 2 — stage A + stage B (asynchronous durability barriers):
 
 | Build | One 1M-row transaction | 1,000-row transactions |
 |---|---|---|
 | main (303de13) | 15,720/s | 27,198/s |
-| + stage A: decode once, buffered spool, configurable budget | 15,515/s | 27,650/s |
-| + stage B: asynchronous durability barriers | **20,187/s** | **49,520/s** |
+| + stage A + B | **20,187/s** | **49,520/s** |
 | v0.1.18 | 30,963/s | 52,815/s |
 
-Stage A alone was worth ~7%: the spool was never the main cost. Stage B
-(pipelining recomposition against sink confirmation, bounded at 8 in-flight
-barriers, same checkpoint invariant) recovered the ordinary-transaction
-case to within 6% of v0.1.18 and lifted engine CPU from 35% back to 64% —
-the engine had been idle, waiting on the sink, half of the time.
+Stage B is the whole win: pipelining recomposition against sink
+confirmation (bounded at 8 in-flight barriers, same checkpoint invariant)
+recovered the ordinary-transaction case to within 6% of v0.1.18 and lifted
+engine CPU from 35% back to 64% — the engine had been idle, waiting on the
+sink, half of the time.
+
+Pipelining is enabled only for sinks that order writes by source version
+(OpenSearch, Redis). Meilisearch and SurrealDB apply writes last-arrival-
+wins, so overlapping batches could land two recompositions of one parent
+out of order; they keep the confirm-each-batch policy and therefore the
+pre-fix throughput. A batch that needs a sink reverse lookup (child delete
+without the parent key) drains the in-flight barriers first, since the
+lookup reads the sink.
 
 ## What remains
 

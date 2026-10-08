@@ -277,7 +277,13 @@ impl Drop for TransactionBuffer {
             },
         );
         if let TransactionStorage::Disk { io, path, .. } = storage {
-            drop(io);
+            // Don't flush a buffered writer into a file we are unlinking:
+            // take the raw handle out and drop that.
+            match io {
+                SpoolIo::Writing(writer) => drop(writer.into_parts().0),
+                SpoolIo::Reading(reader) => drop(reader.into_inner()),
+                SpoolIo::Switching => {}
+            }
             let _ = std::fs::remove_file(path);
         }
     }
@@ -397,8 +403,7 @@ impl PostgresCdcSource {
             .unwrap_or_else(|| std::env::temp_dir().join("ventstream-postgres-transactions"));
         let transaction_memory_limit = config
             .transaction_memory_limit_bytes
-            .unwrap_or(DEFAULT_TRANSACTION_MEMORY_LIMIT_BYTES)
-            .max(1);
+            .unwrap_or(DEFAULT_TRANSACTION_MEMORY_LIMIT_BYTES);
         Self {
             config,
             relations: RelationCache::new(),
@@ -450,7 +455,7 @@ impl PostgresCdcSource {
     /// the cost of memory; the default is 8 MiB.
     #[must_use]
     pub fn with_transaction_memory_limit(mut self, bytes: usize) -> Self {
-        self.transaction_memory_limit = bytes.max(1);
+        self.transaction_memory_limit = bytes;
         self
     }
 
@@ -904,7 +909,12 @@ impl PostgresCdcSource {
                                 // until #202) doubled the source task's CPU
                                 // for no information the replay doesn't
                                 // recover — relation messages and empty
-                                // payloads are handled in order there.
+                                // payloads are handled in order there. The
+                                // trade: a malformed payload or an
+                                // unknown-relation streak inside a large
+                                // transaction surfaces only at commit, after
+                                // the whole transaction was spooled (and
+                                // again on each restart that replays it).
                                 debug!(
                                     wal_start = %wal_start,
                                     wal_end = %wal_end,

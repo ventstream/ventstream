@@ -79,20 +79,58 @@ pub struct SqlDenormalizeDurability {
     source_progress: Arc<AtomicU64>,
     /// Emitted but unconfirmed barriers, oldest first: (sequence, watermark).
     pending: VecDeque<(u64, u64)>,
+    /// Batches allowed in flight between recomposition and sink
+    /// confirmation. `0` = confirm each batch before starting the next.
+    max_in_flight: usize,
 }
 
 impl SqlDenormalizeDurability {
+    /// Synchronous by default: every batch is confirmed durable before the
+    /// next is recomposed. See [`Self::with_version_ordered_sink`].
     pub fn new(transform_progress: Arc<AtomicU64>, source_progress: Arc<AtomicU64>) -> Self {
         Self {
             transform_progress,
             source_progress,
             pending: VecDeque::new(),
+            max_in_flight: 0,
         }
+    }
+
+    /// Let batches overlap in the sink. Only safe when the sink itself
+    /// rejects a stale write to a document by source version (OpenSearch
+    /// `external_gte`, Redis versioned keys): with batches overlapping,
+    /// two recompositions of one parent can reach the sink out of order,
+    /// and a sink that applies writes last-arrival-wins (Meilisearch,
+    /// SurrealDB) would keep the older one. Those sinks keep the
+    /// synchronous confirm-then-continue behaviour.
+    #[must_use]
+    pub fn with_version_ordered_sink(mut self, ordered: bool) -> Self {
+        self.max_in_flight = if ordered { MAX_IN_FLIGHT_BARRIERS } else { 0 };
+        self
+    }
+
+    /// Commit the batch just handled with this configuration's policy:
+    /// pipelined (emit and continue) for version-ordered sinks, otherwise
+    /// confirm-then-continue. Returns `Ok(false)` only on shutdown.
+    async fn commit_batch(
+        &mut self,
+        sender: &EventSender,
+        shutdown: &ShutdownToken,
+        next_sequence: &mut u64,
+        source_watermark: u64,
+    ) -> Result<bool> {
+        if self.max_in_flight == 0 {
+            return self
+                .commit(sender, shutdown, next_sequence, source_watermark)
+                .await;
+        }
+        self.emit_barrier(sender, shutdown, next_sequence, source_watermark)
+            .await
     }
 
     /// Emit a barrier for the batch just handled and return as soon as a
     /// lookahead slot is free. Returns `Ok(false)` only on shutdown.
-    async fn commit_async(
+    async fn emit_barrier(
         &mut self,
         sender: &EventSender,
         shutdown: &ShutdownToken,
@@ -100,7 +138,8 @@ impl SqlDenormalizeDurability {
         source_watermark: u64,
     ) -> Result<bool> {
         self.settle();
-        while self.pending.len() >= MAX_IN_FLIGHT_BARRIERS {
+        let lookahead = self.max_in_flight.max(1);
+        while self.pending.len() >= lookahead {
             if !self.wait_for_oldest(shutdown).await {
                 return Ok(false);
             }
@@ -131,7 +170,7 @@ impl SqlDenormalizeDurability {
         source_watermark: u64,
     ) -> Result<bool> {
         if !self
-            .commit_async(sender, shutdown, next_sequence, source_watermark)
+            .emit_barrier(sender, shutdown, next_sequence, source_watermark)
             .await?
         {
             return Ok(false);
@@ -185,6 +224,28 @@ impl SqlDenormalizeDurability {
             }
         }
         true
+    }
+
+    /// Shutdown path: give the dispatcher a bounded window to confirm the
+    /// barriers it is still applying, so their watermarks are released and
+    /// the restart replays as little as possible. Independent of the
+    /// shutdown token, which has already fired.
+    async fn settle_until(&mut self, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            self.settle();
+            if !self.has_pending() {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    unconfirmed = self.pending.len(),
+                    "sql-denormalize: barriers still unconfirmed at shutdown; their batches replay on restart"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }
 
@@ -776,6 +837,7 @@ impl SqlDenormalizer {
         events: &[Event],
         sender: &EventSender,
         shutdown: &ShutdownToken,
+        durability: &mut SqlDenormalizeDurability,
     ) -> Result<()> {
         if events.is_empty() {
             return Ok(());
@@ -998,6 +1060,14 @@ impl SqlDenormalizer {
                 }
             }
 
+            // A sink reverse lookup reads the sink, so every batch emitted
+            // before this one must be applied first — otherwise a parent
+            // recomposed in a still-pending batch is invisible to the lookup
+            // and the deleted child is never removed from it. Drain the
+            // pipelined barriers before asking.
+            if !lookup_buckets.is_empty() && !durability.drain(shutdown).await {
+                anyhow::bail!("shutdown while draining sink writes before a reverse lookup");
+            }
             // One batched reverse-lookup per embedded field set → affected parents.
             for (fields, mut tuples) in lookup_buckets {
                 tuples.sort();
@@ -1380,9 +1450,10 @@ impl SqlDenormalizer {
                         }
 
                         let result = async {
-                            self.handle_tail_batch(&batch, &sender, &shutdown).await?;
+                            self.handle_tail_batch(&batch, &sender, &shutdown, &mut durability)
+                                .await?;
                             durability
-                                .commit_async(
+                                .commit_batch(
                                     &sender,
                                     &shutdown,
                                     &mut next_sequence,
@@ -1427,10 +1498,22 @@ impl SqlDenormalizer {
                                 ventstream_telemetry::record_error(format!(
                                     "postgres SQL denormalizer tail recompose failed (attempt {attempt}): {err:#}"
                                 ));
-                                tokio::select! {
-                                    biased;
-                                    () = shutdown.cancelled() => break 'tail,
-                                    () = tokio::time::sleep(backoff) => {}
+                                // Barriers the sink confirms during the
+                                // outage still release their watermarks;
+                                // otherwise WAL would pin behind up to the
+                                // whole lookahead for the outage's length.
+                                durability.settle();
+                                let backoff_sleep = tokio::time::sleep(backoff);
+                                tokio::pin!(backoff_sleep);
+                                loop {
+                                    tokio::select! {
+                                        biased;
+                                        () = shutdown.cancelled() => break 'tail,
+                                        () = &mut backoff_sleep => break,
+                                        _ = settle_tick.tick(), if durability.has_pending() => {
+                                            durability.settle();
+                                        }
+                                    }
                                 }
                                 self.reconnect_if_dead().await;
                             }
@@ -1439,11 +1522,12 @@ impl SqlDenormalizer {
                 }
             }
         }
-        // Confirmed-but-unreleased barriers release their watermarks now;
-        // unconfirmed ones simply never advance the slot (safe on restart).
-        durability.settle();
-        // Drop sender → dispatcher drains.
+        // Drop sender → dispatcher drains what it already holds. Then give
+        // it a bounded window to confirm those batches so their watermarks
+        // are released; anything still unconfirmed replays on restart
+        // (idempotent), the same as a crash.
         drop(sender);
+        durability.settle_until(Duration::from_secs(5)).await;
     }
 }
 
@@ -1994,7 +2078,8 @@ mod tests {
         let mut durability = SqlDenormalizeDurability::new(
             Arc::clone(&transform_progress),
             Arc::clone(&source_progress),
-        );
+        )
+        .with_version_ordered_sink(true);
         let bus = ventstream_core::EventBus::new(64);
         let (sender, mut receiver) = bus.split();
         let shutdown = ShutdownToken::new();
@@ -2003,7 +2088,7 @@ mod tests {
         // Fill the lookahead without any sink confirmation: all return at once.
         for watermark in 1..=MAX_IN_FLIGHT_BARRIERS as u64 {
             assert!(durability
-                .commit_async(&sender, &shutdown, &mut sequence, watermark * 100)
+                .commit_batch(&sender, &shutdown, &mut sequence, watermark * 100)
                 .await
                 .expect("barrier"));
         }
@@ -2029,12 +2114,13 @@ mod tests {
                 SqlDenormalizeDurability::new(
                     Arc::clone(&transform_progress),
                     Arc::clone(&source_progress),
-                ),
+                )
+                .with_version_ordered_sink(true),
             );
             tokio::spawn(async move {
                 let mut sequence = MAX_IN_FLIGHT_BARRIERS as u64 + 1;
                 let ok = durability
-                    .commit_async(&sender, &shutdown, &mut sequence, 999_900)
+                    .commit_batch(&sender, &shutdown, &mut sequence, 999_900)
                     .await
                     .expect("barrier");
                 (ok, durability)
@@ -2056,6 +2142,41 @@ mod tests {
         durability.settle();
         assert_eq!(source_progress.load(Ordering::Acquire), 999_900);
         assert!(!durability.has_pending());
+    }
+
+    /// Sinks that apply writes last-arrival-wins keep the synchronous
+    /// policy: the default `commit_batch` does not return until the sink
+    /// has confirmed the batch, so consecutive batches can never overlap.
+    #[tokio::test]
+    async fn default_policy_confirms_each_batch_before_continuing() {
+        let transform_progress = Arc::new(AtomicU64::new(0));
+        let source_progress = Arc::new(AtomicU64::new(0));
+        let durability = SqlDenormalizeDurability::new(
+            Arc::clone(&transform_progress),
+            Arc::clone(&source_progress),
+        );
+        let bus = ventstream_core::EventBus::new(8);
+        let (sender, mut receiver) = bus.split();
+        let shutdown = ShutdownToken::new();
+        let task = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                let mut durability = durability;
+                let mut sequence = 1u64;
+                durability
+                    .commit_batch(&sender, &shutdown, &mut sequence, 777)
+                    .await
+                    .expect("barrier")
+            }
+        });
+        let barrier = receiver.recv().await.expect("barrier event");
+        assert_eq!(barrier.headers.get(JOIN_SEQUENCE_HEADER), Some("1"));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!task.is_finished(), "must wait for sink confirmation");
+        assert_eq!(source_progress.load(Ordering::Acquire), 0);
+        transform_progress.store(1, Ordering::Release);
+        assert!(task.await.expect("task"));
+        assert_eq!(source_progress.load(Ordering::Acquire), 777);
     }
 
     #[test]
